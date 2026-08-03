@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../widgets/welcome_avatar.dart';
 import 'chat_screen.dart';
 import 'files_screen.dart';
 import 'memory_screen.dart';
@@ -560,17 +561,10 @@ class _SessionTile extends StatelessWidget {
     return ListTile(
       dense: true,
       visualDensity: VisualDensity.compact,
-      leading: CircleAvatar(
-        radius: 16,
-        backgroundColor: theme.colorScheme.surfaceContainerHighest,
-        child: ClipOval(
-          child: Image.asset(
-            'assets/avatar.png',
-            width: 32,
-            height: 32,
-            fit: BoxFit.cover,
-          ),
-        ),
+      leading: SizedBox(
+        width: 34,
+        height: 34,
+        child: WelcomeAvatar(size: 32, asset: 'assets/avatar.png'),
       ),
       title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: busy
@@ -713,11 +707,7 @@ class _EmptyState extends StatelessWidget {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(
-            Icons.smart_toy_outlined,
-            size: 72,
-            color: theme.colorScheme.primary.withValues(alpha: .6),
-          ),
+          WelcomeAvatar(size: 240),
           const SizedBox(height: 16),
           Text('与拾忆开始对话', style: theme.textTheme.titleLarge),
           const SizedBox(height: 8),
@@ -725,11 +715,17 @@ class _EmptyState extends StatelessWidget {
             '跨会话记忆 · 技能沉淀 · 工具调用',
             style: theme.textTheme.bodyMedium!.copyWith(color: theme.hintColor),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 28),
           FilledButton.icon(
             onPressed: onCreate,
-            icon: const Icon(Icons.chat_bubble_outline),
+            icon: const Icon(Icons.add_rounded, size: 18),
             label: const Text('创建一个会话'),
+            style: FilledButton.styleFrom(
+              shape: const StadiumBorder(),
+              padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 14),
+              textStyle: theme.textTheme.labelLarge,
+              elevation: 0,
+            ),
           ),
         ],
       ),

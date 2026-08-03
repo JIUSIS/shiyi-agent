@@ -1,21 +1,28 @@
 // macOS 风格主题（钛金属浅色 / 深色）：柔和配色、大圆角、轻边框。
+// 强调色采用 macOS「石墨色 Graphite」灰阶（无彩色），与系统灰阶背景统一。
 import 'package:flutter/material.dart';
 
 abstract final class MacTheme {
-  static const Color accent = Color(0xFF0A84FF);
+  /// macOS Graphite 强调色：浅色模式（中灰，配白字）。
+  static const Color lightAccent = Color(0xFF8E8E93);
+
+  /// macOS Graphite 强调色：深色模式（亮灰，配深字）。
+  static const Color darkAccent = Color(0xFFAEAEB2);
 
   static ThemeData light() => _build(Brightness.light);
   static ThemeData dark() => _build(Brightness.dark);
 
   static ThemeData _build(Brightness brightness) {
     final isLight = brightness == Brightness.light;
+    final accent = isLight ? lightAccent : darkAccent;
+    final onAccent = isLight ? Colors.white : const Color(0xFF1C1C1E);
     final scheme = ColorScheme.fromSeed(
       seedColor: accent,
       brightness: brightness,
       surface: isLight ? const Color(0xFFF5F5F7) : const Color(0xFF1E1E20),
     ).copyWith(
       primary: accent,
-      onPrimary: Colors.white,
+      onPrimary: onAccent,
       surface: isLight ? const Color(0xFFFFFFFF) : const Color(0xFF1E1E20),
       onSurface: isLight ? const Color(0xFF1C1C1E) : const Color(0xFFF5F5F7),
       onSurfaceVariant: isLight ? const Color(0xFF6E6E73) : const Color(0xFF98989D),
@@ -85,8 +92,8 @@ abstract final class MacTheme {
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          backgroundColor: accent,
-          foregroundColor: Colors.white,
+          backgroundColor: scheme.primary,
+          foregroundColor: scheme.onPrimary,
           shape: const StadiumBorder(),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
@@ -101,8 +108,8 @@ abstract final class MacTheme {
         ),
       ),
       floatingActionButtonTheme: FloatingActionButtonThemeData(
-        backgroundColor: accent,
-        foregroundColor: Colors.white,
+        backgroundColor: scheme.primary,
+        foregroundColor: scheme.onPrimary,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       ),
       inputDecorationTheme: InputDecorationTheme(
@@ -120,7 +127,7 @@ abstract final class MacTheme {
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
-          borderSide: BorderSide(color: accent, width: 1.5),
+          borderSide: BorderSide(color: scheme.primary, width: 1.5),
         ),
       ),
       dividerTheme: DividerThemeData(
@@ -146,14 +153,14 @@ abstract final class MacTheme {
         iconColor: scheme.onSurfaceVariant,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
-      progressIndicatorTheme: ProgressIndicatorThemeData(color: accent),
+      progressIndicatorTheme: ProgressIndicatorThemeData(color: scheme.primary),
       switchTheme: SwitchThemeData(
         thumbColor: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.selected)) return Colors.white;
           return scheme.onSurfaceVariant;
         }),
         trackColor: WidgetStateProperty.resolveWith((states) {
-          if (states.contains(WidgetState.selected)) return accent;
+          if (states.contains(WidgetState.selected)) return scheme.primary;
           return scheme.surfaceContainerHighest;
         }),
         trackOutlineColor: const WidgetStatePropertyAll(Colors.transparent),

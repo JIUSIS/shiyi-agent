@@ -10,6 +10,7 @@ import '../services/image_service.dart';
 import '../services/permission_service.dart';
 import '../services/tts_service.dart';
 import '../widgets/message_bubble.dart';
+import '../widgets/welcome_avatar.dart';
 
 class ChatScreen extends StatefulWidget {
   final ShiyiState shiyi;
@@ -816,6 +817,55 @@ class _TokenStats extends StatelessWidget {
   }
 }
 
+/// 输入栏圆形图标按钮：有内容时主题色实心、无内容时浅色禁用。
+class _RoundIconButton extends StatelessWidget {
+  final VoidCallback? onPressed;
+  final IconData icon;
+  final String tooltip;
+  final bool filled;
+  final bool active;
+  const _RoundIconButton({
+    required this.onPressed,
+    required this.icon,
+    required this.tooltip,
+    required this.filled,
+    required this.active,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final enabled = onPressed != null;
+    final Color bg;
+    final Color fg;
+    if (filled && active) {
+      bg = cs.primary;
+      fg = cs.onPrimary;
+    } else {
+      bg = enabled
+          ? cs.surfaceContainerHighest
+          : cs.surfaceContainerHighest.withValues(alpha: .45);
+      fg = enabled
+          ? cs.onSurfaceVariant
+          : cs.onSurfaceVariant.withValues(alpha: .35);
+    }
+    return Tooltip(
+      message: tooltip,
+      child: IconButton(
+        onPressed: onPressed,
+        icon: Icon(icon, size: 18),
+        style: IconButton.styleFrom(
+          backgroundColor: bg,
+          foregroundColor: fg,
+          minimumSize: const Size(32, 32),
+          maximumSize: const Size(32, 32),
+          shape: const CircleBorder(),
+        ),
+      ),
+    );
+  }
+}
+
 class _Composer extends StatelessWidget {
   final TextEditingController input;
   final bool busy;
@@ -840,7 +890,7 @@ class _Composer extends StatelessWidget {
     return SafeArea(
       top: false,
       child: Container(
-        padding: const EdgeInsets.all(8),
+        padding: const EdgeInsets.fromLTRB(12, 6, 12, 8),
         decoration: BoxDecoration(
           color: theme.colorScheme.surfaceContainer.withValues(alpha: .92),
           border: Border(
@@ -853,12 +903,21 @@ class _Composer extends StatelessWidget {
             if (pendingImages.isNotEmpty) _previewRow(theme),
             const SizedBox(height: 6),
             Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 IconButton(
                   onPressed: onPickImage,
-                  icon: const Icon(Icons.add_photo_alternate_outlined),
+                  icon: const Icon(
+                    Icons.add_photo_alternate_outlined,
+                    size: 22,
+                  ),
                   tooltip: '发送图片',
                   color: theme.colorScheme.primary,
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints(
+                    minWidth: 36,
+                    minHeight: 36,
+                  ),
                 ),
                 Expanded(
                   child: TextField(
@@ -867,59 +926,59 @@ class _Composer extends StatelessWidget {
                     maxLines: 5,
                     textInputAction: TextInputAction.newline,
                     onSubmitted: (_) => onSend(),
+                    style: theme.textTheme.bodyLarge,
                     decoration: InputDecoration(
                       hintText: '输入消息…',
                       hintStyle: TextStyle(color: theme.hintColor),
-                      filled: true,
-                      fillColor: theme.colorScheme.surfaceContainerHigh
-                          .withValues(alpha: .85),
+                      border: InputBorder.none,
                       contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 10,
-                      ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(24),
-                        borderSide: BorderSide.none,
+                        horizontal: 8,
+                        vertical: 6,
                       ),
                     ),
                   ),
                 ),
-                const SizedBox(width: 8),
-                ValueListenableBuilder<TextEditingValue>(
-                  valueListenable: input,
-                  builder: (context, value, _) {
-                    final hasInput =
-                        value.text.trim().isNotEmpty ||
-                        pendingImages.isNotEmpty;
-                    if (!busy) {
-                      return IconButton.filled(
-                        onPressed: onSend,
-                        icon: const Icon(Icons.send_rounded),
+                  ValueListenableBuilder<TextEditingValue>(
+                    valueListenable: input,
+                    builder: (context, value, _) {
+                      final hasInput =
+                          value.text.trim().isNotEmpty ||
+                          pendingImages.isNotEmpty;
+                      if (busy) {
+                        return Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _RoundIconButton(
+                              onPressed: onStop,
+                              icon: Icons.stop_rounded,
+                              tooltip: '停止',
+                              filled: false,
+                              active: true,
+                            ),
+                            if (hasInput) ...[
+                              const SizedBox(width: 4),
+                              _RoundIconButton(
+                                onPressed: onSend,
+                                icon: Icons.send_rounded,
+                                tooltip: '发送并引导',
+                                filled: true,
+                                active: true,
+                              ),
+                            ],
+                          ],
+                        );
+                      }
+                      return _RoundIconButton(
+                        onPressed: hasInput ? onSend : null,
+                        icon: Icons.send_rounded,
                         tooltip: '发送',
+                        filled: true,
+                        active: hasInput,
                       );
-                    }
-                    return Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        IconButton(
-                          onPressed: onStop,
-                          icon: const Icon(Icons.stop_rounded),
-                          tooltip: '停止',
-                        ),
-                        if (hasInput) ...[
-                          const SizedBox(width: 4),
-                          IconButton.filled(
-                            onPressed: onSend,
-                            icon: const Icon(Icons.send_rounded),
-                            tooltip: '发送并引导',
-                          ),
-                        ],
-                      ],
-                    );
-                  },
-                ),
-              ],
-            ),
+                    },
+                  ),
+                ],
+              ),
           ],
         ),
       ),
@@ -998,11 +1057,7 @@ class _Welcome extends StatelessWidget {
       padding: const EdgeInsets.all(24),
       children: [
         const SizedBox(height: 40),
-        Icon(
-          Icons.auto_mode_outlined,
-          size: 80,
-          color: theme.colorScheme.primary.withValues(alpha: .7),
-        ),
+        const Center(child: WelcomeAvatar(size: 240)),
         const SizedBox(height: 12),
         Text(
           '你好，我是拾忆\n与你共同成长的智能体',

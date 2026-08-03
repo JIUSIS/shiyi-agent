@@ -71,7 +71,9 @@ class _WelcomeScreenState extends State<WelcomeScreen>
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      backgroundColor: theme.colorScheme.surface,
+      // 页面背景与主题空背景一致（scaffoldBackgroundColor: 浅 #F2F2F7 / 深 #1E1E20），
+      // 避免欢迎页用 surface 纯白导致与主页背景不统一。
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: AnimatedBuilder(
         animation: _ctrl,
         builder: (context, child) =>
@@ -80,30 +82,11 @@ class _WelcomeScreenState extends State<WelcomeScreen>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Container(
+              Image.asset(
+                'assets/welcome.png',
                 width: 240,
                 height: 240,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(28),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: .12),
-                      blurRadius: 30,
-                      offset: const Offset(0, 12),
-                    ),
-                  ],
-                ),
-                padding: const EdgeInsets.all(18),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(18),
-                  child: Image.asset(
-                    'assets/welcome.png',
-                    fit: BoxFit.contain,
-                    width: double.infinity,
-                    height: double.infinity,
-                  ),
-                ),
+                fit: BoxFit.contain,
               ),
               const SizedBox(height: 30),
               Text(
