@@ -11,7 +11,7 @@ class TermuxRuntime {
   static const String _assetPath = 'assets/termux/bootstrap-aarch64.zip';
 
   /// 环境版本号：bootstrap 内容/结构变更时递增，写进 .env_version 强制重新部署。
-  static const String _envVersion = 'v11';
+  static const String _envVersion = 'v12';
 
   /// 环境根目录（app 私有 files 目录下的固定 termux 目录，无版本后缀）。
   static Future<String> _baseDir() async {
@@ -67,6 +67,54 @@ class TermuxRuntime {
       Directory('$destDir/$d').createSync(recursive: true);
     }
     File(await _versionFilePath()).writeAsStringSync(_envVersion);
+    // 重写 profile / home 配置：修正官方模板的 files/usr 错误路径，并固化全部 env。
+    await _writeProfile();
+  }
+
+  /// 重写 usr/etc/profile 与 home 的 .profile/.bashrc。
+  /// 官方 Termux 模板路径含 /files/usr（我们的结构是 usr 直接在根下），
+  /// 且 env 需对登录 shell 也可用。
+  static Future<void> _writeProfile() async {
+    final usr = await usrDir();
+    final prefix = await prefixDir();
+    final cert = '$usr/etc/tls/cert.pem';
+    final profile = '''
+# shiyi agent termux profile
+for i in $usr/etc/profile.d/*.sh; do
+	if [ -r \$i ]; then
+		. \$i
+	fi
+done
+unset i
+
+if [ "\$BASH" ]; then
+	if [[ "\$-" == *"i"* ]]; then
+		if [ -r $usr/etc/bash.bashrc ]; then
+			. $usr/etc/bash.bashrc
+		fi
+		if [ -r $prefix/home/.bashrc ]; then
+			. $prefix/home/.bashrc
+		fi
+	fi
+fi
+
+# --- shiyi agent env ---
+export PREFIX="$usr"
+export TERMUX__PREFIX="$usr"
+export SHELL="$usr/bin/bash"
+export LD_LIBRARY_PATH="$usr/lib"
+export PYTHONHOME="$usr"
+export CURL_CA_BUNDLE="$cert"
+export SSL_CERT_FILE="$cert"
+export PROOT_TMP_DIR="$prefix/tmp"
+export PROOT_LOADER="$usr/libexec/proot/loader"
+export TMPDIR="$prefix/tmp"
+export PATH="$usr/bin:$usr/bin/applets:/system/bin:/system/xbin"
+''';
+    File('$usr/etc/profile').writeAsStringSync(profile);
+    final homeRc = 'export PATH="$usr/bin:\$PATH"\n';
+    File('$prefix/home/.profile').writeAsStringSync(homeRc);
+    File('$prefix/home/.bashrc').writeAsStringSync(homeRc);
   }
 
   /// 确保已安装：未安装则解压，失败抛异常。
@@ -75,16 +123,25 @@ class TermuxRuntime {
     await install();
   }
 
-  /// 内嵌 Termux 的执行环境变量。
+  /// 内嵌 Termux 的执行环境变量（run_terminal / 终端页每次执行都注入，
+  /// 不依赖 profile —— 非登录 bash -c 不会加载 profile）。
   static Future<Map<String, String>> environment() async {
     final usr = await usrDir();
     final prefix = await prefixDir();
+    final cert = '$usr/etc/tls/cert.pem';
     return {
       'HOME': '$prefix/home',
       'PREFIX': usr,
+      'TERMUX__PREFIX': usr,
+      'SHELL': '$usr/bin/bash',
       'PATH': '$usr/bin:$usr/bin/applets:/system/bin:/system/xbin',
-      'TMPDIR': '$usr/tmp',
+      'TMPDIR': '$prefix/tmp',
       'LD_LIBRARY_PATH': '$usr/lib',
+      'PYTHONHOME': usr,
+      'CURL_CA_BUNDLE': cert,
+      'SSL_CERT_FILE': cert,
+      'PROOT_TMP_DIR': '$prefix/tmp',
+      'PROOT_LOADER': '$usr/libexec/proot/loader',
     };
   }
 }
