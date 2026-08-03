@@ -11,7 +11,7 @@ class TermuxRuntime {
   static const String _assetPath = 'assets/termux/bootstrap-aarch64.zip';
 
   /// 环境版本号：bootstrap 内容/结构变更时递增，写进 .env_version 强制重新部署。
-  static const String _envVersion = 'v8';
+  static const String _envVersion = 'v11';
 
   /// 环境根目录（app 私有 files 目录下的固定 termux 目录，无版本后缀）。
   static Future<String> _baseDir() async {
@@ -56,6 +56,16 @@ class TermuxRuntime {
     Directory('$destDir/tmp').createSync(recursive: true);
     Directory('$prefix/tmp').createSync(recursive: true);
     Directory('$prefix/cache').createSync(recursive: true);
+    // apt/dpkg 运行必需的目录（空目录不随 tar/zip 保留，这里显式创建）。
+    for (final d in const [
+      'etc/apt/apt.conf.d',
+      'etc/apt/preferences.d',
+      'var/lib/dpkg/updates',
+      'var/lib/apt/lists/partial',
+      'var/cache/apt/archives/partial',
+    ]) {
+      Directory('$destDir/$d').createSync(recursive: true);
+    }
     File(await _versionFilePath()).writeAsStringSync(_envVersion);
   }
 

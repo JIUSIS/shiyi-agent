@@ -1269,9 +1269,15 @@ class ShiyiState extends ChangeNotifier {
               shell == 'cmd' ? ['/c', command] : ['-c', command],
               workingDirectory: cwd,
               environment: embedded ? await TermuxRuntime.environment() : null,
+              stdoutEncoding: null,
+              stderrEncoding: null,
             ).timeout(const Duration(seconds: 120));
-            final out = result.stdout.toString().trim();
-            final err = result.stderr.toString().trim();
+            final out = utf8
+                .decode(result.stdout as List<int>, allowMalformed: true)
+                .trim();
+            final err = utf8
+                .decode(result.stderr as List<int>, allowMalformed: true)
+                .trim();
             final buf = StringBuffer();
             if (out.isNotEmpty) buf.write(out);
             if (err.isNotEmpty) buf.write(buf.isEmpty ? err : '\n$err');

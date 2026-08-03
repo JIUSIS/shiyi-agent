@@ -13,6 +13,7 @@ TAR = 'termux_usr.tgz'
 OUT = 'bootstrap-custom.zip'
 OLD_V5 = b'/data/user/0/com.shiyi.agent/files/termux_v5'
 OLD_V4 = b'/data/user/0/com.shiyi.agent/files/termux_v4'
+OLD_CUR = b'/data/user/0/com.shiyi.agent/files/termux'
 
 TERMUX_APT = '''#!/data/data/com.termux/files/usr/bin/sh
 # termux-apt: run apt/pkg through proot (dynamic prefix resolution)
@@ -23,7 +24,7 @@ mkdir -p "$ROOTFS/tmp" "$ROOTFS/cache" "$ROOTFS/usr/tmp"
 export LD_LIBRARY_PATH=$ROOTFS/usr/lib
 export PROOT_TMP_DIR=$ROOTFS/tmp
 export PROOT_LOADER=$ROOTFS/usr/libexec/proot/loader
-ARGS="-r $ROOTFS -b /system:/system -b /vendor:/vendor -b /data:/data -b /dev:/dev -b /proc:/proc -b /sys:/sys -b /apex:/apex -b $ROOTFS:/data/data/com.termux/files -b $ROOTFS/cache:/data/data/com.termux/cache"
+ARGS="-r $ROOTFS -b /system:/system -b /vendor:/vendor -b /data:/data -b /dev:/dev -b /proc:/proc -b /sys:/sys -b /apex:/apex -b /linkerconfig:/linkerconfig -b $ROOTFS:/data/data/com.termux/files -b $ROOTFS/cache:/data/data/com.termux/cache"
 if [ "$1" = "apt" ] || [ "$1" = "pkg" ]; then
     CMD="$1"; shift
     exec "$ROOTFS/usr/bin/proot" $ARGS -w / /usr/bin/$CMD "$@"
@@ -33,7 +34,7 @@ fi
 '''.encode('utf-8')
 
 def norm(data: bytes) -> bytes:
-    for old in (OLD_V5, OLD_V4):
+    for old in (OLD_V5, OLD_V4, OLD_CUR):
         if old in data:
             data = data.replace(old, b'/data/data/com.termux')
     return data
@@ -44,9 +45,10 @@ file_entries = []      # (rel_path, data)
 
 for m in tf.getmembers():
     name = m.name.replace('\\', '/')
-    if not name.startswith('termux_v5/usr/'):
+    if not (name.startswith('termux_v5/usr/') or name.startswith('termux/usr/')):
         continue
-    rel = name[len('termux_v5/usr/'):]
+    prefix = 'termux_v5/usr/' if name.startswith('termux_v5/usr/') else 'termux/usr/'
+    rel = name[len(prefix):]
     if rel == '':
         continue
     if m.isdir():
