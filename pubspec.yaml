@@ -74,6 +74,7 @@ flutter:
   assets:
     - assets/welcome.png
     - assets/avatar.png
+    - assets/termux/bootstrap-aarch64.zip
 
   # To add assets to your application, add an assets section, like this:
   # assets:

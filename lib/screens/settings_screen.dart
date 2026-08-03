@@ -22,6 +22,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _keyCtrl;
   late final TextEditingController _modelCtrl;
   late final TextEditingController _promptCtrl;
+  late final TextEditingController _visionUrlCtrl;
+  late final TextEditingController _visionKeyCtrl;
+  late final TextEditingController _visionModelCtrl;
   double _temperature = 0.7;
   bool _tools = true;
   bool _memory = true;
@@ -31,6 +34,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _contextLimit = 1000000;
   double _compressThresholdPercent = 80;
   bool _autoCompress = true;
+  bool _visionEnabled = false;
+  bool _showVisionKey = false;
   String _keyHint = 'sk-...';
   String? _presetName;
   bool _showKey = false;
@@ -47,6 +52,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _keyCtrl = TextEditingController(text: s.apiKey);
     _modelCtrl = TextEditingController(text: s.model);
     _promptCtrl = TextEditingController(text: s.systemPrompt);
+    _visionUrlCtrl = TextEditingController(text: s.visionBaseUrl);
+    _visionKeyCtrl = TextEditingController(text: s.visionApiKey);
+    _visionModelCtrl = TextEditingController(text: s.visionModel);
+    _visionEnabled = s.visionEnabled;
     _temperature = s.temperature;
     _tools = s.enableTools;
     _memory = s.enableMemory;
@@ -128,6 +137,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _baseCtrl.dispose();
     _keyCtrl.dispose();
     _modelCtrl.dispose();
+    _visionUrlCtrl.dispose();
+    _visionKeyCtrl.dispose();
+    _visionModelCtrl.dispose();
     _promptCtrl.dispose();
     super.dispose();
   }
@@ -162,6 +174,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         contextLimit: _contextLimit,
         compressThresholdPercent: _compressThresholdPercent,
         autoCompress: _autoCompress,
+        visionEnabled: _visionEnabled,
+        visionBaseUrl: _visionUrlCtrl.text.trim(),
+        visionApiKey: _visionKeyCtrl.text.trim(),
+        visionModel: _visionModelCtrl.text.trim(),
       ),
     );
     // 把当前接口地址/密钥/模型写回所选配置并落盘，切换时自动带出。
@@ -700,6 +716,76 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ],
                 ),
               ),
+              const Divider(),
+              _section('视觉模型'),
+              SwitchListTile(
+                secondary: const Icon(Icons.image_search_outlined),
+                title: const Text('启用视觉模型'),
+                subtitle: const Text('主模型不支持图片时，自动调用视觉模型描述图片后再继续对话'),
+                value: _visionEnabled,
+                onChanged: (v) {
+                  setState(() => _visionEnabled = v);
+                  _autoSave();
+                },
+              ),
+              if (_visionEnabled) ...[
+                ListTile(
+                  leading: const Icon(Icons.link),
+                  title: const Text('视觉模型接口地址'),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: TextField(
+                      controller: _visionUrlCtrl,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        hintText: '留空则与主模型同接口',
+                      ),
+                      onChanged: (_) => _autoSave(),
+                    ),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.key),
+                  title: const Text('视觉模型密钥'),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: TextField(
+                      controller: _visionKeyCtrl,
+                      obscureText: !_showVisionKey,
+                      decoration: InputDecoration(
+                        border: const OutlineInputBorder(),
+                        hintText: '留空则与主模型同密钥',
+                        suffixIcon: IconButton(
+                          icon: Icon(
+                            _showVisionKey
+                                ? Icons.visibility_off_outlined
+                                : Icons.visibility_outlined,
+                          ),
+                          onPressed: () =>
+                              setState(() => _showVisionKey = !_showVisionKey),
+                          tooltip: _showVisionKey ? '隐藏密钥' : '显示密钥',
+                        ),
+                      ),
+                      onChanged: (_) => _autoSave(),
+                    ),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.model_training),
+                  title: const Text('视觉模型'),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: TextField(
+                      controller: _visionModelCtrl,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        hintText: '例如 gpt-4o-mini / qwen-vl-max',
+                      ),
+                      onChanged: (_) => _autoSave(),
+                    ),
+                  ),
+                ),
+              ],
               const Divider(),
               _section('能力'),
               SwitchListTile(

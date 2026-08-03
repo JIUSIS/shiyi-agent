@@ -12,6 +12,9 @@ import 'screens/welcome_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 强制 edge-to-edge：状态栏/导航栏透明沉浸。
+  // targetSdk 降到 34 后系统不再强制，这里显式开启保持沉浸效果。
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   final initialThemeMode = await _readInitialThemeMode();
   runApp(ShiyiAgentApp(initialThemeMode: initialThemeMode));
   unawaited(PermissionService.ensureOnLaunch());
@@ -68,9 +71,7 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
       SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
         statusBarIconBrightness: isDark ? Brightness.light : Brightness.dark,
-        systemNavigationBarColor: isDark
-            ? const Color(0xFF1E1E20)
-            : const Color(0xFFF2F2F7),
+        systemNavigationBarColor: Colors.transparent,
         systemNavigationBarIconBrightness: isDark
             ? Brightness.light
             : Brightness.dark,

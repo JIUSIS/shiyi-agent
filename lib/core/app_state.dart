@@ -10,6 +10,7 @@ import '../services/permission_service.dart';
 import '../services/llm_client.dart';
 import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
+import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
 
 class ShiyiState extends ChangeNotifier {
@@ -64,6 +65,31 @@ class ShiyiState extends ChangeNotifier {
 
   /// 终端工具遇到存储权限不足时的提示（聊天页显示授权横幅）。
   bool storagePermissionHint = false;
+
+  /// 模型发起的待用户确认问题：{question, options}；UI 弹窗后用户选择。
+  Map<String, dynamic>? pendingQuestion;
+  Completer<String>? _questionCompleter;
+
+  /// 用户回答 question 工具；optionIndex 为空表示取消。
+  void answerQuestion(int? optionIndex) {
+    final c = _questionCompleter;
+    final q = pendingQuestion;
+    if (c == null || q == null) return;
+    final options = (q['options'] as List?) ?? const [];
+    final answer =
+        (optionIndex != null &&
+            optionIndex >= 0 &&
+            optionIndex < options.length)
+        ? options[optionIndex].toString()
+        : '用户取消了选择';
+    pendingQuestion = null;
+    _questionCompleter = null;
+    if (!c.isCompleted) c.complete(answer);
+    notifyListeners();
+  }
+
+  /// 图片路径 -> 视觉模型描述缓存（避免同一图片每轮重复调用）。
+  final Map<String, String> _imageDescCache = {};
 
   static const List<Map<String, dynamic>> functionTools = [
     {
@@ -147,7 +173,7 @@ class ShiyiState extends ChangeNotifier {
       'function': {
         'name': 'run_terminal',
         'description':
-            '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。',
+            '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。',
         'parameters': {
           'type': 'object',
           'properties': {
@@ -158,6 +184,81 @@ class ShiyiState extends ChangeNotifier {
             },
           },
           'required': ['command'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
+        'name': 'file_write',
+        'description':
+            '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'path': {'type': 'string', 'description': '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt'},
+            'content': {'type': 'string', 'description': '要写入的完整内容'},
+          },
+          'required': ['path', 'content'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
+        'name': 'file_read',
+        'description': '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'path': {'type': 'string', 'description': '文件路径'},
+          },
+          'required': ['path'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
+        'name': 'question',
+        'description':
+            '向用户发起一个确认或选择问题，必须等待用户回答后流程才能继续。用于需要用户确认才能继续的操作，如「是否保存文件」「选择下一步方案」等。一次只问一个问题，选项 2~4 个。',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'question': {'type': 'string', 'description': '要问用户的问题'},
+            'options': {
+              'type': 'array',
+              'items': {'type': 'string'},
+              'description': '选项列表（2~4 个），用户从中选择',
+            },
+          },
+          'required': ['question'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
+        'name': 'create_skill',
+        'description':
+            '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'name': {'type': 'string', 'description': '技能名称，英文小写+连字符，如 chapter-outliner'},
+            'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
+            'content': {
+              'type': 'string',
+              'description': 'SKILL.md 完整内容（含 --- frontmatter）',
+            },
+            'files': {
+              'type': 'object',
+              'description': '可选辅助文件：相对路径 -> 内容',
+              'additionalProperties': {'type': 'string'},
+            },
+          },
+          'required': ['name', 'description', 'content'],
         },
       },
     },
@@ -182,6 +283,34 @@ class ShiyiState extends ChangeNotifier {
       initError = '$e';
     }
     notifyListeners();
+    // 后台安装内嵌 Termux（完整 Linux 环境），不阻塞启动。
+    unawaited(_ensureTermux());
+  }
+
+  Future<void> _ensureTermux() async {
+    try {
+      await TermuxRuntime.ensureInstalled();
+      // 自检：确认 bash 能启动（SELinux exec 是否放行），结果写日志便于诊断。
+      try {
+        final shell = await TermuxRuntime.shellPath();
+        final probe = await Process.run(
+          shell,
+          ['-c', 'echo probe-ok'],
+          environment: await TermuxRuntime.environment(),
+        ).timeout(const Duration(seconds: 15));
+        await _logError(
+          'TermuxProbe',
+          'exit=${probe.exitCode} out=${probe.stdout.toString().trim()} '
+          'err=${probe.stderr.toString().trim()}',
+        );
+      } catch (e) {
+        await _logError('TermuxProbe', 'EXEC_FAILED: $e');
+      }
+    } catch (e) {
+      await _logError('Termux', '$e');
+      status = '内嵌终端环境安装失败: $e';
+      notifyListeners();
+    }
   }
 
   Future<void> _reloadAll() async {
@@ -196,6 +325,9 @@ class ShiyiState extends ChangeNotifier {
   }
 
   // ---------------- sessions ----------------
+
+  /// 当前会话手动加载的技能（输入 / 选择），注入到系统提示，切换会话时清空。
+  Skill? loadedSkill;
 
   Future<void> newSession() async {
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -213,6 +345,7 @@ class ShiyiState extends ChangeNotifier {
     messages = [];
     _messagesLoadedForSessionId = id;
     toolEvents = [];
+    loadedSkill = null;
     sessionTotalTokens = 0;
     lastRoundTokens = 0;
     sessionChars = 0;
@@ -223,6 +356,7 @@ class ShiyiState extends ChangeNotifier {
     currentSessionId = id;
     viewingSessionId = id;
     unreadSessions.remove(id);
+    loadedSkill = null;
     messages = await _db.listMessages(id);
     _messagesLoadedForSessionId = id;
     toolEvents = await _db.listToolEvents(id);
@@ -256,8 +390,15 @@ class ShiyiState extends ChangeNotifier {
       messages = [];
       _messagesLoadedForSessionId = null;
       toolEvents = [];
+      loadedSkill = null;
     }
     await refreshSessions();
+  }
+
+  /// 在当前会话加载/移除技能（输入 / 选择），内容注入系统提示供模型使用。
+  void loadSkill(Skill? s) {
+    loadedSkill = s;
+    notifyListeners();
   }
 
   Future<List<SessionSearchResult>> searchSessions(String query) =>
@@ -281,7 +422,12 @@ class ShiyiState extends ChangeNotifier {
           out.add(await _userMessageToApi(m));
         } else {
           final text = stripImageMarkers(m.content);
-          out.add({'role': 'user', 'content': text.isEmpty ? '[图片]' : text});
+          final desc = await _describeImagesIfEnabled(m);
+          final combined = [
+            if (text.isNotEmpty) text,
+            if (desc.isNotEmpty) desc,
+          ].join('\n');
+          out.add({'role': 'user', 'content': combined.isEmpty ? '[图片]' : combined});
         }
         continue;
       }
@@ -320,6 +466,71 @@ class ShiyiState extends ChangeNotifier {
     }
     if (parts.isEmpty) parts.add({'type': 'text', 'text': '[图片]'});
     return {'role': 'user', 'content': parts};
+  }
+
+  /// 启用视觉模型时，用视觉模型把消息里的图片描述成文字；
+  /// 未启用、未配置模型或调用失败时返回空串（上层回退 [图片] 占位）。
+  /// 描述按图片路径缓存，同一图片不重复调用。
+  Future<String> _describeImagesIfEnabled(ChatMessage m) async {
+    if (!settings.visionEnabled || settings.visionModel.trim().isEmpty) {
+      return '';
+    }
+    final paths = extractImagePaths(m.content);
+    if (paths.isEmpty) return '';
+    final parts = <String>[];
+    for (final p in paths) {
+      final cached = _imageDescCache[p];
+      if (cached != null) {
+        if (cached.isNotEmpty) parts.add(cached);
+        continue;
+      }
+      String? b64;
+      try {
+        final f = File(p);
+        if (await f.exists()) b64 = base64Encode(await f.readAsBytes());
+      } catch (_) {
+        b64 = null;
+      }
+      if (b64 == null) continue;
+      var desc = '';
+      try {
+        final client = LlmClient(
+          baseUrl: settings.visionBaseUrl.trim().isEmpty
+              ? settings.baseUrl
+              : settings.visionBaseUrl.trim(),
+          apiKey: settings.visionApiKey.trim().isEmpty
+              ? settings.apiKey
+              : settings.visionApiKey.trim(),
+          model: settings.visionModel.trim(),
+          temperature: 0.2,
+          tools: const [],
+        );
+        desc = (await client.completeOne([
+          {
+            'role': 'system',
+            'content':
+                '你是图像描述助手。请详细描述图片内容：主体、场景、空间布局、关键细节与数据；'
+                '如果是截图、文档、聊天记录或代码，请完整提取其中的文字内容（保留原文，不省略）。'
+                '用简体中文输出，500 字以内，只输出描述，不要解释、不要评论。',
+          },
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'image_url',
+                'image_url': {'url': 'data:image/jpeg;base64,$b64'},
+              },
+            ],
+          },
+        ], temperature: 0.2, maxTokens: 700)).trim();
+      } catch (_) {
+        desc = '';
+      }
+      _imageDescCache[p] = desc;
+      if (desc.isNotEmpty) parts.add(desc);
+    }
+    if (parts.isEmpty) return '';
+    return parts.map((e) => '【图片：$e】').join('\n');
   }
 
   Future<void> send(String text) async {
@@ -426,7 +637,11 @@ class ShiyiState extends ChangeNotifier {
   }) async {
     final systemPrompt = await _buildSystemPrompt(systemHint);
 
-    var imagesAllowed = !_knownImageUnsupported;
+    // 配了视觉模型 = 声明主模型不看图：带图消息直接走视觉模型描述，不试多模态。
+    // 未配视觉模型：先按多模态发，失败自动降级（_knownImageUnsupported）。
+    final visionReady = settings.visionEnabled &&
+        settings.visionModel.trim().isNotEmpty;
+    var imagesAllowed = !_knownImageUnsupported && !visionReady;
     var completed = false;
     for (var attempt = 0; attempt < 2 && !completed; attempt++) {
       try {
@@ -611,8 +826,8 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 多轮工具调用循环：每轮工具调用输出的文字作为独立消息保留，
-  /// 最多 12 轮（每轮可含多个工具），最后一轮强制再请求一次拿到最终文本。
-  static const int _maxToolRounds = 12;
+  /// 最多 99 轮（每轮可含多个工具），最后一轮强制再请求一次拿到最终文本。
+  static const int _maxToolRounds = 99;
 
   Future<void> _runAgentLoop(
     String sessionId,
@@ -884,6 +1099,21 @@ class ShiyiState extends ChangeNotifier {
         '【已掌握技能】\n${skills.map((s) => '- ${s.name}${s.description.isEmpty ? '' : ': ${s.description}'}').join('\n')}\n（需要时用 run_skill 获取技能完整内容）',
       );
     }
+
+    // 用户手动加载的技能（输入 / 选择）：完整内容直接注入，无需 run_skill。
+    final loaded = loadedSkill;
+    if (loaded != null) {
+      final sb = StringBuffer('【已加载技能：${loaded.name}】\n${loaded.content}');
+      for (final e in loaded.files.entries) {
+        sb.writeln('\n--- ${e.key} ---\n${e.value}');
+      }
+      if (loaded.largeFiles.isNotEmpty) {
+        sb.writeln(
+          '\n（技能大文件在磁盘 ${loaded.dirPath}，内容较大未内联，需要时用 run_terminal 读取）',
+        );
+      }
+      parts.add(sb.toString());
+    }
     return parts.join('\n\n');
   }
 
@@ -1000,10 +1230,45 @@ class ShiyiState extends ChangeNotifier {
             final isWin = Platform.isWindows;
             var cwd = (args['cwd'] ?? '').toString().trim();
             if (cwd.isEmpty) cwd = await FileWorkspace.current();
+            // 优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用）；
+            // 其次系统 Termux；都没有则用系统精简 shell。
+            const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
+            final embeddedShell = await TermuxRuntime.shellPath();
+            final embedded = !isWin && File(embeddedShell).existsSync();
+            final systemTermux =
+                !isWin && File(systemTermuxShell).existsSync();
+            final useTermux = embedded || systemTermux;
+            final shell = embedded
+                ? embeddedShell
+                : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
+            // 内嵌 Termux：先自检 bash 能否启动，失败时给出可诊断的错误。
+            if (embedded) {
+              try {
+                final probe = await Process.run(
+                  embeddedShell,
+                  ['-c', 'true'],
+                  environment: await TermuxRuntime.environment(),
+                ).timeout(const Duration(seconds: 15));
+                if (probe.exitCode != 0) {
+                  final msg =
+                      '内嵌终端自检失败(exit ${probe.exitCode}): '
+                      '${probe.stderr.toString().trim()}';
+                  await _logError('Termux', msg);
+                  return '内嵌终端不可用：$msg';
+                }
+              } on ProcessException catch (e) {
+                final msg = '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})';
+                await _logError('Termux', msg);
+                return '内嵌终端不可用：$msg';
+              } on TimeoutException {
+                return '内嵌终端启动超时';
+              }
+            }
             final result = await Process.run(
-              isWin ? 'cmd' : 'sh',
-              isWin ? ['/c', command] : ['-c', command],
+              shell,
+              shell == 'cmd' ? ['/c', command] : ['-c', command],
               workingDirectory: cwd,
+              environment: embedded ? await TermuxRuntime.environment() : null,
             ).timeout(const Duration(seconds: 120));
             final out = result.stdout.toString().trim();
             final err = result.stderr.toString().trim();
@@ -1013,6 +1278,23 @@ class ShiyiState extends ChangeNotifier {
             var text = buf.toString();
             if (text.length > 4000) {
               text = '${text.substring(0, 4000)}…（输出过长，已截断）';
+            }
+            // Android 精简 shell（toybox）缺包管理器：命中 apt/pkg 类命令时引导装 Termux。
+            if (!useTermux && !isWin) {
+              final firstWord = command
+                  .trim()
+                  .split(RegExp(r'\s+'))
+                  .first
+                  .toLowerCase();
+              const pkgMgrs = ['apt', 'apt-get', 'pkg', 'dnf', 'yum', 'apk', 'pacman'];
+              final wantsPkg = pkgMgrs.contains(firstWord) ||
+                  pkgMgrs.any((p) => command.contains(' $p '));
+              if (wantsPkg) {
+                text = text.isEmpty ? '（无输出）' : text;
+                text +=
+                    '\n\n【提示】当前是 Android 精简 shell（toybox），没有 apt/pkg 等包管理器。'
+                    '重启应用后会自动部署内嵌 Termux 环境（完整 Linux），届时 pkg install xxx 即可用。';
+              }
             }
             final textLower = text.toLowerCase();
             final cmdLower = command.toLowerCase();
@@ -1041,12 +1323,99 @@ class ShiyiState extends ChangeNotifier {
           } on ProcessException catch (e) {
             return '终端执行异常: ${e.message}';
           }
+        case 'file_write':
+          final wPath = (args['path'] ?? '').toString().trim();
+          final content = (args['content'] ?? '').toString();
+          if (wPath.isEmpty) return '写入失败：path 为空';
+          try {
+            final resolved = await _resolveToolPath(wPath);
+            if (resolved == null) return '写入失败：路径无效';
+            final f = File(resolved);
+            await f.create(recursive: true);
+            await f.writeAsString(content, flush: true);
+            return '已写入 $resolved（${content.length} 字符）';
+          } catch (e) {
+            return '写入失败: $e';
+          }
+        case 'file_read':
+          final rPath = (args['path'] ?? '').toString().trim();
+          if (rPath.isEmpty) return '读取失败：path 为空';
+          try {
+            final resolved = await _resolveToolPath(rPath);
+            final f = resolved == null ? null : File(resolved);
+            if (f == null || !f.existsSync()) return '文件不存在：$rPath';
+            if (await f.length() > 200 * 1024) {
+              return '文件过大（>200KB），请用 run_terminal 分段读取';
+            }
+            return await f.readAsString();
+          } catch (e) {
+            return '读取失败: $e';
+          }
+        case 'question':
+          final qText = (args['question'] ?? '').toString().trim();
+          if (qText.isEmpty) return '问题为空';
+          final opts = args['options'];
+          final options = (opts is List && opts.isNotEmpty)
+              ? opts.map((e) => e.toString()).take(4).toList()
+              : const <String>['确认', '取消'];
+          final completer = Completer<String>();
+          pendingQuestion = {'question': qText, 'options': options};
+          _questionCompleter = completer;
+          notifyListeners();
+          final answer = await completer.future;
+          return '用户的选择：$answer';
+        case 'create_skill':
+          final skillName = (args['name'] ?? '').toString().trim();
+          final skillDesc = (args['description'] ?? '').toString().trim();
+          final skillContent = (args['content'] ?? '').toString();
+          if (skillName.isEmpty) return '创建失败：name 为空';
+          final filesArg = args['files'];
+          final filesMap = <String, String>{};
+          if (filesArg is Map) {
+            for (final e in filesArg.entries) {
+              filesMap[e.key.toString()] = e.value.toString();
+            }
+          }
+          try {
+            final existing = await _db.getSkillByName(skillName);
+            final skill = Skill(
+              id: existing?.id ?? 0,
+              name: skillName,
+              description: skillDesc,
+              content: skillContent,
+              createdAt:
+                  existing?.createdAt ??
+                  DateTime.now().millisecondsSinceEpoch,
+              files: filesMap,
+            );
+            if (existing == null) {
+              await _db.addSkill(skill);
+            } else {
+              await _db.updateSkill(skill);
+            }
+            skills = await _db.listSkills();
+            notifyListeners();
+            return existing == null
+                ? '技能「$skillName」已创建'
+                : '技能「$skillName」已更新';
+          } catch (e) {
+            return '技能保存失败: $e';
+          }
         default:
           return '未知工具';
       }
     } catch (e) {
       return '工具执行异常: $e';
     }
+  }
+
+  /// 解析工具的文件路径：相对路径基于工作目录，绝对路径直接使用。
+  Future<String?> _resolveToolPath(String path) async {
+    final t = path.trim();
+    if (t.isEmpty) return null;
+    if (t.startsWith('/') || RegExp(r'^[A-Za-z]:').hasMatch(t)) return t;
+    final base = await FileWorkspace.current();
+    return '$base/$t';
   }
 
   // ---------------- 上下文压缩 ----------------
@@ -1305,6 +1674,11 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> updateSettings(AppSettings s) async {
     if (s.model != settings.model) _knownImageUnsupported = false;
+    if (s.model != settings.model ||
+        s.visionEnabled != settings.visionEnabled ||
+        s.visionModel != settings.visionModel) {
+      _imageDescCache.clear();
+    }
     settings = s;
     await _settingsService.save(s);
     notifyListeners();

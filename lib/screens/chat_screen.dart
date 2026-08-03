@@ -1,11 +1,14 @@
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../services/file_workspace.dart';
 import '../services/image_service.dart';
 import '../services/permission_service.dart';
 import '../services/tts_service.dart';
@@ -60,6 +63,8 @@ class _ChatScreenState extends State<ChatScreen>
     widget.shiyi.streamText.addListener(_onStreamTextChanged);
     TtsService.instance.speakingId.addListener(_onSpeakingChanged);
     TtsService.instance.lastError.addListener(_onTtsError);
+    // 输入 @ 时弹出文件/文件夹选择器。
+    _input.addListener(_onInputTextChanged);
   }
 
   @override
@@ -81,6 +86,8 @@ class _ChatScreenState extends State<ChatScreen>
     widget.shiyi.viewingSessionId = null;
     TtsService.instance.speakingId.removeListener(_onSpeakingChanged);
     TtsService.instance.lastError.removeListener(_onTtsError);
+    _input.removeListener(_onInputTextChanged);
+    _input.dispose();
     super.dispose();
   }
 
@@ -167,20 +174,40 @@ class _ChatScreenState extends State<ChatScreen>
 
   Future<void> _send() async {
     final text = _input.text;
-    if (text.trim().isEmpty && _pendingImages.isEmpty) return;
+    if (text.trim().isEmpty &&
+        _pendingImages.isEmpty &&
+        _pendingFiles.isEmpty) {
+      return;
+    }
     final sb = StringBuffer();
     for (final path in _pendingImages) {
       sb.writeln('![图片]($path)');
     }
+    for (final path in _pendingFiles) {
+      sb.writeln('【附件：${p.basename(path)}】');
+      sb.writeln('路径：$path');
+    }
     if (text.trim().isNotEmpty) sb.write(text);
     _input.clear();
-    setState(() => _pendingImages.clear());
+    setState(() {
+      _pendingImages.clear();
+      _pendingFiles.clear();
+    });
     FocusScope.of(context).unfocus();
     await widget.shiyi.guideSend(sb.toString());
     _scrollToLatest();
   }
 
   final List<String> _pendingImages = [];
+
+  /// 待发送的附件文件（已复制到工作目录 attachments/ 下）。
+  final List<String> _pendingFiles = [];
+
+  /// 上次输入 @ 触发选择器的时间（防抖）。
+  DateTime? _lastAtTrigger;
+
+  /// 上次输入 / 触发技能选择器的时间（防抖）。
+  DateTime? _lastSlashTrigger;
 
   Future<void> _pickImage({required bool fromCamera}) async {
     try {
@@ -204,7 +231,188 @@ class _ChatScreenState extends State<ChatScreen>
     setState(() => _pendingImages.removeAt(index));
   }
 
-  void _pickImageSheet() {
+  void _removeFile(int index) {
+    setState(() => _pendingFiles.removeAt(index));
+  }
+
+  /// 选择一个文件并复制到工作目录 attachments/ 下，供模型用 run_terminal 读取。
+  Future<void> _pickFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles();
+      if (result == null || result.files.isEmpty) return;
+      final src = result.files.first.path;
+      if (src == null || !mounted) return;
+      final dest = await FileWorkspace.copyToAttachments(src);
+      if (dest == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('文件复制到工作目录失败')),
+        );
+        return;
+      }
+      setState(() => _pendingFiles.add(dest));
+      _stripAt();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '选择文件失败：${e.toString().replaceFirst('Exception: ', '')}',
+          ),
+        ),
+      );
+    }
+  }
+
+  /// 选择文件夹并整体复制到工作目录 attachments/ 下。
+  Future<void> _pickFolder() async {
+    try {
+      final path = await FilePicker.platform.getDirectoryPath();
+      if (path == null || !mounted) return;
+      final dest = await FileWorkspace.copyDirectoryToAttachments(path);
+      if (dest == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('文件夹复制到工作目录失败（可能同名已存在）')),
+        );
+        return;
+      }
+      setState(() => _pendingFiles.add(dest));
+      _stripAt();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '选择文件夹失败：${e.toString().replaceFirst('Exception: ', '')}',
+          ),
+        ),
+      );
+    }
+  }
+
+  /// 输入框末尾是 @ 时弹文件/文件夹选择，是 / 时弹技能选择（都带防抖）。
+  void _onInputTextChanged() {
+    final t = _input.text;
+    final now = DateTime.now();
+    if (t.endsWith('@')) {
+      if (_lastAtTrigger != null &&
+          now.difference(_lastAtTrigger!).inMilliseconds < 600) {
+        return;
+      }
+      _lastAtTrigger = now;
+      _pickAtTarget();
+      return;
+    }
+    if (t.endsWith('/')) {
+      if (_lastSlashTrigger != null &&
+          now.difference(_lastSlashTrigger!).inMilliseconds < 600) {
+        return;
+      }
+      _lastSlashTrigger = now;
+      _pickSkillSheet();
+    }
+  }
+
+  /// 输入 / 时弹出技能选择，选中后加载到当前会话（注入系统提示）。
+  void _pickSkillSheet() {
+    final skills = widget.shiyi.skills;
+    final loadedId = widget.shiyi.loadedSkill?.id;
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: skills.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.all(24),
+                child: Text('还没有技能，去「技能」页创建或导入'),
+              )
+            : ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final s in skills)
+                    ListTile(
+                      leading: const Icon(Icons.bolt_outlined),
+                      title: Text(s.name),
+                      subtitle: s.description.isEmpty
+                          ? null
+                          : Text(
+                              s.description,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                      trailing: loadedId == s.id
+                          ? Icon(
+                              Icons.check_circle,
+                              size: 20,
+                              color: Theme.of(ctx).colorScheme.primary,
+                            )
+                          : null,
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _stripSlash();
+                        widget.shiyi.loadSkill(s);
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('已加载技能：${s.name}，可直接提问')),
+                          );
+                        }
+                      },
+                    ),
+                ],
+              ),
+      ),
+    );
+  }
+
+  /// 选择成功后把触发用的 / 从输入框删掉。
+  void _stripSlash() {
+    final t = _input.text;
+    if (t.endsWith('/')) {
+      _input.text = t.substring(0, t.length - 1);
+      _input.selection = TextSelection.collapsed(offset: _input.text.length);
+    }
+  }
+
+  void _pickAtTarget() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_outlined),
+              title: const Text('选择文件'),
+              subtitle: const Text('复制到工作目录，模型可读取'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickFile();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_outlined),
+              title: const Text('选择文件夹'),
+              subtitle: const Text('整体复制到工作目录，模型可浏览'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickFolder();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 选择成功后把触发用的 @ 从输入框删掉。
+  void _stripAt() {
+    final t = _input.text;
+    if (t.endsWith('@')) {
+      _input.text = t.substring(0, t.length - 1);
+      _input.selection = TextSelection.collapsed(offset: _input.text.length);
+    }
+  }
+
+  void _pickAttachmentSheet() {
     showModalBottomSheet<void>(
       context: context,
       builder: (ctx) => SafeArea(
@@ -224,6 +432,15 @@ class _ChatScreenState extends State<ChatScreen>
               onTap: () {
                 Navigator.pop(ctx);
                 _pickImage(fromCamera: true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_outlined),
+              title: const Text('发送文件'),
+              subtitle: const Text('文档 / 代码 / 压缩包等，模型可读取'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickFile();
               },
             ),
           ],
@@ -415,6 +632,7 @@ class _ChatScreenState extends State<ChatScreen>
           child: RepaintBoundary(
             child: Stack(
               children: [
+                _QuestionHandler(shiyi: widget.shiyi),
                 Scaffold(
                   appBar: AppBar(
                     leadingWidth: 104,
@@ -630,12 +848,21 @@ class _ChatScreenState extends State<ChatScreen>
                       ),
                       ListenableBuilder(
                         listenable: widget.shiyi,
+                        builder: (context, _) => _LoadedSkillChip(
+                          skill: widget.shiyi.loadedSkill,
+                          onRemove: () => widget.shiyi.loadSkill(null),
+                        ),
+                      ),
+                      ListenableBuilder(
+                        listenable: widget.shiyi,
                         builder: (context, _) => _Composer(
                           input: _input,
                           busy: widget.shiyi.isBusy,
                           pendingImages: _pendingImages,
-                          onPickImage: _pickImageSheet,
+                          pendingFiles: _pendingFiles,
+                          onPickAttachment: _pickAttachmentSheet,
                           onRemoveImage: _removeImage,
+                          onRemoveFile: _removeFile,
                           onSend: _send,
                           onStop: widget.shiyi.stop,
                         ),
@@ -866,20 +1093,128 @@ class _RoundIconButton extends StatelessWidget {
   }
 }
 
+/// 监听模型发起的 question 工具：pendingQuestion 非空时弹出确认对话框，
+/// 用户选择后通过 answerQuestion 把结果交回工具循环。
+class _QuestionHandler extends StatefulWidget {
+  final ShiyiState shiyi;
+  const _QuestionHandler({required this.shiyi});
+
+  @override
+  State<_QuestionHandler> createState() => _QuestionHandlerState();
+}
+
+class _QuestionHandlerState extends State<_QuestionHandler> {
+  bool _showing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.shiyi.addListener(_onChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.shiyi.removeListener(_onChanged);
+    super.dispose();
+  }
+
+  void _onChanged() {
+    final q = widget.shiyi.pendingQuestion;
+    if (q == null || _showing) return;
+    _showing = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _show(q));
+  }
+
+  Future<void> _show(Map<String, dynamic> q) async {
+    final options = (q['options'] as List?)?.cast<String>() ??
+        const <String>['确认', '取消'];
+    final result = await showDialog<int>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('拾忆 向你确认'),
+        content: Text(q['question']?.toString() ?? ''),
+        actions: [
+          for (var i = 0; i < options.length; i++)
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, i),
+              child: Text(options[i]),
+            ),
+        ],
+      ),
+    );
+    _showing = false;
+    widget.shiyi.answerQuestion(result);
+  }
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.shrink();
+}
+
+/// 当前会话已加载技能的小提示条（输入栏上方），可一键移除。
+class _LoadedSkillChip extends StatelessWidget {
+  final Skill? skill;
+  final VoidCallback onRemove;
+  const _LoadedSkillChip({required this.skill, required this.onRemove});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = skill;
+    if (s == null) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.bolt, size: 15, color: theme.colorScheme.primary),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              '技能：${s.name}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelSmall,
+            ),
+          ),
+          const SizedBox(width: 4),
+          InkWell(
+            onTap: onRemove,
+            borderRadius: BorderRadius.circular(8),
+            child: const Padding(
+              padding: EdgeInsets.all(2),
+              child: Icon(Icons.close, size: 15),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _Composer extends StatelessWidget {
   final TextEditingController input;
   final bool busy;
   final List<String> pendingImages;
-  final VoidCallback onPickImage;
+  final List<String> pendingFiles;
+  final VoidCallback onPickAttachment;
   final ValueChanged<int> onRemoveImage;
+  final ValueChanged<int> onRemoveFile;
   final VoidCallback onSend;
   final VoidCallback onStop;
   const _Composer({
     required this.input,
     required this.busy,
     required this.pendingImages,
-    required this.onPickImage,
+    required this.pendingFiles,
+    required this.onPickAttachment,
     required this.onRemoveImage,
+    required this.onRemoveFile,
     required this.onSend,
     required this.onStop,
   });
@@ -900,18 +1235,19 @@ class _Composer extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (pendingImages.isNotEmpty) _previewRow(theme),
+            if (pendingImages.isNotEmpty || pendingFiles.isNotEmpty)
+              _previewRow(theme),
             const SizedBox(height: 6),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 IconButton(
-                  onPressed: onPickImage,
+                  onPressed: onPickAttachment,
                   icon: const Icon(
-                    Icons.add_photo_alternate_outlined,
+                    Icons.attach_file,
                     size: 22,
                   ),
-                  tooltip: '发送图片',
+                  tooltip: '添加附件',
                   color: theme.colorScheme.primary,
                   visualDensity: VisualDensity.compact,
                   constraints: const BoxConstraints(
@@ -943,7 +1279,8 @@ class _Composer extends StatelessWidget {
                     builder: (context, value, _) {
                       final hasInput =
                           value.text.trim().isNotEmpty ||
-                          pendingImages.isNotEmpty;
+                          pendingImages.isNotEmpty ||
+                          pendingFiles.isNotEmpty;
                       if (busy) {
                         return Row(
                           mainAxisSize: MainAxisSize.min,
@@ -990,35 +1327,86 @@ class _Composer extends StatelessWidget {
       height: 64,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        itemCount: pendingImages.length,
+        itemCount: pendingImages.length + pendingFiles.length,
         separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemBuilder: (context, i) {
-          final path = pendingImages[i];
-          return Stack(
-            children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.file(
-                  File(path),
-                  width: 56,
-                  height: 56,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) => Container(
+          if (i < pendingImages.length) {
+            final path = pendingImages[i];
+            return Stack(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.file(
+                    File(path),
                     width: 56,
                     height: 56,
-                    color: theme.colorScheme.surfaceContainerHighest,
-                    child: Icon(
-                      Icons.broken_image_outlined,
-                      color: theme.hintColor,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) => Container(
+                      width: 56,
+                      height: 56,
+                      color: theme.colorScheme.surfaceContainerHighest,
+                      child: Icon(
+                        Icons.broken_image_outlined,
+                        color: theme.hintColor,
+                      ),
                     ),
                   ),
+                ),
+                Positioned(
+                  top: 0,
+                  right: 0,
+                  child: GestureDetector(
+                    onTap: () => onRemoveImage(i),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.close,
+                        size: 14,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          }
+          final f = pendingFiles[i - pendingImages.length];
+          return Stack(
+            children: [
+              Container(
+                width: 140,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.insert_drive_file_outlined,
+                      size: 20,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        p.basename(f),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall,
+                      ),
+                    ),
+                  ],
                 ),
               ),
               Positioned(
                 top: 0,
                 right: 0,
                 child: GestureDetector(
-                  onTap: () => onRemoveImage(i),
+                  onTap: () => onRemoveFile(i - pendingImages.length),
                   child: Container(
                     decoration: BoxDecoration(
                       color: Colors.black54,

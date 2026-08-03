@@ -1,5 +1,10 @@
 package com.shiyi.agent
 
+import android.graphics.Color
+import android.os.Bundle
+import android.system.Os
+import android.view.WindowManager
+import androidx.core.view.WindowCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -13,6 +18,16 @@ import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 class MainActivity : FlutterActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // 手动启用 edge-to-edge（内容延伸到状态栏/导航栏后面）并强制系统栏透明：
+        // targetSdk 降到 34 后系统不再强制，这里显式开启保持与原版一致的沉浸效果。
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+    }
+
     override fun onPostResume() {
         super.onPostResume()
         // Flutter 引擎在 resume 时切到 NormalTheme 会重置窗口背景，这里再按 App 主题覆盖一次。
@@ -64,6 +79,13 @@ class MainActivity : FlutterActivity() {
                                 ?: throw IllegalArgumentException("zipPath missing")
                             createZip(srcDir, zipPath)
                             result.success(true)
+                        }
+                        "extractTermux" -> {
+                            val assetPath = call.argument<String>("assetPath")
+                                ?: throw IllegalArgumentException("assetPath missing")
+                            val destDir = call.argument<String>("destDir")
+                                ?: throw IllegalArgumentException("destDir missing")
+                            result.success(extractTermux(assetPath, destDir))
                         }
                         else -> result.notImplemented()
                     }
@@ -133,6 +155,133 @@ class MainActivity : FlutterActivity() {
             }
             addDir(src, "")
         }
+    }
+
+    /**
+     * 解压内嵌的 Termux bootstrap（来自 assets）到目标目录。
+     * 与 TermuxInstaller 一致：SYMLINKS.txt 建符号链接、bin/libexec 等设可执行位、
+     * 并把硬编码的 shebang 前缀 /data/data/com.termux/files/usr/bin/ 替换为实际路径。
+     */
+    private fun extractTermux(assetPath: String, destDirPath: String): Map<String, Any> {
+        val dest = File(destDirPath)
+        if (dest.exists()) dest.deleteRecursively()
+        dest.mkdirs()
+        val symlinks = mutableListOf<Pair<String, String>>()
+        val assets = assets
+        var fileCount = 0
+        assets.open("flutter_assets/$assetPath").use { input ->
+            ZipInputStream(BufferedInputStream(input)).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    val name = entry.name.replace('\\', '/')
+                    if (name == "SYMLINKS.txt") {
+                        val content = zis.readBytes().toString(Charsets.UTF_8)
+                        for (line in content.lineSequence()) {
+                            val parts = line.split("←")
+                            if (parts.size == 2) {
+                                symlinks.add(parts[0] to "$destDirPath/${parts[1]}")
+                            }
+                        }
+                    } else if (!entry.isDirectory) {
+                        val outFile = File(dest, name)
+                        outFile.parentFile?.mkdirs()
+                        BufferedOutputStream(FileOutputStream(outFile)).use { out ->
+                            val buf = ByteArray(64 * 1024)
+                            var n = zis.read(buf)
+                            while (n > 0) {
+                                out.write(buf, 0, n)
+                                n = zis.read(buf)
+                            }
+                        }
+                        if (name.startsWith("bin/") || name.startsWith("libexec") ||
+                            name.startsWith("lib/apt/apt-helper") || name.startsWith("lib/apt/methods")
+                        ) {
+                            outFile.setExecutable(true, false)
+                        }
+                        if (name.startsWith("bin/") || name.startsWith("libexec")) {
+                            fixTermuxPaths(outFile, destDirPath)
+                        }
+                        fileCount++
+                    }
+                    entry = zis.nextEntry
+                }
+            }
+        }
+        for ((old, new) in symlinks) {
+            try {
+                val newFile = File(new)
+                newFile.parentFile?.mkdirs()
+                Os.symlink(old, new)
+            } catch (_: Exception) {
+                // 个别符号链接失败不阻塞整体
+            }
+        }
+        return mapOf("files" to fileCount, "symlinks" to symlinks.size)
+    }
+
+    /**
+     * 修复脚本里硬编码的 Termux 路径。
+     * 文本脚本（无 NUL）：全局替换 /data/data/com.termux 系路径为内嵌路径；
+     * 二进制（含 NUL）：只修文件开头 256 字节内的 shebang，避免破坏 ELF 字符串表。
+     * destDirPath 即内嵌 PREFIX（usr 目录）。
+     */
+    private fun fixTermuxPaths(file: File, destDirPath: String) {
+        try {
+            if (file.length() > 4L * 1024 * 1024) return
+            val bytes = file.readBytes()
+            if (bytes.indexOf(0.toByte()) >= 0) {
+                // 二进制：只修 shebang 区
+                val oldB = "/data/data/com.termux/files/usr/bin/".toByteArray()
+                val newB = "$destDirPath/bin/".toByteArray()
+                val idx = indexOf(bytes, oldB)
+                if (idx in 0 until 256) {
+                    val out = ByteArray(bytes.size - oldB.size + newB.size)
+                    System.arraycopy(bytes, 0, out, 0, idx)
+                    System.arraycopy(newB, 0, out, idx, newB.size)
+                    System.arraycopy(
+                        bytes, idx + oldB.size,
+                        out, idx + newB.size,
+                        bytes.size - idx - oldB.size,
+                    )
+                    file.writeBytes(out)
+                }
+            } else {
+                // 文本：全局替换 Termux 硬编码路径
+                val prefix = File(destDirPath).parent
+                val oldUsr = "/data/data/com.termux/files/usr"
+                val oldHome = "/data/data/com.termux/files/home"
+                val oldCache = "/data/data/com.termux/cache"
+                val oldPrefix = "/data/data/com.termux"
+                val newUsr = destDirPath
+                val newPrefix = prefix ?: destDirPath
+                var text = String(bytes, Charsets.UTF_8)
+                if (text.contains(oldUsr)) {
+                    text = text.replace(oldUsr, newUsr)
+                }
+                if (text.contains(oldHome)) {
+                    text = text.replace(oldHome, "$newPrefix/home")
+                }
+                if (text.contains(oldCache)) {
+                    text = text.replace(oldCache, "$newPrefix/cache")
+                }
+                if (text.contains(oldPrefix)) {
+                    text = text.replace(oldPrefix, newPrefix)
+                }
+                file.writeBytes(text.toByteArray(Charsets.UTF_8))
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
+        if (needle.isEmpty()) return 0
+        outer@ for (i in 0..haystack.size - needle.size) {
+            for (j in needle.indices) {
+                if (haystack[i + j] != needle[j]) continue@outer
+            }
+            return i
+        }
+        return -1
     }
 }
 

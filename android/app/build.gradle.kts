@@ -20,7 +20,9 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        // targetSdk 降到 34：Android 15/16 对 targetSdk>=35 的 app 收紧
+        // 「执行私有目录 ELF」的 SELinux 权限，降级走旧兼容行为（类似 Termux）。
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0"
     }

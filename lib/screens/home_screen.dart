@@ -13,6 +13,7 @@ import 'memory_screen.dart';
 import 'log_screen.dart';
 import 'settings_screen.dart';
 import 'skills_screen.dart';
+import 'terminal_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final ShiyiState shiyi;
@@ -189,6 +190,8 @@ class _HomeScreenState extends State<HomeScreen> {
         return SettingsScreen(shiyi: shiyi);
       case 5:
         return const LogScreen();
+      case 6:
+        return TerminalScreen(shiyi: shiyi);
     }
     return const SizedBox.shrink();
   }
@@ -219,6 +222,11 @@ class _MacSidebar extends StatelessWidget {
     (icon: Icons.folder_outlined, selectedIcon: Icons.folder, label: '文件'),
     (icon: Icons.settings_outlined, selectedIcon: Icons.settings, label: '设置'),
     (icon: Icons.article_outlined, selectedIcon: Icons.article, label: '日志'),
+    (
+      icon: Icons.terminal_outlined,
+      selectedIcon: Icons.terminal,
+      label: '终端',
+    ),
   ];
 
   @override

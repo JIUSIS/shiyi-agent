@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 智能体工作目录管理：
@@ -39,6 +40,53 @@ class FileWorkspace {
       Directory(dir).createSync(recursive: true);
     } catch (_) {}
     return dir;
+  }
+
+  /// 把外部文件复制到工作目录的 attachments/ 下并返回新路径，
+  /// 让模型可以用 run_terminal 读取；复制失败返回 null。
+  static Future<String?> copyToAttachments(String srcPath) async {
+    try {
+      final base = await current();
+      final dir = Directory('$base/attachments');
+      dir.createSync(recursive: true);
+      final src = File(srcPath);
+      if (!src.existsSync()) return null;
+      final dest = '${dir.path}/${p.basename(srcPath)}';
+      await src.copy(dest);
+      return dest;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 把外部文件夹递归复制到工作目录的 attachments/ 下并返回新路径；
+  /// 同名已存在或复制失败返回 null（避免覆盖已有内容）。
+  static Future<String?> copyDirectoryToAttachments(String srcPath) async {
+    try {
+      final base = await current();
+      final dir = Directory('$base/attachments');
+      dir.createSync(recursive: true);
+      final src = Directory(srcPath);
+      if (!src.existsSync()) return null;
+      final name = p.basename(srcPath);
+      final dest = Directory('${dir.path}/$name');
+      if (dest.existsSync()) return null;
+      _copyDirRecursive(src, dest);
+      return dest.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static void _copyDirRecursive(Directory src, Directory dest) {
+    dest.createSync(recursive: true);
+    for (final e in src.listSync(recursive: false)) {
+      if (e is Directory) {
+        _copyDirRecursive(e, Directory('${dest.path}/${p.basename(e.path)}'));
+      } else if (e is File) {
+        e.copySync('${dest.path}/${p.basename(e.path)}');
+      }
+    }
   }
 }
 

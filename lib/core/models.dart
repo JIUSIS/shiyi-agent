@@ -309,6 +309,12 @@ class AppSettings {
   /// 达到压缩阈值时自动压缩。
   bool autoCompress;
 
+  /// 视觉模型（辅助看图）：主模型不支持图片时，自动调用它描述图片。
+  bool visionEnabled;
+  String visionBaseUrl;
+  String visionApiKey;
+  String visionModel;
+
   AppSettings({
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
@@ -324,6 +330,10 @@ class AppSettings {
     this.contextLimit = 1000000,
     this.compressThresholdPercent = 80,
     this.autoCompress = true,
+    this.visionEnabled = false,
+    this.visionBaseUrl = '',
+    this.visionApiKey = '',
+    this.visionModel = '',
   });
 
   AppSettings copyWith({
@@ -341,6 +351,10 @@ class AppSettings {
     int? contextLimit,
     double? compressThresholdPercent,
     bool? autoCompress,
+    bool? visionEnabled,
+    String? visionBaseUrl,
+    String? visionApiKey,
+    String? visionModel,
   }) =>
       AppSettings(
         baseUrl: baseUrl ?? this.baseUrl,
@@ -358,10 +372,14 @@ class AppSettings {
         compressThresholdPercent:
             compressThresholdPercent ?? this.compressThresholdPercent,
         autoCompress: autoCompress ?? this.autoCompress,
+        visionEnabled: visionEnabled ?? this.visionEnabled,
+        visionBaseUrl: visionBaseUrl ?? this.visionBaseUrl,
+        visionApiKey: visionApiKey ?? this.visionApiKey,
+        visionModel: visionModel ?? this.visionModel,
       );
 
   Map<String, dynamic> toJson() =>
-      {'baseUrl': baseUrl, 'apiKey': apiKey, 'model': model, 'systemPrompt': systemPrompt, 'temperature': temperature, 'enableTools': enableTools, 'enableMemory': enableMemory, 'enableAutoLearn': enableAutoLearn, 'ttsEnabled': ttsEnabled, 'ttsRate': ttsRate, 'themeMode': themeMode, 'contextLimit': contextLimit, 'compressThresholdPercent': compressThresholdPercent, 'autoCompress': autoCompress};
+      {'baseUrl': baseUrl, 'apiKey': apiKey, 'model': model, 'systemPrompt': systemPrompt, 'temperature': temperature, 'enableTools': enableTools, 'enableMemory': enableMemory, 'enableAutoLearn': enableAutoLearn, 'ttsEnabled': ttsEnabled, 'ttsRate': ttsRate, 'themeMode': themeMode, 'contextLimit': contextLimit, 'compressThresholdPercent': compressThresholdPercent, 'autoCompress': autoCompress, 'visionEnabled': visionEnabled, 'visionBaseUrl': visionBaseUrl, 'visionApiKey': visionApiKey, 'visionModel': visionModel};
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
         baseUrl: j['baseUrl'] ?? 'https://api.openai.com/v1',
@@ -379,6 +397,10 @@ class AppSettings {
         compressThresholdPercent:
             (j['compressThresholdPercent'] as num?)?.toDouble() ?? 80,
         autoCompress: j['autoCompress'] ?? true,
+        visionEnabled: j['visionEnabled'] ?? false,
+        visionBaseUrl: j['visionBaseUrl'] ?? '',
+        visionApiKey: j['visionApiKey'] ?? '',
+        visionModel: j['visionModel'] ?? '',
       );
 }
 
