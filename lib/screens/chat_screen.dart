@@ -633,8 +633,7 @@ class _ChatScreenState extends State<ChatScreen>
             child: Stack(
               children: [
                 _QuestionHandler(shiyi: widget.shiyi),
-                Scaffold(
-                  appBar: AppBar(
+                Scaffold(                  appBar: AppBar(
                     leadingWidth: 104,
                     leading: Row(
                       children: [
@@ -649,13 +648,8 @@ class _ChatScreenState extends State<ChatScreen>
                         const _TrafficLights(),
                       ],
                     ),
-                    // 右侧对称占位放工具调用信息流胶囊，标题保持居中。
+                    // 右侧对称占位放工具调用信息流胶囊（与左侧返回区等宽），标题保持居中。
                     actions: [
-                      IconButton(
-                        tooltip: '压缩上下文',
-                        icon: const Icon(Icons.compress_outlined, size: 20),
-                        onPressed: () => _compressContext(),
-                      ),
                       SizedBox(
                         width: 104,
                         child: ListenableBuilder(
@@ -880,12 +874,68 @@ class _ChatScreenState extends State<ChatScreen>
                       onClose: () => setState(() => _showToolLog = false),
                     ),
                   ),
+                // 上下文达到压缩阈值后，右下角悬浮「压缩上下文」胶囊。
+                Positioned(
+                  right: 14,
+                  bottom: 110,
+                  child: ListenableBuilder(
+                    listenable: widget.shiyi,
+                    builder: (context, _) {
+                      if (!_compressNeeded()) return const SizedBox.shrink();
+                      final theme = Theme.of(context);
+                      return Material(
+                        color: theme.colorScheme.primary,
+                        borderRadius: BorderRadius.circular(20),
+                        elevation: 3,
+                        shadowColor: Colors.black.withValues(alpha: .3),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(20),
+                          onTap: _compressContext,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 9,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.compress_outlined,
+                                  size: 16,
+                                  color: theme.colorScheme.onPrimary,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  '压缩上下文',
+                                  style: TextStyle(
+                                    color: theme.colorScheme.onPrimary,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
               ],
             ),
           ),
         ),
       ),
     );
+  }
+
+  /// 上下文是否已超过压缩阈值（达到限制后显示悬浮压缩胶囊）。
+  bool _compressNeeded() {
+    final s = widget.shiyi;
+    final limit = s.settings.contextLimit;
+    final pct = s.settings.compressThresholdPercent;
+    if (limit <= 0 || pct <= 0) return false;
+    return s.sessionChars > limit * pct / 100;
   }
 
   Future<void> _compressContext() async {
@@ -1581,28 +1631,35 @@ class _ToolPillIdle extends StatelessWidget {
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(14),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: cs.outlineVariant,
-                  shape: BoxShape.circle,
+        child: SizedBox(
+          width: 92,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: cs.outlineVariant,
+                    shape: BoxShape.circle,
+                  ),
                 ),
-              ),
-              const SizedBox(width: 5),
-              Text(
-                '工具',
-                style: theme.textTheme.labelMedium?.copyWith(
-                  color: theme.hintColor,
-                  fontWeight: FontWeight.w500,
+                const SizedBox(width: 5),
+                Flexible(
+                  child: Text(
+                    '工具',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: theme.hintColor,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -1626,8 +1683,8 @@ class _ToolPill extends StatelessWidget {
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(14),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 92),
+        child: SizedBox(
+          width: 92,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
             child: Row(
