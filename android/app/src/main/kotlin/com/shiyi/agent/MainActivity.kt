@@ -199,7 +199,12 @@ class MainActivity : FlutterActivity() {
                             outFile.setExecutable(true, false)
                         }
                         if (name.startsWith("bin/") || name.startsWith("libexec")) {
-                            fixTermuxPaths(outFile, destDirPath)
+                            // termux-apt 的 proot 绑定路径含 /data/data/com.termux，不能全局替换。
+                            fixTermuxPaths(
+                                outFile,
+                                destDirPath,
+                                skipGlobalRewrite = name == "bin/termux-apt",
+                            )
                         }
                         fileCount++
                     }
@@ -222,15 +227,19 @@ class MainActivity : FlutterActivity() {
     /**
      * 修复脚本里硬编码的 Termux 路径。
      * 文本脚本（无 NUL）：全局替换 /data/data/com.termux 系路径为内嵌路径；
-     * 二进制（含 NUL）：只修文件开头 256 字节内的 shebang，避免破坏 ELF 字符串表。
+     * 二进制（含 NUL）或 skipGlobalRewrite：只修文件开头 256 字节内的 shebang。
      * destDirPath 即内嵌 PREFIX（usr 目录）。
      */
-    private fun fixTermuxPaths(file: File, destDirPath: String) {
+    private fun fixTermuxPaths(
+        file: File,
+        destDirPath: String,
+        skipGlobalRewrite: Boolean = false,
+    ) {
         try {
             if (file.length() > 4L * 1024 * 1024) return
             val bytes = file.readBytes()
-            if (bytes.indexOf(0.toByte()) >= 0) {
-                // 二进制：只修 shebang 区
+            if (skipGlobalRewrite || bytes.indexOf(0.toByte()) >= 0) {
+                // 二进制 / 需要保留内嵌路径的脚本：只修 shebang 区
                 val oldB = "/data/data/com.termux/files/usr/bin/".toByteArray()
                 val newB = "$destDirPath/bin/".toByteArray()
                 val idx = indexOf(bytes, oldB)

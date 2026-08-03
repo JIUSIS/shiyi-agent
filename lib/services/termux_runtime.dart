@@ -10,13 +10,13 @@ class TermuxRuntime {
 
   static const String _assetPath = 'assets/termux/bootstrap-aarch64.zip';
 
-  /// 内嵌目录版本：bootstrap 结构/解压逻辑变更时递增，强制重新部署。
-  static const String _dirVersion = 'v5';
+  /// 环境版本号：bootstrap 内容/结构变更时递增，写进 .env_version 强制重新部署。
+  static const String _envVersion = 'v8';
 
-  /// 环境根目录（app 私有 files 目录）。
+  /// 环境根目录（app 私有 files 目录下的固定 termux 目录，无版本后缀）。
   static Future<String> _baseDir() async {
     final dir = await getApplicationSupportDirectory();
-    return '${dir.path}/termux_$_dirVersion';
+    return '${dir.path}/termux';
   }
 
   /// usr 目录（bootstrap 解压后的 PREFIX）。
@@ -26,10 +26,16 @@ class TermuxRuntime {
 
   static Future<String> prefixDir() async => _baseDir();
 
-  /// 是否已安装（bash 存在）。
+  static Future<String> _versionFilePath() async =>
+      '${await _baseDir()}/.env_version';
+
+  /// 是否已安装且版本匹配（bash 存在 + 版本文件一致）。
   static Future<bool> isInstalled() async {
     try {
-      return File(await shellPath()).existsSync();
+      if (!File(await shellPath()).existsSync()) return false;
+      final vf = File(await _versionFilePath());
+      if (!vf.existsSync()) return false;
+      return (await vf.readAsString()).trim() == _envVersion;
     } catch (_) {
       return false;
     }
@@ -44,10 +50,13 @@ class TermuxRuntime {
       {'assetPath': _assetPath, 'destDir': destDir},
     );
     if (res == null) throw Exception('bootstrap 解压失败');
-    // 确保 home 与 tmp 目录存在。
+    // 确保 home / tmp / cache 目录存在，并写入版本标记。
     final prefix = await prefixDir();
     Directory('$prefix/home').createSync(recursive: true);
     Directory('$destDir/tmp').createSync(recursive: true);
+    Directory('$prefix/tmp').createSync(recursive: true);
+    Directory('$prefix/cache').createSync(recursive: true);
+    File(await _versionFilePath()).writeAsStringSync(_envVersion);
   }
 
   /// 确保已安装：未安装则解压，失败抛异常。
