@@ -57,6 +57,9 @@ app.*.map.json
 *.jks
 *.keystore
 
+# Android 本地构建配置（含签名密码，不入库）
+android/local.properties
+
 # Reasonix local tool state
 .reasonix/
 

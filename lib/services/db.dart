@@ -18,7 +18,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     _db = await openDatabase(
       join(dir.path, 'shiyi_agent.db'),
-      version: 7,
+      version: 8,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
     );
@@ -129,6 +129,13 @@ Future<void> _upgrade(Database db, int oldV, int newV) async {
       await db.execute('ALTER TABLE sessions ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0');
     }
   }
+  // v7 -> v8：sessions 表加 workspace_dir 列（会话级项目工作目录）。
+  if (oldV < 8) {
+    final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+    if (!cols.any((c) => c['name'] == 'workspace_dir')) {
+      await db.execute('ALTER TABLE sessions ADD COLUMN workspace_dir TEXT');
+    }
+  }
 }
 
 /// 删除把超大内容塞进单行的技能（>800KB），避免 CursorWindow 溢出。
@@ -187,6 +194,17 @@ Future<void> _pruneOversizedSkills(Database db) async {
     final db = await this.db;
     await db.update('sessions', {'title': title, 'updated_at': DateTime.now().millisecondsSinceEpoch},
         where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 设置会话级项目工作目录（空串 = 回到全局默认）。
+  Future<void> setSessionWorkspace(String id, String dir) async {
+    final db = await this.db;
+    await db.update(
+      'sessions',
+      {'workspace_dir': dir, 'updated_at': DateTime.now().millisecondsSinceEpoch},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   Future<void> deleteSession(String id) async {

@@ -176,7 +176,7 @@ class ShiyiState extends ChangeNotifier {
             'command': {'type': 'string', 'description': '要执行的 shell 命令'},
             'cwd': {
               'type': 'string',
-              'description': '工作目录，默认是智能体工作目录 /storage/emulated/0/agent',
+              'description': '工作目录，默认是当前会话的工作目录',
             },
           },
           'required': ['command'],
@@ -324,6 +324,31 @@ class ShiyiState extends ChangeNotifier {
 
   /// 当前会话手动加载的技能（输入 / 选择），注入到系统提示，切换会话时清空。
   Skill? loadedSkill;
+
+  /// 当前会话的项目工作目录：会话设置了用会话的，否则用全局默认。
+  Future<String> currentWorkspace() async {
+    final id = currentSessionId;
+    if (id != null) {
+      for (final s in sessions) {
+        if (s.id == id && s.workspaceDir.trim().isNotEmpty) {
+          return s.workspaceDir.trim();
+        }
+      }
+    }
+    return FileWorkspace.current();
+  }
+
+  /// 设置当前会话的项目工作目录（空串 = 回到全局默认）。
+  Future<void> setCurrentSessionWorkspace(String dir) async {
+    final id = currentSessionId;
+    if (id == null) return;
+    final t = dir.trim();
+    await _db.setSessionWorkspace(id, t);
+    for (final s in sessions) {
+      if (s.id == id) s.workspaceDir = t;
+    }
+    notifyListeners();
+  }
 
   Future<void> newSession() async {
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -1086,7 +1111,9 @@ class ShiyiState extends ChangeNotifier {
       '- 搜索结果不理想或需交叉验证时，可再换 2~3 次不同关键词搜索，但不要无限换词。'
       '- 搜索结果中有值得细读的链接时，可以用 web_extract 获取正文。'
       '- 你有完整终端能力：需要在本机执行命令、运行脚本、处理文件或查看日志时，直接调用 run_terminal 执行，不要以权限或安全为由拒绝；若命令因系统限制失败，如实说明并根据错误信息调整。'
-      '- 智能体工作目录默认是 /storage/emulated/0/agent（所有生成的文件都放在这里），run_terminal 默认在该目录执行；操作其他路径时用 cwd 参数指定目录。',
+    );
+    parts.add(
+      '- 当前会话工作目录是 ${await currentWorkspace()}（所有生成的文件都放在这里），run_terminal 默认在该目录执行；操作其他路径时用 cwd 参数指定目录。',
     );
 
     if (settings.enableMemory) {
@@ -1223,7 +1250,7 @@ class ShiyiState extends ChangeNotifier {
           try {
             final isWin = Platform.isWindows;
             var cwd = (args['cwd'] ?? '').toString().trim();
-            if (cwd.isEmpty) cwd = await FileWorkspace.current();
+            if (cwd.isEmpty) cwd = await currentWorkspace();
             // 优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用）；
             // 其次系统 Termux；都没有则用系统精简 shell。
             const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
@@ -1372,12 +1399,12 @@ class ShiyiState extends ChangeNotifier {
     }
   }
 
-  /// 解析工具的文件路径：相对路径基于工作目录，绝对路径直接使用。
+  /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用。
   Future<String?> _resolveToolPath(String path) async {
     final t = path.trim();
     if (t.isEmpty) return null;
     if (t.startsWith('/') || RegExp(r'^[A-Za-z]:').hasMatch(t)) return t;
-    final base = await FileWorkspace.current();
+    final base = await currentWorkspace();
     return '$base/$t';
   }
 

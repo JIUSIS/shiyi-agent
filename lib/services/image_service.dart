@@ -27,6 +27,36 @@ class ImageService {
     }
     if (picked == null) return null;
 
+    return _compressAndSave(picked);
+  }
+
+  /// 从相册多选图片，逐个压缩后存入应用目录，返回本地路径列表。
+  static Future<List<String>> pickMultipleAndSave() async {
+    final picker = ImagePicker();
+    final List<XFile> picked;
+    try {
+      picked = await picker.pickMultiImage(
+        maxWidth: 2048,
+        maxHeight: 2048,
+      );
+    } catch (e) {
+      throw Exception('无法打开相册: $e');
+    }
+    if (picked.isEmpty) return const [];
+
+    final out = <String>[];
+    for (final f in picked) {
+      try {
+        final p = await _compressAndSave(f);
+        if (p != null) out.add(p);
+      } catch (_) {
+        // 单张失败不影响其余。
+      }
+    }
+    return out;
+  }
+
+  static Future<String?> _compressAndSave(XFile picked) async {
     final bytes = await picked.readAsBytes();
     final compressed = await FlutterImageCompress.compressWithList(
       bytes,

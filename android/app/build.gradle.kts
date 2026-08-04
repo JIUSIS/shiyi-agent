@@ -1,7 +1,22 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// 签名密码从 local.properties（不入库）或环境变量 KEYSTORE_PASSWORD 读取，
+// 避免把签名凭据提交进仓库。
+val keystorePassword: String by lazy {
+    val props = Properties()
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { props.load(it) }
+    props.getProperty("KEYSTORE_PASSWORD")
+        ?: System.getenv("KEYSTORE_PASSWORD")
+        ?: error(
+            "缺少签名密码：请在 android/local.properties 或环境变量中设置 KEYSTORE_PASSWORD"
+        )
 }
 
 android {
@@ -30,9 +45,9 @@ android {
     signingConfigs {
         create("release") {
             storeFile = file("../../keystore.jks")
-            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "KEYSTORE_PASSWORD_PLACEHOLDER"
+            storePassword = keystorePassword
             keyAlias = "shiyi"
-            keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: "KEYSTORE_PASSWORD_PLACEHOLDER"
+            keyPassword = keystorePassword
         }
     }
 

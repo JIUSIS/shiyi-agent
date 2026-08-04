@@ -64,6 +64,7 @@ class _ChatScreenState extends State<ChatScreen>
     TtsService.instance.lastError.addListener(_onTtsError);
     // 输入 @ 时弹出文件/文件夹选择器。
     _input.addListener(_onInputTextChanged);
+    _refreshWorkspace();
   }
 
   @override
@@ -202,6 +203,70 @@ class _ChatScreenState extends State<ChatScreen>
   /// 待发送的附件文件（已复制到工作目录 attachments/ 下）。
   final List<String> _pendingFiles = [];
 
+  /// 当前会话工作目录（缓存显示用）。
+  String? _workspace;
+
+  Future<void> _refreshWorkspace() async {
+    final w = await widget.shiyi.currentWorkspace();
+    if (!mounted) return;
+    setState(() => _workspace = w);
+  }
+
+  /// 弹出会话工作目录设置面板。
+  Future<void> _pickWorkspace() async {
+    await _refreshWorkspace();
+    if (!mounted) return;
+    final current = _workspace ?? '';
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.folder_outlined),
+              title: const Text('当前项目目录'),
+              subtitle: Text(
+                current.isEmpty ? '（读取中…）' : current,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_open_outlined),
+              title: const Text('选择目录'),
+              subtitle: const Text('把本会话的工作目录设为选中的文件夹'),
+              onTap: () async {
+                Navigator.pop(ctx);
+                final p = await FilePicker.platform.getDirectoryPath();
+                if (p == null || !mounted) return;
+                await widget.shiyi.setCurrentSessionWorkspace(p);
+                await _refreshWorkspace();
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('本会话项目目录已设为：$p')),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.restart_alt),
+              title: const Text('使用全局默认目录'),
+              subtitle: const Text('清除本会话的自定义目录'),
+              onTap: () async {
+                Navigator.pop(ctx);
+                await widget.shiyi.setCurrentSessionWorkspace('');
+                await _refreshWorkspace();
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('已恢复全局默认工作目录')),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// 上次输入 @ 触发选择器的时间（防抖）。
   DateTime? _lastAtTrigger;
 
@@ -210,9 +275,16 @@ class _ChatScreenState extends State<ChatScreen>
 
   Future<void> _pickImage({required bool fromCamera}) async {
     try {
-      final path = await ImageService.pickAndSave(fromCamera: fromCamera);
-      if (path != null && mounted) {
-        setState(() => _pendingImages.add(path));
+      if (fromCamera) {
+        final path = await ImageService.pickAndSave(fromCamera: true);
+        if (path != null && mounted) {
+          setState(() => _pendingImages.add(path));
+        }
+      } else {
+        final paths = await ImageService.pickMultipleAndSave();
+        if (paths.isNotEmpty && mounted) {
+          setState(() => _pendingImages.addAll(paths));
+        }
       }
     } catch (e) {
       if (!mounted) return;
@@ -234,23 +306,26 @@ class _ChatScreenState extends State<ChatScreen>
     setState(() => _pendingFiles.removeAt(index));
   }
 
-  /// 选择一个文件并复制到工作目录 attachments/ 下，供模型用 run_terminal 读取。
+  /// 选择一个或多个文件并复制到工作目录 attachments/ 下，供模型用 run_terminal 读取。
   Future<void> _pickFile() async {
     try {
-      final result = await FilePicker.platform.pickFiles();
+      final result = await FilePicker.platform.pickFiles(allowMultiple: true);
       if (result == null || result.files.isEmpty) return;
-      final src = result.files.first.path;
-      if (src == null || !mounted) return;
-      final dest = await FileWorkspace.copyToAttachments(src);
-      if (dest == null) {
-        if (!mounted) return;
+      var added = 0;
+      for (final f in result.files) {
+        final src = f.path;
+        if (src == null || !mounted) return;
+        final dest = await FileWorkspace.copyToAttachments(src);
+        if (dest == null) continue;
+        setState(() => _pendingFiles.add(dest));
+        added++;
+      }
+      if (added > 0) _stripAt();
+      if (added == 0 && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('文件复制到工作目录失败')),
         );
-        return;
       }
-      setState(() => _pendingFiles.add(dest));
-      _stripAt();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -815,6 +890,48 @@ class _ChatScreenState extends State<ChatScreen>
                         builder: (context, _) => _LoadedSkillChip(
                           skill: widget.shiyi.loadedSkill,
                           onRemove: () => widget.shiyi.loadSkill(null),
+                        ),
+                      ),
+                      // 当前会话项目目录条：点击可修改。
+                      GestureDetector(
+                        onTap: _pickWorkspace,
+                        child: Container(
+                          margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHigh
+                                .withValues(alpha: .6),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.folder_outlined,
+                                size: 14,
+                                color: theme.colorScheme.primary,
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  _workspace ?? '项目目录…',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.labelSmall!.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              Icon(
+                                Icons.edit_outlined,
+                                size: 13,
+                                color: theme.hintColor,
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                       ListenableBuilder(

@@ -55,6 +55,9 @@ class Session {
   int messageCount;
   int totalTokens;
 
+  /// 会话级项目工作目录（空 = 用全局默认工作目录）。
+  String workspaceDir;
+
   Session({
     required this.id,
     required this.title,
@@ -63,6 +66,7 @@ class Session {
     required this.updatedAt,
     this.messageCount = 0,
     this.totalTokens = 0,
+    this.workspaceDir = '',
   });
 
   Map<String, dynamic> toMap() => {
@@ -72,6 +76,7 @@ class Session {
         'created_at': createdAt,
         'updated_at': updatedAt,
         'total_tokens': totalTokens,
+        'workspace_dir': workspaceDir,
       };
 
   factory Session.fromMap(Map<String, dynamic> m) => Session(
@@ -82,6 +87,7 @@ class Session {
         updatedAt: m['updated_at'],
         messageCount: m['message_count'] == null ? 0 : int.parse('${m['message_count']}'),
         totalTokens: m['total_tokens'] == null ? 0 : int.parse('${m['total_tokens']}'),
+        workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
       );
 }
 

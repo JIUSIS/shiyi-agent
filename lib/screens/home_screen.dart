@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
@@ -510,8 +512,7 @@ class _SessionsTabState extends State<_SessionsTab> {
         ListView.separated(
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
           itemCount: shiyi.sessions.length,
-          separatorBuilder: (_, _) =>
-              const Divider(height: 1, indent: 16, endIndent: 16),
+          separatorBuilder: (_, _) => const SizedBox(height: 8),
           itemBuilder: (context, i) =>
               _SessionTile(shiyi: shiyi, session: shiyi.sessions[i]),
         ),
@@ -536,8 +537,7 @@ class _SessionsTabState extends State<_SessionsTab> {
           ListView.separated(
             padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
             itemCount: results.length,
-            separatorBuilder: (_, _) =>
-                const Divider(height: 1, indent: 16, endIndent: 16),
+            separatorBuilder: (_, _) => const SizedBox(height: 8),
             itemBuilder: (context, i) => _SessionTile(
               shiyi: shiyi,
               session: results[i].session,
@@ -566,7 +566,7 @@ class _SessionTile extends StatelessWidget {
     final theme = Theme.of(context);
     final busy = shiyi.isBusy && shiyi.busySessionId == s.id;
     final unread = shiyi.unreadSessions.contains(s.id);
-    return ListTile(
+    final tile = ListTile(
       dense: true,
       visualDensity: VisualDensity.compact,
       leading: SizedBox(
@@ -604,6 +604,21 @@ class _SessionTile extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
+      trailing: unread
+          ? Container(
+              width: 8,
+              height: 8,
+              margin: const EdgeInsets.only(right: 2),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary,
+                shape: BoxShape.circle,
+              ),
+            )
+          : null,
+    );
+    return _SwipeActions(
+      key: ValueKey(s.id),
+      // 左滑拉出拼合胶囊操作（重命名 / 删除）。
       onTap: () async {
         await shiyi.selectSession(s.id);
         if (context.mounted) {
@@ -615,53 +630,235 @@ class _SessionTile extends StatelessWidget {
           );
         }
       },
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (unread)
-            Container(
-              width: 8,
-              height: 8,
-              margin: const EdgeInsets.only(right: 2),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.primary,
-                shape: BoxShape.circle,
+      actions: [
+        // 左滑拉出的操作按钮：圆角交给外层 ClipRRect 裁剪，
+        // 左缘直角与内容右缘（展开时为直角）拼接，整体呈胶囊。
+        _SlidablePillAction(
+          icon: Icons.edit_outlined,
+          label: '重命名',
+          backgroundColor: theme.colorScheme.secondaryContainer,
+          foregroundColor: theme.colorScheme.onSecondaryContainer,
+          onTap: () async {
+            await _rename(context, shiyi, s);
+          },
+        ),
+        _SlidablePillAction(
+          icon: Icons.delete_outline,
+          label: '删除',
+          backgroundColor: theme.colorScheme.error,
+          foregroundColor: theme.colorScheme.onError,
+          onTap: () async {
+            final ok = await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: const Text('删除会话'),
+                content: Text('确定删除「${s.title}」及其全部消息吗？'),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: const Text('取消'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: theme.colorScheme.error,
+                    ),
+                    child: const Text(
+                      '删除',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ],
               ),
-            ),
-          PopupMenuButton<String>(
-            onSelected: (v) async {
-              if (v == 'rename') {
-                await _rename(context, shiyi, s);
-              } else if (v == 'delete') {
-                final ok = await showDialog<bool>(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: const Text('删除会话'),
-                    content: Text('确定删除「${s.title}」及其全部消息吗？'),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(ctx, false),
-                        child: const Text('取消'),
-                      ),
-                      FilledButton(
-                        onPressed: () => Navigator.pop(ctx, true),
-                        child: const Text(
-                          '删除',
-                          style: TextStyle(color: Colors.white),
-                        ),
-                      ),
+            );
+            if (ok == true) await shiyi.deleteSession(s.id);
+          },
+        ),
+      ],
+      child: tile,
+    );
+  }
+}
+
+/// 自实现左滑操作容器：内容跟随手指左移，露出右侧固定宽度的操作胶囊；
+/// 已滑开时点击内容先收回，再点才触发 onTap。
+class _SwipeActions extends StatefulWidget {
+  final Widget child;
+  final List<Widget> actions;
+  final VoidCallback? onTap;
+
+  const _SwipeActions({
+    super.key,
+    required this.child,
+    required this.actions,
+    this.onTap,
+  });
+
+  @override
+  State<_SwipeActions> createState() => _SwipeActionsState();
+}
+
+class _SwipeActionsState extends State<_SwipeActions> {
+  static const double actionWidth = 108;
+
+  double _offset = 0;
+  bool _settling = false;
+  Timer? _settleTimer;
+
+  @override
+  void dispose() {
+    _settleTimer?.cancel();
+    super.dispose();
+  }
+
+  /// 计算松手后的目标偏移。
+  /// 规则：半程以上或快速左滑 → 展开；已完全展开时右滑收回、再左滑（双滑）也收回；
+  /// 目标与当前相同则不做动画（避免 _settling 卡死）。
+  double _target(double velocity) {
+    final fullyOpen = _offset <= -actionWidth + 2;
+    if (fullyOpen) {
+      // 已展开：向右滑收回，向左再滑（双滑关闭）也收回，原地松手保持展开。
+      if (velocity.abs() > 300) return 0;
+      return -actionWidth;
+    }
+    return (_offset < -actionWidth / 2 || velocity < -300) ? -actionWidth : 0;
+  }
+
+  void _drag(double dx) {
+    // 用户重新拖动：立即接管，取消吸附中的锁定，保证全程跟手。
+    if (_settling) {
+      _settleTimer?.cancel();
+      _settling = false;
+    }
+    setState(() {
+      _offset = (_offset + dx).clamp(-actionWidth, 0.0);
+    });
+  }
+
+  /// 吸附到目标位置，并启动兜底计时器确保 _settling 一定解除（防卡死导致拉不开）。
+  void _settle(double target) {
+    _settleTimer?.cancel();
+    _settleTimer = Timer(const Duration(milliseconds: 260), () {
+      if (mounted) setState(() => _settling = false);
+    });
+    _settling = true;
+    setState(() => _offset = target);
+  }
+
+  void _end(double velocity) {
+    final t = _target(velocity);
+    if (t == _offset) {
+      _settleTimer?.cancel();
+      if (_settling) setState(() => _settling = false);
+      return;
+    }
+    _settle(t);
+  }
+
+  void _handleTap() {
+    if (_offset < 0) {
+      _settle(0);
+      return;
+    }
+    widget.onTap?.call();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(14),
+      child: Stack(
+        children: [
+          // 底层：右侧固定宽度操作区（仅滑动展开时显示，静止时完全不可见）。
+          Positioned.fill(
+            child: AnimatedOpacity(
+              opacity: _offset < 0 ? 1 : 0,
+              duration: const Duration(milliseconds: 100),
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: SizedBox(
+                  width: actionWidth,
+                  height: double.infinity,
+                  child: Row(
+                    children: [
+                      for (final a in widget.actions) Expanded(child: a),
                     ],
                   ),
-                );
-                if (ok == true) await shiyi.deleteSession(s.id);
-              }
+                ),
+              ),
+            ),
+          ),
+          // 上层：内容。手势放在 transform 内部，命中区域随左移，
+          // 右侧露出的操作区才能被点中；内容带不透明背景遮挡底层。
+          // 右缘圆角跟随展开状态：静止时整卡圆角，展开时右缘变直角与胶囊拼接。
+          AnimatedContainer(
+            duration: Duration(milliseconds: _settling ? 180 : 0),
+            curve: Curves.easeOutCubic,
+            transform: Matrix4.translationValues(_offset, 0, 0),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHigh,
+              borderRadius: BorderRadius.horizontal(
+                right: Radius.circular(_offset < 0 ? 0 : 14),
+              ),
+            ),
+            onEnd: () {
+              _settleTimer?.cancel();
+              if (mounted) setState(() => _settling = false);
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'rename', child: Text('重命名')),
-              PopupMenuItem(value: 'delete', child: Text('删除')),
-            ],
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (d) => _drag(d.delta.dx),
+              onHorizontalDragEnd: (d) => _end(d.primaryVelocity ?? 0),
+              onHorizontalDragCancel: () => _end(0),
+              onTap: _handleTap,
+              child: widget.child,
+            ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 左滑操作胶囊中的单个按钮（icon 在上、文字在下，可点按有水波纹）。
+class _SlidablePillAction extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color backgroundColor;
+  final Color foregroundColor;
+  final VoidCallback onTap;
+
+  const _SlidablePillAction({
+    required this.icon,
+    required this.label,
+    required this.backgroundColor,
+    required this.foregroundColor,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: backgroundColor,
+      child: InkWell(
+        onTap: onTap,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, color: foregroundColor, size: 16),
+            const SizedBox(height: 3),
+            Text(
+              label,
+              maxLines: 1,
+              style: TextStyle(
+                color: foregroundColor,
+                fontSize: 10,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
