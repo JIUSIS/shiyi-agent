@@ -43,6 +43,16 @@
 - 项目文件可视化浏览
 - 内置日志与排障能力
 
+## 界面预览
+
+| 主页 | 侧边栏 | 记忆 |
+| --- | --- | --- |
+| ![主页](docs/screenshots/home.jpg) | ![侧边栏](docs/screenshots/sidebar.jpg) | ![记忆](docs/screenshots/memory.jpg) |
+
+| 技能 | 文件 | 设置 | 关于 |
+| --- | --- | --- | --- |
+| ![技能](docs/screenshots/skills.jpg) | ![文件](docs/screenshots/files.jpg) | ![设置](docs/screenshots/settings.jpg) | ![关于](docs/screenshots/about.jpg) |
+
 ## 安装
 
 1. 从 [Releases](https://github.com/JIUSIS/shiyi-agent/releases) 下载 APK（Android 8.0+）
