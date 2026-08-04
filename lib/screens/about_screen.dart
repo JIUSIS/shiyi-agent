@@ -84,34 +84,69 @@ class _AboutScreenState extends State<AboutScreen> {
     if (_checking) return;
     setState(() => _checking = true);
     try {
-      final res = await http
-          .get(Uri.parse(AboutScreen.apiReleaseUrl))
-          .timeout(const Duration(seconds: 10));
+      final latest = await _fetchLatest();
       if (!mounted) return;
-      if (res.statusCode == 404) {
-        _showDialog('当前已是最新版本',
-            '尚未发布新的 Release，v${AboutScreen.version} 为当前版本。');
+      if (latest == null) {
+        _showDialog('检查更新失败', '无法获取版本信息，请检查网络后重试。');
         return;
       }
-      if (res.statusCode != 200) {
-        _showDialog('检查更新失败', '服务器返回异常（${res.statusCode}），请稍后再试。');
-        return;
-      }
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final tag = (data['tag_name'] ?? '') as String;
-      final remoteVer = tag.replaceFirst(RegExp('^v'), '');
+      final remoteVer = latest.tag.replaceFirst(RegExp('^v'), '');
       if (_compareVersion(remoteVer, AboutScreen.version) > 0) {
-        final notes = (data['body'] as String? ?? '').trim();
-        _showUpdateAvailable(remoteVer, notes);
+        _showUpdateAvailable(remoteVer, latest.notes);
       } else {
         _showDialog('当前已是最新版本', 'v${AboutScreen.version} 已经是最新版本。');
       }
-    } catch (_) {
-      if (!mounted) return;
-      _showDialog('检查更新失败', '无法连接 GitHub，请检查网络后重试。');
     } finally {
       if (mounted) setState(() => _checking = false);
     }
+  }
+
+  /// 获取最新版本：优先 GitHub Releases API，403/网络失败时回退 jsDelivr 镜像。
+  /// 返回 null 表示两种来源都不可用。
+  Future<({String tag, String notes})?> _fetchLatest() async {
+    // ① GitHub Releases API（公开仓库无需鉴权；403 多为区域网络受限/限流）
+    try {
+      final res = await http
+          .get(
+            Uri.parse(AboutScreen.apiReleaseUrl),
+            headers: const {'User-Agent': 'ShiYi'},
+          )
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200) {
+        final d = jsonDecode(res.body) as Map<String, dynamic>;
+        return (
+          tag: (d['tag_name'] ?? '') as String,
+          notes: (d['body'] as String? ?? '').trim(),
+        );
+      }
+      if (res.statusCode == 404) {
+        // 仓库没有任何 Release：视为当前版本即最新。
+        return (tag: 'v${AboutScreen.version}', notes: '');
+      }
+    } catch (_) {}
+    // ② jsDelivr 镜像（国内可达，不受 GitHub API 限流影响）
+    try {
+      final res = await http
+          .get(
+            Uri.parse('https://data.jsdelivr.com/v1/packages/gh/JIUSIS/shiyi-agent'),
+          )
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200) {
+        final d = jsonDecode(res.body) as Map<String, dynamic>;
+        final versions = (d['versions'] as List? ?? []);
+        String? best;
+        for (final v in versions) {
+          final s = (v is Map ? v['version'] : v)?.toString() ?? '';
+          final tag = s.replaceFirst(RegExp('^v'), '');
+          if (tag.isEmpty || int.tryParse(tag.split('.').first) == null) {
+            continue;
+          }
+          if (best == null || _compareVersion(tag, best) > 0) best = tag;
+        }
+        if (best != null) return (tag: 'v$best', notes: '');
+      }
+    } catch (_) {}
+    return null;
   }
 
   void _showDialog(String title, String message) {
