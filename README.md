@@ -1,5 +1,9 @@
 # 拾忆 ShiYi
 
+> 运行在 Android 手机上的个人 AI 工作台
+
+📦 **下载安装**：[shiyi-agent-v1.0.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v1.0.0/shiyi-agent-v1.0.0.apk) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+
 拾忆（ShiYi）是一款运行在 Android 手机上的个人 AI 工作台。
 
 它将大语言模型、长期记忆、项目文件管理、内置终端和技能系统整合到一个移动应用中，让 AI 不只是回答问题，还可以参与实际工作：读取资料、修改文件、运行命令、整理项目。
@@ -68,4 +72,4 @@ flutter build apk --release
 
 ## 许可证
 
-本项目暂未选择开源许可证。未经作者许可，请勿复制、修改、分发或用于商业用途。
+本项目基于 [GPL-3.0](LICENSE) 开源发布。使用、修改与分发请遵守 GPL-3.0 协议条款。
