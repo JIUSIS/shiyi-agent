@@ -9,6 +9,7 @@ import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../widgets/welcome_avatar.dart';
+import 'about_screen.dart';
 import 'chat_screen.dart';
 import 'files_screen.dart';
 import 'memory_screen.dart';
@@ -129,6 +130,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     onSelect: (i) => setState(() => _tab = i),
                     onToggle: () => setState(() => _sidebarVisible = false),
                     onNewSession: _newSession,
+                    onAbout: _openAbout,
                   ),
                 ),
                 // 收起时的悬浮红绿灯入口：所有侧边栏页面都显示，方便随时展开。
@@ -181,6 +183,13 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  void _openAbout() {
+    Navigator.push(
+      context,
+      MacPageRoute(builder: (_) => const AboutScreen()),
+    );
+  }
+
   Widget _buildTab() {
     final shiyi = widget.shiyi;
     switch (_tab) {
@@ -210,11 +219,13 @@ class _MacSidebar extends StatelessWidget {
   final ValueChanged<int> onSelect;
   final VoidCallback onToggle;
   final VoidCallback onNewSession;
+  final VoidCallback onAbout;
   const _MacSidebar({
     required this.selected,
     required this.onSelect,
     required this.onToggle,
     required this.onNewSession,
+    required this.onAbout,
   });
 
   static const List<({IconData icon, IconData selectedIcon, String label})>
@@ -289,6 +300,16 @@ class _MacSidebar extends StatelessWidget {
             const SizedBox(height: 4),
           ],
           const Spacer(),
+          _SidebarItem(
+            item: (
+              icon: Icons.info_outline,
+              selectedIcon: Icons.info_outline,
+              label: '关于',
+            ),
+            selected: false,
+            onTap: onAbout,
+          ),
+          const SizedBox(height: 4),
           Padding(
             padding: EdgeInsets.only(
               bottom: MediaQuery.paddingOf(context).bottom + 14,
