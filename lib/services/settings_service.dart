@@ -10,7 +10,10 @@ class SettingsService {
     final raw = prefs.getString(_key);
     if (raw == null) return AppSettings();
     try {
-      return AppSettings.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+      final s = AppSettings.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+      // 迁移旧默认：此前按“字符”计、默认 100 万；现按 token 计，默认 128k。
+      if (s.contextLimit >= 500000) s.contextLimit = 128000;
+      return s;
     } catch (_) {
       return AppSettings();
     }

@@ -308,7 +308,7 @@ class AppSettings {
   double ttsRate;
   String themeMode; // light / dark / system
 
-  /// 会话上下文上限（字符，最大 100 万）。
+  /// 会话上下文上限（估算 token，默认 128k）。
   int contextLimit;
   /// 上下文压缩阈值（占上下文上限的百分比，如 80 表示 80%）。
   double compressThresholdPercent;
@@ -333,7 +333,7 @@ class AppSettings {
     this.ttsEnabled = false,
     this.ttsRate = 1.0,
     this.themeMode = 'dark',
-    this.contextLimit = 1000000,
+    this.contextLimit = 128000,
     this.compressThresholdPercent = 80,
     this.autoCompress = true,
     this.visionEnabled = false,
@@ -399,7 +399,7 @@ class AppSettings {
         ttsEnabled: j['ttsEnabled'] ?? false,
         ttsRate: (j['ttsRate'] as num?)?.toDouble() ?? 1.0,
         themeMode: j['themeMode'] ?? 'dark',
-        contextLimit: (j['contextLimit'] as num?)?.toInt() ?? 1000000,
+        contextLimit: (j['contextLimit'] as num?)?.toInt() ?? 128000,
         compressThresholdPercent:
             (j['compressThresholdPercent'] as num?)?.toDouble() ?? 80,
         autoCompress: j['autoCompress'] ?? true,

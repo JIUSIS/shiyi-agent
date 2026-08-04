@@ -18,7 +18,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     _db = await openDatabase(
       join(dir.path, 'shiyi_agent.db'),
-      version: 8,
+      version: 9,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
     );
@@ -33,7 +33,8 @@ Future<void> _createBaseTables(Database db, int version) async {
       model TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      total_tokens INTEGER NOT NULL DEFAULT 0
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      workspace_dir TEXT
     )
   ''');
   await db.execute('''
@@ -131,6 +132,13 @@ Future<void> _upgrade(Database db, int oldV, int newV) async {
   }
   // v7 -> v8：sessions 表加 workspace_dir 列（会话级项目工作目录）。
   if (oldV < 8) {
+    final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+    if (!cols.any((c) => c['name'] == 'workspace_dir')) {
+      await db.execute('ALTER TABLE sessions ADD COLUMN workspace_dir TEXT');
+    }
+  }
+  // v8 -> v9：强制补 workspace_dir 列（修复部分 v8 库因 onCreate 漏列而缺列）。
+  if (oldV < 9) {
     final cols = await db.rawQuery('PRAGMA table_info(sessions)');
     if (!cols.any((c) => c['name'] == 'workspace_dir')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN workspace_dir TEXT');

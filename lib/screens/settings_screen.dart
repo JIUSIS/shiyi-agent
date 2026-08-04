@@ -31,7 +31,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _autoLearn = true;
   double _ttsRate = 1.0;
   String _themeMode = 'dark';
-  int _contextLimit = 1000000;
+  int _contextLimit = 128000;
   double _compressThresholdPercent = 80;
   bool _autoCompress = true;
   bool _visionEnabled = false;
@@ -825,7 +825,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ListTile(
                 leading: const Icon(Icons.compress_outlined),
                 title: const Text('上下文上限'),
-                subtitle: const Text('会话上下文最大字符数（最高 100 万）'),
+                subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200 万）'),
                 trailing: SizedBox(
                   width: 110,
                   child: TextFormField(
@@ -842,7 +842,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       final n = int.tryParse(v);
                       if (n != null && n > 0) {
                         setState(
-                          () => _contextLimit = n.clamp(10000, 1000000),
+                          () => _contextLimit = n.clamp(1000, 2000000),
                         );
                         _autoSave();
                       }

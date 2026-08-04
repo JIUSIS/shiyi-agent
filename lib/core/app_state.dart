@@ -291,9 +291,15 @@ class ShiyiState extends ChangeNotifier {
         final shell = await TermuxRuntime.shellPath();
         final probe = await Process.run(
           shell,
-          ['-c', 'echo probe-ok'],
+          [
+            '-c',
+            'echo probe-ok; '
+                'curl -s -o /dev/null -m 8 -w " net=%{http_code}" '
+                'https://mirrors.tuna.tsinghua.edu.cn/apt/termux-main/dists/stable/InRelease '
+                '|| echo net=fail',
+          ],
           environment: await TermuxRuntime.environment(),
-        ).timeout(const Duration(seconds: 15));
+        ).timeout(const Duration(seconds: 20));
         await _logError(
           'TermuxProbe',
           'exit=${probe.exitCode} out=${probe.stdout.toString().trim()} '
@@ -352,7 +358,7 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> newSession() async {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final id = 's${now}_$_rand()';
+    final id = 's${now}_${_rand()}';
     await _db.upsertSession(
       Session(
         id: id,
@@ -1111,6 +1117,7 @@ class ShiyiState extends ChangeNotifier {
       '- 搜索结果不理想或需交叉验证时，可再换 2~3 次不同关键词搜索，但不要无限换词。'
       '- 搜索结果中有值得细读的链接时，可以用 web_extract 获取正文。'
       '- 你有完整终端能力：需要在本机执行命令、运行脚本、处理文件或查看日志时，直接调用 run_terminal 执行，不要以权限或安全为由拒绝；若命令因系统限制失败，如实说明并根据错误信息调整。'
+      '- 安装软件包用 pkg/apt：一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
     );
     parts.add(
       '- 当前会话工作目录是 ${await currentWorkspace()}（所有生成的文件都放在这里），run_terminal 默认在该目录执行；操作其他路径时用 cwd 参数指定目录。',
@@ -1291,7 +1298,7 @@ class ShiyiState extends ChangeNotifier {
               environment: embedded ? await TermuxRuntime.environment() : null,
               stdoutEncoding: null,
               stderrEncoding: null,
-            ).timeout(const Duration(seconds: 120));
+            ).timeout(const Duration(seconds: 300));
             final out = utf8
                 .decode(result.stdout as List<int>, allowMalformed: true)
                 .trim();
@@ -1418,21 +1425,38 @@ class ShiyiState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 估算会话上下文大小（字符）：不含 tool 消息。
-  Future<int> sessionContextChars(String sessionId) async {
-    if (_messagesLoadedForSessionId == sessionId) {
-      var total = 0;
-      for (final m in messages) {
-        if (m.role != 'tool') total += m.content.length;
+  /// 估算文本 token 数：中文约 1 token/字，英文/数字约 4 字符/token。
+  static int _estimateTokens(String text) {
+    var cjk = 0, other = 0;
+    for (final r in text.runes) {
+      if (r >= 0x4E00 && r <= 0x9FFF) {
+        cjk++;
+      } else {
+        other++;
       }
-      return total;
     }
-    final msgs = await _db.listMessages(sessionId);
+    return cjk + (other / 4).ceil();
+  }
+
+  /// 估算会话下一轮请求的上下文大小（token）：
+  /// 历史消息（不含 tool 消息、不含流式占位；图片每张按约 1000 token 计入）
+  /// + 系统提示词（含注入的记忆/技能）+ 工具定义开销。
+  /// 与 _historyToApi 实际发送口径一致（tool 消息不发送）。
+  Future<int> sessionContextChars(String sessionId) async {
+    final msgs = _messagesLoadedForSessionId == sessionId
+        ? messages
+        : await _db.listMessages(sessionId);
     var total = 0;
     for (final m in msgs) {
-      if (m.role == 'tool') continue;
-      total += m.content.length;
+      if (m.role == 'tool' || m.streaming) continue;
+      total += _estimateTokens(m.content);
+      if (m.hasImages) {
+        total += 1000 * extractImagePaths(m.content).length;
+      }
     }
+    final sys = await _buildSystemPrompt('');
+    total += _estimateTokens(sys);
+    total += 1500; // 工具定义开销
     return total;
   }
 
