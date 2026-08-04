@@ -20,6 +20,42 @@ class AboutScreen extends StatefulWidget {
   State<AboutScreen> createState() => _AboutScreenState();
 }
 
+/// 功能特性列表（与 README 保持一致）。
+const _features = <(IconData, String)>[
+  (Icons.api, '接入不同 LLM API，自由切换模型'),
+  (Icons.forum_outlined, '多轮对话与独立会话管理'),
+  (Icons.folder_outlined, '每个会话可设置独立项目工作目录'),
+  (Icons.attach_file_outlined, '文件 / 图片附件，支持视觉模型'),
+  (Icons.terminal, '内置免 root 终端（bash / python3 / apt 装包）'),
+  (Icons.psychology_outlined, '长期记忆：记住偏好与项目背景'),
+  (Icons.bolt_outlined, '技能系统：输入 / 快速选择技能'),
+  (Icons.travel_explore, '网页搜索与网页内容提取'),
+  (Icons.record_voice_over_outlined, '语音朗读、深浅色主题'),
+];
+
+class _FeatureTile extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  const _FeatureTile({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: theme.colorScheme.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(label, style: theme.textTheme.bodyMedium),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _AboutScreenState extends State<AboutScreen> {
   bool _checking = false;
 
@@ -169,6 +205,29 @@ class _AboutScreenState extends State<AboutScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 28),
+              Text(
+                '功能特性',
+                style: theme.textTheme.bodySmall!.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Card(
+                color: theme.colorScheme.surfaceContainerHigh,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Column(
+                  children: [
+                    for (final f in _features) ...[
+                      _FeatureTile(icon: f.$1, label: f.$2),
+                      if (f != _features.last) const Divider(height: 1, indent: 48),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 28),
               Card(
                 color: theme.colorScheme.surfaceContainerHigh,
                 shape: RoundedRectangleBorder(
@@ -222,7 +281,7 @@ class _AboutScreenState extends State<AboutScreen> {
               const SizedBox(height: 28),
               Center(
                 child: Text(
-                  '本项目暂未选择开源许可证\n未经作者许可，请勿复制、修改、分发或用于商业用途',
+                  '本项目基于 GPL-3.0 协议开源\n使用、修改与分发请遵守 GPL-3.0 条款',
                   textAlign: TextAlign.center,
                   style: theme.textTheme.bodySmall!.copyWith(
                     color: theme.colorScheme.onSurfaceVariant.withValues(alpha: .7),
