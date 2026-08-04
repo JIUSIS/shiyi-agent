@@ -10,7 +10,6 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/file_workspace.dart';
 import '../services/image_service.dart';
-import '../services/permission_service.dart';
 import '../services/tts_service.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/welcome_avatar.dart';
@@ -775,35 +774,6 @@ class _ChatScreenState extends State<ChatScreen>
                         builder: (context, _) => Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            if (widget.shiyi.storagePermissionHint)
-                              _FileAccessBanner(
-                                onGrant: () async {
-                                  final messenger = ScaffoldMessenger.of(
-                                    context,
-                                  );
-                                  final grantedBefore =
-                                      await PermissionService.isFullAccessGranted();
-                                  if (!grantedBefore) {
-                                    await PermissionService.requestFullAccess();
-                                  }
-                                  final granted =
-                                      await PermissionService.isFullAccessGranted();
-                                  if (granted) {
-                                    widget.shiyi.clearStoragePermissionHint();
-                                    messenger.showSnackBar(
-                                      const SnackBar(
-                                        content: Text('文件访问权限已开启，可以再让拾忆试试'),
-                                      ),
-                                    );
-                                  } else {
-                                    messenger.showSnackBar(
-                                      const SnackBar(
-                                        content: Text('请在系统设置中手动开启「所有文件访问权限」'),
-                                      ),
-                                    );
-                                  }
-                                },
-                              ),
                             if (widget.shiyi.status != null)
                               Builder(
                                 builder: (context) {
@@ -1550,49 +1520,6 @@ class _MacDot extends StatelessWidget {
     height: 7,
     decoration: BoxDecoration(color: color, shape: BoxShape.circle),
   );
-}
-
-/// 终端访问手机存储被系统拒绝时的提示横幅，点击一键去授权。
-class _FileAccessBanner extends StatelessWidget {
-  final VoidCallback onGrant;
-  const _FileAccessBanner({required this.onGrant});
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final cs = theme.colorScheme;
-    return Container(
-      width: double.infinity,
-      color: cs.tertiaryContainer.withValues(alpha: .55),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Row(
-        children: [
-          Icon(
-            Icons.folder_off_outlined,
-            size: 16,
-            color: cs.onTertiaryContainer,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              '终端访问手机存储被系统拒绝，需要开启「所有文件访问权限」',
-              style: theme.textTheme.bodySmall!.copyWith(
-                color: cs.onTertiaryContainer,
-              ),
-            ),
-          ),
-          TextButton(
-            onPressed: onGrant,
-            style: TextButton.styleFrom(
-              visualDensity: VisualDensity.compact,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-            ),
-            child: const Text('去授权'),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 // ---------- 工具调用信息流（右上角胶囊 + 展开面板） ----------

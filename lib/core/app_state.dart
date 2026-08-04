@@ -6,7 +6,6 @@ import 'package:flutter/foundation.dart';
 
 import '../core/models.dart';
 import '../services/db.dart';
-import '../services/permission_service.dart';
 import '../services/llm_client.dart';
 import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
@@ -62,9 +61,6 @@ class ShiyiState extends ChangeNotifier {
   DateTime? _lastRefine;
   int _refineCount = 0;
   bool _knownImageUnsupported = false;
-
-  /// 终端工具遇到存储权限不足时的提示（聊天页显示授权横幅）。
-  bool storagePermissionHint = false;
 
   /// 模型发起的待用户确认问题：{question, options}；UI 弹窗后用户选择。
   Map<String, dynamic>? pendingQuestion;
@@ -684,6 +680,13 @@ class ShiyiState extends ChangeNotifier {
       }
     }
 
+    // 兜底：只要有一次尝试成功（completed），就清除重试/等待提示，
+    // 避免中断重试成功后状态条残留。
+    if (completed) {
+      status = null;
+      notifyListeners();
+    }
+
     await _db.touchSession(sessionId, model: settings.model);
     await refreshSessions();
   }
@@ -838,7 +841,6 @@ class ShiyiState extends ChangeNotifier {
     // 每轮工具调用时模型输出的文字都作为独立消息保留（像多发了几条消息），不合并。
     var asst = firstAsst;
     _streaming = asst;
-    storagePermissionHint = false;
     for (var round = 0; round < _maxToolRounds; round++) {
       final result = await _streamRound(sessionId, loopMsgs, asst);
       if (result == null) {
@@ -1156,14 +1158,6 @@ class ShiyiState extends ChangeNotifier {
       output.startsWith('记录失败') ||
       output.startsWith('未知工具');
 
-  /// 用户完成授权后清除终端权限提示。
-  void clearStoragePermissionHint() {
-    if (storagePermissionHint) {
-      storagePermissionHint = false;
-      notifyListeners();
-    }
-  }
-
   Future<String> _executeTool(String name, String argsJson) async {
     try {
       Map<String, dynamic> args = {};
@@ -1237,7 +1231,6 @@ class ShiyiState extends ChangeNotifier {
             final embedded = !isWin && File(embeddedShell).existsSync();
             final systemTermux =
                 !isWin && File(systemTermuxShell).existsSync();
-            final useTermux = embedded || systemTermux;
             final shell = embedded
                 ? embeddedShell
                 : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
@@ -1284,42 +1277,6 @@ class ShiyiState extends ChangeNotifier {
             var text = buf.toString();
             if (text.length > 4000) {
               text = '${text.substring(0, 4000)}…（输出过长，已截断）';
-            }
-            // Android 精简 shell（toybox）缺包管理器：命中 apt/pkg 类命令时引导装 Termux。
-            if (!useTermux && !isWin) {
-              final firstWord = command
-                  .trim()
-                  .split(RegExp(r'\s+'))
-                  .first
-                  .toLowerCase();
-              const pkgMgrs = ['apt', 'apt-get', 'pkg', 'dnf', 'yum', 'apk', 'pacman'];
-              final wantsPkg = pkgMgrs.contains(firstWord) ||
-                  pkgMgrs.any((p) => command.contains(' $p '));
-              if (wantsPkg) {
-                text = text.isEmpty ? '（无输出）' : text;
-                text +=
-                    '\n\n【提示】当前是 Android 精简 shell（toybox），没有 apt/pkg 等包管理器。'
-                    '重启应用后会自动部署内嵌 Termux 环境（完整 Linux），届时 pkg install xxx 即可用。';
-              }
-            }
-            final textLower = text.toLowerCase();
-            final cmdLower = command.toLowerCase();
-            final isPermErr =
-                textLower.contains('permission denied') ||
-                textLower.contains('operation not permitted') ||
-                textLower.contains('没有权限') ||
-                textLower.contains('不允许');
-            final touchesStorage =
-                cmdLower.contains('sdcard') ||
-                cmdLower.contains('/storage') ||
-                cmdLower.contains('/mnt') ||
-                textLower.contains('sdcard') ||
-                textLower.contains('/storage');
-            final fullAccess = await PermissionService.isFullAccessGranted();
-            // 只提示与手机存储权限相关的问题，避免 /data 等系统目录误报。
-            if (isPermErr && (touchesStorage || !fullAccess)) {
-              storagePermissionHint = true;
-              notifyListeners();
             }
             return text.isEmpty
                 ? '命令执行完成（无输出），退出码 ${result.exitCode}'
