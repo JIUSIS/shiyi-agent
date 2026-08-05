@@ -50,8 +50,8 @@ app.*.map.json
 /*.jpeg
 /*.xml
 /*.zip
-/*.db
-/*.db-*
+**/*.db
+**/*.db-*
 
 # Local signing material
 *.jks
