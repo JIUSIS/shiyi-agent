@@ -100,12 +100,31 @@ flutter pub get
 # 运行（debug）
 flutter run
 
-# 构建 release APK
-# 需在 android/local.properties 或环境变量 KEYSTORE_PASSWORD 中提供签名密码（不入库）
+# 构建 release APK（需先配置签名，见下）
 flutter build apk --release
 ```
 
-签名凭据（`keystore.jks`）与本地构建配置（`android/local.properties`）均被 `.gitignore` 排除，不随源码提交。
+### Release 签名配置
+
+`android/app/build.gradle.kts` 的 release 签名配置读取项目根目录的 `keystore.jks`（keyAlias 为 `shiyi`），签名密码从 `android/local.properties` 的 `KEYSTORE_PASSWORD` 或环境变量 `KEYSTORE_PASSWORD` 读取。
+
+首次构建 release 需要：
+
+```bash
+# 1. 生成签名密钥（只需一次；请务必妥善保管密码）
+keytool -genkeypair -v -keystore keystore.jks -keyalg RSA -keysize 2048 \
+  -validity 10000 -alias shiyi -dname "CN=ShiYi, OU=ShiYi, O=ShiYi, L=Beijing, ST=Beijing, C=CN"
+
+# 2. 配置密码（二选一）
+#    方式 A：写入 android/local.properties（不入库）
+echo "KEYSTORE_PASSWORD=你的密码" >> android/local.properties
+#    方式 B：构建时用环境变量
+export KEYSTORE_PASSWORD="你的密码"
+flutter build apk --release
+```
+
+> 注意：`keystore.jks` 与 `android/local.properties` 均被 `.gitignore` 排除，**不随源码提交**。丢失密钥意味着无法再对已发布的版本做覆盖更新（签名不一致），请务必备份。
+
 
 ## 隐私与数据
 

@@ -172,7 +172,7 @@ packages:
   file_picker:
     dependency: "direct main"
     description:
-      path: "../file_picker_patch"
+      path: "third_party/file_picker_patch"
       relative: true
     source: path
     version: "8.3.7"

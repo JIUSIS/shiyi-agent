@@ -48,7 +48,7 @@ dependencies:
   file_picker: ^8.1.2
 dependency_overrides:
   file_picker:
-    path: ../file_picker_patch
+    path: third_party/file_picker_patch
 
 dev_dependencies:
   flutter_test:
