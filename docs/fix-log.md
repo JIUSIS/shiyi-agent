@@ -237,6 +237,15 @@
 - **修复**：`_ToolPillIdle` 两端对齐（`spaceBetween`）——左侧灰点+工具，右侧 **0.0s**（读秒初始态）。
 - **涉及**：`lib/screens/chat_screen.dart`。
 
+### 36. tab 切换无过渡 + 设置入口点击无响应（卡顿）
+- **现象**：① 侧边栏切 tab 直接硬切无淡入淡出；② 点右上角设置第一次"没反应"，再点其他按钮才切换。
+- **根因**：
+  - `_selectTab` 用 `addPostFrameCallback` 延迟 setState，点击要等下一帧才生效；
+  - 首次切到设置页时同步构建 40+ 项 `ListView`，主线程被占满、点击事件被吞；
+  - 尝试的 `AnimatedSwitcher`（新旧双页并存）反而加重首帧负担。
+- **修复**：`IndexedStack` 常驻全部 6 个 tab（切换零构建、立即响应）+ `FadeTransition` 180ms 淡入 + 启动后逐帧预构建 tab 1-5（`_prebuildTabs`）；`_selectTab` 去掉 postFrame 延迟直接 setState。
+- **涉及**：`lib/screens/home_screen.dart`（`c49d501` 尝试方案、`9a96768` 最终方案）。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）
