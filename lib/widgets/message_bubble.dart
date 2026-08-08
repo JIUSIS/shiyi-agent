@@ -5,11 +5,13 @@ import 'package:flutter/material.dart';
 import '../core/models.dart';
 import 'markdown_text.dart';
 
-class MessageBubble extends StatelessWidget {
+class MessageBubble extends StatefulWidget {
   final ChatMessage message;
 
   /// 流式实时文本：非空时用它渲染（独立刷新只更新这一条气泡）。
   final String? liveContent;
+  /// 流式实时思考内容（reasoning_content）。
+  final String? liveReasoning;
   final bool busy;
   final void Function(ChatMessage msg)? onCopy;
   final void Function(ChatMessage msg)? onDelete;
@@ -24,6 +26,7 @@ class MessageBubble extends StatelessWidget {
     super.key,
     required this.message,
     this.liveContent,
+    this.liveReasoning,
     this.busy = false,
     this.onCopy,
     this.onDelete,
@@ -34,6 +37,27 @@ class MessageBubble extends StatelessWidget {
     this.onStopSpeak,
     this.speaking = false,
   });
+
+  @override
+  State<MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<MessageBubble> {
+  /// 思考内容是否展开（默认收起）。
+  bool _showReasoning = false;
+
+  ChatMessage get message => widget.message;
+  String? get liveContent => widget.liveContent;
+  String? get liveReasoning => widget.liveReasoning;
+  bool get busy => widget.busy;
+  bool get speaking => widget.speaking;
+  void Function(ChatMessage)? get onCopy => widget.onCopy;
+  void Function(ChatMessage)? get onDelete => widget.onDelete;
+  void Function(ChatMessage)? get onRegenerate => widget.onRegenerate;
+  void Function(ChatMessage)? get onSaveMemory => widget.onSaveMemory;
+  void Function(ChatMessage)? get onSaveSkill => widget.onSaveSkill;
+  void Function(ChatMessage)? get onSpeak => widget.onSpeak;
+  VoidCallback? get onStopSpeak => widget.onStopSpeak;
 
   @override
   Widget build(BuildContext context) {
@@ -80,13 +104,23 @@ class MessageBubble extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // 思考内容（如有）：默认收起，点击展开/收回。
+              // 进行中（streaming）也实时显示，让用户能看到模型的思考过程。
+              if ((liveReasoning ?? message.reasoning).isNotEmpty) ...[
+                _reasoningHeader(theme),
+                if (_showReasoning)
+                  _reasoningBody(
+                    theme,
+                    liveReasoning ?? message.reasoning,
+                  ),
+              ],
               // 只要这条消息还在进行（streaming），「正在思考…」就不消失：
               // 无文本时作为占位，有流式文本时显示在文本上方。
               if (message.streaming && (liveContent ?? message.content).isNotEmpty)
                 _thinkingIndicator(theme),
               if ((liveContent ?? message.content).isNotEmpty)
                 AdaptiveMarkdownText(liveContent ?? message.content)
-              else if (message.streaming)
+              else if (message.streaming && (liveReasoning ?? message.reasoning).isEmpty)
                 _thinkingIndicator(theme),
             ],
           ),
@@ -137,6 +171,67 @@ class MessageBubble extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 思考内容折叠头：点击展开/收回，进行中显示小 spinner。
+  Widget _reasoningHeader(ThemeData theme) {
+    return InkWell(
+      onTap: () => setState(() => _showReasoning = !_showReasoning),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _showReasoning ? Icons.unfold_less : Icons.unfold_more,
+              size: 15,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              _showReasoning ? '收起思考' : '思考过程',
+              style: theme.textTheme.bodySmall!.copyWith(
+                color: theme.colorScheme.primary,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            if (message.streaming) ...[
+              const SizedBox(width: 6),
+              const SizedBox(
+                width: 10,
+                height: 10,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 思考内容正文：浅色块 + 小字，超高可滚动。
+  Widget _reasoningBody(ThemeData theme, String reasoning) {
+    return Container(
+      margin: const EdgeInsets.only(top: 2, bottom: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 220),
+        child: SingleChildScrollView(
+          child: SelectableText(
+            reasoning,
+            style: theme.textTheme.bodySmall!.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              height: 1.5,
+            ),
+          ),
+        ),
       ),
     );
   }

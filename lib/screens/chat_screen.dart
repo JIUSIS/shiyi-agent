@@ -128,10 +128,11 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   /// 构建单条消息气泡；liveContent 非空时渲染流式实时文本。
-  Widget _messageItem(ChatMessage m, {String? liveContent}) {
+  Widget _messageItem(ChatMessage m, {String? liveContent, String? liveReasoning}) {
     return MessageBubble(
       message: m,
       liveContent: liveContent,
+      liveReasoning: liveReasoning,
       busy: widget.shiyi.isBusy,
       speaking: _speakingId == m.id,
       onCopy: _copyMessage,
@@ -740,6 +741,8 @@ class _ChatScreenState extends State<ChatScreen>
                                     )
                                   : _ToolPill(
                                       event: events.last,
+                                      index: events.length,
+                                      total: events.length,
                                       onTap: () => setState(
                                         () => _showToolLog = !_showToolLog,
                                       ),
@@ -827,9 +830,19 @@ class _ChatScreenState extends State<ChatScreen>
                                   return KeyedSubtree(
                                     key: ValueKey(m.id),
                                     child: ValueListenableBuilder<String>(
-                                      valueListenable: widget.shiyi.streamText,
-                                      builder: (context, text, _) =>
-                                          _messageItem(m, liveContent: text),
+                                      valueListenable:
+                                          widget.shiyi.streamReasoning,
+                                      builder: (context, reasoning, _) =>
+                                          ValueListenableBuilder<String>(
+                                        valueListenable:
+                                            widget.shiyi.streamText,
+                                        builder: (context, text, _) =>
+                                            _messageItem(
+                                          m,
+                                          liveContent: text,
+                                          liveReasoning: reasoning,
+                                        ),
+                                      ),
                                     ),
                                   );
                                 }
@@ -952,16 +965,29 @@ class _ChatScreenState extends State<ChatScreen>
                     ],
                   ),
                 ),
-                if (_showToolLog)
-                  Positioned(
-                    top: MediaQuery.paddingOf(context).top + kToolbarHeight + 8,
-                    right: 8,
-                    width: 280,
-                    child: _ToolLogPanel(
-                      events: widget.shiyi.toolEvents,
-                      onClose: () => setState(() => _showToolLog = false),
-                    ),
-                  ),
+                // 操作信息流面板：有进行中的操作时自动展开（创建过程每一步可见），
+                // 空闲时跟随手动开关。
+                ListenableBuilder(
+                  listenable: widget.shiyi,
+                  builder: (context, _) {
+                    final running =
+                        widget.shiyi.toolEvents.any((e) => !e.done);
+                    if (!(running || _showToolLog)) {
+                      return const SizedBox.shrink();
+                    }
+                    return Positioned(
+                      top: MediaQuery.paddingOf(context).top +
+                          kToolbarHeight +
+                          8,
+                      right: 8,
+                      width: 280,
+                      child: _ToolLogPanel(
+                        events: widget.shiyi.toolEvents,
+                        onClose: () => setState(() => _showToolLog = false),
+                      ),
+                    );
+                  },
+                ),
                 // 上下文达到压缩阈值后，右下角悬浮「压缩上下文」胶囊。
                 Positioned(
                   right: 14,
@@ -1712,11 +1738,18 @@ class _ToolPillIdle extends StatelessWidget {
   }
 }
 
-/// 右上角胶囊：显示最近一条工具调用状态，点击展开信息流面板。
+/// 右上角胶囊：显示最近一条工具调用状态（含步骤计数/读秒），点击展开信息流面板。
 class _ToolPill extends StatefulWidget {
   final ToolEvent event;
+  final int index; // 当前事件序号（1-based）
+  final int total; // 本轮事件总数
   final VoidCallback onTap;
-  const _ToolPill({required this.event, required this.onTap});
+  const _ToolPill({
+    required this.event,
+    required this.index,
+    required this.total,
+    required this.onTap,
+  });
 
   @override
   State<_ToolPill> createState() => _ToolPillState();
@@ -1780,7 +1813,9 @@ class _ToolPillState extends State<_ToolPill> {
                 const SizedBox(width: 5),
                 Flexible(
                   child: Text(
-                    _toolLabel(event.name),
+                    event.done
+                        ? _toolLabel(event.name)
+                        : '${_toolLabel(event.name)} ${widget.index}/${widget.total}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.labelMedium?.copyWith(

@@ -19,8 +19,12 @@ class LlmInterruptedException extends LlmException {
 class TurnResult {
   final String text;
   final List<Map<String, String>> toolCalls; // [{id,name,arguments}]
-  TurnResult({this.text = '', List<Map<String, String>>? toolCalls})
-    : toolCalls = toolCalls ?? [];
+  final String reasoning; // 模型思考内容（reasoning_content）
+  TurnResult({
+    this.text = '',
+    this.reasoning = '',
+    List<Map<String, String>>? toolCalls,
+  }) : toolCalls = toolCalls ?? [];
 }
 
 /// OpenAI-compatible streaming client with SSE parsing and tool calls.
@@ -219,6 +223,7 @@ class LlmClient {
   Future<void> _parseSse(Stream<List<int>> raw) async {
     final denyBuffer = StringBuffer(); // line buffer
     String text = '';
+    String reasoning = '';
     final toolBuf = <int, Map<String, String>>{};
     var doneReceived = false;
     var stoppedByUser = false;
@@ -226,9 +231,13 @@ class LlmClient {
     final completer = Completer<void>();
 
     void emitPartial() {
-      if (text.isNotEmpty) {
+      if (text.isNotEmpty || reasoning.isNotEmpty) {
         onTurn?.call(
-          TurnResult(text: text, toolCalls: _snapshotTools(toolBuf)),
+          TurnResult(
+            text: text,
+            reasoning: reasoning,
+            toolCalls: _snapshotTools(toolBuf),
+          ),
         );
       }
     }
@@ -271,6 +280,12 @@ class LlmClient {
         final content = delta['content'];
         if (content is String && content.isNotEmpty) {
           text += content;
+          emitPartial();
+        }
+        // DeepSeek 等思考模型的思考内容（reasoning_content）。
+        final rc = delta['reasoning_content'];
+        if (rc is String && rc.isNotEmpty) {
+          reasoning += rc;
           emitPartial();
         }
         final toolCalls = delta['tool_calls'] as List<dynamic>?;
@@ -351,10 +366,11 @@ class LlmClient {
               }
               denyBuffer.clear();
             }
-            if (text.isNotEmpty || toolBuf.isNotEmpty) {
+            if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
               onTurn?.call(
                 TurnResult(
                   text: text.trim(),
+                  reasoning: reasoning,
                   toolCalls: _snapshotTools(toolBuf),
                 ),
               );

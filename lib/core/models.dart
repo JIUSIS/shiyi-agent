@@ -130,6 +130,7 @@ class ChatMessage {
   String sessionId;
   String role; // user | assistant | system | tool
   String content;
+  String reasoning; // 模型思考内容（reasoning_content，如 DeepSeek R1）
   List<ToolCall> toolCalls;
   String toolCallId; // for tool results
   int createdAt;
@@ -140,6 +141,7 @@ class ChatMessage {
     required this.sessionId,
     required this.role,
     this.content = '',
+    this.reasoning = '',
     List<ToolCall>? toolCalls,
     this.toolCallId = '',
     required this.createdAt,
@@ -154,6 +156,7 @@ class ChatMessage {
         'session_id': sessionId,
         'role': role,
         'content': content,
+        'reasoning': reasoning,
         'tool_calls': jsonEncode(toolCalls.map((t) => t.toJson()).toList()),
         'tool_call_id': toolCallId,
         'created_at': createdAt,
@@ -164,6 +167,7 @@ class ChatMessage {
         sessionId: m['session_id'],
         role: m['role'],
         content: m['content'] ?? '',
+        reasoning: m['reasoning'] ?? '',
         toolCalls: (m['tool_calls'] == null || m['tool_calls'] == '')
             ? []
             : (jsonDecode(m['tool_calls']) as List)

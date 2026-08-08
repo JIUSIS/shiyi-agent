@@ -49,6 +49,7 @@ class ShiyiState extends ChangeNotifier {
 
   /// 正在流式输出的消息文本（独立通知器：流式刷新只重建这一条气泡，不重建整个列表）。
   final ValueNotifier<String> streamText = ValueNotifier('');
+  final ValueNotifier<String> streamReasoning = ValueNotifier('');
   String? initError;
 
   bool _loaded = false;
@@ -1003,12 +1004,14 @@ class ShiyiState extends ChangeNotifier {
     messages.add(m);
     _streaming = m;
     streamText.value = '';
+    streamReasoning.value = '';
     return m;
   }
 
   /// 把一轮结果写入占位消息并落库。
   Future<void> _applyTurn(ChatMessage asst, TurnResult result) async {
     asst.content = result.text;
+    asst.reasoning = result.reasoning;
     asst.toolCalls = result.toolCalls
         .map(
           (tc) => ToolCall(
@@ -1022,9 +1025,11 @@ class ShiyiState extends ChangeNotifier {
     await _db.updateMessageContent(
       asst.id,
       result.text,
+      reasoning: result.reasoning.isEmpty ? null : result.reasoning,
       toolCalls: result.toolCalls.isEmpty ? null : asst.toolCalls,
     );
     streamText.value = '';
+    streamReasoning.value = '';
     notifyListeners();
   }
 
@@ -1066,6 +1071,8 @@ class ShiyiState extends ChangeNotifier {
       onTurn: (t) {
         accumulated = t;
         asst.content = t.text;
+        asst.reasoning = t.reasoning;
+        streamReasoning.value = t.reasoning;
         if (t.toolCalls.isNotEmpty) {
           asst.toolCalls = t.toolCalls
               .map(

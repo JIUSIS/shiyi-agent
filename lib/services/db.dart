@@ -18,7 +18,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     _db = await openDatabase(
       join(dir.path, 'shiyi_agent.db'),
-      version: 9,
+      version: 10,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
     );
@@ -43,6 +43,7 @@ Future<void> _createBaseTables(Database db, int version) async {
       session_id TEXT NOT NULL,
       role TEXT NOT NULL,
       content TEXT,
+      reasoning TEXT,
       tool_calls TEXT,
       tool_call_id TEXT,
       created_at INTEGER NOT NULL
@@ -142,6 +143,13 @@ Future<void> _upgrade(Database db, int oldV, int newV) async {
     final cols = await db.rawQuery('PRAGMA table_info(sessions)');
     if (!cols.any((c) => c['name'] == 'workspace_dir')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN workspace_dir TEXT');
+    }
+  }
+  // v9 -> v10：messages 表加 reasoning 列（模型思考内容）。
+  if (oldV < 10) {
+    final cols = await db.rawQuery('PRAGMA table_info(messages)');
+    if (!cols.any((c) => c['name'] == 'reasoning')) {
+      await db.execute('ALTER TABLE messages ADD COLUMN reasoning TEXT');
     }
   }
 }
@@ -278,11 +286,19 @@ Future<void> _pruneOversizedSkills(Database db) async {
     await db.insert('messages', m.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
-  Future<void> updateMessageContent(String id, String content, {List<ToolCall>? toolCalls}) async {
+  Future<void> updateMessageContent(
+    String id,
+    String content, {
+    String? reasoning,
+    List<ToolCall>? toolCalls,
+  }) async {
     final db = await this.db;
     final upd = <String, dynamic>{
       'content': content,
     };
+    if (reasoning != null) {
+      upd['reasoning'] = reasoning;
+    }
     if (toolCalls != null) {
       upd['tool_calls'] = jsonEncode(toolCalls.map((t) => t.toJson()).toList());
     }
