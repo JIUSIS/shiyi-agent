@@ -263,6 +263,20 @@
 
 ---
 
+## 2026-08-09 · 子代理系统（第二批：Agent 委派）
+
+### 40. spawn_agent 子代理系统（explore/plan/worker/general-purpose）
+- **需求**：复杂多步骤任务（写章节/多文件调研）由主循环单线程硬扛易乱；参考常见 Agent 架构引入"派子代理分工"：主脑派专项小兵干活，小兵报告后主脑整合。
+- **实现**：
+  1. `lib/services/subagent.dart`：`SubagentDefinition`（**数据驱动**：name / whenToUse / allowedTools 白名单 / systemPrompt / maxTurns）+ 4 个内置定义（`explore` 只读搜索、`plan` 只读规划、`worker` 独立执行、`general-purpose` 兜底）+ `SubagentRunner`（独立 LLM 工具循环：构造子代理对话 → 解析 tool_calls → 白名单校验 → 复用主循环 `_executeTool` 执行 → 回填 → 直到无工具）；
+  2. `app_state.dart` 注册表新增 `spawn_agent` 工具 + `_execSpawnAgent` + `_toolsJsonFor`（按白名单过滤注册表）。
+- **安全设计**：子代理工具白名单（explore/plan 只读；worker/general 排除 spawn_agent/question/save_memory/create_skill）；**子代理不能再派子代理**（防递归）；`maxTurns` 轮数上限（15/15/40/25）防失控；提示词含只读命令白名单与"最终文本=返回值"协议（禁"Done"类确认语）。
+- **扩展点**：新增代理类型 = 加一个 `SubagentDefinition` 条目（后台代理/观察者可直接加定义，执行器无需改动）。
+- **说明**：注释与描述全部中性表述（无外部产品引用，符合 #38 约定）。
+- **涉及**：`lib/services/subagent.dart`（新增）、`lib/core/app_state.dart`。
+
+---
+
 ## 遗留已知项（非 bug，勿当问题）
 
 - `ln`（软/硬链接）在 SD 卡（FUSE）上 `Permission denied`：Android 系统限制。

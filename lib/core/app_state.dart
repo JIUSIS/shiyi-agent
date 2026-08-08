@@ -10,6 +10,7 @@ import '../services/db.dart';
 import '../services/llm_client.dart';
 import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
+import '../services/subagent.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
 import '../services/notifier.dart';
@@ -357,6 +358,35 @@ class ShiyiState extends ChangeNotifier {
         'required': ['reason'],
       },
       execute: (self, args) => self._execExitPlanMode(args),
+    ),
+    AgentTool(
+      name: 'spawn_agent',
+      description:
+          '派一个子代理独立执行子任务，等待其报告后继续。'
+          '适合需要专项处理、且与主任务相对独立的工作：'
+          'explore 只读搜索定位；plan 只出方案不动手；'
+          'worker 独立执行（写文件/跑命令）；general-purpose 兜底。'
+          '子代理完成后会把报告作为本工具结果返回，你再整合进主任务。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'agent_type': {
+            'type': 'string',
+            'enum': ['explore', 'plan', 'worker', 'general-purpose'],
+            'description': '子代理类型（见描述）',
+          },
+          'description': {
+            'type': 'string',
+            'description': '任务的简短描述（3~5 词）',
+          },
+          'prompt': {
+            'type': 'string',
+            'description': '给子代理的具体任务指令，越明确越好',
+          },
+        },
+        'required': ['agent_type', 'description', 'prompt'],
+      },
+      execute: (self, args) => self._execSpawnAgent(args),
     ),
   ];
 
@@ -1706,6 +1736,37 @@ class ShiyiState extends ChangeNotifier {
     planMode = false;
     notifyListeners();
     return '已退出计划模式，恢复正常执行能力，开始执行方案。';
+  }
+
+  /// 按子代理白名单过滤出工具 JSON（子代理只能调白名单内的工具）。
+  List<Map<String, dynamic>> _toolsJsonFor(Set<String> names) => [
+        for (final t in toolRegistry)
+          if (names.contains(t.name)) t.toJson(),
+      ];
+
+  /// 派发子代理：独立 LLM 对话 + 受限工具集，返回其最终文本报告。
+  Future<String> _execSpawnAgent(Map<String, dynamic> args) async {
+    final type = (args['agent_type'] ?? '').toString().trim();
+    final prompt = (args['prompt'] ?? '').toString().trim();
+    if (type.isEmpty) return '派发失败：agent_type 为空';
+    if (prompt.isEmpty) return '派发失败：prompt 为空';
+    final def = SubagentDefinition.byName(type);
+    if (def == null) {
+      return '未知子代理类型：$type（可选 '
+          '${SubagentDefinition.all.map((d) => d.name).join(' / ')}）';
+    }
+    final runner = SubagentRunner(
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      model: settings.model,
+      temperature: settings.temperature,
+      toolsJson: _toolsJsonFor(def.allowedTools),
+      executeTool: _executeTool,
+      workingDir: await currentWorkspace(),
+      shouldStop: () => _stopRequested,
+    );
+    final report = await runner.run(def, prompt);
+    return '【${def.name} 子代理报告】\n$report';
   }
 
   /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用。
