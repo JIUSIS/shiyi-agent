@@ -1833,7 +1833,7 @@ class ShiyiState extends ChangeNotifier {
   // ---------------- memories / skills ----------------
 
   /// 重建 memory/MEMORY.md 索引文件（app 文档目录下）。
-  /// 一行一条：`- [标题](memory-<id>) — [类型] 摘要`，与 Claude Code 的
+  /// 一行一条：`- [标题](memory-<id>) — [类型] 摘要`，与常见 Agent 记忆索引格式一致。
   /// MEMORY.md 索引同构，便于人工翻阅与模型快速定位记忆。
   Future<void> _rebuildMemoryIndex() async {
     try {
