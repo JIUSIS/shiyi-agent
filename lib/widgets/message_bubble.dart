@@ -106,6 +106,8 @@ class _MessageBubbleState extends State<MessageBubble> {
             children: [
               // 思考内容（如有）：默认收起，点击展开/收回。
               // 进行中（streaming）也实时显示，让用户能看到模型的思考过程。
+              // 有思考内容时用「思考过程」折叠头（自带 spinner），
+              // 不再叠加单独的「正在思考…」；无思考内容的模型保留原占位。
               if ((liveReasoning ?? message.reasoning).isNotEmpty) ...[
                 _reasoningHeader(theme),
                 if (_showReasoning)
@@ -113,15 +115,11 @@ class _MessageBubbleState extends State<MessageBubble> {
                     theme,
                     liveReasoning ?? message.reasoning,
                   ),
+              ] else if (message.streaming) ...[
+                _thinkingIndicator(theme),
               ],
-              // 只要这条消息还在进行（streaming），「正在思考…」就不消失：
-              // 无文本时作为占位，有流式文本时显示在文本上方。
-              if (message.streaming && (liveContent ?? message.content).isNotEmpty)
-                _thinkingIndicator(theme),
               if ((liveContent ?? message.content).isNotEmpty)
-                AdaptiveMarkdownText(liveContent ?? message.content)
-              else if (message.streaming && (liveReasoning ?? message.reasoning).isEmpty)
-                _thinkingIndicator(theme),
+                AdaptiveMarkdownText(liveContent ?? message.content),
             ],
           ),
         ),
