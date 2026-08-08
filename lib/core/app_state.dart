@@ -1154,7 +1154,9 @@ class ShiyiState extends ChangeNotifier {
       '- 安装软件包用 pkg/apt：一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
     );
     parts.add(
-      '- 当前会话工作目录是 ${await currentWorkspace()}（所有生成的文件都放在这里），run_terminal 默认在该目录执行；操作其他路径时用 cwd 参数指定目录。',
+      '- 当前会话工作目录是 ${await currentWorkspace()}（文件相关操作默认在这里）。'
+      'run_terminal 默认在 Agent 工作目录（${FileWorkspace.defaultWorkspacePath}）执行；'
+      '需要在其他目录执行时用 cwd 参数指定。',
     );
 
     if (settings.enableMemory) {
@@ -1291,7 +1293,18 @@ class ShiyiState extends ChangeNotifier {
           try {
             final isWin = Platform.isWindows;
             var cwd = (args['cwd'] ?? '').toString().trim();
-            if (cwd.isEmpty) cwd = await currentWorkspace();
+            if (cwd.isEmpty) {
+              // 默认在 Agent 工作目录执行；首次使用自动创建，
+              // 不可用则回退到 Agent 默认目录，避免 Process.start 因目录无效抛异常。
+              cwd = FileWorkspace.defaultWorkspacePath;
+              try {
+                Directory(cwd).createSync(recursive: true);
+              } catch (_) {}
+            } else {
+              try {
+                Directory(cwd).createSync(recursive: true);
+              } catch (_) {}
+            }
             // 优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用）；
             // 其次系统 Termux；都没有则用系统精简 shell。
             const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
