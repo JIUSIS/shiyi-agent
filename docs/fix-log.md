@@ -108,6 +108,29 @@
 - **修复**：升级为完整版（工作台定位 + 6 条工作原则：先行动、简洁输出、工具优先、信息求真、记忆复用、诚实边界）。
 - **涉及**：`lib/core/app_state.dart`（设置页可自定义覆盖）。
 
+### 20. question 工具未弹窗、模型自行决定保存
+- **现象**：模型问用户"是否保存到文件"时没有弹出选择框，自己决定直接保存了。
+- **根因（两层）**：
+  1. 模型把问句写进回复文本、直接调 `file_write` 自己保存——**没有生成 question 的 tool_calls**，所以 `_QuestionHandler` 弹窗从未触发（`_execQuestion` 是阻塞式 `await completer.future`，真调用必弹窗；没弹 = 没调用）；
+  2. 系统提示词自相矛盾：「先行动」+「长内容直接 file_write 存文件」教它别问，`question` 描述又要求确认——中小模型（DeepSeek/MiMo）倾向服从更强的"先行动"。
+- **修复（提示词层三处 + 工具描述一处）**：
+  1. 工作原则 1「先行动」加限定：涉及「是否保存/写入」「选哪个方案」等需用户拍板的决策，必须先调用 question 等待回答，不得替用户决定；
+  2. 【工具使用规则】新增强制规则：需要确认/选择的决策必须调用 question 并等待；禁止在回复文本里提问后不等待、自己替用户决定；
+  3. 「长内容先用 file_write」补例外：用户明确要求先确认的除外，此时先 question 再写入；
+  4. `question` 工具 description 强化：任何需拍板操作都必须用本工具并等待回答，禁止文本提问后自行继续。
+- **遗留**：提示词修复对中小模型非 100% 保险；若再遇"文本提问没弹窗"，兜底方案是检测回复以问句结尾且无 tool_calls 时提示用户确认（未实现）。
+- **涉及**：`lib/core/app_state.dart`。
+
+### 21. flutter install 签名不一致触发卸载重装、清空 app 数据
+- **现象**：`flutter install --debug` 日志出现 `Uninstalling old version...`，旧版本被卸载重装，`/data/data/com.shiyi.agent` 下 `shiyi_agent.db`、SharedPreferences 全部重建——API Key/会话/记忆被清空（违反"覆盖安装不清数据"部署偏好）。
+- **根因**：设备上旧包签名与本次构建不一致（`adb install -r` 返回 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），flutter 自动兜底先卸载再安装；`f29c6ad8`（Android 11）设备上的旧包来源与当前 debug keystore 不同。
+- **修复/预防**：装前先验签确认一致再装：
+  ```bash
+  adb shell dumpsys package com.shiyi.agent | grep signatures   # 看设备上现有签名
+  ```
+  或装前先备份应用数据（debug 包可 `run-as com.shiyi.agent` 拉出 `app_flutter/shiyi_agent.db` + `shared_prefs/`）。
+- **涉及**：部署流程（非代码）。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）
