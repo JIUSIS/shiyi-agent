@@ -30,7 +30,6 @@ class _ChatScreenState extends State<ChatScreen>
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   int _lastCount = 0;
-  int _lastStreamLen = 0;
   String? _speakingId;
 
   /// 预测性返回：拖动进度 0~1，1 表示完全缩小悬浮。
@@ -43,6 +42,7 @@ class _ChatScreenState extends State<ChatScreen>
   MacPageRoute? _route;
   double _screenWidth = 0;
   bool _showToolLog = false;
+  bool _autoScrollScheduled = false;
 
   @override
   void initState() {
@@ -117,12 +117,17 @@ class _ChatScreenState extends State<ChatScreen>
     });
   }
 
-  /// 流式文本变化：只在靠近底部时平滑跟随，不打断用户上翻历史。
+  /// 流式文本变化：每帧最多安排一次跟随滚动，避免 token 高频到达时
+  /// addPostFrameCallback/animateTo 队列堆积拖慢 UI 主线程。
   void _onStreamTextChanged() {
+    if (_autoScrollScheduled) return;
+    _autoScrollScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _autoScrollScheduled = false;
       if (!mounted || !_scroll.hasClients) return;
       if (_scroll.position.pixels <= 96) {
-        _scrollToLatest();
+        // 流式阶段直接跳到最新位置；连续 animateTo 会反复创建动画控制器并掉帧。
+        _scroll.jumpTo(0);
       }
     });
   }
@@ -151,26 +156,18 @@ class _ChatScreenState extends State<ChatScreen>
     );
   }
 
-  /// 新消息或流式内容增长时自动跟随到底部；用户上翻历史时不打扰。
+  /// 新消息加入时自动跟随到底部；流式文本增长由 [_onStreamTextChanged]
+  /// 单独处理，避免 ListenableBuilder 每次重建又额外安排滚动回调。
   void _maybeAutoScroll(List<ChatMessage> messages) {
+    final count = messages.length;
+    if (count == _lastCount) return;
+    _lastCount = count;
+    if (_autoScrollScheduled) return;
+    _autoScrollScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _autoScrollScheduled = false;
       if (!mounted || !_scroll.hasClients) return;
-      final pos = _scroll.position;
-      // reverse 列表：offset 0 就是最新消息，无需进入时滚动。
-      final nearLatest = pos.pixels <= 96;
-      final count = messages.length;
-      final countChanged = count != _lastCount;
-      _lastCount = count;
-      var streamLen = 0;
-      if (messages.isNotEmpty && messages.last.streaming) {
-        streamLen = messages.last.content.length;
-      }
-      final streamChanged = streamLen != _lastStreamLen;
-      _lastStreamLen = streamLen;
-      if (!countChanged && !streamChanged) return;
-      if (nearLatest) {
-        _scrollToLatest();
-      }
+      if (_scroll.position.pixels <= 96) _scroll.jumpTo(0);
     });
   }
 
@@ -1293,11 +1290,12 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
     final options = (q['options'] as List?)?.cast<String>() ??
         const <String>['确认', '取消'];
     final ctrl = TextEditingController();
-    // 结果在点击回调里直接提交（不依赖 Navigator.pop 返回值）：
-    // 顺序 = 收起键盘（TextField 失焦）→ answerQuestion 提交 → 再关弹窗。
-    // 规避 Flutter issue #180569：弹窗关闭动画中若还有活跃子组件（聚焦的
-    // TextField / 开着的输入法），LayoutBuilder 重建会触发 GlobalKey element
-    // 回收断言（_elements.contains）红屏。
+    int? selectedIndex;
+    String? customAnswer;
+
+    // 点击时只记录答案并关闭弹窗。等退出动画完成后再 answerQuestion/notifyListeners，
+    // 避免 modal 仍在退场时重建整个聊天页（Flutter issue #180569 变体）。
+    // 不自动聚焦输入框：只点快捷选项时不拉起输入法，减少窗口 resize 与整页 layout。
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -1311,7 +1309,6 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
             const SizedBox(height: 12),
             TextField(
               controller: ctrl,
-              autofocus: true,
               maxLines: 3,
               minLines: 1,
               decoration: const InputDecoration(
@@ -1319,10 +1316,8 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
                 border: OutlineInputBorder(),
               ),
               onSubmitted: (v) {
+                customAnswer = v.trim();
                 FocusManager.instance.primaryFocus?.unfocus();
-                final t = v.trim();
-                widget.shiyi
-                    .answerQuestion(null, custom: t.isEmpty ? null : t);
                 Navigator.of(ctx).pop();
               },
             ),
@@ -1332,17 +1327,16 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
           for (var i = 0; i < options.length; i++)
             TextButton(
               onPressed: () {
+                selectedIndex = i;
                 FocusManager.instance.primaryFocus?.unfocus();
-                widget.shiyi.answerQuestion(i);
                 Navigator.of(ctx).pop();
               },
               child: Text(options[i]),
             ),
           TextButton(
             onPressed: () {
+              customAnswer = ctrl.text.trim();
               FocusManager.instance.primaryFocus?.unfocus();
-              final t = ctrl.text.trim();
-              widget.shiyi.answerQuestion(null, custom: t.isEmpty ? null : t);
               Navigator.of(ctx).pop();
             },
             child: const Text('确定'),
@@ -1350,12 +1344,16 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
         ],
       ),
     );
-    // 等退出动画结束再释放 controller，避免 TextField 在动画中仍引用已释放的 controller。
+
     await Future<void>.delayed(const Duration(milliseconds: 350));
-    if (mounted) {
-      ctrl.dispose();
-      _showing = false;
-    }
+    ctrl.dispose();
+    _showing = false;
+    if (!mounted) return;
+    final custom = customAnswer?.trim() ?? '';
+    widget.shiyi.answerQuestion(
+      selectedIndex,
+      custom: custom.isEmpty ? null : custom,
+    );
   }
 
   @override

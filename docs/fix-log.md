@@ -149,6 +149,20 @@
   3. `TextEditingController.dispose()` 延迟到退出动画结束后（`Future.delayed 350ms`），避免动画中 TextField 引用已释放 controller。
 - **涉及**：`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
 
+### 24. 聊天页卡顿掉帧（主线程回调/弹窗键盘布局抖动）
+- **现象**：骁龙 870 设备上聊天页操作和流式输出明显卡顿；坚果 ROM 报 `slow_main_thread`。
+- **测量**：优化前 `dumpsys gfxinfo com.shiyi.agent`：Janky frames 58/151（38.41%）、90th 44ms、Slow UI thread 35；GPU 90th 仅 5ms，确认瓶颈在 Flutter/Dart UI 主线程而非 GPU/CPU 性能不足。
+- **根因**：
+  1. 流式 token 每次变化都会安排 `addPostFrameCallback`，回调又调用带动画的 `_scrollToLatest/animateTo`，高频 token 下滚动回调和动画重复排队；
+  2. question 弹窗的 `TextField autofocus=true`，即使用户只点快捷选项也会强制拉起键盘，触发窗口 resize、整页 layout 和 ROM FPS 切换；
+  3. `answerQuestion → notifyListeners` 在弹窗退出动画前执行，modal 退场与整个聊天页重建重叠。
+- **修复**：
+  1. 流式自动滚动增加 `_autoScrollScheduled`，每帧最多安排一次；流式阶段用 `jumpTo(0)` 替代连续 `animateTo`；消息新增和 token 增长分开处理，避免重复排滚动回调；
+  2. question 输入框取消 `autofocus`，只点快捷选项时不弹键盘；
+  3. 点击时仅记录答案并关闭弹窗，等待 350ms 退出动画结束后再 `answerQuestion/notifyListeners` 和释放 controller。
+- **初步结果**：新包冷启动清零统计后 Janky frames 5/50（10%）、90th 22ms、Slow UI thread 4；需继续用实际会话/流式输出验证。
+- **涉及**：`lib/screens/chat_screen.dart`。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）
