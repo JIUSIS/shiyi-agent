@@ -73,8 +73,9 @@ class LlmClient {
           if (includeUsage) 'stream_options': {'include_usage': true},
           'temperature': temperature,
           // 显式声明输出上限：部分网关默认 max_tokens 过小，
-          // 思考模型（reasoning 占 token）会导致 content 被截断（停在冒号/逗号）。
-          'max_tokens': 4096,
+          // 思考模型（reasoning 占 token）+ 长工具调用会导致 content 被截断。
+          // mimo-v2.5 实测支持 8192。
+          'max_tokens': 8192,
           if (tools.isNotEmpty) 'tools': tools,
           if (tools.isNotEmpty) 'tool_choice': 'auto',
         };
