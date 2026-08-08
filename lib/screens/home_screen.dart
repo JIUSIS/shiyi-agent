@@ -124,7 +124,19 @@ class _HomeScreenState extends State<HomeScreen> {
             return Stack(
               children: [
                 // 内容区始终全宽，侧边栏展开时悬浮覆盖其上，不挤压内容。
-                SafeArea(child: _buildTab()),
+                SafeArea(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 240),
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    transitionBuilder: (child, animation) =>
+                        FadeTransition(opacity: animation, child: child),
+                    child: KeyedSubtree(
+                      key: ValueKey<int>(_tab),
+                      child: _buildTab(),
+                    ),
+                  ),
+                ),
                 // 侧边栏展开时的拦截遮罩：点击任何空白只收起，不传递给下层内容区。
                 if (_sidebarVisible)
                   Positioned.fill(
