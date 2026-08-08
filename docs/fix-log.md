@@ -138,6 +138,12 @@
   2. **更新 `question` 工具描述**：明确"弹窗支持自由文本输入，用户可直接打字回答；选项为 0~4 个可选快捷项"，消除"只能从选项里选"的误导；`options` 参数 description 同步改为"可选快捷选项（0~4 个）"。
 - **涉及**：`lib/core/app_state.dart`（`question` 工具 description）、`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
 
+### 23. 坚果 ROM 全屏红屏（Impeller/Vulkan 渲染故障）
+- **现象**：app 打开后整屏暗红（`#880000`），无任何错误提示；logcat 无 Dart 异常、无崩溃堆栈。
+- **根因**：设备为坚果 ROM（smartisanos，Android 11，DT2002C 系），启动日志显示 `Using the Impeller rendering backend (Vulkan)` 后随即回退 `(OpenGLES)`——Impeller 的 Vulkan 后端在该 ROM 的 GPU 驱动上渲染故障，表现为全屏红屏。属**渲染层问题，与业务代码无关**（诊断依据：进程无异常日志、ErrorWidget 必然打 logcat 而这里没有）。
+- **修复**：`AndroidManifest.xml` 的 `<application>` 加 `io.flutter.embedding.android.EnableImpeller=false`，回退 Skia 渲染；启动日志确认 opt-out 生效（新版 Flutter 提示 "Impeller opt-out deprecated"，当前版本仍有效）。
+- **涉及**：`android/app/src/main/AndroidManifest.xml`。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）

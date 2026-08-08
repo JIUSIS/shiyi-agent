@@ -41,6 +41,11 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 坚果 ROM 上 Impeller(Vulkan) 渲染故障导致全屏红屏（无 Dart 异常）：
+             回退 Skia 渲染。 -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
         <!-- 更新包安装：通过 FileProvider 暴露下载的 APK 给系统安装器 -->
         <provider
             android:name="androidx.core.content.FileProvider"
