@@ -67,6 +67,9 @@ class LlmClient {
           'stream': true,
           if (includeUsage) 'stream_options': {'include_usage': true},
           'temperature': temperature,
+          // 显式声明输出上限：部分网关默认 max_tokens 过小，
+          // 思考模型（reasoning 占 token）会导致 content 被截断（停在冒号/逗号）。
+          'max_tokens': 4096,
           if (tools.isNotEmpty) 'tools': tools,
           if (tools.isNotEmpty) 'tool_choice': 'auto',
         };
@@ -244,8 +247,21 @@ class LlmClient {
 
     /// 流结束时统一检查：输出被 max_tokens/网关限制截断时视为中断（触发重试），
     /// 避免「AI 说到一半静默结束」——例如承诺创建脚本却停在冒号后。
+    /// ① finish_reason='length'（标准 OpenAI 兼容）；
+    /// ② 启发式：思考模型已完成推理（reasoning 非空）、正文却停在半截标点
+    ///    （冒号/逗号）且没有工具调用 → 高度疑似被网关截断（网关常不发 finish_reason）。
     bool completeIfTruncated() {
-      if (finishReason == 'length' && !completer.isCompleted) {
+      if (completer.isCompleted) return false;
+      final t = text.trim();
+      final looksHalfCut = reasoning.isNotEmpty &&
+          t.isNotEmpty &&
+          toolBuf.isEmpty &&
+          !doneReceived &&
+          (t.endsWith('：') ||
+              t.endsWith(':') ||
+              t.endsWith('，') ||
+              t.endsWith(','));
+      if (finishReason == 'length' || looksHalfCut) {
         completer.completeError(
           LlmInterruptedException('回复被截断：输出达到模型长度上限，已自动重试'),
         );
