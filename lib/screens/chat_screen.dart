@@ -43,8 +43,6 @@ class _ChatScreenState extends State<ChatScreen>
   MacPageRoute? _route;
   double _screenWidth = 0;
   bool _showToolLog = false;
-  // 本回合是否已自动打开过面板（打开一次保持，避免工具间隙自动收起/弹出闪烁）。
-  bool _autoOpened = false;
 
   @override
   void initState() {
@@ -967,20 +965,10 @@ class _ChatScreenState extends State<ChatScreen>
                     ],
                   ),
                 ),
-                // 操作信息流面板：首次出现工具事件时自动打开一次并保持
-                //（不随工具完成/间隙自动收起，避免一闪一闪），用户手动关闭后
-                // 本回合不再自动弹出。
+                // 操作信息流面板：默认收起，点右上角胶囊手动展开/收起。
                 ListenableBuilder(
                   listenable: widget.shiyi,
                   builder: (context, _) {
-                    final events = widget.shiyi.toolEvents;
-                    if (events.isNotEmpty && !_showToolLog && !_autoOpened) {
-                      _autoOpened = true;
-                      WidgetsBinding.instance.addPostFrameCallback((_) {
-                        if (mounted) setState(() => _showToolLog = true);
-                      });
-                    }
-                    if (events.isEmpty) _autoOpened = false;
                     if (!_showToolLog) return const SizedBox.shrink();
                     return Positioned(
                       top: MediaQuery.paddingOf(context).top +
@@ -989,7 +977,7 @@ class _ChatScreenState extends State<ChatScreen>
                       right: 8,
                       width: 280,
                       child: _ToolLogPanel(
-                        events: events,
+                        events: widget.shiyi.toolEvents,
                         onClose: () => setState(() => _showToolLog = false),
                       ),
                     );
