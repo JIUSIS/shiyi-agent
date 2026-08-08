@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v1.0.2.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v1.0.2/shiyi-agent-v1.0.2.apk) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v1.1.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v1.1.0/shiyi-agent-v1.1.0.apk) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -24,6 +24,14 @@
 - 每个会话可设置独立项目工作目录，多项目互不干扰
 - 文件 / 图片多选附件，支持视觉模型图片理解
 - 流式输出、自动重试、上下文自动压缩
+- 思考过程流式展示，长思考自动滚动跟随
+
+### 子代理（委派分工）
+
+- `spawn_agent`：让 AI 派出专项子代理分头处理子任务，干完交回报告
+- 内置四类：`explore` 只读侦查、`plan` 只读方案设计、`worker` 独立执行、`general-purpose` 兜底
+- 子代理执行进度实时可见（当前轮次 / 正在调用的工具）
+- 安全设计：工具白名单、禁止递归委派、轮次上限
 
 ### 内置终端
 
