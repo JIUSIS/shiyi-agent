@@ -80,26 +80,14 @@ class MessageBubble extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // 只要这条消息还在进行（streaming），「正在思考…」就不消失：
+              // 无文本时作为占位，有流式文本时显示在文本上方。
+              if (message.streaming && (liveContent ?? message.content).isNotEmpty)
+                _thinkingIndicator(theme),
               if ((liveContent ?? message.content).isNotEmpty)
                 AdaptiveMarkdownText(liveContent ?? message.content)
               else if (message.streaming)
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      '正在思考…',
-                      style: theme.textTheme.bodySmall!.copyWith(
-                        color: theme.disabledColor,
-                      ),
-                    ),
-                  ],
-                ),
+                _thinkingIndicator(theme),
             ],
           ),
         ),
@@ -126,6 +114,30 @@ class MessageBubble extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+
+  /// 「正在思考…」指示：spinner + 文字，进行中常驻显示。
+  Widget _thinkingIndicator(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(
+            width: 13,
+            height: 13,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '正在思考…',
+            style: theme.textTheme.bodySmall!.copyWith(
+              color: theme.disabledColor,
+            ),
+          ),
+        ],
+      ),
     );
   }
 

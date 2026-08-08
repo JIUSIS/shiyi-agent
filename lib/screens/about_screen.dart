@@ -1,8 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 
 import '../widgets/welcome_avatar.dart';
 
@@ -177,26 +180,137 @@ class _AboutScreenState extends State<AboutScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () async {
-              Navigator.pop(ctx);
-              await Clipboard.setData(
-                const ClipboardData(text: AboutScreen.repoUrl),
-              );
-              if (ctx.mounted) {
-                ScaffoldMessenger.of(ctx).showSnackBar(
-                  const SnackBar(content: Text('Release 链接已复制，可到浏览器打开下载')),
-                );
-              }
-            },
-            child: const Text('复制链接'),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('稍后'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('知道了'),
+            onPressed: () {
+              Navigator.pop(ctx);
+              _downloadAndInstall(ver);
+            },
+            child: const Text('下载更新'),
           ),
         ],
       ),
     );
+  }
+
+  /// 下载并安装新版本 APK。
+  /// 优先 GitHub 官方直链，首字节无响应或下载过慢时自动切换国内镜像源。
+  Future<void> _downloadAndInstall(String ver) async {
+    final direct =
+        'https://github.com/JIUSIS/shiyi-agent/releases/download/'
+        'v$ver/shiyi-agent-v$ver.apk';
+    const mirrors = [
+      'https://gh-proxy.com/',
+      'https://ghfast.top/',
+    ];
+    final progress = ValueNotifier<double>(0);
+    var cancelled = false;
+    final dir = await getTemporaryDirectory();
+    final file = File('${dir.path}/shiyi-agent-v$ver.apk');
+
+    if (!mounted) return;
+    final dialogCtx = context;
+    if (!dialogCtx.mounted) return;
+    showDialog<void>(
+      context: dialogCtx,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('正在下载更新…'),
+        content: ValueListenableBuilder<double>(
+          valueListenable: progress,
+          builder: (_, p, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              LinearProgressIndicator(
+                value: p > 0 ? p.clamp(0.0, 1.0) : null,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                p > 0 ? '${(p * 100).toStringAsFixed(0)}%' : '连接中…',
+                style: Theme.of(ctx).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              cancelled = true;
+              Navigator.pop(ctx);
+            },
+            child: const Text('取消'),
+          ),
+        ],
+      ),
+    );
+
+    var ok = false;
+    for (final base in ['', ...mirrors]) {
+      if (cancelled) break;
+      final url = '$base$direct';
+      try {
+        final req = http.Request('GET', Uri.parse(url));
+        final res = await http
+            .Client()
+            .send(req)
+            .timeout(const Duration(seconds: 15));
+        if (res.statusCode != 200) continue;
+        final total = res.contentLength ?? 0;
+        final sink = file.openWrite();
+        var received = 0;
+        var lastChunk = DateTime.now();
+        var slow = false;
+        try {
+          await for (final chunk in res.stream) {
+            if (cancelled) break;
+            sink.add(chunk);
+            received += chunk.length;
+            final now = DateTime.now();
+            if (now.difference(lastChunk) >
+                const Duration(seconds: 30)) {
+              slow = true; // 30 秒无进度：判定源太慢，换镜像
+              break;
+            }
+            lastChunk = now;
+            if (total > 0) progress.value = received / total;
+          }
+        } finally {
+          await sink.close();
+        }
+        if (slow || received == 0) continue;
+        if (total == 0 || received >= total) {
+          ok = true;
+          progress.value = 1;
+          break;
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+
+    if (!mounted) return;
+    if (!dialogCtx.mounted) return;
+    Navigator.of(dialogCtx, rootNavigator: true).pop();
+    if (cancelled) return;
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('下载失败：所有下载源均不可用，请稍后再试')),
+      );
+      return;
+    }
+    // 交给系统安装器
+    try {
+      const channel = MethodChannel('shiyi/skillpack');
+      await channel.invokeMethod('installApk', {'path': file.path});
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('打开安装器失败：$e')),
+        );
+      }
+    }
   }
 
   @override

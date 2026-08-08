@@ -1,9 +1,12 @@
 package com.shiyi.agent
 
+import android.content.Intent
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.system.Os
 import android.view.WindowManager
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -87,12 +90,31 @@ class MainActivity : FlutterActivity() {
                                 ?: throw IllegalArgumentException("destDir missing")
                             result.success(extractTermux(assetPath, destDir))
                         }
+                        "installApk" -> {
+                            val path = call.argument<String>("path")
+                                ?: throw IllegalArgumentException("path missing")
+                            installApk(path)
+                            result.success(true)
+                        }
                         else -> result.notImplemented()
                     }
                 } catch (e: Exception) {
                     result.error("SKILL_PACK_ERROR", e.message ?: e.toString(), null)
                 }
             }
+    }
+
+    /** 通过系统安装器安装更新包（FileProvider 暴露 APK 给 PackageInstaller）。 */
+    private fun installApk(path: String) {
+        val apk = File(path)
+        if (!apk.exists()) throw IllegalStateException("APK 不存在: $path")
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
     }
 
     /** 流式解压 zip 到目标目录，返回条目清单 [{path, size}]，全程不把压缩包读进内存。 */
