@@ -246,6 +246,21 @@
 - **修复**：`IndexedStack` 常驻全部 6 个 tab（切换零构建、立即响应）+ `FadeTransition` 180ms 淡入 + 启动后逐帧预构建 tab 1-5（`_prebuildTabs`）；`_selectTab` 去掉 postFrame 延迟直接 setState。
 - **涉及**：`lib/screens/home_screen.dart`（`c49d501` 尝试方案、`9a96768` 最终方案）。
 
+### 37. 关于页：开源协议与功能特性展示
+- **需求**：关于页展示软件介绍、功能特性列表与 GPL-3.0 开源协议说明。
+- **修复**：`about_screen.dart` 新增「功能特性」卡片区块（LLM 切换/多轮会话/独立工作目录/附件/内置终端/长期记忆/技能系统/网页搜索/语音朗读等）；底部版权改为 GPL-3.0 开源说明；功能列表与公开 README 对齐。
+- **涉及**：`lib/screens/about_screen.dart`、`README.md`。
+
+### 38. 公开仓库清理外部引用（Claude 字样）
+- **需求**：公开仓库与 Release 描述中不出现"Claude Code 移植"等外部产品引用。
+- **修复**：Release v1.0.2 body 中"参考 Claude Code 工具体系"改为中性表述；`app_state.dart` 注释"与 Claude Code 的"改为"与常见 Agent 记忆索引格式一致"；全库 grep 确认无残留。
+- **涉及**：`lib/core/app_state.dart`、GitHub Release v1.0.2。
+
+### 39. v1.0.2 发行版发布与资产替换流程
+- **需求**：修复（IndexedStack tab 常驻、设置入口无响应等）后重新构建发行版，替换 GitHub 已上传的 APK。
+- **流程**：版本号三处（`pubspec.yaml` 1.0.2+3 / `build.gradle.kts` versionCode=3 versionName=1.0.2 / `about_screen.dart` '1.0.2'）→ analyze + test(19) + `flutter build apk --release` → 提交推送源码 → GitHub API **删除旧资产再上传同名新资产**（DELETE assets/{id} 204 → POST uploads）→ Release body 更新修复描述。
+- **注意**：APK ~93MB 上传超 2 分钟工具限制，需后台任务；资产替换必须先 DELETE 再 POST（同名会 422）。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）
