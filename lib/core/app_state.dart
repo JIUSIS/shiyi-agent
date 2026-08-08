@@ -1284,7 +1284,9 @@ class ShiyiState extends ChangeNotifier {
                   return '内嵌终端不可用：$msg';
                 }
               } on ProcessException catch (e) {
-                final msg = '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})';
+                final msg =
+                    '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
+                    '${await _diagnoseTermuxExec(embeddedShell)}';
                 await _logError('Termux', msg);
                 return '内嵌终端不可用：$msg';
               } on TimeoutException {
@@ -1665,6 +1667,41 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 记录错误日志到智能体工作目录 logs/error.log，方便排查生成与工具错误。
+  /// 终端 exec 失败时收集诊断信息（系统 sh 保证可执行），
+  /// 用于定位「Permission denied」是 ROM/SELinux 策略还是权限/依赖问题。
+  Future<String> _diagnoseTermuxExec(String shell) async {
+    final buf = StringBuffer('--- 终端诊断 ---');
+    try {
+      final r = await Process.run('/system/bin/sh', [
+        '-c',
+        '''
+B="\$1"
+echo "[bash 路径] \$B"
+echo "[bash 权限/context]"
+ls -lZ "\$B" 2>&1
+echo "[usr 目录 context]"
+ls -ldZ "\$(dirname "\$B")/.." 2>&1
+echo "[依赖库 libandroid-support]"
+ls -lZ "\$(dirname "\$B")/../lib/libandroid-support.so" 2>&1 | head -1
+echo "[SELinux]"
+getenforce 2>&1
+echo "[设备] android=\$(getprop ro.build.version.release) api=\$(getprop ro.build.version.sdk) brand=\$(getprop ro.product.brand) model=\$(getprop ro.product.model)"
+echo "[直跑 bash]"
+"\$B" -c 'echo bash-ok' 2>&1
+echo "[rc=\$?]"
+''',
+        'diag',
+        shell,
+      ]).timeout(const Duration(seconds: 10));
+      buf.write('\n${r.stdout}'.trimRight());
+      final err = r.stderr.toString().trim();
+      if (err.isNotEmpty) buf.write('\n[stderr] $err');
+    } catch (e) {
+      buf.write('\n[诊断命令执行失败] $e');
+    }
+    return buf.toString();
+  }
+
   Future<void> _logError(String source, String message) async {
     try {
       final dir = await FileWorkspace.current();

@@ -24,6 +24,12 @@ android {
     compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
+    lint {
+        // 自用/开源分发，不发布 Google Play：忽略 Play 的 targetSdk 强制要求
+        //（targetSdk=27 是内嵌 Termux 可执行所必需的 SELinux 兼容域技巧）。
+        disable += "ExpiredTargetSdkVersion"
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -35,9 +41,11 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        // targetSdk 降到 34：Android 15/16 对 targetSdk>=35 的 app 收紧
-        // 「执行私有目录 ELF」的 SELinux 权限，降级走旧兼容行为（类似 Termux）。
-        targetSdk = 34
+        // targetSdk 降到 27：<28 的 app 使用 untrusted_app_27 兼容域，
+        // 该域保留对 app_data_file 的 execute_no_trans（可直接 exec 内嵌 Termux ELF）。
+        // Android 15/16 的标准策略对 targetSdk<35 也有同样豁免（主测试机可用）。
+        // 坚果等国产 ROM 的 untrusted_app 域无此权限，必须走旧域才能跑终端。
+        targetSdk = 27
         versionCode = 1
         versionName = "1.0"
     }

@@ -86,7 +86,7 @@
 
 | 层次 | 技术 |
 | --- | --- |
-| 客户端 | Flutter / Dart（Android，targetSdk 34） |
+| 客户端 | Flutter / Dart（Android，targetSdk 27，兼容 SELinux 直接执行内嵌终端 ELF） |
 | 数据存储 | SQLite（会话与消息）、SharedPreferences（设置） |
 | 终端环境 | 内置 Termux 用户空间（bootstrap 固化进 assets，proot 沙箱） |
 | 模型接入 | LLM API + 多模态图片处理 |
