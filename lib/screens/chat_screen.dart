@@ -1293,9 +1293,12 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
     final options = (q['options'] as List?)?.cast<String>() ??
         const <String>['确认', '取消'];
     final ctrl = TextEditingController();
-    // 主弹窗内嵌自由文本输入框 + 快捷选项：用户可以直接打字提交，
-    // 也可以一键点模型给的选项；空输入按"用户取消了选择"处理。
-    final result = await showDialog<_QuestionResult>(
+    // 结果在点击回调里直接提交（不依赖 Navigator.pop 返回值）：
+    // 顺序 = 收起键盘（TextField 失焦）→ answerQuestion 提交 → 再关弹窗。
+    // 规避 Flutter issue #180569：弹窗关闭动画中若还有活跃子组件（聚焦的
+    // TextField / 开着的输入法），LayoutBuilder 重建会触发 GlobalKey element
+    // 回收断言（_elements.contains）红屏。
+    await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
@@ -1315,59 +1318,48 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
                 hintText: '也可以直接输入你的回答…',
                 border: OutlineInputBorder(),
               ),
-              onSubmitted: (v) =>
-                  Navigator.pop(ctx, _QuestionResult.custom(v)),
+              onSubmitted: (v) {
+                FocusManager.instance.primaryFocus?.unfocus();
+                final t = v.trim();
+                widget.shiyi
+                    .answerQuestion(null, custom: t.isEmpty ? null : t);
+                Navigator.of(ctx).pop();
+              },
             ),
           ],
         ),
         actions: [
           for (var i = 0; i < options.length; i++)
             TextButton(
-              onPressed: () => Navigator.pop(ctx, _QuestionResult.option(i)),
+              onPressed: () {
+                FocusManager.instance.primaryFocus?.unfocus();
+                widget.shiyi.answerQuestion(i);
+                Navigator.of(ctx).pop();
+              },
               child: Text(options[i]),
             ),
           TextButton(
-            onPressed: () =>
-                Navigator.pop(ctx, _QuestionResult.custom(ctrl.text)),
+            onPressed: () {
+              FocusManager.instance.primaryFocus?.unfocus();
+              final t = ctrl.text.trim();
+              widget.shiyi.answerQuestion(null, custom: t.isEmpty ? null : t);
+              Navigator.of(ctx).pop();
+            },
             child: const Text('确定'),
           ),
         ],
       ),
     );
-    ctrl.dispose();
-    _showing = false;
-    if (result == null) {
-      widget.shiyi.answerQuestion(null);
-      return;
-    }
-    switch (result.kind) {
-      case _QuestionResult.optionKind:
-        widget.shiyi.answerQuestion(result.index);
-      case _QuestionResult.customKind:
-        widget.shiyi.answerQuestion(null, custom: result.text);
+    // 等退出动画结束再释放 controller，避免 TextField 在动画中仍引用已释放的 controller。
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (mounted) {
+      ctrl.dispose();
+      _showing = false;
     }
   }
 
   @override
   Widget build(BuildContext context) => const SizedBox.shrink();
-}
-
-/// question 弹窗的结果：快捷选项（option）或自由文本（custom）。
-class _QuestionResult {
-  static const int optionKind = 0;
-  static const int customKind = 1;
-
-  final int kind;
-  final int? index;
-  final String? text;
-
-  _QuestionResult.option(int this.index)
-      : kind = optionKind,
-        text = null;
-
-  _QuestionResult.custom(String this.text)
-      : kind = customKind,
-        index = null;
 }
 
 /// 当前会话已加载技能的小提示条（输入栏上方），可一键移除。

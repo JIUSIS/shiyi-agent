@@ -138,11 +138,16 @@
   2. **更新 `question` 工具描述**：明确"弹窗支持自由文本输入，用户可直接打字回答；选项为 0~4 个可选快捷项"，消除"只能从选项里选"的误导；`options` 参数 description 同步改为"可选快捷选项（0~4 个）"。
 - **涉及**：`lib/core/app_state.dart`（`question` 工具 description）、`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
 
-### 23. 坚果 ROM 全屏红屏（Impeller/Vulkan 渲染故障）
-- **现象**：app 打开后整屏暗红（`#880000`），无任何错误提示；logcat 无 Dart 异常、无崩溃堆栈。
-- **根因**：设备为坚果 ROM（smartisanos，Android 11，DT2002C 系），启动日志显示 `Using the Impeller rendering backend (Vulkan)` 后随即回退 `(OpenGLES)`——Impeller 的 Vulkan 后端在该 ROM 的 GPU 驱动上渲染故障，表现为全屏红屏。属**渲染层问题，与业务代码无关**（诊断依据：进程无异常日志、ErrorWidget 必然打 logcat 而这里没有）。
-- **修复**：`AndroidManifest.xml` 的 `<application>` 加 `io.flutter.embedding.android.EnableImpeller=false`，回退 Skia 渲染；启动日志确认 opt-out 生效（新版 Flutter 提示 "Impeller opt-out deprecated"，当前版本仍有效）。
-- **涉及**：`android/app/src/main/AndroidManifest.xml`。
+### 23. 点 question 弹窗选项全屏红屏（Flutter issue #180569 变体）
+- **现象**：点击弹窗里任意快捷选项后全屏暗红（`#880000`）ErrorWidget，红屏上输入法键盘还开着；logcat 无 E/flutter（错误发生在非标准错误路径，未进 logcat）。
+- **根因**：**Flutter 框架 bug 的变体**（官方 issue #180569，found in 3.38/3.40，2026-05-29 修复）：弹窗关闭动画中若还有活跃子组件（聚焦的 TextField + 开着的输入法），`LayoutBuilder` 重建会触发 `Element._retakeInactiveElement` → `_InactiveElements.remove` 断言失败（framework.dart:2168 `_elements.contains(element)`）→ ErrorWidget 红屏。我们项目 3.44.2 仍复现（修复不完整或变体路径）。
+  - 我们的触发模式：`Navigator.pop` **立即 resolve** `showDialog` 的 future（不等退出动画）→ `_show` 后续代码（`ctrl.dispose()` + `answerQuestion` → `notifyListeners` → 全页重建）都在弹窗退出动画中执行，此时 TextField/键盘仍活跃。
+  - 此前的"Impeller 渲染故障"诊断为误判（禁 Impeller 后仍红屏），已撤销 `EnableImpeller=false`。
+- **修复（代码规避，chat_screen.dart `_QuestionHandler._show`）**：
+  1. 结果在**点击回调里直接提交**，不依赖 `Navigator.pop` 返回值（`answerQuestion` 在 pop 前调用）；
+  2. 点击时先 `FocusManager.instance.primaryFocus?.unfocus()` 收起键盘，让 TextField 失焦（消除关闭动画中的活跃子组件）；
+  3. `TextEditingController.dispose()` 延迟到退出动画结束后（`Future.delayed 350ms`），避免动画中 TextField 引用已释放 controller。
+- **涉及**：`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
 
 ---
 
