@@ -65,3 +65,6 @@ android/local.properties
 
 # Android build artifacts
 android/build/
+
+# 临时调试文件
+/tmp/

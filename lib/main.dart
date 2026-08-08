@@ -46,12 +46,29 @@ class ShiyiAgentApp extends StatefulWidget {
 
 class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
   late final ShiyiState shiyi;
+  late String _themeModeSetting;
 
   @override
   void initState() {
     super.initState();
     shiyi = ShiyiState();
+    _themeModeSetting = widget.initialThemeMode;
+    shiyi.addListener(_handleShiyiChanged);
     shiyi.init();
+  }
+
+  void _handleShiyiChanged() {
+    final nextMode = shiyi.loaded
+        ? shiyi.settings.themeMode
+        : widget.initialThemeMode;
+    if (nextMode == _themeModeSetting || !mounted) return;
+    setState(() => _themeModeSetting = nextMode);
+  }
+
+  @override
+  void dispose() {
+    shiyi.removeListener(_handleShiyiChanged);
+    super.dispose();
   }
 
   ThemeMode _resolveThemeMode(String mode) {
@@ -81,32 +98,23 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: shiyi,
-      builder: (context, _) {
-        // 设置异步加载完成前，用启动时读到的主题渲染首帧，避免闪黑/闪白。
-        final mode = shiyi.loaded
-            ? shiyi.settings.themeMode
-            : widget.initialThemeMode;
-        final themeMode = _resolveThemeMode(mode);
-        final platformDark =
-            MediaQuery.platformBrightnessOf(context) == Brightness.dark;
-        final isDark =
-            themeMode == ThemeMode.dark ||
-            (themeMode == ThemeMode.system && platformDark);
-        // 状态栏/导航栏亮度与主题同步。
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _syncStatusBar(isDark ? Brightness.dark : Brightness.light);
-        });
-        return MaterialApp(
-          title: '拾忆',
-          debugShowCheckedModeBanner: false,
-          theme: MacTheme.light(),
-          darkTheme: MacTheme.dark(),
-          themeMode: themeMode,
-          home: WelcomeScreen(shiyi: shiyi),
-        );
-      },
+    final themeMode = _resolveThemeMode(_themeModeSetting);
+    final platformDark =
+        MediaQuery.platformBrightnessOf(context) == Brightness.dark;
+    final isDark =
+        themeMode == ThemeMode.dark ||
+        (themeMode == ThemeMode.system && platformDark);
+    // 状态栏/导航栏亮度与主题同步。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _syncStatusBar(isDark ? Brightness.dark : Brightness.light);
+    });
+    return MaterialApp(
+      title: '拾忆',
+      debugShowCheckedModeBanner: false,
+      theme: MacTheme.light(),
+      darkTheme: MacTheme.dark(),
+      themeMode: themeMode,
+      home: WelcomeScreen(shiyi: shiyi),
     );
   }
 }

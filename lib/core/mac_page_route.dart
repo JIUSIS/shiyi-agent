@@ -21,14 +21,14 @@ abstract interface class BackGestureTarget {
 
 class MacPageRoute<T> extends PageRouteBuilder<T> {
   MacPageRoute({required WidgetBuilder builder, super.settings})
-      : super(
-          opaque: false,
-          pageBuilder: (context, animation, secondaryAnimation) =>
-              builder(context),
-          transitionDuration: const Duration(milliseconds: 300),
-          reverseTransitionDuration: const Duration(milliseconds: 240),
-          transitionsBuilder: _buildTransitions,
-        );
+    : super(
+        opaque: false,
+        pageBuilder: (context, animation, secondaryAnimation) =>
+            builder(context),
+        transitionDuration: const Duration(milliseconds: 300),
+        reverseTransitionDuration: const Duration(milliseconds: 240),
+        transitionsBuilder: _buildTransitions,
+      );
 
   /// 当前页面注册后，可接收系统预测性返回手势事件。
   BackGestureTarget? backGestureTarget;
@@ -63,6 +63,7 @@ class MacPageRoute<T> extends PageRouteBuilder<T> {
       curve: Curves.easeOutCubic,
       reverseCurve: Curves.easeInCubic,
     );
+    // 纯淡入淡出（无缩放/位移），低开销。
     return FadeTransition(opacity: curved, child: child);
   }
 }

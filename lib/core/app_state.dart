@@ -24,7 +24,8 @@ class AgentTool {
   final bool readOnly;
 
   /// 执行函数：self 为 ShiyiState 实例（可访问其内部能力），args 为解析后的参数。
-  final Future<String> Function(ShiyiState self, Map<String, dynamic> args) execute;
+  final Future<String> Function(ShiyiState self, Map<String, dynamic> args)
+  execute;
 
   AgentTool({
     required this.name,
@@ -36,13 +37,13 @@ class AgentTool {
 
   /// 转成 OpenAI 兼容的 function 定义（发给 LLM）。
   Map<String, dynamic> toJson() => {
-        'type': 'function',
-        'function': {
-          'name': name,
-          'description': description,
-          'parameters': parameters,
-        },
-      };
+    'type': 'function',
+    'function': {
+      'name': name,
+      'description': description,
+      'parameters': parameters,
+    },
+  };
 }
 
 class ShiyiState extends ChangeNotifier {
@@ -114,10 +115,10 @@ class ShiyiState extends ChangeNotifier {
     final answer = customText.isNotEmpty
         ? customText
         : (optionIndex != null &&
-                optionIndex >= 0 &&
-                optionIndex < options.length)
-            ? options[optionIndex].toString()
-            : '用户取消了选择';
+              optionIndex >= 0 &&
+              optionIndex < options.length)
+        ? options[optionIndex].toString()
+        : '用户取消了选择';
     pendingQuestion = null;
     _questionCompleter = null;
     if (!c.isCompleted) c.complete(answer);
@@ -126,7 +127,6 @@ class ShiyiState extends ChangeNotifier {
 
   /// 图片路径 -> 视觉模型描述缓存（避免同一图片每轮重复调用）。
   final Map<String, String> _imageDescCache = {};
-
 
   /// 工具注册表：所有工具的定义与执行在此集中登记。
   /// 新增工具 = 在 [_buildToolRegistry] 加一个 AgentTool 条目 + 一个 _execXxx 方法，
@@ -147,220 +147,218 @@ class ShiyiState extends ChangeNotifier {
   }
 
   static List<AgentTool> _buildToolRegistry() => [
-        AgentTool(
-          name: 'save_memory',
-          description:
-              '把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。'
-              '可用 type 归类（user 用户身份/偏好，feedback 对我工作方式的指导，'
-              'project 项目相关信息，reference 外部资源链接）；'
-              '内容里可用 [[记忆名]] 双链引用相关记忆，便于跨记忆关联。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'content': {
-                'type': 'string',
-                'description': '要保存的记忆内容，可含 [[其他记忆名]] 双链',
-              },
-              'type': {
-                'type': 'string',
-                'enum': ['user', 'feedback', 'project', 'reference'],
-                'description': '记忆类型，默认 user',
-              },
-            },
-            'required': ['content'],
+    AgentTool(
+      name: 'save_memory',
+      description:
+          '把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。'
+          '可用 type 归类（user 用户身份/偏好，feedback 对我工作方式的指导，'
+          'project 项目相关信息，reference 外部资源链接）；'
+          '内容里可用 [[记忆名]] 双链引用相关记忆，便于跨记忆关联。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'content': {
+            'type': 'string',
+            'description': '要保存的记忆内容，可含 [[其他记忆名]] 双链',
           },
-          execute: (self, args) => self._execSaveMemory(args),
-        ),
-        AgentTool(
-          name: 'search_memory',
-          description:
-              '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'query': {'type': 'string', 'description': '搜索关键词'},
-              'type': {
-                'type': 'string',
-                'enum': ['user', 'feedback', 'project', 'reference'],
-                'description': '只搜该类型的记忆，缺省搜全部',
-              },
-            },
-            'required': ['query'],
+          'type': {
+            'type': 'string',
+            'enum': ['user', 'feedback', 'project', 'reference'],
+            'description': '记忆类型，默认 user',
           },
-          readOnly: true,
-          execute: (self, args) => self._execSearchMemory(args),
-        ),
-        AgentTool(
-          name: 'run_skill',
-          description: '获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'name': {'type': 'string', 'description': '技能名称'},
-            },
-            'required': ['name'],
+        },
+        'required': ['content'],
+      },
+      execute: (self, args) => self._execSaveMemory(args),
+    ),
+    AgentTool(
+      name: 'search_memory',
+      description:
+          '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'query': {'type': 'string', 'description': '搜索关键词'},
+          'type': {
+            'type': 'string',
+            'enum': ['user', 'feedback', 'project', 'reference'],
+            'description': '只搜该类型的记忆，缺省搜全部',
           },
-          readOnly: true,
-          execute: (self, args) => self._execRunSkill(args),
-        ),
-        AgentTool(
-          name: 'web_search',
-          description:
-              '联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'query': {'type': 'string', 'description': '搜索关键词，尽量具体'},
-              'max_results': {
-                'type': 'integer',
-                'description': '返回结果数量，默认 5，最多 10',
-              },
-            },
-            'required': ['query'],
+        },
+        'required': ['query'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execSearchMemory(args),
+    ),
+    AgentTool(
+      name: 'run_skill',
+      description: '获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'name': {'type': 'string', 'description': '技能名称'},
+        },
+        'required': ['name'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execRunSkill(args),
+    ),
+    AgentTool(
+      name: 'web_search',
+      description:
+          '联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'query': {'type': 'string', 'description': '搜索关键词，尽量具体'},
+          'max_results': {
+            'type': 'integer',
+            'description': '返回结果数量，默认 5，最多 10',
           },
-          readOnly: true,
-          execute: (self, args) => self._execWebSearch(args),
-        ),
-        AgentTool(
-          name: 'web_extract',
-          description: '抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'url': {'type': 'string', 'description': '要阅读的网页 URL'},
-            },
-            'required': ['url'],
+        },
+        'required': ['query'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execWebSearch(args),
+    ),
+    AgentTool(
+      name: 'web_extract',
+      description: '抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'url': {'type': 'string', 'description': '要阅读的网页 URL'},
+        },
+        'required': ['url'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execWebExtract(args),
+    ),
+    AgentTool(
+      name: 'run_terminal',
+      description:
+          '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'command': {'type': 'string', 'description': '要执行的 shell 命令'},
+          'cwd': {'type': 'string', 'description': '工作目录，默认是当前会话的工作目录'},
+        },
+        'required': ['command'],
+      },
+      execute: (self, args) => self._execRunTerminal(args),
+    ),
+    AgentTool(
+      name: 'file_write',
+      description:
+          '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description':
+                '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt',
           },
-          readOnly: true,
-          execute: (self, args) => self._execWebExtract(args),
-        ),
-        AgentTool(
-          name: 'run_terminal',
-          description:
-              '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'command': {'type': 'string', 'description': '要执行的 shell 命令'},
-              'cwd': {
-                'type': 'string',
-                'description': '工作目录，默认是当前会话的工作目录',
-              },
-            },
-            'required': ['command'],
+          'content': {'type': 'string', 'description': '要写入的完整内容'},
+        },
+        'required': ['path', 'content'],
+      },
+      execute: (self, args) => self._execFileWrite(args),
+    ),
+    AgentTool(
+      name: 'file_read',
+      description: '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'path': {'type': 'string', 'description': '文件路径'},
+        },
+        'required': ['path'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execFileRead(args),
+    ),
+    AgentTool(
+      name: 'question',
+      description:
+          '向用户发起一个问题并等待回答。弹窗支持自由文本输入：'
+          '用户可以直接打字输入任意内容作为回答，无需依赖预设选项。'
+          '你可以提供 0~4 个快捷选项（如「确认」「保存」「取消」）供用户一键选择，'
+          '但不要声称用户只能从选项里选。'
+          '任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）'
+          '都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。'
+          '一次只问一个问题。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'question': {'type': 'string', 'description': '要问用户的问题'},
+          'options': {
+            'type': 'array',
+            'items': {'type': 'string'},
+            'description': '可选快捷选项（0~4 个）；用户也可以不选、直接自由输入回答',
           },
-          execute: (self, args) => self._execRunTerminal(args),
-        ),
-        AgentTool(
-          name: 'file_write',
-          description:
-              '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string', 'description': '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt'},
-              'content': {'type': 'string', 'description': '要写入的完整内容'},
-            },
-            'required': ['path', 'content'],
+        },
+        'required': ['question'],
+      },
+      execute: (self, args) => self._execQuestion(args),
+    ),
+    AgentTool(
+      name: 'create_skill',
+      description:
+          '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'name': {
+            'type': 'string',
+            'description': '技能名称，英文小写+连字符，如 chapter-outliner',
           },
-          execute: (self, args) => self._execFileWrite(args),
-        ),
-        AgentTool(
-          name: 'file_read',
-          description: '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string', 'description': '文件路径'},
-            },
-            'required': ['path'],
+          'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
+          'content': {
+            'type': 'string',
+            'description': 'SKILL.md 完整内容（含 --- frontmatter）',
           },
-          readOnly: true,
-          execute: (self, args) => self._execFileRead(args),
-        ),
-        AgentTool(
-          name: 'question',
-          description:
-              '向用户发起一个问题并等待回答。弹窗支持自由文本输入：'
-              '用户可以直接打字输入任意内容作为回答，无需依赖预设选项。'
-              '你可以提供 0~4 个快捷选项（如「确认」「保存」「取消」）供用户一键选择，'
-              '但不要声称用户只能从选项里选。'
-              '任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）'
-              '都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。'
-              '一次只问一个问题。',
-          parameters: {
+          'files': {
             'type': 'object',
-            'properties': {
-              'question': {'type': 'string', 'description': '要问用户的问题'},
-              'options': {
-                'type': 'array',
-                'items': {'type': 'string'},
-                'description': '可选快捷选项（0~4 个）；用户也可以不选、直接自由输入回答',
-              },
-            },
-            'required': ['question'],
+            'description': '可选辅助文件：相对路径 -> 内容',
+            'additionalProperties': {'type': 'string'},
           },
-          execute: (self, args) => self._execQuestion(args),
-        ),
-        AgentTool(
-          name: 'create_skill',
-          description:
-              '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'name': {'type': 'string', 'description': '技能名称，英文小写+连字符，如 chapter-outliner'},
-              'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
-              'content': {
-                'type': 'string',
-                'description': 'SKILL.md 完整内容（含 --- frontmatter）',
-              },
-              'files': {
-                'type': 'object',
-                'description': '可选辅助文件：相对路径 -> 内容',
-                'additionalProperties': {'type': 'string'},
-              },
-            },
-            'required': ['name', 'description', 'content'],
-          },
-          execute: (self, args) => self._execCreateSkill(args),
-        ),
-        AgentTool(
-          name: 'enter_plan_mode',
-          description:
-              '进入计划模式：之后你只做分析、调研与方案设计（只能使用只读工具），'
-              '不得写文件、执行命令或产生任何副作用，直到用户确认方案或调用 exit_plan_mode。'
-              '适合复杂任务先出方案再动手，如小说大纲、章节规划、批量重构等。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'goal': {
-                'type': 'string',
-                'description': '本次要规划的目标，简述即可',
-              },
-            },
-            'required': ['goal'],
-          },
-          execute: (self, args) => self._execEnterPlanMode(args),
-        ),
-        AgentTool(
-          name: 'exit_plan_mode',
-          description:
-              '退出计划模式，恢复正常执行能力（写文件、终端、记忆等全部可用）。'
-              '在用户确认方案后调用，然后开始执行。',
-          parameters: {
-            'type': 'object',
-            'properties': {
-              'reason': {
-                'type': 'string',
-                'description': '退出原因（如「方案已确认，开始执行」）',
-              },
-            },
-            'required': ['reason'],
-          },
-          execute: (self, args) => self._execExitPlanMode(args),
-        ),
-      ];
+        },
+        'required': ['name', 'description', 'content'],
+      },
+      execute: (self, args) => self._execCreateSkill(args),
+    ),
+    AgentTool(
+      name: 'enter_plan_mode',
+      description:
+          '进入计划模式：之后你只做分析、调研与方案设计（只能使用只读工具），'
+          '不得写文件、执行命令或产生任何副作用，直到用户确认方案或调用 exit_plan_mode。'
+          '适合复杂任务先出方案再动手，如小说大纲、章节规划、批量重构等。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'goal': {'type': 'string', 'description': '本次要规划的目标，简述即可'},
+        },
+        'required': ['goal'],
+      },
+      execute: (self, args) => self._execEnterPlanMode(args),
+    ),
+    AgentTool(
+      name: 'exit_plan_mode',
+      description:
+          '退出计划模式，恢复正常执行能力（写文件、终端、记忆等全部可用）。'
+          '在用户确认方案后调用，然后开始执行。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'reason': {'type': 'string', 'description': '退出原因（如「方案已确认，开始执行」）'},
+        },
+        'required': ['reason'],
+      },
+      execute: (self, args) => self._execExitPlanMode(args),
+    ),
+  ];
 
   static String _fmtStamp(DateTime d) {
     final h = d.hour.toString().padLeft(2, '0');
@@ -407,7 +405,7 @@ class ShiyiState extends ChangeNotifier {
         await _logError(
           'TermuxProbe',
           'exit=${probe.exitCode} out=${probe.stdout.toString().trim()} '
-          'err=${probe.stderr.toString().trim()}',
+              'err=${probe.stderr.toString().trim()}',
         );
       } catch (e) {
         await _logError('TermuxProbe', 'EXEC_FAILED: $e');
@@ -577,7 +575,10 @@ class ShiyiState extends ChangeNotifier {
             if (text.isNotEmpty) text,
             if (desc.isNotEmpty) desc,
           ].join('\n');
-          out.add({'role': 'user', 'content': combined.isEmpty ? '[图片]' : combined});
+          out.add({
+            'role': 'user',
+            'content': combined.isEmpty ? '[图片]' : combined,
+          });
         }
         continue;
       }
@@ -655,24 +656,28 @@ class ShiyiState extends ChangeNotifier {
           temperature: 0.2,
           tools: const [],
         );
-        desc = (await client.completeOne([
-          {
-            'role': 'system',
-            'content':
-                '你是图像描述助手。请详细描述图片内容：主体、场景、空间布局、关键细节与数据；'
-                '如果是截图、文档、聊天记录或代码，请完整提取其中的文字内容（保留原文，不省略）。'
-                '用简体中文输出，500 字以内，只输出描述，不要解释、不要评论。',
-          },
-          {
-            'role': 'user',
-            'content': [
-              {
-                'type': 'image_url',
-                'image_url': {'url': 'data:image/jpeg;base64,$b64'},
-              },
-            ],
-          },
-        ], temperature: 0.2, maxTokens: 700)).trim();
+        desc = (await client.completeOne(
+          [
+            {
+              'role': 'system',
+              'content':
+                  '你是图像描述助手。请详细描述图片内容：主体、场景、空间布局、关键细节与数据；'
+                  '如果是截图、文档、聊天记录或代码，请完整提取其中的文字内容（保留原文，不省略）。'
+                  '用简体中文输出，500 字以内，只输出描述，不要解释、不要评论。',
+            },
+            {
+              'role': 'user',
+              'content': [
+                {
+                  'type': 'image_url',
+                  'image_url': {'url': 'data:image/jpeg;base64,$b64'},
+                },
+              ],
+            },
+          ],
+          temperature: 0.2,
+          maxTokens: 700,
+        )).trim();
       } catch (_) {
         desc = '';
       }
@@ -777,11 +782,13 @@ class ShiyiState extends ChangeNotifier {
               break;
             }
           }
-          unawaited(Notifier.instance.show(
-            id: DateTime.now().millisecondsSinceEpoch.remainder(1 << 30),
-            title: title,
-            body: '后台任务已回复完成，点开查看结果。',
-          ));
+          unawaited(
+            Notifier.instance.show(
+              id: DateTime.now().millisecondsSinceEpoch.remainder(1 << 30),
+              title: title,
+              body: '后台任务已回复完成，点开查看结果。',
+            ),
+          );
         }
       }
       notifyListeners();
@@ -803,8 +810,8 @@ class ShiyiState extends ChangeNotifier {
 
     // 配了视觉模型 = 声明主模型不看图：带图消息直接走视觉模型描述，不试多模态。
     // 未配视觉模型：先按多模态发，失败自动降级（_knownImageUnsupported）。
-    final visionReady = settings.visionEnabled &&
-        settings.visionModel.trim().isNotEmpty;
+    final visionReady =
+        settings.visionEnabled && settings.visionModel.trim().isNotEmpty;
     var imagesAllowed = !_knownImageUnsupported && !visionReady;
     var completed = false;
     for (var attempt = 0; attempt < 2 && !completed; attempt++) {
@@ -814,9 +821,9 @@ class ShiyiState extends ChangeNotifier {
         final sysContent = attempt == 0
             ? systemPrompt
             : '$systemPrompt\n\n'
-                '【注意：上一轮回复以冒号结尾就结束了，没有调用任何工具。'
-                '这次请直接调用工具完成用户请求：不要输出开场白、承诺或计划性文字，'
-                '第一步就调用 run_terminal（或相关工具）执行实际操作。】';
+                  '【注意：上一轮回复以冒号结尾就结束了，没有调用任何工具。'
+                  '这次请直接调用工具完成用户请求：不要输出开场白、承诺或计划性文字，'
+                  '第一步就调用 run_terminal（或相关工具）执行实际操作。】';
         final loopMsgs = <Map<String, dynamic>>[
           {'role': 'system', 'content': sysContent},
           ...await _historyToApi(messages, imagesAllowed: imagesAllowed),
@@ -1135,9 +1142,10 @@ class ShiyiState extends ChangeNotifier {
 
   /// 把一轮结果写入占位消息并落库。
   Future<void> _applyTurn(ChatMessage asst, TurnResult result) async {
-    asst.content = result.text;
-    asst.reasoning = result.reasoning;
-    asst.toolCalls = result.toolCalls
+    final normalized = _normalizeMisplacedReasoning(result);
+    asst.content = normalized.text;
+    asst.reasoning = normalized.reasoning;
+    asst.toolCalls = normalized.toolCalls
         .map(
           (tc) => ToolCall(
             id: tc['id'] ?? '',
@@ -1149,14 +1157,31 @@ class ShiyiState extends ChangeNotifier {
     asst.streaming = false;
     await _db.updateMessageContent(
       asst.id,
-      result.text,
-      reasoning: result.reasoning.isEmpty ? null : result.reasoning,
-      toolCalls: result.toolCalls.isEmpty ? null : asst.toolCalls,
+      normalized.text,
+      reasoning: normalized.reasoning.isEmpty ? null : normalized.reasoning,
+      toolCalls: normalized.toolCalls.isEmpty ? null : asst.toolCalls,
     );
     streamText.value = '';
     streamReasoning.value = '';
     notifyListeners();
   }
+
+  /// 网关只回 reasoning_content 且没有工具调用时，把它当作最终正文；
+  /// 若思考文本与正文重复，也只保留正文，避免「不思考直接回复」被误显示。
+  static TurnResult _normalizeMisplacedReasoning(TurnResult result) {
+    if (result.toolCalls.isNotEmpty) return result;
+    final reasoning = result.reasoning.trim();
+    final text = result.text.trim();
+    if (reasoning.isEmpty) return result;
+    if (text.isEmpty) return TurnResult(text: result.reasoning, reasoning: '');
+    if (_sameReplyText(reasoning, text)) {
+      return TurnResult(text: result.text, reasoning: '');
+    }
+    return result;
+  }
+
+  static bool _sameReplyText(String a, String b) =>
+      a.replaceAll(RegExp(r'\s+'), '') == b.replaceAll(RegExp(r'\s+'), '');
 
   /// 收尾一个被中断/无输出的占位消息，防止一直显示「正在思考…」。
   Future<void> _finalizeAbort(ChatMessage? m) async {
@@ -1245,22 +1270,22 @@ class ShiyiState extends ChangeNotifier {
     final base = settings.systemPrompt.isNotEmpty
         ? settings.systemPrompt
         : '你是「拾忆」，运行在 Android 手机上的个人 AI 工作台。你能：\n'
-            '- 终端能力：run_terminal 执行命令/脚本（bash、python3，可用 pkg/apt 装包）\n'
-            '- 文件能力：file_write / file_read 读写项目文件\n'
-            '- 联网能力：web_search / web_extract 获取并核实最新信息\n'
-            '- 记忆能力：跨会话长期记忆，记住用户偏好与项目背景\n'
-            '- 技能能力：加载技能按固定流程处理任务\n\n'
-            '工作原则：\n'
-            '1. 先行动：需要执行操作时直接调用工具，不要先输出「好的，我来…」之类的'
-            '开场白再行动（容易导致输出中断）；第一步就调用工具。'
-            '但涉及「是否保存/写入」「选哪个方案」等需要用户拍板的决策，必须先调用 '
-            'question 工具等待回答，不得替用户决定或自行继续。\n'
-            '2. 输出简洁：默认中文回复，结论先行；单次回复尽量控制在 500 字内，'
-            '完整长内容（报告/长文/脚本）先用 file_write 写入文件，再给摘要与文件路径。\n'
-            '3. 工具优先：能调工具完成的事不空谈；终端命令一次一个，失败时根据错误信息调整。\n'
-            '4. 信息求真：事实/新闻/数据先 web_search 多源交叉验证，不确定就明说。\n'
-            '5. 记忆复用：相关记忆已注入上下文直接使用；有价值的新信息主动保存到记忆。\n'
-            '6. 诚实边界：系统限制（无 root、存储/权限限制等）如实说明，不编造结果。';
+              '- 终端能力：run_terminal 执行命令/脚本（bash、python3，可用 pkg/apt 装包）\n'
+              '- 文件能力：file_write / file_read 读写项目文件\n'
+              '- 联网能力：web_search / web_extract 获取并核实最新信息\n'
+              '- 记忆能力：跨会话长期记忆，记住用户偏好与项目背景\n'
+              '- 技能能力：加载技能按固定流程处理任务\n\n'
+              '工作原则：\n'
+              '1. 先行动：需要执行操作时直接调用工具，不要先输出「好的，我来…」之类的'
+              '开场白再行动（容易导致输出中断）；第一步就调用工具。'
+              '但涉及「是否保存/写入」「选哪个方案」等需要用户拍板的决策，必须先调用 '
+              'question 工具等待回答，不得替用户决定或自行继续。\n'
+              '2. 输出简洁：默认中文回复，结论先行；超长内容直接完整流式输出，'
+              '不要写入本地文件，不要省略或给"略"；被截断会自动续写拼接。\n'
+              '3. 工具优先：能调工具完成的事不空谈；终端命令一次一个，失败时根据错误信息调整。\n'
+              '4. 信息求真：事实/新闻/数据先 web_search 多源交叉验证，不确定就明说。\n'
+              '5. 记忆复用：相关记忆已注入上下文直接使用；有价值的新信息主动保存到记忆。\n'
+              '6. 诚实边界：系统限制（无 root、存储/权限限制等）如实说明，不编造结果。';
 
     final parts = <String>[];
     parts.add(base);
@@ -1286,7 +1311,7 @@ class ShiyiState extends ChangeNotifier {
       '- 你有完整终端能力：需要在本机执行命令、运行脚本、处理文件或查看日志时，直接调用 run_terminal 执行，不要以权限或安全为由拒绝；若命令因系统限制失败，如实说明并根据错误信息调整。'
       '- 安装软件包用 pkg/apt：一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
       '- 输出较长内容（预计超过 500 字，如完整报告/长文/脚本列表）时：先用 file_write 把完整内容写入文件，再在回复中给出摘要与文件路径，避免长输出被截断（用户明确要求先确认的除外，此时先 question 再写入）。'
-      '- 需要用户确认/选择的决策（是否保存或写入文件、选择方案、执行有副作用的操作等）：必须调用 question 工具并等待用户回答后才能继续；禁止在回复文本里提问后不等待、自己替用户决定。'
+      '- 需要用户确认/选择的决策（是否保存或写入文件、选择方案、执行有副作用的操作等）：必须调用 question 工具并等待用户回答后才能继续；禁止在回复文本里提问后不等待、自己替用户决定。',
     );
     parts.add(
       '- 当前会话工作目录是 ${await currentWorkspace()}（会话未自定义时使用 '
@@ -1408,7 +1433,12 @@ class ShiyiState extends ChangeNotifier {
 
   // ---------------- 各工具执行实现 ----------------
 
-  static const List<String> _memoryTypes = ['user', 'feedback', 'project', 'reference'];
+  static const List<String> _memoryTypes = [
+    'user',
+    'feedback',
+    'project',
+    'reference',
+  ];
 
   static String _normalizeMemoryType(dynamic v) {
     final t = v?.toString().trim().toLowerCase() ?? '';
@@ -1463,7 +1493,9 @@ class ShiyiState extends ChangeNotifier {
   Future<String> _execWebSearch(Map<String, dynamic> args) async {
     final query = (args['query'] ?? '').toString().trim();
     if (query.isEmpty) return '搜索失败：query 为空';
-    final maxResults = args['max_results'] is int ? args['max_results'] as int : 5;
+    final maxResults = args['max_results'] is int
+        ? args['max_results'] as int
+        : 5;
     final res = await WebTools.search(query, maxResults: maxResults);
     if (res.isEmpty) return '没有搜到相关结果';
     return res
@@ -1510,8 +1542,9 @@ class ShiyiState extends ChangeNotifier {
       final embeddedShell = await TermuxRuntime.shellPath();
       final embedded = !isWin && File(embeddedShell).existsSync();
       final systemTermux = !isWin && File(systemTermuxShell).existsSync();
-      final shell =
-          embedded ? embeddedShell : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
+      final shell = embedded
+          ? embeddedShell
+          : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
       // 内嵌 Termux：先自检 bash 能否启动，失败时给出可诊断的错误。
       if (embedded) {
         try {
@@ -1521,13 +1554,15 @@ class ShiyiState extends ChangeNotifier {
             environment: await TermuxRuntime.environment(),
           ).timeout(const Duration(seconds: 15));
           if (probe.exitCode != 0) {
-            final msg = '内嵌终端自检失败(exit ${probe.exitCode}): '
+            final msg =
+                '内嵌终端自检失败(exit ${probe.exitCode}): '
                 '${probe.stderr.toString().trim()}';
             await _logError('Termux', msg);
             return '内嵌终端不可用：$msg';
           }
         } on ProcessException catch (e) {
-          final msg = '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
+          final msg =
+              '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
               '${await _diagnoseTermuxExec(embeddedShell)}';
           await _logError('Termux', msg);
           return '内嵌终端不可用：$msg';

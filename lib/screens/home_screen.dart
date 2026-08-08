@@ -28,16 +28,39 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _tab = 0;
   bool _sidebarVisible = false;
+  int _sessionsResetRevision = 0;
+  // tab 懒缓存：切换过的页面保留不重建（页面切换卡顿根因=每次全量重建+DB重查）。
+  final Map<int, Widget> _tabCache = {};
+
+  void _dismissKeyboard() {
+    FocusManager.instance.primaryFocus?.unfocus();
+  }
+
+  void _setSidebarVisible(bool visible) {
+    _dismissKeyboard();
+    setState(() => _sidebarVisible = visible);
+  }
+
+  void _selectTab(int tab) {
+    _dismissKeyboard();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() {
+        _tab = tab;
+        _sidebarVisible = false;
+      });
+    });
+  }
 
   Future<void> _handleBack() async {
     // 临时层优先于页面导航：系统返回手势先收起侧边栏。
     if (_sidebarVisible) {
-      setState(() => _sidebarVisible = false);
+      _setSidebarVisible(false);
       return;
     }
     // 非主页 tab 先退回会话页，层层返回。
     if (_tab != 0) {
-      setState(() => _tab = 0);
+      _selectTab(0);
       return;
     }
     // 已在主页，二次确认后退出。
@@ -73,6 +96,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _handleBack();
       },
       child: Scaffold(
+        // 键盘只应压缩当前 tab 的内容，不能把悬浮侧边栏一起压矮。
+        resizeToAvoidBottomInset: false,
         body: ListenableBuilder(
           listenable: shiyi,
           builder: (context, _) {
@@ -99,23 +124,13 @@ class _HomeScreenState extends State<HomeScreen> {
             return Stack(
               children: [
                 // 内容区始终全宽，侧边栏展开时悬浮覆盖其上，不挤压内容。
-                SafeArea(
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 240),
-                    switchInCurve: Curves.easeOut,
-                    switchOutCurve: Curves.easeIn,
-                    child: KeyedSubtree(
-                      key: ValueKey(_tab),
-                      child: _buildTab(),
-                    ),
-                  ),
-                ),
+                SafeArea(child: _buildTab()),
                 // 侧边栏展开时的拦截遮罩：点击任何空白只收起，不传递给下层内容区。
                 if (_sidebarVisible)
                   Positioned.fill(
                     child: GestureDetector(
                       behavior: HitTestBehavior.opaque,
-                      onTap: () => setState(() => _sidebarVisible = false),
+                      onTap: () => _setSidebarVisible(false),
                     ),
                   ),
                 // 悬浮侧边栏：带滑入/滑出动画。
@@ -127,8 +142,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   bottom: 0,
                   child: _MacSidebar(
                     selected: _tab,
-                    onSelect: (i) => setState(() => _tab = i),
-                    onToggle: () => setState(() => _sidebarVisible = false),
+                    onSelect: _selectTab,
+                    onToggle: () => _setSidebarVisible(false),
                     onNewSession: _newSession,
                     onAbout: _openAbout,
                   ),
@@ -150,7 +165,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         curve: Curves.easeOutBack,
                         child: Center(
                           child: _FloatingTrafficLights(
-                            onTap: () => setState(() => _sidebarVisible = true),
+                            onTap: () => _setSidebarVisible(true),
                           ),
                         ),
                       ),
@@ -167,13 +182,19 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _newSession() async {
     final shiyi = widget.shiyi;
+    _dismissKeyboard();
+    setState(() {
+      _sidebarVisible = false;
+      _sessionsResetRevision++;
+      _tabCache.remove(0); // 会话列表变更：强制重建会话 tab
+    });
     try {
       await shiyi.newSession();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('新建会话失败：$e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('新建会话失败：$e')));
       return;
     }
     if (!mounted) return;
@@ -184,32 +205,38 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _openAbout() {
-    Navigator.push(
-      context,
-      MacPageRoute(builder: (_) => const AboutScreen()),
-    );
+    _dismissKeyboard();
+    if (_sidebarVisible) {
+      setState(() => _sidebarVisible = false);
+    }
+    Navigator.push(context, MacPageRoute(builder: (_) => const AboutScreen()));
   }
 
   Widget _buildTab() {
     final shiyi = widget.shiyi;
-    switch (_tab) {
-      case 0:
-        return _SessionsTab(
-          shiyi: shiyi,
-          onOpenSettings: () => setState(() => _tab = 4),
-        );
-      case 1:
-        return MemoryScreen(shiyi: shiyi);
-      case 2:
-        return SkillsScreen(shiyi: shiyi);
-      case 3:
-        return FilesScreen(shiyi: shiyi);
-      case 4:
-        return SettingsScreen(shiyi: shiyi);
-      case 5:
-        return const LogScreen();
-    }
-    return const SizedBox.shrink();
+    // 懒缓存：首次切换到该 tab 时构建，之后复用（各页内部用 ListenableBuilder
+    // 监听 shiyi 自动刷新数据，缓存不影响内容更新）。
+    return _tabCache.putIfAbsent(_tab, () {
+      switch (_tab) {
+        case 0:
+          return _SessionsTab(
+            shiyi: shiyi,
+            resetRevision: _sessionsResetRevision,
+            onOpenSettings: () => _selectTab(4),
+          );
+        case 1:
+          return MemoryScreen(shiyi: shiyi);
+        case 2:
+          return SkillsScreen(shiyi: shiyi);
+        case 3:
+          return FilesScreen(shiyi: shiyi);
+        case 4:
+          return SettingsScreen(shiyi: shiyi);
+        case 5:
+          return const LogScreen();
+      }
+      return const SizedBox.shrink();
+    });
   }
 }
 
@@ -438,8 +465,13 @@ class _SidebarItem extends StatelessWidget {
 
 class _SessionsTab extends StatefulWidget {
   final ShiyiState shiyi;
+  final int resetRevision;
   final VoidCallback onOpenSettings;
-  const _SessionsTab({required this.shiyi, required this.onOpenSettings});
+  const _SessionsTab({
+    required this.shiyi,
+    required this.resetRevision,
+    required this.onOpenSettings,
+  });
 
   @override
   State<_SessionsTab> createState() => _SessionsTabState();
@@ -447,14 +479,37 @@ class _SessionsTab extends StatefulWidget {
 
 class _SessionsTabState extends State<_SessionsTab> {
   final TextEditingController _searchCtrl = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
   String _query = '';
 
   ShiyiState get shiyi => widget.shiyi;
 
   @override
+  void didUpdateWidget(covariant _SessionsTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.resetRevision != widget.resetRevision) {
+      _dismissSearch();
+      _searchCtrl.clear();
+      _query = '';
+    }
+  }
+
+  @override
   void dispose() {
+    _searchFocus.dispose();
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  void _dismissSearch() {
+    _searchFocus.unfocus();
+  }
+
+  void _resetSearch() {
+    _dismissSearch();
+    if (_query.isEmpty && _searchCtrl.text.isEmpty) return;
+    _searchCtrl.clear();
+    setState(() => _query = '');
   }
 
   @override
@@ -477,7 +532,10 @@ class _SessionsTabState extends State<_SessionsTab> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
             child: TextField(
               controller: _searchCtrl,
+              focusNode: _searchFocus,
               onChanged: (v) => setState(() => _query = v),
+              onTapOutside: (_) => _dismissSearch(),
+              onSubmitted: (_) => _dismissSearch(),
               textInputAction: TextInputAction.search,
               decoration: InputDecoration(
                 hintText: '搜索会话或消息内容',
@@ -508,13 +566,14 @@ class _SessionsTabState extends State<_SessionsTab> {
 
   void _openNewSession() async {
     final shiyi = widget.shiyi;
+    _resetSearch();
     try {
       await shiyi.newSession();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('新建会话失败：$e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('新建会话失败：$e')));
       return;
     }
     if (!mounted) return;
@@ -543,8 +602,12 @@ class _SessionsTabState extends State<_SessionsTab> {
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
           itemCount: shiyi.sessions.length,
           separatorBuilder: (_, _) => const SizedBox(height: 8),
-          itemBuilder: (context, i) =>
-              _SessionTile(shiyi: shiyi, session: shiyi.sessions[i]),
+          itemBuilder: (context, i) => _SessionTile(
+            shiyi: shiyi,
+            session: shiyi.sessions[i],
+            onBeforeOpen: _dismissSearch,
+            onReturn: _resetSearch,
+          ),
         ),
       );
     }
@@ -572,6 +635,8 @@ class _SessionsTabState extends State<_SessionsTab> {
               shiyi: shiyi,
               session: results[i].session,
               snippet: results[i].snippet,
+              onBeforeOpen: _dismissSearch,
+              onReturn: _resetSearch,
             ),
           ),
         );
@@ -584,9 +649,13 @@ class _SessionTile extends StatelessWidget {
   final ShiyiState shiyi;
   final Session session;
   final String snippet;
+  final VoidCallback onBeforeOpen;
+  final VoidCallback onReturn;
   const _SessionTile({
     required this.shiyi,
     required this.session,
+    required this.onBeforeOpen,
+    required this.onReturn,
     this.snippet = '',
   });
 
@@ -650,14 +719,20 @@ class _SessionTile extends StatelessWidget {
       key: ValueKey(s.id),
       // 左滑拉出拼合胶囊操作（重命名 / 删除）。
       onTap: () async {
+        onBeforeOpen();
         await shiyi.selectSession(s.id);
         if (context.mounted) {
-          Navigator.push(
+          await Navigator.push(
             context,
             MacPageRoute(
               builder: (_) => ChatScreen(shiyi: shiyi, sessionId: s.id),
             ),
           );
+          // Navigator.push 的 Future 会在 pop 时先完成，此时自定义路由仍在
+          // 播放 240ms 退场动画。等动画彻底结束后再重建主页，避免依赖树
+          // 在退场过程中被拆卸并触发 InheritedElement 生命周期断言。
+          await Future<void>.delayed(const Duration(milliseconds: 350));
+          if (context.mounted) onReturn();
         }
       },
       actions: [
@@ -894,11 +969,7 @@ class _SlidablePillAction extends StatelessWidget {
   }
 }
 
-Future<void> _rename(
-  BuildContext context,
-  ShiyiState shiyi,
-  Session s,
-) async {
+Future<void> _rename(BuildContext context, ShiyiState shiyi, Session s) async {
   final controller = TextEditingController(text: s.title);
   final title = await showDialog<String>(
     context: context,

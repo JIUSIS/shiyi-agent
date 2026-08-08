@@ -133,7 +133,11 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   /// 构建单条消息气泡；liveContent 非空时渲染流式实时文本。
-  Widget _messageItem(ChatMessage m, {String? liveContent, String? liveReasoning}) {
+  Widget _messageItem(
+    ChatMessage m, {
+    String? liveContent,
+    String? liveReasoning,
+  }) {
     return MessageBubble(
       message: m,
       liveContent: liveContent,
@@ -241,9 +245,9 @@ class _ChatScreenState extends State<ChatScreen>
                 await widget.shiyi.setCurrentSessionWorkspace(p);
                 await _refreshWorkspace();
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('本会话项目目录已设为：$p')),
-                );
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(SnackBar(content: Text('本会话项目目录已设为：$p')));
               },
             ),
             ListTile(
@@ -255,9 +259,9 @@ class _ChatScreenState extends State<ChatScreen>
                 await widget.shiyi.setCurrentSessionWorkspace('');
                 await _refreshWorkspace();
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('已恢复全局默认工作目录')),
-                );
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('已恢复全局默认工作目录')));
               },
             ),
           ],
@@ -321,9 +325,9 @@ class _ChatScreenState extends State<ChatScreen>
       }
       if (added > 0) _stripAt();
       if (added == 0 && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('文件复制到工作目录失败')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('文件复制到工作目录失败')));
       }
     } catch (e) {
       if (!mounted) return;
@@ -345,9 +349,9 @@ class _ChatScreenState extends State<ChatScreen>
       final dest = await FileWorkspace.copyDirectoryToAttachments(path);
       if (dest == null) {
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('文件夹复制到工作目录失败（可能同名已存在）')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('文件夹复制到工作目录失败（可能同名已存在）')));
         return;
       }
       setState(() => _pendingFiles.add(dest));
@@ -674,6 +678,7 @@ class _ChatScreenState extends State<ChatScreen>
       return;
     }
     // 直接由路由的淡入淡出完成返回，省掉额外的拖动收尾动画。
+    FocusManager.instance.primaryFocus?.unfocus();
     if (mounted) Navigator.pop(context);
   }
 
@@ -706,7 +711,8 @@ class _ChatScreenState extends State<ChatScreen>
             child: Stack(
               children: [
                 _QuestionHandler(shiyi: widget.shiyi),
-                Scaffold(                  appBar: AppBar(
+                Scaffold(
+                  appBar: AppBar(
                     leadingWidth: 104,
                     leading: Row(
                       children: [
@@ -831,15 +837,15 @@ class _ChatScreenState extends State<ChatScreen>
                                           widget.shiyi.streamReasoning,
                                       builder: (context, reasoning, _) =>
                                           ValueListenableBuilder<String>(
-                                        valueListenable:
-                                            widget.shiyi.streamText,
-                                        builder: (context, text, _) =>
-                                            _messageItem(
-                                          m,
-                                          liveContent: text,
-                                          liveReasoning: reasoning,
-                                        ),
-                                      ),
+                                            valueListenable:
+                                                widget.shiyi.streamText,
+                                            builder: (context, text, _) =>
+                                                _messageItem(
+                                                  m,
+                                                  liveContent: text,
+                                                  liveReasoning: reasoning,
+                                                ),
+                                          ),
                                     ),
                                   );
                                 }
@@ -973,7 +979,8 @@ class _ChatScreenState extends State<ChatScreen>
                   builder: (context, _) {
                     if (!_showToolLog) return const SizedBox.shrink();
                     return Positioned(
-                      top: MediaQuery.paddingOf(context).top +
+                      top:
+                          MediaQuery.paddingOf(context).top +
                           kToolbarHeight +
                           8,
                       right: 8,
@@ -1287,8 +1294,8 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
   }
 
   Future<void> _show(Map<String, dynamic> q) async {
-    final options = (q['options'] as List?)?.cast<String>() ??
-        const <String>['确认', '取消'];
+    final options =
+        (q['options'] as List?)?.cast<String>() ?? const <String>['确认', '取消'];
     final ctrl = TextEditingController();
     int? selectedIndex;
     String? customAnswer;
@@ -1301,27 +1308,31 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         title: const Text('拾忆 向你提问'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(q['question']?.toString() ?? ''),
-            const SizedBox(height: 12),
-            TextField(
-              controller: ctrl,
-              maxLines: 3,
-              minLines: 1,
-              decoration: const InputDecoration(
-                hintText: '也可以直接输入你的回答…',
-                border: OutlineInputBorder(),
+        // 键盘弹出后弹窗可用高度骤减，content 必须可滚动，
+        // 否则 TextField + 问题文字超出 → 底部 RenderFlex overflow（黄黑条）。
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(q['question']?.toString() ?? ''),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                maxLines: 3,
+                minLines: 1,
+                decoration: const InputDecoration(
+                  hintText: '也可以直接输入你的回答…',
+                  border: OutlineInputBorder(),
+                ),
+                onSubmitted: (v) {
+                  customAnswer = v.trim();
+                  FocusManager.instance.primaryFocus?.unfocus();
+                  Navigator.of(ctx).pop();
+                },
               ),
-              onSubmitted: (v) {
-                customAnswer = v.trim();
-                FocusManager.instance.primaryFocus?.unfocus();
-                Navigator.of(ctx).pop();
-              },
-            ),
-          ],
+            ],
+          ),
         ),
         actions: [
           for (var i = 0; i < options.length; i++)
@@ -1425,8 +1436,11 @@ class _PlanModeChip extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.engineering_outlined,
-              size: 15, color: theme.colorScheme.onTertiaryContainer),
+          Icon(
+            Icons.engineering_outlined,
+            size: 15,
+            color: theme.colorScheme.onTertiaryContainer,
+          ),
           const SizedBox(width: 6),
           Flexible(
             child: Text(
@@ -1490,10 +1504,7 @@ class _Composer extends StatelessWidget {
               children: [
                 IconButton(
                   onPressed: onPickAttachment,
-                  icon: const Icon(
-                    Icons.attach_file,
-                    size: 22,
-                  ),
+                  icon: const Icon(Icons.attach_file, size: 22),
                   tooltip: '添加附件',
                   color: theme.colorScheme.primary,
                   visualDensity: VisualDensity.compact,
@@ -1521,48 +1532,48 @@ class _Composer extends StatelessWidget {
                     ),
                   ),
                 ),
-                  ValueListenableBuilder<TextEditingValue>(
-                    valueListenable: input,
-                    builder: (context, value, _) {
-                      final hasInput =
-                          value.text.trim().isNotEmpty ||
-                          pendingImages.isNotEmpty ||
-                          pendingFiles.isNotEmpty;
-                      if (busy) {
-                        return Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
+                ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: input,
+                  builder: (context, value, _) {
+                    final hasInput =
+                        value.text.trim().isNotEmpty ||
+                        pendingImages.isNotEmpty ||
+                        pendingFiles.isNotEmpty;
+                    if (busy) {
+                      return Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _RoundIconButton(
+                            onPressed: onStop,
+                            icon: Icons.stop_rounded,
+                            tooltip: '停止',
+                            filled: false,
+                            active: true,
+                          ),
+                          if (hasInput) ...[
+                            const SizedBox(width: 4),
                             _RoundIconButton(
-                              onPressed: onStop,
-                              icon: Icons.stop_rounded,
-                              tooltip: '停止',
-                              filled: false,
+                              onPressed: onSend,
+                              icon: Icons.send_rounded,
+                              tooltip: '发送并引导',
+                              filled: true,
                               active: true,
                             ),
-                            if (hasInput) ...[
-                              const SizedBox(width: 4),
-                              _RoundIconButton(
-                                onPressed: onSend,
-                                icon: Icons.send_rounded,
-                                tooltip: '发送并引导',
-                                filled: true,
-                                active: true,
-                              ),
-                            ],
                           ],
-                        );
-                      }
-                      return _RoundIconButton(
-                        onPressed: hasInput ? onSend : null,
-                        icon: Icons.send_rounded,
-                        tooltip: '发送',
-                        filled: true,
-                        active: hasInput,
+                        ],
                       );
-                    },
-                  ),
-                ],
-              ),
+                    }
+                    return _RoundIconButton(
+                      onPressed: hasInput ? onSend : null,
+                      icon: Icons.send_rounded,
+                      tooltip: '发送',
+                      filled: true,
+                      active: hasInput,
+                    );
+                  },
+                ),
+              ],
+            ),
           ],
         ),
       ),
@@ -1790,26 +1801,35 @@ class _ToolPillIdle extends StatelessWidget {
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
             child: Row(
-              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color: cs.outlineVariant,
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                const SizedBox(width: 5),
-                Flexible(
-                  child: Text(
-                    '工具',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelMedium?.copyWith(
-                      color: theme.hintColor,
-                      fontWeight: FontWeight.w500,
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: cs.outlineVariant,
+                        shape: BoxShape.circle,
+                      ),
                     ),
+                    const SizedBox(width: 5),
+                    Text(
+                      '工具',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: theme.hintColor,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+                Text(
+                  '0.0s',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.hintColor,
                   ),
                 ),
               ],
