@@ -381,7 +381,7 @@ class LlmClient {
               stoppedByUser = true;
               idleTimer?.cancel();
               sub?.cancel();
-              if (!completer.isCompleted) completer.complete();
+              if (!completer.isCompleted) completer.complete(false);
               return;
             }
             resetIdleTimer();
