@@ -25,12 +25,49 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin {
   int _tab = 0;
   bool _sidebarVisible = false;
   int _sessionsResetRevision = 0;
   // tab 懒缓存：切换过的页面保留不重建（页面切换卡顿根因=每次全量重建+DB重查）。
   final Map<int, Widget> _tabCache = {};
+  // 切换淡入：IndexedStack 常驻全部 tab，切换零构建、立即响应。
+  late final AnimationController _fadeController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 180),
+  );
+  late final Animation<double> _fade = CurvedAnimation(
+    parent: _fadeController,
+    curve: Curves.easeOut,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _fadeController.value = 1;
+    _prebuildTabs();
+  }
+
+  @override
+  void dispose() {
+    _fadeController.dispose();
+    super.dispose();
+  }
+
+  // 启动后逐帧预构建其余 tab，首次切换不再卡顿（构建成本分摊到空闲帧）。
+  void _prebuildTabs() {
+    var i = 1;
+    void next() {
+      if (!mounted || i > 5) return;
+      _tabCache[i] = _buildTabFor(i);
+      setState(() {});
+      i++;
+      WidgetsBinding.instance.addPostFrameCallback((_) => next());
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => next());
+  }
 
   void _dismissKeyboard() {
     FocusManager.instance.primaryFocus?.unfocus();
@@ -42,14 +79,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _selectTab(int tab) {
+    if (tab == _tab) return;
     _dismissKeyboard();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      setState(() {
-        _tab = tab;
-        _sidebarVisible = false;
-      });
+    setState(() {
+      _tab = tab;
+      _sidebarVisible = false;
     });
+    _fadeController.forward(from: 0);
   }
 
   Future<void> _handleBack() async {
@@ -124,16 +160,17 @@ class _HomeScreenState extends State<HomeScreen> {
             return Stack(
               children: [
                 // 内容区始终全宽，侧边栏展开时悬浮覆盖其上，不挤压内容。
+                // IndexedStack 常驻全部 tab：切换零构建、立即响应；切换时淡入。
                 SafeArea(
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 240),
-                    switchInCurve: Curves.easeOut,
-                    switchOutCurve: Curves.easeIn,
-                    transitionBuilder: (child, animation) =>
-                        FadeTransition(opacity: animation, child: child),
-                    child: KeyedSubtree(
-                      key: ValueKey<int>(_tab),
-                      child: _buildTab(),
+                  child: FadeTransition(
+                    opacity: _fade,
+                    child: IndexedStack(
+                      index: _tab,
+                      children: [
+                        for (var i = 0; i <= 5; i++)
+                          _tabCache[i] ??
+                              (i == _tab ? _buildTabFor(i) : const SizedBox.shrink()),
+                      ],
                     ),
                   ),
                 ),
@@ -224,31 +261,27 @@ class _HomeScreenState extends State<HomeScreen> {
     Navigator.push(context, MacPageRoute(builder: (_) => const AboutScreen()));
   }
 
-  Widget _buildTab() {
+  Widget _buildTabFor(int i) {
     final shiyi = widget.shiyi;
-    // 懒缓存：首次切换到该 tab 时构建，之后复用（各页内部用 ListenableBuilder
-    // 监听 shiyi 自动刷新数据，缓存不影响内容更新）。
-    return _tabCache.putIfAbsent(_tab, () {
-      switch (_tab) {
-        case 0:
-          return _SessionsTab(
-            shiyi: shiyi,
-            resetRevision: _sessionsResetRevision,
-            onOpenSettings: () => _selectTab(4),
-          );
-        case 1:
-          return MemoryScreen(shiyi: shiyi);
-        case 2:
-          return SkillsScreen(shiyi: shiyi);
-        case 3:
-          return FilesScreen(shiyi: shiyi);
-        case 4:
-          return SettingsScreen(shiyi: shiyi);
-        case 5:
-          return const LogScreen();
-      }
-      return const SizedBox.shrink();
-    });
+    switch (i) {
+      case 0:
+        return _SessionsTab(
+          shiyi: shiyi,
+          resetRevision: _sessionsResetRevision,
+          onOpenSettings: () => _selectTab(4),
+        );
+      case 1:
+        return MemoryScreen(shiyi: shiyi);
+      case 2:
+        return SkillsScreen(shiyi: shiyi);
+      case 3:
+        return FilesScreen(shiyi: shiyi);
+      case 4:
+        return SettingsScreen(shiyi: shiyi);
+      case 5:
+        return const LogScreen();
+    }
+    return const SizedBox.shrink();
   }
 }
 
