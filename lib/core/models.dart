@@ -208,13 +208,24 @@ class MemoryEntry {
   String source;
   int createdAt;
 
-  MemoryEntry({required this.id, required this.content, required this.source, required this.createdAt});
+  /// 记忆类型：user 用户身份/偏好 / feedback 工作方式指导 / project 项目信息 /
+  /// reference 外部资源链接。默认 user。
+  String type;
+
+  MemoryEntry({
+    required this.id,
+    required this.content,
+    required this.source,
+    required this.createdAt,
+    this.type = 'user',
+  });
 
   Map<String, dynamic> toMap() => {
         'id': id,
         'content': content,
         'source': source,
         'created_at': createdAt,
+        'type': type,
       };
 
   factory MemoryEntry.fromMap(Map<String, dynamic> m) => MemoryEntry(
@@ -222,6 +233,7 @@ class MemoryEntry {
         content: m['content'],
         source: m['source'] ?? '',
         createdAt: m['created_at'],
+        type: m['type'] ?? 'user',
       );
 }
 
@@ -325,6 +337,9 @@ class AppSettings {
   String visionApiKey;
   String visionModel;
 
+  /// 长任务完成时推送系统通知（app 在后台/切走时）。
+  bool enableNotifications;
+
   AppSettings({
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
@@ -344,6 +359,7 @@ class AppSettings {
     this.visionBaseUrl = '',
     this.visionApiKey = '',
     this.visionModel = '',
+    this.enableNotifications = true,
   });
 
   AppSettings copyWith({
@@ -365,6 +381,7 @@ class AppSettings {
     String? visionBaseUrl,
     String? visionApiKey,
     String? visionModel,
+    bool? enableNotifications,
   }) =>
       AppSettings(
         baseUrl: baseUrl ?? this.baseUrl,
@@ -386,10 +403,11 @@ class AppSettings {
         visionBaseUrl: visionBaseUrl ?? this.visionBaseUrl,
         visionApiKey: visionApiKey ?? this.visionApiKey,
         visionModel: visionModel ?? this.visionModel,
+        enableNotifications: enableNotifications ?? this.enableNotifications,
       );
 
   Map<String, dynamic> toJson() =>
-      {'baseUrl': baseUrl, 'apiKey': apiKey, 'model': model, 'systemPrompt': systemPrompt, 'temperature': temperature, 'enableTools': enableTools, 'enableMemory': enableMemory, 'enableAutoLearn': enableAutoLearn, 'ttsEnabled': ttsEnabled, 'ttsRate': ttsRate, 'themeMode': themeMode, 'contextLimit': contextLimit, 'compressThresholdPercent': compressThresholdPercent, 'autoCompress': autoCompress, 'visionEnabled': visionEnabled, 'visionBaseUrl': visionBaseUrl, 'visionApiKey': visionApiKey, 'visionModel': visionModel};
+      {'baseUrl': baseUrl, 'apiKey': apiKey, 'model': model, 'systemPrompt': systemPrompt, 'temperature': temperature, 'enableTools': enableTools, 'enableMemory': enableMemory, 'enableAutoLearn': enableAutoLearn, 'ttsEnabled': ttsEnabled, 'ttsRate': ttsRate, 'themeMode': themeMode, 'contextLimit': contextLimit, 'compressThresholdPercent': compressThresholdPercent, 'autoCompress': autoCompress, 'visionEnabled': visionEnabled, 'visionBaseUrl': visionBaseUrl, 'visionApiKey': visionApiKey, 'visionModel': visionModel, 'enableNotifications': enableNotifications};
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
         baseUrl: j['baseUrl'] ?? 'https://api.openai.com/v1',
@@ -411,6 +429,7 @@ class AppSettings {
         visionBaseUrl: j['visionBaseUrl'] ?? '',
         visionApiKey: j['visionApiKey'] ?? '',
         visionModel: j['visionModel'] ?? '',
+        enableNotifications: j['enableNotifications'] ?? true,
       );
 }
 

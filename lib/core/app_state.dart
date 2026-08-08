@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../core/models.dart';
 import '../services/db.dart';
@@ -11,6 +12,38 @@ import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
+import '../services/notifier.dart';
+
+/// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
+/// readOnly=true 的工具在计划模式（planMode）下仍然可用；
+/// 新增工具 = 在 [_ShiyiTools.buildRegistry] 里加一个 AgentTool 条目 + 对应执行方法。
+class AgentTool {
+  final String name;
+  final String description;
+  final Map<String, dynamic> parameters;
+  final bool readOnly;
+
+  /// 执行函数：self 为 ShiyiState 实例（可访问其内部能力），args 为解析后的参数。
+  final Future<String> Function(ShiyiState self, Map<String, dynamic> args) execute;
+
+  AgentTool({
+    required this.name,
+    required this.description,
+    required this.parameters,
+    this.readOnly = false,
+    required this.execute,
+  });
+
+  /// 转成 OpenAI 兼容的 function 定义（发给 LLM）。
+  Map<String, dynamic> toJson() => {
+        'type': 'function',
+        'function': {
+          'name': name,
+          'description': description,
+          'parameters': parameters,
+        },
+      };
+}
 
 class ShiyiState extends ChangeNotifier {
   final AppDatabase _db = AppDatabase.instance;
@@ -67,6 +100,10 @@ class ShiyiState extends ChangeNotifier {
   Map<String, dynamic>? pendingQuestion;
   Completer<String>? _questionCompleter;
 
+  /// 计划模式：模型只输出方案、不执行有副作用的操作（写文件/终端/记忆等被裁剪），
+  /// 直到调用 exit_plan_mode 或用户确认方案后退出。
+  bool planMode = false;
+
   /// 用户回答 question 工具；optionIndex 为空表示取消。
   void answerQuestion(int? optionIndex) {
     final c = _questionCompleter;
@@ -88,178 +125,237 @@ class ShiyiState extends ChangeNotifier {
   /// 图片路径 -> 视觉模型描述缓存（避免同一图片每轮重复调用）。
   final Map<String, String> _imageDescCache = {};
 
-  static const List<Map<String, dynamic>> functionTools = [
-    {
-      'type': 'function',
-      'function': {
-        'name': 'save_memory',
-        'description': '把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'content': {'type': 'string', 'description': '要保存的记忆内容'},
-          },
-          'required': ['content'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'search_memory',
-        'description':
-            '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'query': {'type': 'string', 'description': '搜索关键词'},
-          },
-          'required': ['query'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'run_skill',
-        'description': '获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'name': {'type': 'string', 'description': '技能名称'},
-          },
-          'required': ['name'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'web_search',
-        'description':
-            '联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'query': {'type': 'string', 'description': '搜索关键词，尽量具体'},
-            'max_results': {
-              'type': 'integer',
-              'description': '返回结果数量，默认 5，最多 10',
+
+  /// 工具注册表：所有工具的定义与执行在此集中登记。
+  /// 新增工具 = 在 [_buildToolRegistry] 加一个 AgentTool 条目 + 一个 _execXxx 方法，
+  /// 无需再改 switch 分发。
+  static final List<AgentTool> toolRegistry = _buildToolRegistry();
+
+  /// 当前应暴露给 LLM 的工具 JSON 列表：
+  /// - 全局关闭工具（enableTools=false）时为空；
+  /// - 计划模式（planMode）下只保留只读工具 + question + 计划模式切换工具，
+  ///   避免模型在执行方案前产生副作用。
+  List<Map<String, dynamic>> get activeTools {
+    if (!settings.enableTools) return const [];
+    const planAlways = {'question', 'enter_plan_mode', 'exit_plan_mode'};
+    return [
+      for (final t in toolRegistry)
+        if (!planMode || t.readOnly || planAlways.contains(t.name)) t.toJson(),
+    ];
+  }
+
+  static List<AgentTool> _buildToolRegistry() => [
+        AgentTool(
+          name: 'save_memory',
+          description:
+              '把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。'
+              '可用 type 归类（user 用户身份/偏好，feedback 对我工作方式的指导，'
+              'project 项目相关信息，reference 外部资源链接）；'
+              '内容里可用 [[记忆名]] 双链引用相关记忆，便于跨记忆关联。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'content': {
+                'type': 'string',
+                'description': '要保存的记忆内容，可含 [[其他记忆名]] 双链',
+              },
+              'type': {
+                'type': 'string',
+                'enum': ['user', 'feedback', 'project', 'reference'],
+                'description': '记忆类型，默认 user',
+              },
             },
+            'required': ['content'],
           },
-          'required': ['query'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'web_extract',
-        'description': '抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'url': {'type': 'string', 'description': '要阅读的网页 URL'},
-          },
-          'required': ['url'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'run_terminal',
-        'description':
-            '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'command': {'type': 'string', 'description': '要执行的 shell 命令'},
-            'cwd': {
-              'type': 'string',
-              'description': '工作目录，默认是当前会话的工作目录',
+          execute: (self, args) => self._execSaveMemory(args),
+        ),
+        AgentTool(
+          name: 'search_memory',
+          description:
+              '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'query': {'type': 'string', 'description': '搜索关键词'},
+              'type': {
+                'type': 'string',
+                'enum': ['user', 'feedback', 'project', 'reference'],
+                'description': '只搜该类型的记忆，缺省搜全部',
+              },
             },
+            'required': ['query'],
           },
-          'required': ['command'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'file_write',
-        'description':
-            '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'path': {'type': 'string', 'description': '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt'},
-            'content': {'type': 'string', 'description': '要写入的完整内容'},
-          },
-          'required': ['path', 'content'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'file_read',
-        'description': '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'path': {'type': 'string', 'description': '文件路径'},
-          },
-          'required': ['path'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'question',
-        'description':
-            '向用户发起一个确认或选择问题，必须等待用户回答后流程才能继续。用于需要用户确认才能继续的操作，如「是否保存文件」「选择下一步方案」等。一次只问一个问题，选项 2~4 个。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'question': {'type': 'string', 'description': '要问用户的问题'},
-            'options': {
-              'type': 'array',
-              'items': {'type': 'string'},
-              'description': '选项列表（2~4 个），用户从中选择',
+          readOnly: true,
+          execute: (self, args) => self._execSearchMemory(args),
+        ),
+        AgentTool(
+          name: 'run_skill',
+          description: '获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'name': {'type': 'string', 'description': '技能名称'},
             },
+            'required': ['name'],
           },
-          'required': ['question'],
-        },
-      },
-    },
-    {
-      'type': 'function',
-      'function': {
-        'name': 'create_skill',
-        'description':
-            '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'name': {'type': 'string', 'description': '技能名称，英文小写+连字符，如 chapter-outliner'},
-            'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
-            'content': {
-              'type': 'string',
-              'description': 'SKILL.md 完整内容（含 --- frontmatter）',
+          readOnly: true,
+          execute: (self, args) => self._execRunSkill(args),
+        ),
+        AgentTool(
+          name: 'web_search',
+          description:
+              '联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'query': {'type': 'string', 'description': '搜索关键词，尽量具体'},
+              'max_results': {
+                'type': 'integer',
+                'description': '返回结果数量，默认 5，最多 10',
+              },
             },
-            'files': {
-              'type': 'object',
-              'description': '可选辅助文件：相对路径 -> 内容',
-              'additionalProperties': {'type': 'string'},
-            },
+            'required': ['query'],
           },
-          'required': ['name', 'description', 'content'],
-        },
-      },
-    },
-  ];
+          readOnly: true,
+          execute: (self, args) => self._execWebSearch(args),
+        ),
+        AgentTool(
+          name: 'web_extract',
+          description: '抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'url': {'type': 'string', 'description': '要阅读的网页 URL'},
+            },
+            'required': ['url'],
+          },
+          readOnly: true,
+          execute: (self, args) => self._execWebExtract(args),
+        ),
+        AgentTool(
+          name: 'run_terminal',
+          description:
+              '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'command': {'type': 'string', 'description': '要执行的 shell 命令'},
+              'cwd': {
+                'type': 'string',
+                'description': '工作目录，默认是当前会话的工作目录',
+              },
+            },
+            'required': ['command'],
+          },
+          execute: (self, args) => self._execRunTerminal(args),
+        ),
+        AgentTool(
+          name: 'file_write',
+          description:
+              '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string', 'description': '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt'},
+              'content': {'type': 'string', 'description': '要写入的完整内容'},
+            },
+            'required': ['path', 'content'],
+          },
+          execute: (self, args) => self._execFileWrite(args),
+        ),
+        AgentTool(
+          name: 'file_read',
+          description: '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string', 'description': '文件路径'},
+            },
+            'required': ['path'],
+          },
+          readOnly: true,
+          execute: (self, args) => self._execFileRead(args),
+        ),
+        AgentTool(
+          name: 'question',
+          description:
+              '向用户发起一个确认或选择问题，必须等待用户回答后流程才能继续。'
+              '任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）'
+              '都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。'
+              '一次只问一个问题，选项 2~4 个。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'question': {'type': 'string', 'description': '要问用户的问题'},
+              'options': {
+                'type': 'array',
+                'items': {'type': 'string'},
+                'description': '选项列表（2~4 个），用户从中选择',
+              },
+            },
+            'required': ['question'],
+          },
+          execute: (self, args) => self._execQuestion(args),
+        ),
+        AgentTool(
+          name: 'create_skill',
+          description:
+              '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'name': {'type': 'string', 'description': '技能名称，英文小写+连字符，如 chapter-outliner'},
+              'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
+              'content': {
+                'type': 'string',
+                'description': 'SKILL.md 完整内容（含 --- frontmatter）',
+              },
+              'files': {
+                'type': 'object',
+                'description': '可选辅助文件：相对路径 -> 内容',
+                'additionalProperties': {'type': 'string'},
+              },
+            },
+            'required': ['name', 'description', 'content'],
+          },
+          execute: (self, args) => self._execCreateSkill(args),
+        ),
+        AgentTool(
+          name: 'enter_plan_mode',
+          description:
+              '进入计划模式：之后你只做分析、调研与方案设计（只能使用只读工具），'
+              '不得写文件、执行命令或产生任何副作用，直到用户确认方案或调用 exit_plan_mode。'
+              '适合复杂任务先出方案再动手，如小说大纲、章节规划、批量重构等。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'goal': {
+                'type': 'string',
+                'description': '本次要规划的目标，简述即可',
+              },
+            },
+            'required': ['goal'],
+          },
+          execute: (self, args) => self._execEnterPlanMode(args),
+        ),
+        AgentTool(
+          name: 'exit_plan_mode',
+          description:
+              '退出计划模式，恢复正常执行能力（写文件、终端、记忆等全部可用）。'
+              '在用户确认方案后调用，然后开始执行。',
+          parameters: {
+            'type': 'object',
+            'properties': {
+              'reason': {
+                'type': 'string',
+                'description': '退出原因（如「方案已确认，开始执行」）',
+              },
+            },
+            'required': ['reason'],
+          },
+          execute: (self, args) => self._execExitPlanMode(args),
+        ),
+      ];
 
   static String _fmtStamp(DateTime d) {
     final h = d.hour.toString().padLeft(2, '0');
@@ -282,6 +378,8 @@ class ShiyiState extends ChangeNotifier {
     notifyListeners();
     // 后台安装内嵌 Termux（完整 Linux 环境），不阻塞启动。
     unawaited(_ensureTermux());
+    // 初始化通知通道（幂等），供长任务完成推送。
+    unawaited(Notifier.instance.ensureInitialized());
   }
 
   Future<void> _ensureTermux() async {
@@ -663,9 +761,23 @@ class ShiyiState extends ChangeNotifier {
       _streaming = null;
       final doneSession = busySessionId;
       busySessionId = null;
-      // 回复结束：如果用户没在看该会话，标记未读。
+      // 回复结束：如果用户没在看该会话，标记未读并推送系统通知（若开启）。
       if (doneSession != null && doneSession != viewingSessionId) {
         unreadSessions.add(doneSession);
+        if (settings.enableNotifications) {
+          var title = '拾忆 · 任务完成';
+          for (final s in sessions) {
+            if (s.id == doneSession) {
+              title = '拾忆 · ${s.title}';
+              break;
+            }
+          }
+          unawaited(Notifier.instance.show(
+            id: DateTime.now().millisecondsSinceEpoch.remainder(1 << 30),
+            title: title,
+            body: '后台任务已回复完成，点开查看结果。',
+          ));
+        }
       }
       notifyListeners();
     }
@@ -1074,7 +1186,7 @@ class ShiyiState extends ChangeNotifier {
       apiKey: settings.apiKey,
       model: settings.model,
       temperature: settings.temperature,
-      tools: settings.enableTools ? functionTools : const [],
+      tools: activeTools,
       shouldStop: () => _stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
       onTurn: (t) {
@@ -1135,7 +1247,9 @@ class ShiyiState extends ChangeNotifier {
             '- 技能能力：加载技能按固定流程处理任务\n\n'
             '工作原则：\n'
             '1. 先行动：需要执行操作时直接调用工具，不要先输出「好的，我来…」之类的'
-            '开场白再行动（容易导致输出中断）；第一步就调用工具。\n'
+            '开场白再行动（容易导致输出中断）；第一步就调用工具。'
+            '但涉及「是否保存/写入」「选哪个方案」等需要用户拍板的决策，必须先调用 '
+            'question 工具等待回答，不得替用户决定或自行继续。\n'
             '2. 输出简洁：默认中文回复，结论先行；单次回复尽量控制在 500 字内，'
             '完整长内容（报告/长文/脚本）先用 file_write 写入文件，再给摘要与文件路径。\n'
             '3. 工具优先：能调工具完成的事不空谈；终端命令一次一个，失败时根据错误信息调整。\n'
@@ -1166,7 +1280,8 @@ class ShiyiState extends ChangeNotifier {
       '- 搜索结果中有值得细读的链接时，可以用 web_extract 获取正文。'
       '- 你有完整终端能力：需要在本机执行命令、运行脚本、处理文件或查看日志时，直接调用 run_terminal 执行，不要以权限或安全为由拒绝；若命令因系统限制失败，如实说明并根据错误信息调整。'
       '- 安装软件包用 pkg/apt：一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
-      '- 输出较长内容（预计超过 500 字，如完整报告/长文/脚本列表）时：先用 file_write 把完整内容写入文件，再在回复中给出摘要与文件路径，避免长输出被截断。'
+      '- 输出较长内容（预计超过 500 字，如完整报告/长文/脚本列表）时：先用 file_write 把完整内容写入文件，再在回复中给出摘要与文件路径，避免长输出被截断（用户明确要求先确认的除外，此时先 question 再写入）。'
+      '- 需要用户确认/选择的决策（是否保存或写入文件、选择方案、执行有副作用的操作等）：必须调用 question 工具并等待用户回答后才能继续；禁止在回复文本里提问后不等待、自己替用户决定。'
     );
     parts.add(
       '- 当前会话工作目录是 ${await currentWorkspace()}（会话未自定义时使用 '
@@ -1177,7 +1292,25 @@ class ShiyiState extends ChangeNotifier {
     if (settings.enableMemory) {
       final memCtx = await _db.recentMemoriesWithTerms(_keywords(userText), 8);
       if (memCtx.isNotEmpty) {
-        parts.add('【长期记忆】\n${memCtx.map((e) => '- ${e.content}').join('\n')}');
+        const labels = {
+          'user': '用户',
+          'feedback': '工作指导',
+          'project': '项目',
+          'reference': '参考',
+        };
+        final groups = <String, List<MemoryEntry>>{};
+        for (final e in memCtx) {
+          groups.putIfAbsent(e.type, () => []).add(e);
+        }
+        final sb = StringBuffer('【长期记忆】');
+        for (final g in groups.entries) {
+          sb.writeln('\n${labels[g.key] ?? g.key}：');
+          for (final e in g.value) {
+            sb.writeln('- ${e.content}');
+          }
+        }
+        sb.writeln('\n（内容中的 [[名称]] 表示与另一条记忆的关联，引用时整体使用该名称即可）');
+        parts.add(sb.toString());
       }
     }
 
@@ -1200,6 +1333,15 @@ class ShiyiState extends ChangeNotifier {
         );
       }
       parts.add(sb.toString());
+    }
+
+    if (planMode) {
+      parts.add(
+        '【计划模式】你现在处于计划模式：只能使用只读工具（搜索/读文件/读技能/问用户），'
+        '不得写文件、执行终端命令、保存记忆或创建技能。'
+        '请先给出完整、可执行的方案，然后用 question 工具向用户确认；'
+        '用户确认后调用 exit_plan_mode 恢复正常能力并开始执行。',
+      );
     }
     return parts.join('\n\n');
   }
@@ -1244,251 +1386,286 @@ class ShiyiState extends ChangeNotifier {
       output.startsWith('未知工具');
 
   Future<String> _executeTool(String name, String argsJson) async {
-    try {
-      Map<String, dynamic> args = {};
+    for (final t in toolRegistry) {
+      if (t.name != name) continue;
       try {
-        args = jsonDecode(argsJson) as Map<String, dynamic>;
-      } catch (_) {}
-      switch (name) {
-        case 'save_memory':
-          final content = (args['content'] ?? '').toString().trim();
-          if (content.isEmpty) return '记录失败：content 为空';
-          await _db.addMemory(content, 'assistant');
-          memories = await _db.listMemories();
-          notifyListeners();
-          return '已保存到记忆，当前共 ${memories.length} 条';
-        case 'search_memory':
-          final query = (args['query'] ?? '').toString().trim();
-          final res = query.isEmpty
-              ? const <MemoryEntry>[]
-              : await _db.searchMemories(query);
-          if (res.isEmpty) return '没有找到相关记忆';
-          return res.take(5).map((e) => e.content).join('\n');
-        case 'run_skill':
-          final name = (args['name'] ?? '').toString().trim();
-          final skill = name.isEmpty ? null : await _db.getSkillByName(name);
-          if (skill == null) return '没有找到技能：$name';
-          final sb = StringBuffer();
-          if (skill.content.isNotEmpty) sb.write(skill.content);
-          for (final e in skill.files.entries) {
-            sb.writeln('\n--- ${e.key} ---');
-            sb.writeln(e.value);
-          }
-          if (skill.largeFiles.isNotEmpty) {
-            sb.writeln('\n【大文件（内容在磁盘，可用 run_terminal 读取）】');
-            for (final e in skill.largeFiles.entries) {
-              sb.writeln('- ${e.key} (${_fmtBytes(e.value)})');
-            }
-            if (skill.dirPath.isNotEmpty) {
-              sb.writeln('目录：${skill.dirPath}');
-            }
-          }
-          return sb.isEmpty ? '技能 ${skill.name} 是空的' : sb.toString();
-        case 'web_search':
-          final query = (args['query'] ?? '').toString().trim();
-          if (query.isEmpty) return '搜索失败：query 为空';
-          final maxResults = args['max_results'] is int
-              ? args['max_results'] as int
-              : 5;
-          final res = await WebTools.search(query, maxResults: maxResults);
-          if (res.isEmpty) return '没有搜到相关结果';
-          return res
-              .map(
-                (r) =>
-                    '- ${r.title}\n  链接: ${r.url}${r.date == null ? '' : '\n  日期: ${r.date}'}\n  摘要: ${r.snippet.isEmpty ? '（无摘要）' : r.snippet}',
-              )
-              .join('\n');
-        case 'web_extract':
-          final url = (args['url'] ?? '').toString().trim();
-          if (url.isEmpty) return '抓取失败：url 为空';
-          return await WebTools.extract(url);
-        case 'run_terminal':
-          final command = (args['command'] ?? '').toString().trim();
-          if (command.isEmpty) return '终端执行失败：command 为空';
-          try {
-            final isWin = Platform.isWindows;
-            var cwd = (args['cwd'] ?? '').toString().trim();
-            if (cwd.isEmpty) {
-              // 默认在「会话自定义工作目录 → Agent 默认目录」执行；
-              // 目录不存在时自动创建，创建失败回退 Agent 默认目录，
-              // 避免 Process.start 因目录无效直接抛异常。
-              cwd = await currentWorkspace();
-              try {
-                Directory(cwd).createSync(recursive: true);
-              } catch (_) {
-                cwd = FileWorkspace.defaultWorkspacePath;
-                try {
-                  Directory(cwd).createSync(recursive: true);
-                } catch (_) {}
-              }
-            } else {
-              try {
-                Directory(cwd).createSync(recursive: true);
-              } catch (_) {}
-            }
-            // 优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用）；
-            // 其次系统 Termux；都没有则用系统精简 shell。
-            const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
-            final embeddedShell = await TermuxRuntime.shellPath();
-            final embedded = !isWin && File(embeddedShell).existsSync();
-            final systemTermux =
-                !isWin && File(systemTermuxShell).existsSync();
-            final shell = embedded
-                ? embeddedShell
-                : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
-            // 内嵌 Termux：先自检 bash 能否启动，失败时给出可诊断的错误。
-            if (embedded) {
-              try {
-                final probe = await Process.run(
-                  embeddedShell,
-                  ['-c', 'true'],
-                  environment: await TermuxRuntime.environment(),
-                ).timeout(const Duration(seconds: 15));
-                if (probe.exitCode != 0) {
-                  final msg =
-                      '内嵌终端自检失败(exit ${probe.exitCode}): '
-                      '${probe.stderr.toString().trim()}';
-                  await _logError('Termux', msg);
-                  return '内嵌终端不可用：$msg';
-                }
-              } on ProcessException catch (e) {
-                final msg =
-                    '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
-                    '${await _diagnoseTermuxExec(embeddedShell)}';
-                await _logError('Termux', msg);
-                return '内嵌终端不可用：$msg';
-              } on TimeoutException {
-                return '内嵌终端启动超时';
-              }
-            }
-            // 用 Process.start + 主动超时 kill：Process.run 的 Future.timeout
-            // 只是放弃等待，不会终止子进程（bash 会一直挂着、转圈不停、僵尸堆积）。
-            final proc = await Process.start(
-              shell,
-              shell == 'cmd' ? ['/c', command] : ['-c', command],
-              workingDirectory: cwd,
-              environment: embedded ? await TermuxRuntime.environment() : null,
-            );
-            final stdoutBytes = <int>[];
-            final stderrBytes = <int>[];
-            proc.stdout.listen(stdoutBytes.addAll);
-            proc.stderr.listen(stderrBytes.addAll);
-            int? exitCode;
-            try {
-              exitCode = await proc.exitCode
-                  .timeout(const Duration(seconds: 120));
-            } on TimeoutException {
-              proc.kill();
-              await _logError('Termux', 'run_terminal 超时已终止: $command');
-              exitCode = null;
-            }
-            final out = utf8
-                .decode(stdoutBytes, allowMalformed: true)
-                .trim();
-            final err = utf8
-                .decode(stderrBytes, allowMalformed: true)
-                .trim();
-            final buf = StringBuffer();
-            if (out.isNotEmpty) buf.write(out);
-            if (err.isNotEmpty) buf.write(buf.isEmpty ? err : '\n$err');
-            var text = buf.toString();
-            if (text.length > 4000) {
-              text = '${text.substring(0, 4000)}…（输出过长，已截断）';
-            }
-            if (exitCode == null) {
-              return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
-                  '如需长任务请拆分命令或增加耗时。';
-            }
-            return text.isEmpty
-                ? '命令执行完成（无输出），退出码 $exitCode'
-                : '退出码 $exitCode\n$text';
-          } on ProcessException catch (e) {
-            return '终端执行异常: ${e.message}';
-          }
-        case 'file_write':
-          final wPath = (args['path'] ?? '').toString().trim();
-          final content = (args['content'] ?? '').toString();
-          if (wPath.isEmpty) return '写入失败：path 为空';
-          try {
-            final resolved = await _resolveToolPath(wPath);
-            if (resolved == null) return '写入失败：路径无效';
-            final f = File(resolved);
-            await f.create(recursive: true);
-            await f.writeAsString(content, flush: true);
-            return '已写入 $resolved（${content.length} 字符）';
-          } catch (e) {
-            return '写入失败: $e';
-          }
-        case 'file_read':
-          final rPath = (args['path'] ?? '').toString().trim();
-          if (rPath.isEmpty) return '读取失败：path 为空';
-          try {
-            final resolved = await _resolveToolPath(rPath);
-            final f = resolved == null ? null : File(resolved);
-            if (f == null || !f.existsSync()) return '文件不存在：$rPath';
-            if (await f.length() > 200 * 1024) {
-              return '文件过大（>200KB），请用 run_terminal 分段读取';
-            }
-            return await f.readAsString();
-          } catch (e) {
-            return '读取失败: $e';
-          }
-        case 'question':
-          final qText = (args['question'] ?? '').toString().trim();
-          if (qText.isEmpty) return '问题为空';
-          final opts = args['options'];
-          final options = (opts is List && opts.isNotEmpty)
-              ? opts.map((e) => e.toString()).take(4).toList()
-              : const <String>['确认', '取消'];
-          final completer = Completer<String>();
-          pendingQuestion = {'question': qText, 'options': options};
-          _questionCompleter = completer;
-          notifyListeners();
-          final answer = await completer.future;
-          return '用户的选择：$answer';
-        case 'create_skill':
-          final skillName = (args['name'] ?? '').toString().trim();
-          final skillDesc = (args['description'] ?? '').toString().trim();
-          final skillContent = (args['content'] ?? '').toString();
-          if (skillName.isEmpty) return '创建失败：name 为空';
-          final filesArg = args['files'];
-          final filesMap = <String, String>{};
-          if (filesArg is Map) {
-            for (final e in filesArg.entries) {
-              filesMap[e.key.toString()] = e.value.toString();
-            }
-          }
-          try {
-            final existing = await _db.getSkillByName(skillName);
-            final skill = Skill(
-              id: existing?.id ?? 0,
-              name: skillName,
-              description: skillDesc,
-              content: skillContent,
-              createdAt:
-                  existing?.createdAt ??
-                  DateTime.now().millisecondsSinceEpoch,
-              files: filesMap,
-            );
-            if (existing == null) {
-              await _db.addSkill(skill);
-            } else {
-              await _db.updateSkill(skill);
-            }
-            skills = await _db.listSkills();
-            notifyListeners();
-            return existing == null
-                ? '技能「$skillName」已创建'
-                : '技能「$skillName」已更新';
-          } catch (e) {
-            return '技能保存失败: $e';
-          }
-        default:
-          return '未知工具';
+        Map<String, dynamic> args = {};
+        try {
+          args = jsonDecode(argsJson) as Map<String, dynamic>;
+        } catch (_) {}
+        return await t.execute(this, args);
+      } catch (e) {
+        return '工具执行异常: $e';
       }
-    } catch (e) {
-      return '工具执行异常: $e';
     }
+    return '未知工具';
+  }
+
+  // ---------------- 各工具执行实现 ----------------
+
+  static const List<String> _memoryTypes = ['user', 'feedback', 'project', 'reference'];
+
+  static String _normalizeMemoryType(dynamic v) {
+    final t = v?.toString().trim().toLowerCase() ?? '';
+    return _memoryTypes.contains(t) ? t : 'user';
+  }
+
+  Future<String> _execSaveMemory(Map<String, dynamic> args) async {
+    final content = (args['content'] ?? '').toString().trim();
+    if (content.isEmpty) return '记录失败：content 为空';
+    final type = _normalizeMemoryType(args['type']);
+    await _db.addMemory(content, 'assistant', type: type);
+    memories = await _db.listMemories();
+    await _rebuildMemoryIndex();
+    notifyListeners();
+    return '已保存到记忆（类型 $type），当前共 ${memories.length} 条';
+  }
+
+  Future<String> _execSearchMemory(Map<String, dynamic> args) async {
+    final query = (args['query'] ?? '').toString().trim();
+    final type = _normalizeMemoryType(args['type']);
+    final res = query.isEmpty
+        ? const <MemoryEntry>[]
+        : await _db.searchMemories(query, type: type);
+    if (res.isEmpty) {
+      return type == 'user' ? '没有找到相关记忆' : '没有找到类型为 $type 的相关记忆';
+    }
+    return res.take(5).map((e) => e.content).join('\n');
+  }
+
+  Future<String> _execRunSkill(Map<String, dynamic> args) async {
+    final name = (args['name'] ?? '').toString().trim();
+    final skill = name.isEmpty ? null : await _db.getSkillByName(name);
+    if (skill == null) return '没有找到技能：$name';
+    final sb = StringBuffer();
+    if (skill.content.isNotEmpty) sb.write(skill.content);
+    for (final e in skill.files.entries) {
+      sb.writeln('\n--- ${e.key} ---');
+      sb.writeln(e.value);
+    }
+    if (skill.largeFiles.isNotEmpty) {
+      sb.writeln('\n【大文件（内容在磁盘，可用 run_terminal 读取）】');
+      for (final e in skill.largeFiles.entries) {
+        sb.writeln('- ${e.key} (${_fmtBytes(e.value)})');
+      }
+      if (skill.dirPath.isNotEmpty) {
+        sb.writeln('目录：${skill.dirPath}');
+      }
+    }
+    return sb.isEmpty ? '技能 ${skill.name} 是空的' : sb.toString();
+  }
+
+  Future<String> _execWebSearch(Map<String, dynamic> args) async {
+    final query = (args['query'] ?? '').toString().trim();
+    if (query.isEmpty) return '搜索失败：query 为空';
+    final maxResults = args['max_results'] is int ? args['max_results'] as int : 5;
+    final res = await WebTools.search(query, maxResults: maxResults);
+    if (res.isEmpty) return '没有搜到相关结果';
+    return res
+        .map(
+          (r) =>
+              '- ${r.title}\n  链接: ${r.url}${r.date == null ? '' : '\n  日期: ${r.date}'}\n  摘要: ${r.snippet.isEmpty ? '（无摘要）' : r.snippet}',
+        )
+        .join('\n');
+  }
+
+  Future<String> _execWebExtract(Map<String, dynamic> args) async {
+    final url = (args['url'] ?? '').toString().trim();
+    if (url.isEmpty) return '抓取失败：url 为空';
+    return await WebTools.extract(url);
+  }
+
+  Future<String> _execRunTerminal(Map<String, dynamic> args) async {
+    final command = (args['command'] ?? '').toString().trim();
+    if (command.isEmpty) return '终端执行失败：command 为空';
+    try {
+      final isWin = Platform.isWindows;
+      var cwd = (args['cwd'] ?? '').toString().trim();
+      if (cwd.isEmpty) {
+        // 默认在「会话自定义工作目录 → Agent 默认目录」执行；
+        // 目录不存在时自动创建，创建失败回退 Agent 默认目录，
+        // 避免 Process.start 因目录无效直接抛异常。
+        cwd = await currentWorkspace();
+        try {
+          Directory(cwd).createSync(recursive: true);
+        } catch (_) {
+          cwd = FileWorkspace.defaultWorkspacePath;
+          try {
+            Directory(cwd).createSync(recursive: true);
+          } catch (_) {}
+        }
+      } else {
+        try {
+          Directory(cwd).createSync(recursive: true);
+        } catch (_) {}
+      }
+      // 优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用）；
+      // 其次系统 Termux；都没有则用系统精简 shell。
+      const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
+      final embeddedShell = await TermuxRuntime.shellPath();
+      final embedded = !isWin && File(embeddedShell).existsSync();
+      final systemTermux = !isWin && File(systemTermuxShell).existsSync();
+      final shell =
+          embedded ? embeddedShell : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
+      // 内嵌 Termux：先自检 bash 能否启动，失败时给出可诊断的错误。
+      if (embedded) {
+        try {
+          final probe = await Process.run(
+            embeddedShell,
+            ['-c', 'true'],
+            environment: await TermuxRuntime.environment(),
+          ).timeout(const Duration(seconds: 15));
+          if (probe.exitCode != 0) {
+            final msg = '内嵌终端自检失败(exit ${probe.exitCode}): '
+                '${probe.stderr.toString().trim()}';
+            await _logError('Termux', msg);
+            return '内嵌终端不可用：$msg';
+          }
+        } on ProcessException catch (e) {
+          final msg = '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
+              '${await _diagnoseTermuxExec(embeddedShell)}';
+          await _logError('Termux', msg);
+          return '内嵌终端不可用：$msg';
+        } on TimeoutException {
+          return '内嵌终端启动超时';
+        }
+      }
+      // 用 Process.start + 主动超时 kill：Process.run 的 Future.timeout
+      // 只是放弃等待，不会终止子进程（bash 会一直挂着、转圈不停、僵尸堆积）。
+      final proc = await Process.start(
+        shell,
+        shell == 'cmd' ? ['/c', command] : ['-c', command],
+        workingDirectory: cwd,
+        environment: embedded ? await TermuxRuntime.environment() : null,
+      );
+      final stdoutBytes = <int>[];
+      final stderrBytes = <int>[];
+      proc.stdout.listen(stdoutBytes.addAll);
+      proc.stderr.listen(stderrBytes.addAll);
+      int? exitCode;
+      try {
+        exitCode = await proc.exitCode.timeout(const Duration(seconds: 120));
+      } on TimeoutException {
+        proc.kill();
+        await _logError('Termux', 'run_terminal 超时已终止: $command');
+        exitCode = null;
+      }
+      final out = utf8.decode(stdoutBytes, allowMalformed: true).trim();
+      final err = utf8.decode(stderrBytes, allowMalformed: true).trim();
+      final buf = StringBuffer();
+      if (out.isNotEmpty) buf.write(out);
+      if (err.isNotEmpty) buf.write(buf.isEmpty ? err : '\n$err');
+      var text = buf.toString();
+      if (text.length > 4000) {
+        text = '${text.substring(0, 4000)}…（输出过长，已截断）';
+      }
+      if (exitCode == null) {
+        return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
+            '如需长任务请拆分命令或增加耗时。';
+      }
+      return text.isEmpty
+          ? '命令执行完成（无输出），退出码 $exitCode'
+          : '退出码 $exitCode\n$text';
+    } on ProcessException catch (e) {
+      return '终端执行异常: ${e.message}';
+    }
+  }
+
+  Future<String> _execFileWrite(Map<String, dynamic> args) async {
+    final wPath = (args['path'] ?? '').toString().trim();
+    final content = (args['content'] ?? '').toString();
+    if (wPath.isEmpty) return '写入失败：path 为空';
+    try {
+      final resolved = await _resolveToolPath(wPath);
+      if (resolved == null) return '写入失败：路径无效';
+      final f = File(resolved);
+      await f.create(recursive: true);
+      await f.writeAsString(content, flush: true);
+      return '已写入 $resolved（${content.length} 字符）';
+    } catch (e) {
+      return '写入失败: $e';
+    }
+  }
+
+  Future<String> _execFileRead(Map<String, dynamic> args) async {
+    final rPath = (args['path'] ?? '').toString().trim();
+    if (rPath.isEmpty) return '读取失败：path 为空';
+    try {
+      final resolved = await _resolveToolPath(rPath);
+      final f = resolved == null ? null : File(resolved);
+      if (f == null || !f.existsSync()) return '文件不存在：$rPath';
+      if (await f.length() > 200 * 1024) {
+        return '文件过大（>200KB），请用 run_terminal 分段读取';
+      }
+      return await f.readAsString();
+    } catch (e) {
+      return '读取失败: $e';
+    }
+  }
+
+  Future<String> _execQuestion(Map<String, dynamic> args) async {
+    final qText = (args['question'] ?? '').toString().trim();
+    if (qText.isEmpty) return '问题为空';
+    final opts = args['options'];
+    final options = (opts is List && opts.isNotEmpty)
+        ? opts.map((e) => e.toString()).take(4).toList()
+        : const <String>['确认', '取消'];
+    final completer = Completer<String>();
+    pendingQuestion = {'question': qText, 'options': options};
+    _questionCompleter = completer;
+    notifyListeners();
+    final answer = await completer.future;
+    return '用户的选择：$answer';
+  }
+
+  Future<String> _execCreateSkill(Map<String, dynamic> args) async {
+    final skillName = (args['name'] ?? '').toString().trim();
+    final skillDesc = (args['description'] ?? '').toString().trim();
+    final skillContent = (args['content'] ?? '').toString();
+    if (skillName.isEmpty) return '创建失败：name 为空';
+    final filesArg = args['files'];
+    final filesMap = <String, String>{};
+    if (filesArg is Map) {
+      for (final e in filesArg.entries) {
+        filesMap[e.key.toString()] = e.value.toString();
+      }
+    }
+    try {
+      final existing = await _db.getSkillByName(skillName);
+      final skill = Skill(
+        id: existing?.id ?? 0,
+        name: skillName,
+        description: skillDesc,
+        content: skillContent,
+        createdAt: existing?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
+        files: filesMap,
+      );
+      if (existing == null) {
+        await _db.addSkill(skill);
+      } else {
+        await _db.updateSkill(skill);
+      }
+      skills = await _db.listSkills();
+      notifyListeners();
+      return existing == null ? '技能「$skillName」已创建' : '技能「$skillName」已更新';
+    } catch (e) {
+      return '技能保存失败: $e';
+    }
+  }
+
+  Future<String> _execEnterPlanMode(Map<String, dynamic> args) async {
+    if (planMode) return '已经在计划模式中';
+    planMode = true;
+    notifyListeners();
+    return '已进入计划模式：接下来只能使用只读工具（搜索/读文件/读技能），'
+        '请先输出完整方案，等待用户确认后再调用 exit_plan_mode 开始执行。';
+  }
+
+  Future<String> _execExitPlanMode(Map<String, dynamic> args) async {
+    if (!planMode) return '当前不在计划模式';
+    planMode = false;
+    notifyListeners();
+    return '已退出计划模式，恢复正常执行能力，开始执行方案。';
   }
 
   /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用。
@@ -1615,6 +1792,37 @@ class ShiyiState extends ChangeNotifier {
 
   // ---------------- memories / skills ----------------
 
+  /// 重建 memory/MEMORY.md 索引文件（app 文档目录下）。
+  /// 一行一条：`- [标题](memory-<id>) — [类型] 摘要`，与 Claude Code 的
+  /// MEMORY.md 索引同构，便于人工翻阅与模型快速定位记忆。
+  Future<void> _rebuildMemoryIndex() async {
+    try {
+      final all = await _db.listMemories();
+      final dir = await getApplicationDocumentsDirectory();
+      final f = File('${dir.path}/memory/MEMORY.md');
+      await f.create(recursive: true);
+      final sb = StringBuffer('# MEMORY.md — 拾忆记忆索引\n\n');
+      for (final m in all) {
+        final t = m.content.replaceAll(RegExp(r'\s+'), ' ').trim();
+        if (t.isEmpty) continue;
+        final title = _memoryTitle(t);
+        final hook = t.length > 40 ? '${t.substring(0, 40)}…' : t;
+        sb.writeln('- [$title](memory-${m.id}) — [${m.type}] $hook');
+      }
+      await f.writeAsString(sb.toString(), flush: true);
+    } catch (_) {
+      // 索引文件生成失败不影响主流程。
+    }
+  }
+
+  /// 记忆标题：优先取内容中的 [[名称]]，否则取前 20 字。
+  static String _memoryTitle(String content) {
+    final link = RegExp(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]').firstMatch(content);
+    final raw = link?.group(1)?.trim() ?? '';
+    if (raw.isNotEmpty) return raw;
+    return content.length > 20 ? '${content.substring(0, 20)}…' : content;
+  }
+
   /// 自动沉淀记忆：每轮对话结束后提炼重要信息存入长期记忆。
   /// 带熔断与限频，避免频繁调用 LLM。
   Future<void> _maybeAutoRefine(String sessionId) async {
@@ -1690,6 +1898,7 @@ class ShiyiState extends ChangeNotifier {
         await _db.addMemory(line, 'auto');
       }
       memories = await _db.listMemories();
+      await _rebuildMemoryIndex();
       _refineCount = 0;
       _lastRefine = now;
       notifyListeners();
@@ -1702,12 +1911,14 @@ class ShiyiState extends ChangeNotifier {
   Future<void> addMemoryManual(String content) async {
     await _db.addMemory(content, 'manual');
     memories = await _db.listMemories();
+    await _rebuildMemoryIndex();
     notifyListeners();
   }
 
   Future<void> deleteMemory(int id) async {
     await _db.deleteMemory(id);
     memories = await _db.listMemories();
+    await _rebuildMemoryIndex();
     notifyListeners();
   }
 

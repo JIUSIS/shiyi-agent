@@ -29,6 +29,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _tools = true;
   bool _memory = true;
   bool _autoLearn = true;
+  bool _notifications = true;
   double _ttsRate = 1.0;
   String _themeMode = 'dark';
   int _contextLimit = 128000;
@@ -60,6 +61,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _tools = s.enableTools;
     _memory = s.enableMemory;
     _autoLearn = s.enableAutoLearn;
+    _notifications = s.enableNotifications;
     _ttsRate = s.ttsRate;
     _themeMode = s.themeMode;
     _contextLimit = s.contextLimit;
@@ -169,6 +171,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         enableTools: _tools,
         enableMemory: _memory,
         enableAutoLearn: _autoLearn,
+        enableNotifications: _notifications,
         ttsRate: _ttsRate,
         themeMode: _themeMode,
         contextLimit: _contextLimit,
@@ -817,6 +820,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 value: _autoLearn,
                 onChanged: (v) {
                   setState(() => _autoLearn = v);
+                  _autoSave();
+                },
+              ),
+              SwitchListTile(
+                secondary: const Icon(Icons.notifications_outlined),
+                title: const Text('任务完成通知'),
+                subtitle: const Text('切走会话/后台运行时，任务完成后推送系统通知'),
+                value: _notifications,
+                onChanged: (v) {
+                  setState(() => _notifications = v);
                   _autoSave();
                 },
               ),

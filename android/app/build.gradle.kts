@@ -33,6 +33,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // flutter_local_notifications 10+ 要求启用 core library desugaring
+        //（即使不用 scheduled notifications 也需要）。
+        isCoreLibraryDesugaringEnabled = true
     }
 
     defaultConfig {
@@ -70,6 +73,11 @@ kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
+}
+
+dependencies {
+    // flutter_local_notifications 10+ 的 core library desugaring 支持库。
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
 
 flutter {

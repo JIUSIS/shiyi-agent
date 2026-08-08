@@ -906,6 +906,11 @@ class _ChatScreenState extends State<ChatScreen>
                           onRemove: () => widget.shiyi.loadSkill(null),
                         ),
                       ),
+                      ListenableBuilder(
+                        listenable: widget.shiyi,
+                        builder: (context, _) =>
+                            _PlanModeChip(planMode: widget.shiyi.planMode),
+                      ),
                       // 当前会话项目目录条：点击可修改。
                       GestureDetector(
                         onTap: _pickWorkspace,
@@ -1348,6 +1353,44 @@ class _LoadedSkillChip extends StatelessWidget {
             child: const Padding(
               padding: EdgeInsets.all(2),
               child: Icon(Icons.close, size: 15),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 计划模式指示条（输入栏上方）：提示当前处于只读计划阶段。
+class _PlanModeChip extends StatelessWidget {
+  final bool planMode;
+  const _PlanModeChip({required this.planMode});
+
+  @override
+  Widget build(BuildContext context) {
+    if (!planMode) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.engineering_outlined,
+              size: 15, color: theme.colorScheme.onTertiaryContainer),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              '计划模式：只读 · 先出方案，确认后再执行',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.onTertiaryContainer,
+              ),
             ),
           ),
         ],

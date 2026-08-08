@@ -18,7 +18,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     _db = await openDatabase(
       join(dir.path, 'shiyi_agent.db'),
-      version: 10,
+      version: 11,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
     );
@@ -150,6 +150,13 @@ Future<void> _upgrade(Database db, int oldV, int newV) async {
     final cols = await db.rawQuery('PRAGMA table_info(messages)');
     if (!cols.any((c) => c['name'] == 'reasoning')) {
       await db.execute('ALTER TABLE messages ADD COLUMN reasoning TEXT');
+    }
+  }
+  // v10 -> v11：memories 表加 type 列（user/feedback/project/reference，默认 user）。
+  if (oldV < 11) {
+    final cols = await db.rawQuery('PRAGMA table_info(memories)');
+    if (!cols.any((c) => c['name'] == 'type')) {
+      await db.execute("ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'user'");
     }
   }
 }
@@ -311,10 +318,15 @@ Future<void> _pruneOversizedSkills(Database db) async {
   }
 
   // ---- memories ----
-  Future<int> addMemory(String content, String source) async {
+  Future<int> addMemory(String content, String source, {String type = 'user'}) async {
     final db = await this.db;
     return db.insert('memories',
-        {'content': content, 'source': source, 'created_at': DateTime.now().millisecondsSinceEpoch},
+        {
+          'content': content,
+          'source': source,
+          'type': type,
+          'created_at': DateTime.now().millisecondsSinceEpoch,
+        },
         conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
@@ -329,11 +341,16 @@ Future<void> _pruneOversizedSkills(Database db) async {
     return rows.map(MemoryEntry.fromMap).toList();
   }
 
-  Future<List<MemoryEntry>> searchMemories(String query) async {
+  Future<List<MemoryEntry>> searchMemories(String query, {String? type}) async {
     final db = await this.db;
+    final where = type == null || type.isEmpty
+        ? 'content LIKE ?'
+        : 'content LIKE ? AND type = ?';
+    final args = type == null || type.isEmpty
+        ? <Object>['%$query%']
+        : <Object>['%$query%', type];
     final rows = await db.query('memories',
-        where: 'content LIKE ?', whereArgs: ['%$query%'], orderBy: 'created_at DESC',
-        limit: 50);
+        where: where, whereArgs: args, orderBy: 'created_at DESC', limit: 50);
     return rows.map(MemoryEntry.fromMap).toList();
   }
 
