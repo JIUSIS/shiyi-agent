@@ -692,8 +692,16 @@ class ShiyiState extends ChangeNotifier {
     var completed = false;
     for (var attempt = 0; attempt < 2 && !completed; attempt++) {
       try {
+        // 第二次尝试注入「直接行动」指令：上一轮常见的问题是模型
+        // 输出开场白（以冒号结尾）后就结束、不调用任何工具，重试时强制它行动。
+        final sysContent = attempt == 0
+            ? systemPrompt
+            : '$systemPrompt\n\n'
+                '【注意：上一轮回复以冒号结尾就结束了，没有调用任何工具。'
+                '这次请直接调用工具完成用户请求：不要输出开场白、承诺或计划性文字，'
+                '第一步就调用 run_terminal（或相关工具）执行实际操作。】';
         final loopMsgs = <Map<String, dynamic>>[
-          {'role': 'system', 'content': systemPrompt},
+          {'role': 'system', 'content': sysContent},
           ...await _historyToApi(messages, imagesAllowed: imagesAllowed),
         ];
         await _runAgentLoop(sessionId, firstAsst, loopMsgs);

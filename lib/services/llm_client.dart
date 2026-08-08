@@ -256,7 +256,6 @@ class LlmClient {
       final looksHalfCut = reasoning.isNotEmpty &&
           t.isNotEmpty &&
           toolBuf.isEmpty &&
-          !doneReceived &&
           (t.endsWith('：') ||
               t.endsWith(':') ||
               t.endsWith('，') ||
