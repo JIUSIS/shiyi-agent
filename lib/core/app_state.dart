@@ -1293,19 +1293,32 @@ class ShiyiState extends ChangeNotifier {
                 return '内嵌终端启动超时';
               }
             }
-            final result = await Process.run(
+            // 用 Process.start + 主动超时 kill：Process.run 的 Future.timeout
+            // 只是放弃等待，不会终止子进程（bash 会一直挂着、转圈不停、僵尸堆积）。
+            final proc = await Process.start(
               shell,
               shell == 'cmd' ? ['/c', command] : ['-c', command],
               workingDirectory: cwd,
               environment: embedded ? await TermuxRuntime.environment() : null,
-              stdoutEncoding: null,
-              stderrEncoding: null,
-            ).timeout(const Duration(seconds: 300));
+            );
+            final stdoutBytes = <int>[];
+            final stderrBytes = <int>[];
+            proc.stdout.listen(stdoutBytes.addAll);
+            proc.stderr.listen(stderrBytes.addAll);
+            int? exitCode;
+            try {
+              exitCode = await proc.exitCode
+                  .timeout(const Duration(seconds: 120));
+            } on TimeoutException {
+              proc.kill();
+              await _logError('Termux', 'run_terminal 超时已终止: $command');
+              exitCode = null;
+            }
             final out = utf8
-                .decode(result.stdout as List<int>, allowMalformed: true)
+                .decode(stdoutBytes, allowMalformed: true)
                 .trim();
             final err = utf8
-                .decode(result.stderr as List<int>, allowMalformed: true)
+                .decode(stderrBytes, allowMalformed: true)
                 .trim();
             final buf = StringBuffer();
             if (out.isNotEmpty) buf.write(out);
@@ -1314,11 +1327,13 @@ class ShiyiState extends ChangeNotifier {
             if (text.length > 4000) {
               text = '${text.substring(0, 4000)}…（输出过长，已截断）';
             }
+            if (exitCode == null) {
+              return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
+                  '如需长任务请拆分命令或增加耗时。';
+            }
             return text.isEmpty
-                ? '命令执行完成（无输出），退出码 ${result.exitCode}'
-                : '退出码 ${result.exitCode}\n$text';
-          } on TimeoutException {
-            return '终端执行超时：命令超过 30 秒未完成';
+                ? '命令执行完成（无输出），退出码 $exitCode'
+                : '退出码 $exitCode\n$text';
           } on ProcessException catch (e) {
             return '终端执行异常: ${e.message}';
           }

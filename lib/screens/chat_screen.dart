@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -1712,20 +1713,47 @@ class _ToolPillIdle extends StatelessWidget {
 }
 
 /// 右上角胶囊：显示最近一条工具调用状态，点击展开信息流面板。
-class _ToolPill extends StatelessWidget {
+class _ToolPill extends StatefulWidget {
   final ToolEvent event;
   final VoidCallback onTap;
   const _ToolPill({required this.event, required this.onTap});
 
   @override
+  State<_ToolPill> createState() => _ToolPillState();
+}
+
+class _ToolPillState extends State<_ToolPill> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    // 工具运行中：每秒刷新读秒。
+    if (!widget.event.done) {
+      _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    final event = widget.event;
+    final elapsedSec =
+        (DateTime.now().millisecondsSinceEpoch - event.startedAt) / 1000;
     return Material(
       color: cs.surfaceContainerHigh.withValues(alpha: .92),
       borderRadius: BorderRadius.circular(14),
       child: InkWell(
-        onTap: onTap,
+        onTap: widget.onTap,
         borderRadius: BorderRadius.circular(14),
         child: SizedBox(
           width: 92,
@@ -1760,10 +1788,13 @@ class _ToolPill extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (event.done && event.durationMs != null) ...[
+                if (event.durationMs != null ||
+                    (!event.done && elapsedSec >= 1)) ...[
                   const SizedBox(width: 4),
                   Text(
-                    '${(event.durationMs! / 1000).toStringAsFixed(1)}s',
+                    event.done
+                        ? '${(event.durationMs! / 1000).toStringAsFixed(1)}s'
+                        : '${elapsedSec.toStringAsFixed(0)}s',
                     style: theme.textTheme.labelSmall?.copyWith(
                       color: theme.hintColor,
                     ),
