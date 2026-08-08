@@ -46,6 +46,35 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// 思考内容是否展开（默认收起）。
   bool _showReasoning = false;
 
+  /// 思考区滚动控制器（流式增长时自动跟随到最新）。
+  final ScrollController _reasoningCtrl = ScrollController();
+
+  @override
+  void dispose() {
+    _reasoningCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant MessageBubble oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 流式思考内容增长时，思考区自动跟随到最新。
+    final newR = widget.liveReasoning;
+    if (newR != null &&
+        newR != oldWidget.liveReasoning &&
+        _showReasoning) {
+      _scrollReasoningToBottom();
+    }
+  }
+
+  /// 思考区滚到最底部（布局完成后执行）。
+  void _scrollReasoningToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_reasoningCtrl.hasClients) return;
+      _reasoningCtrl.jumpTo(_reasoningCtrl.position.maxScrollExtent);
+    });
+  }
+
   ChatMessage get message => widget.message;
   String? get liveContent => widget.liveContent;
   String? get liveReasoning => widget.liveReasoning;
@@ -176,7 +205,12 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// 思考内容折叠头：点击展开/收回，进行中显示小 spinner。
   Widget _reasoningHeader(ThemeData theme) {
     return InkWell(
-      onTap: () => setState(() => _showReasoning = !_showReasoning),
+      onTap: () {
+        setState(() => _showReasoning = !_showReasoning);
+        // 展开时直接看到最新思考（而不是顶部）。
+        if (!_showReasoning) return;
+        _scrollReasoningToBottom();
+      },
       borderRadius: BorderRadius.circular(6),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 2),
@@ -222,6 +256,7 @@ class _MessageBubbleState extends State<MessageBubble> {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxHeight: 220),
         child: SingleChildScrollView(
+          controller: _reasoningCtrl,
           child: SelectableText(
             reasoning,
             style: theme.textTheme.bodySmall!.copyWith(

@@ -204,6 +204,9 @@ class SubagentRunner {
   /// 用户停止生成时返回 true。
   final bool Function()? shouldStop;
 
+  /// 每轮开始前的进度回调（供 UI 展示子代理内部状态）。
+  final void Function(int round, int maxTurns, String lastTool)? onProgress;
+
   SubagentRunner({
     required this.baseUrl,
     required this.apiKey,
@@ -213,6 +216,7 @@ class SubagentRunner {
     required this.executeTool,
     required this.workingDir,
     this.shouldStop,
+    this.onProgress,
   });
 
   /// 运行子代理，返回其最终文本。
@@ -231,6 +235,7 @@ class SubagentRunner {
       if (shouldStop?.call() ?? false) {
         return '（子代理已因用户停止而中断）';
       }
+      onProgress?.call(round, def.maxTurns, '');
       final TurnResult? result = await _round(msgs);
       if (result == null) return '（子代理生成失败）';
       if (result.toolCalls.isEmpty) {
@@ -258,6 +263,7 @@ class SubagentRunner {
         final tc = result.toolCalls[i];
         final name = (tc['name'] ?? '').toString();
         final args = (tc['arguments'] ?? '').toString();
+        onProgress?.call(round, def.maxTurns, name);
         String output;
         if (!def.allowedTools.contains(name)) {
           output = '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';

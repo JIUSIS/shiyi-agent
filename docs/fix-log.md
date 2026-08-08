@@ -275,6 +275,15 @@
 - **说明**：注释与描述全部中性表述（无外部产品引用，符合 #38 约定）。
 - **涉及**：`lib/services/subagent.dart`（新增）、`lib/core/app_state.dart`。
 
+### 41. 系统提示重写为「工作台」结构 + 子代理体验三连（滚动/进度/自主识别）
+- **需求**：用户要求提示词也按主流 agent 架构的结构来（去道德、留实用规则），且子代理要"看得见、自己会判断"。
+- **系统提示重写**（`_buildSystemPrompt` base）：新增【运行方式】（你的输出=用户看到的一切、工具被拒=换方式、并行工具调用）、【沟通规范】（先给结论、可读性>简洁、删除前先看目标、如实报告）、【自主与确认】（有信息就行动、拍板才 question、结束前当场完成承诺）、【临时文件】、【安全底线】（不泄漏密钥、不编造工具/子代理结果）；保留原 6 条工作原则。道德段全部剔除；计划模式下"当场完成承诺"除外（review 后补）。
+- **思考区自动滚动**（`message_bubble.dart`）：`_reasoningBody` 加 `ScrollController`，`didUpdateWidget` 检测 `liveReasoning` 流式增长自动 `jumpTo(maxScrollExtent)`，展开时也直接滚到最新。
+- **子代理进度可见**（`subagent.dart` + `app_state`）：`SubagentRunner` 加 `onProgress(round, maxTurns, tool)` 回调 → `_execSpawnAgent` 更新状态条「子代理「explore」第 3/15 轮 · 正在调用 file_read」。
+- **子代理自主识别**（`_buildSystemPrompt` 工具规则段）：when-to-use 判断规则——读多文件/独立调研→explore；复杂规划→plan；可独立执行无需交互→worker；单点查找直接读不派。
+- **交付检查**：review 审查结论"无阻塞问题"，仅按建议修计划模式冲突一处。
+- **涉及**：`lib/core/app_state.dart`、`lib/services/subagent.dart`、`lib/widgets/message_bubble.dart`。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）
