@@ -1154,9 +1154,9 @@ class ShiyiState extends ChangeNotifier {
       '- 安装软件包用 pkg/apt：一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
     );
     parts.add(
-      '- 当前会话工作目录是 ${await currentWorkspace()}（文件相关操作默认在这里）。'
-      'run_terminal 默认在 Agent 工作目录（${FileWorkspace.defaultWorkspacePath}）执行；'
-      '需要在其他目录执行时用 cwd 参数指定。',
+      '- 当前会话工作目录是 ${await currentWorkspace()}（会话未自定义时使用 '
+      'Agent 工作目录 ${FileWorkspace.defaultWorkspacePath}）；文件操作与 '
+      'run_terminal 默认都在这里执行，需要其他目录时用 cwd 参数指定。',
     );
 
     if (settings.enableMemory) {
@@ -1294,12 +1294,18 @@ class ShiyiState extends ChangeNotifier {
             final isWin = Platform.isWindows;
             var cwd = (args['cwd'] ?? '').toString().trim();
             if (cwd.isEmpty) {
-              // 默认在 Agent 工作目录执行；首次使用自动创建，
-              // 不可用则回退到 Agent 默认目录，避免 Process.start 因目录无效抛异常。
-              cwd = FileWorkspace.defaultWorkspacePath;
+              // 默认在「会话自定义工作目录 → Agent 默认目录」执行；
+              // 目录不存在时自动创建，创建失败回退 Agent 默认目录，
+              // 避免 Process.start 因目录无效直接抛异常。
+              cwd = await currentWorkspace();
               try {
                 Directory(cwd).createSync(recursive: true);
-              } catch (_) {}
+              } catch (_) {
+                cwd = FileWorkspace.defaultWorkspacePath;
+                try {
+                  Directory(cwd).createSync(recursive: true);
+                } catch (_) {}
+              }
             } else {
               try {
                 Directory(cwd).createSync(recursive: true);
