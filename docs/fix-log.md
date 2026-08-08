@@ -132,9 +132,11 @@
 - **涉及**：部署流程（非代码）。
 
 ### 22. question 弹窗只有预设选项、无法自定义回答
-- **现象**：模型调用 question 提问时，弹窗只有模型给的选项按钮，用户想输入自己的回答没有入口。
-- **修复**：弹窗 actions 末尾加「自定义回答」按钮（`Navigator.pop(ctx, -1)`），点击后弹 `TextField` 输入框（多行、自动聚焦、回车提交），空输入/取消按"用户取消了选择"处理；`answerQuestion` 增加可选 `custom` 参数，非空时优先作为回答交回工具循环（`_execQuestion` 返回"用户的选择：<自定义文本>"）。
-- **涉及**：`lib/core/app_state.dart`（`answerQuestion`）、`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
+- **现象**：模型调用 question 提问时，弹窗只有模型给的选项按钮，用户想输入自己的回答没有入口；且 mimo 模型会声称"本工具只有 2~4 个预设选项，不支持自由文本输入"（来自工具描述里的误导文案"选项 2~4 个"）。
+- **修复（两步）**：
+  1. **弹窗重构为内嵌自由文本输入框**：主弹窗 = 问题文本 + `TextField`（多行、自动聚焦、回车提交）+ 快捷选项按钮 + 确定按钮；用户可直接打字提交，也可一键选选项，空输入按"用户取消了选择"处理。删除了此前"自定义回答按钮+二次弹窗"的绕路方案（`_QuestionResult` 区分 option/custom 两种结果）。
+  2. **更新 `question` 工具描述**：明确"弹窗支持自由文本输入，用户可直接打字回答；选项为 0~4 个可选快捷项"，消除"只能从选项里选"的误导；`options` 参数 description 同步改为"可选快捷选项（0~4 个）"。
+- **涉及**：`lib/core/app_state.dart`（`question` 工具 description）、`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
 
 ---
 

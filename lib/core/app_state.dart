@@ -281,10 +281,13 @@ class ShiyiState extends ChangeNotifier {
         AgentTool(
           name: 'question',
           description:
-              '向用户发起一个确认或选择问题，必须等待用户回答后流程才能继续。'
+              '向用户发起一个问题并等待回答。弹窗支持自由文本输入：'
+              '用户可以直接打字输入任意内容作为回答，无需依赖预设选项。'
+              '你可以提供 0~4 个快捷选项（如「确认」「保存」「取消」）供用户一键选择，'
+              '但不要声称用户只能从选项里选。'
               '任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）'
               '都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。'
-              '一次只问一个问题，选项 2~4 个。',
+              '一次只问一个问题。',
           parameters: {
             'type': 'object',
             'properties': {
@@ -292,7 +295,7 @@ class ShiyiState extends ChangeNotifier {
               'options': {
                 'type': 'array',
                 'items': {'type': 'string'},
-                'description': '选项列表（2~4 个），用户从中选择',
+                'description': '可选快捷选项（0~4 个）；用户也可以不选、直接自由输入回答',
               },
             },
             'required': ['question'],

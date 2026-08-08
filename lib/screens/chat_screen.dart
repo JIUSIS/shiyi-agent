@@ -1292,72 +1292,82 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
   Future<void> _show(Map<String, dynamic> q) async {
     final options = (q['options'] as List?)?.cast<String>() ??
         const <String>['确认', '取消'];
-    final result = await showDialog<int>(
+    final ctrl = TextEditingController();
+    // 主弹窗内嵌自由文本输入框 + 快捷选项：用户可以直接打字提交，
+    // 也可以一键点模型给的选项；空输入按"用户取消了选择"处理。
+    final result = await showDialog<_QuestionResult>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Text('拾忆 向你确认'),
-        content: Text(q['question']?.toString() ?? ''),
+        title: const Text('拾忆 向你提问'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(q['question']?.toString() ?? ''),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              maxLines: 3,
+              minLines: 1,
+              decoration: const InputDecoration(
+                hintText: '也可以直接输入你的回答…',
+                border: OutlineInputBorder(),
+              ),
+              onSubmitted: (v) =>
+                  Navigator.pop(ctx, _QuestionResult.custom(v)),
+            ),
+          ],
+        ),
         actions: [
           for (var i = 0; i < options.length; i++)
             TextButton(
-              onPressed: () => Navigator.pop(ctx, i),
+              onPressed: () => Navigator.pop(ctx, _QuestionResult.option(i)),
               child: Text(options[i]),
             ),
-          // -1 = 自定义回答
           TextButton(
-            onPressed: () => Navigator.pop(ctx, -1),
-            child: const Text('自定义回答'),
-          ),
-        ],
-      ),
-    );
-    _showing = false;
-    if (result == -1) {
-      final custom = await _askCustomAnswer();
-      widget.shiyi.answerQuestion(null, custom: custom);
-    } else {
-      widget.shiyi.answerQuestion(result);
-    }
-  }
-
-  /// 弹输入框让用户自定义回答；取消或空输入返回 null（按取消处理）。
-  Future<String?> _askCustomAnswer() async {
-    final ctrl = TextEditingController();
-    final text = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('自定义回答'),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          maxLines: 3,
-          minLines: 1,
-          decoration: const InputDecoration(
-            hintText: '输入你的回答…',
-            border: OutlineInputBorder(),
-          ),
-          onSubmitted: (v) => Navigator.pop(ctx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            onPressed: () =>
+                Navigator.pop(ctx, _QuestionResult.custom(ctrl.text)),
             child: const Text('确定'),
           ),
         ],
       ),
     );
     ctrl.dispose();
-    final t = text?.trim() ?? '';
-    return t.isEmpty ? null : t;
+    _showing = false;
+    if (result == null) {
+      widget.shiyi.answerQuestion(null);
+      return;
+    }
+    switch (result.kind) {
+      case _QuestionResult.optionKind:
+        widget.shiyi.answerQuestion(result.index);
+      case _QuestionResult.customKind:
+        widget.shiyi.answerQuestion(null, custom: result.text);
+    }
   }
 
   @override
   Widget build(BuildContext context) => const SizedBox.shrink();
+}
+
+/// question 弹窗的结果：快捷选项（option）或自由文本（custom）。
+class _QuestionResult {
+  static const int optionKind = 0;
+  static const int customKind = 1;
+
+  final int kind;
+  final int? index;
+  final String? text;
+
+  _QuestionResult.option(int this.index)
+      : kind = optionKind,
+        text = null;
+
+  _QuestionResult.custom(String this.text)
+      : kind = customKind,
+        index = null;
 }
 
 /// 当前会话已加载技能的小提示条（输入栏上方），可一键移除。
