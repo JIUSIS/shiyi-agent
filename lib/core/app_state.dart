@@ -1076,6 +1076,7 @@ class ShiyiState extends ChangeNotifier {
       temperature: settings.temperature,
       tools: settings.enableTools ? functionTools : const [],
       shouldStop: () => _stopRequested,
+      onDiag: (line) => unawaited(_logError('StreamDiag', line)),
       onTurn: (t) {
         accumulated = t;
         asst.content = t.text;

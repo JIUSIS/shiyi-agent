@@ -38,6 +38,10 @@ class LlmClient {
   final void Function(String error)? onError;
   final bool Function()? shouldStop;
 
+  /// 流诊断回调（排查截断/丢工具调用）：记录流结束方式、finish_reason、
+  /// 文本尾部、tool_calls 块数等。
+  final void Function(String line)? onDiag;
+
   /// 最近一次请求的 total_tokens（来自流式 usage）。
   int? lastTotalTokens;
 
@@ -50,6 +54,7 @@ class LlmClient {
     this.onTurn,
     this.onError,
     this.shouldStop,
+    this.onDiag,
   });
 
   String get _endpoint =>
@@ -335,6 +340,7 @@ class LlmClient {
       idleTimer = Timer(const Duration(seconds: 180), () {
         idleTimer = null;
         sub?.cancel();
+        onDiag?.call('[stream] idle 超时断开');
         if (!completer.isCompleted) {
           completer.completeError(LlmInterruptedException('回复中断：连接长时间无数据，请重试'));
         }
@@ -366,6 +372,7 @@ class LlmClient {
           },
           onError: (Object e) {
             idleTimer?.cancel();
+            onDiag?.call('[stream] onError: $e');
             if (!completer.isCompleted) {
               completer.completeError(LlmInterruptedException('回复中断（连接断开）：$e'));
             }
@@ -381,6 +388,14 @@ class LlmClient {
               }
               denyBuffer.clear();
             }
+            final tail = text.length <= 40
+                ? text
+                : '…${text.substring(text.length - 40)}';
+            onDiag?.call(
+              '[stream] end fr=$finishReason done=$doneReceived '
+              'textLen=${text.length} tools=${toolBuf.length} '
+              'reasoningLen=${reasoning.length} tail=${tail.trim()}',
+            );
             if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
               onTurn?.call(
                 TurnResult(
