@@ -163,6 +163,80 @@
 - **初步结果**：新包冷启动清零统计后 Janky frames 5/50（10%）、90th 22ms、Slow UI thread 4；需继续用实际会话/流式输出验证。
 - **涉及**：`lib/screens/chat_screen.dart`。
 
+### 25. 主页搜索框弹出键盘后侧边栏溢出、返回主页目录不可见
+- **现象**：主页点搜索框弹出输入法后，再点左上角侧边栏会出现黄黑溢出条纹；点击空白处无法取消搜索框光标；从搜索结果进入会话再返回，已回到主页但正常会话目录不可见，部分情况下侧栏遮罩仍会拦截点击。
+- **根因**：
+  1. `HomeScreen` 外层 `Scaffold` 默认随键盘 `viewInsets` 缩高，连同悬浮侧边栏一起被压缩；侧边栏是固定内容的 `Column`，剩余高度不足时触发 `RenderFlex overflow`；
+  2. 主页搜索框没有独立 `FocusNode` 和空白点击失焦处理，打开侧栏、切 tab、进入会话时仍保留活跃输入连接；
+  3. `_SessionsTabState` 在路由返回后继续保留搜索 query，因此仍显示搜索结果分支而非正常会话目录；侧栏入口新建会话后也会保留展开遮罩。
+- **修复**：
+  1. 外层主页 `Scaffold` 设置 `resizeToAvoidBottomInset: false`，让各 tab 的内层 `Scaffold` 自行避让键盘，悬浮侧边栏始终保持全高；
+  2. 搜索框增加 `FocusNode`、`onTapOutside`、`onSubmitted`，点击空白或提交搜索时主动失焦；
+  3. 打开/关闭侧栏、切换 tab、进入会话、新建会话、打开关于页及退出聊天页前统一收起键盘；侧栏导航时同步关闭侧栏；
+  4. 新建会话前、已有会话路由完整返回后清空搜索状态，避免在路由动画中拆除活跃输入框，并让主页恢复完整会话目录。
+- **涉及**：`lib/screens/home_screen.dart`、`lib/screens/chat_screen.dart`。
+
+### 26. 会话返回主页后内容空白，切换 tab 触发 `_dependents.isEmpty` 红屏
+- **现象**：从搜索结果进入会话再返回后，主页只剩左上角侧边栏入口，标题、搜索框和会话目录全部不可见；UI 自动化树仍能找到这些控件。此时切换到设置页会显示红色 ErrorWidget：`framework.dart:6268 '_dependents.isEmpty': is not true`。
+- **根因**：`await Navigator.push(...)` 使用的是路由 `popped` Future，会在调用 `Navigator.pop` 时先完成，并不等待 `MacPageRoute` 的 240ms 反向动画结束。主页随即执行 `_resetSearch → setState`，同时整页 `AnimatedSwitcher` 正在拆装 tab 子树，导致仍被依赖的 `InheritedElement` 在退场动画中进入 deactivate，绘制层先失效，后续切 tab 时触发 `debugDeactivated` 断言。
+- **修复**：
+  1. 移除包裹整个主页 tab 的 `AnimatedSwitcher`，tab 直接切换，避免大页面及其 `Scaffold/TextField` 经由 inactive-element 重挂载；
+  2. 会话路由返回后等待 350ms（大于 240ms 反向动画）再清空搜索和重建主页，确保路由 Overlay 已完全移除；
+  3. 保留进入会话前失焦、返回聊天页前失焦，以及侧栏/键盘布局隔离措施。
+- **涉及**：`lib/screens/home_screen.dart`。
+
+### 27. 连续三次进入会话并返回后主页停止绘制
+- **现象**：不操作搜索框，直接连续执行“进入会话 → 返回”，第三次稳定出现主页内容空白；控件仍存在于无障碍树，继续切换页面后触发 `framework.dart:6268 '_dependents.isEmpty'` 断言。
+- **根因**：应用根节点用 `ListenableBuilder(listenable: shiyi)` 包裹整个 `MaterialApp`。会话选择、token 统计刷新、消息状态变化等任意业务 `notifyListeners()` 都会重建 `MaterialApp`，连同 `Navigator` 和 `Theme/MediaQuery` 等继承依赖一起更新。通知若与聊天路由退场重叠，Flutter 会在仍有依赖者时 deactivate 对应 `InheritedElement`；主页先停止绘制，后续切 tab 拆除旧子树时断言才显现。
+- **修复**：根节点改为只监听主题模式的实际变化；普通业务通知不再重建 `MaterialApp`，仍由主页和聊天页内部的局部 `ListenableBuilder` 响应。主题切换保持实时生效，自定义透明路由维持原有返回预览。
+- **涉及**：`lib/main.dart`。
+
+### 28. 不思考直接回复时正文被存成思考过程
+- **现象**：模型未输出独立思考、直接把最终回复放在 `reasoning_content`（可能同时出现在 `content`）时，回复被当成「思考过程」展示；数据库里部分助手消息 `content` 为空或与 `reasoning` 重复，`reasoning=完整回复`。
+- **根因**：流式解析只按 OpenAI 惯例把 `reasoning_content` 当作思考、`content` 当作正文；部分网关/模型在“直接回复”时把正文放进 `reasoning_content`，应用未做兜底。
+- **修复**：落库前若一轮结果正文为空、有思考文本且没有工具调用，则把思考文本当作正文、清空思考字段；若思考文本与正文重复，同样清空思考字段。历史消息从数据库读取时做同样归位，已存错的消息也能正常显示。
+- **涉及**：`lib/core/models.dart`、`lib/core/app_state.dart`。
+
+---
+
+## 2026-08-09 · 输出与交互体验修复
+
+### 29. 输出截断自动续写（fr=length 拼接，不重发整轮）
+- **现象**：mimo 长输出 `finish_reason=length` 截断时，整轮重试会丢已输出内容且可能再次截断。
+- **修复**：`LlmClient` 改为**续写循环**——纯文本截断时追加「继续完成」请求拼接（已输出保留，最多续 3 轮）；**工具调用完整**时即使截断也当完成（工具照常执行）；工具参数半截才整轮重试。
+- **涉及**：`lib/services/llm_client.dart`。
+
+### 30. 内置提示词：超长内容直接流式输出（去掉"写文件"引导）
+- **现象**：此前提示词引导模型"超长内容先写文件再给摘要"，用户不需要本地文件、希望直接输出完。
+- **修复**：system prompt 改为「超长内容直接完整流式输出，不要写入本地文件；被截断会自动续写拼接」。
+- **涉及**：`lib/core/app_state.dart`。
+
+### 31. question 弹窗输入法弹出后黑黄条（BOTTOM OVERFLOWED）
+- **现象**：点弹窗输入框、键盘弹出后，输入框下方出现黄黑条纹 `BOTTOM OVERFLOWED BY 55 PIXELS`（RenderFlex 溢出）。
+- **根因**：键盘弹出使弹窗可用高度骤减，`AlertDialog` 的 `content` 是固定 `Column`（不滚动）→ 底部溢出。
+- **修复**：`content` 外层包 `SingleChildScrollView`（空间不足时可滚动）。
+- **涉及**：`lib/screens/chat_screen.dart`。
+
+### 32. 覆盖安装失败：signatures do not match（debug/release 签名不一致）
+- **现象**：`adb install -r` 报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`，代码改动装不上手机（表面 Success 实际失败）。
+- **根因**：手机上的包是**另一个会话用 debug 构建**装的（`pkgFlags=[DEBUGGABLE]`、证书 `CN=Android Debug`），release 签名覆盖失败。
+- **修复/教训**：该项目**装手机统一用 debug 构建**（`flutter build apk --debug` + `adb install -r`）；release 包覆盖需先卸载（会清数据）。排查"改动了没生效"先查 `dumpsys package <pkg> | grep lastUpdateTime` 与签名。
+
+### 33. 页面切换卡顿：tab 每次切换全量重建
+- **现象**：侧边栏切换 tab 卡顿（操作/页面切换掉帧）。
+- **根因**：`home_screen` 的 `_buildTab()` 用 `switch` **每次切换重建整个页面**（会话列表还重新查 DB）。
+- **修复**：**tab 懒缓存**——切换过的页面复用不重建（内部 `ListenableBuilder` 监听 `shiyi` 自动刷新数据）；新建/删除会话时清会话 tab 缓存强制重建。
+- **涉及**：`lib/screens/home_screen.dart`。
+
+### 34. 路由动画：确认纯淡入淡出
+- **现象/过程**：页面切换动画原为 `FadeTransition`（淡入淡出）；曾尝试加轻微缩放增强，用户明确只要淡入淡出 → 移除缩放。
+- **涉及**：`lib/core/mac_page_route.dart`。
+
+### 35. 工具胶囊：新建会话右侧空荡 → 静默读秒 0.0s
+- **现象**：新建会话时右上角胶囊只有「● 工具」，右侧空出一截。
+- **修复**：`_ToolPillIdle` 两端对齐（`spaceBetween`）——左侧灰点+工具，右侧 **0.0s**（读秒初始态）。
+- **涉及**：`lib/screens/chat_screen.dart`。
+
 ---
 
 ## 遗留已知项（非 bug，勿当问题）
@@ -171,4 +245,4 @@
 - `chmod`/`chown` 在 SD 卡不生效：FUSE 忽略权限变更。
 - 未预装工具（wget/zip/git 等）：用 `pkg install xxx`（走 bin-shim → termux-apt）。
 - `apt-key` 直调、`Dpkg.pm` 裁剪、`termux-info` 慢：内嵌环境已知限制。
-- mimo-v2.5 输出上限较低：长内容走"写文件+摘要"，或换输出上限更大的模型。
+- mimo-v2.5 输出上限较低：app 已实现**截断自动续写**（fr=length → 追加「继续」请求拼接），长内容直接流式输出完；个别超长场景可能续写多次，可换输出上限更大的模型。
