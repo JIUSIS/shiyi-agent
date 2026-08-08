@@ -222,6 +222,7 @@ class LlmClient {
     final toolBuf = <int, Map<String, String>>{};
     var doneReceived = false;
     var stoppedByUser = false;
+    String? finishReason; // 最后一条 chunk 的 finish_reason：'length' = 输出被截断
 
     void emitPartial() {
       if (text.isNotEmpty) {
@@ -229,6 +230,18 @@ class LlmClient {
           TurnResult(text: text, toolCalls: _snapshotTools(toolBuf)),
         );
       }
+    }
+
+    /// 流结束时统一检查：输出被 max_tokens/网关限制截断时视为中断（触发重试），
+    /// 避免「AI 说到一半静默结束」——例如承诺创建脚本却停在冒号后。
+    bool completeIfTruncated() {
+      if (finishReason == 'length' && !completer.isCompleted) {
+        completer.completeError(
+          LlmInterruptedException('回复被截断：输出达到模型长度上限，已自动重试'),
+        );
+        return true;
+      }
+      return false;
     }
 
     void handleLine(String line) {
@@ -250,6 +263,8 @@ class LlmClient {
         if (choices.isEmpty) return;
         final first = choices.first;
         if (first is! Map) return;
+        final fr = first['finish_reason'];
+        if (fr is String && fr.isNotEmpty) finishReason = fr;
         final delta = first['delta'] as Map<String, dynamic>?;
         if (delta == null) return;
         final content = delta['content'];
@@ -344,6 +359,9 @@ class LlmClient {
                 ),
               );
             }
+            // 输出被截断（finish_reason=length）：报中断触发自动重试，
+            // 避免把「说到一半」当正常完成静默结束。
+            if (completeIfTruncated()) return;
             if (!completer.isCompleted) {
               // 已收到内容但没有 [DONE]：不少网关/代理正常结束时不发 [DONE]，
               // 此时视为回复完成，避免误报"回复不完整"导致丢内容重试。
