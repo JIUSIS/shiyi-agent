@@ -1304,11 +1304,56 @@ class _QuestionHandlerState extends State<_QuestionHandler> {
               onPressed: () => Navigator.pop(ctx, i),
               child: Text(options[i]),
             ),
+          // -1 = 自定义回答
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, -1),
+            child: const Text('自定义回答'),
+          ),
         ],
       ),
     );
     _showing = false;
-    widget.shiyi.answerQuestion(result);
+    if (result == -1) {
+      final custom = await _askCustomAnswer();
+      widget.shiyi.answerQuestion(null, custom: custom);
+    } else {
+      widget.shiyi.answerQuestion(result);
+    }
+  }
+
+  /// 弹输入框让用户自定义回答；取消或空输入返回 null（按取消处理）。
+  Future<String?> _askCustomAnswer() async {
+    final ctrl = TextEditingController();
+    final text = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('自定义回答'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          maxLines: 3,
+          minLines: 1,
+          decoration: const InputDecoration(
+            hintText: '输入你的回答…',
+            border: OutlineInputBorder(),
+          ),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    final t = text?.trim() ?? '';
+    return t.isEmpty ? null : t;
   }
 
   @override

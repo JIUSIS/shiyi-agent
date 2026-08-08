@@ -104,18 +104,20 @@ class ShiyiState extends ChangeNotifier {
   /// 直到调用 exit_plan_mode 或用户确认方案后退出。
   bool planMode = false;
 
-  /// 用户回答 question 工具；optionIndex 为空表示取消。
-  void answerQuestion(int? optionIndex) {
+  /// 用户回答 question 工具；optionIndex 为空表示取消；custom 非空时优先作为自定义回答。
+  void answerQuestion(int? optionIndex, {String? custom}) {
     final c = _questionCompleter;
     final q = pendingQuestion;
     if (c == null || q == null) return;
     final options = (q['options'] as List?) ?? const [];
-    final answer =
-        (optionIndex != null &&
-            optionIndex >= 0 &&
-            optionIndex < options.length)
-        ? options[optionIndex].toString()
-        : '用户取消了选择';
+    final customText = custom?.trim() ?? '';
+    final answer = customText.isNotEmpty
+        ? customText
+        : (optionIndex != null &&
+                optionIndex >= 0 &&
+                optionIndex < options.length)
+            ? options[optionIndex].toString()
+            : '用户取消了选择';
     pendingQuestion = null;
     _questionCompleter = null;
     if (!c.isCompleted) c.complete(answer);
