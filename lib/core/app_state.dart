@@ -387,6 +387,25 @@ class ShiyiState extends ChangeNotifier {
     messages = await _db.listMessages(id);
     _messagesLoadedForSessionId = id;
     toolEvents = await _db.listToolEvents(id);
+    // 兜底收尾：会话不在实时生成中时，把 DB 里残留的未完成工具事件标记为
+    // 「已中断」（进程早已结束，事件永远等不到完成回调），避免退出重进后
+    // 终端一直显示运行中转圈。
+    final generating = busySessionId == id && _streaming != null;
+    if (!generating) {
+      final stale = toolEvents.where((e) => !e.done).toList();
+      if (stale.isNotEmpty) {
+        for (final e in stale) {
+          e
+            ..done = true
+            ..ok = false
+            ..summary = '已中断'
+            ..finishedAt = e.startedAt;
+          if (e.id != null) {
+            await _db.updateToolEvent(e.id!, e);
+          }
+        }
+      }
+    }
     final sess = await _db.getSession(id);
     sessionTotalTokens = sess?.totalTokens ?? 0;
     lastRoundTokens = 0;
