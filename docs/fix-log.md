@@ -122,14 +122,19 @@
 - **涉及**：`lib/core/app_state.dart`。
 
 ### 21. flutter install 签名不一致触发卸载重装、清空 app 数据
-- **现象**：`flutter install --debug` 日志出现 `Uninstalling old version...`，旧版本被卸载重装，`/data/data/com.shiyi.agent` 下 `shiyi_agent.db`、SharedPreferences 全部重建——API Key/会话/记忆被清空（违反"覆盖安装不清数据"部署偏好）。
-- **根因**：设备上旧包签名与本次构建不一致（`adb install -r` 返回 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），flutter 自动兜底先卸载再安装；`f29c6ad8`（Android 11）设备上的旧包来源与当前 debug keystore 不同。
-- **修复/预防**：装前先验签确认一致再装：
-  ```bash
-  adb shell dumpsys package com.shiyi.agent | grep signatures   # 看设备上现有签名
-  ```
-  或装前先备份应用数据（debug 包可 `run-as com.shiyi.agent` 拉出 `app_flutter/shiyi_agent.db` + `shared_prefs/`）。
+- **现象**：`flutter install --debug` 日志出现 `Uninstalling old version...`，旧版本被卸载重装，`/data/data/com.shiyi.agent` 下 `shiyi_agent.db`、SharedPreferences 全部重建——API Key/会话/记忆被清空（违反"覆盖安装不清数据"部署偏好）。**2026-08-08 连续两次踩坑。**
+- **根因（查 flutter_tools 源码确认）**：`flutter install` 内部先跑 `adb install -t -r`（`android_device.dart` 的 `_installApp`）；**只要这次安装失败，就自动"Uninstalling old version" → 卸载 → 重装**（`installApp` 兜底分支）。失败的具体原因被 flutter 吞掉（只打印到 stderr trace）。实测**手动 `adb install -r` 同一 APK 成功**——说明同签名下手动覆盖可靠，flutter 的失败原因未知（疑与设备/时序相关），但它卸载清数据的代价不可接受。
+- **修复/预防（已写入 AGENTS.md 部署偏好）**：
+  1. **首选手动 `adb install -r build\app\outputs\flutter-apk\app-debug.apk`**（同 debug keystore 下实测数据保留）；
+  2. 用 `flutter install` 时必须检查输出**无 `Uninstalling old version...`**，有则数据已清；
+  3. 装前验签：`adb shell dumpsys package com.shiyi.agent | grep signatures`；
+  4. debug 包可备份：`adb exec-out run-as com.shiyi.agent cat app_flutter/shiyi_agent.db` 等。
 - **涉及**：部署流程（非代码）。
+
+### 22. question 弹窗只有预设选项、无法自定义回答
+- **现象**：模型调用 question 提问时，弹窗只有模型给的选项按钮，用户想输入自己的回答没有入口。
+- **修复**：弹窗 actions 末尾加「自定义回答」按钮（`Navigator.pop(ctx, -1)`），点击后弹 `TextField` 输入框（多行、自动聚焦、回车提交），空输入/取消按"用户取消了选择"处理；`answerQuestion` 增加可选 `custom` 参数，非空时优先作为回答交回工具循环（`_execQuestion` 返回"用户的选择：<自定义文本>"）。
+- **涉及**：`lib/core/app_state.dart`（`answerQuestion`）、`lib/screens/chat_screen.dart`（`_QuestionHandler`）。
 
 ---
 
