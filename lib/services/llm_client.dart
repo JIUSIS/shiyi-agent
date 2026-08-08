@@ -223,6 +223,7 @@ class LlmClient {
     var doneReceived = false;
     var stoppedByUser = false;
     String? finishReason; // 最后一条 chunk 的 finish_reason：'length' = 输出被截断
+    final completer = Completer<void>();
 
     void emitPartial() {
       if (text.isNotEmpty) {
@@ -297,7 +298,6 @@ class LlmClient {
       }
     }
 
-    final completer = Completer<void>();
     StreamSubscription<String>? sub;
     Timer? idleTimer;
     void resetIdleTimer() {
