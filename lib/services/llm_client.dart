@@ -45,6 +45,9 @@ class LlmClient {
   /// 最近一次请求的 total_tokens（来自流式 usage）。
   int? lastTotalTokens;
 
+  /// 最近一轮收到的文本（纯文本截断续写时拼接用）。
+  String _lastRoundText = '';
+
   LlmClient({
     required this.baseUrl,
     required this.apiKey,
@@ -65,10 +68,13 @@ class LlmClient {
     final client = http.Client();
     try {
       var includeUsage = true;
-      for (var attempt = 0; attempt < 2; attempt++) {
+      // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
+      // 模型从断点继续（不重发整轮，不丢已输出）。
+      final continuation = <Map<String, dynamic>>[];
+      for (var round = 0; round < 3; round++) {
         final body = <String, dynamic>{
           'model': model,
-          'messages': messages,
+          'messages': [...messages, ...continuation],
           'stream': true,
           if (includeUsage) 'stream_options': {'include_usage': true},
           'temperature': temperature,
@@ -99,8 +105,19 @@ class LlmClient {
             }
             throw LlmException('HTTP ${response.statusCode}: ${_short(err)}');
           }
-          await _parseSse(response.stream);
-          return;
+          final needContinue = await _parseSse(response.stream);
+          if (!needContinue) return;
+          // 纯文本截断：追加已输出 + 继续指令，发起续写请求。
+          onDiag?.call('[stream] 续写第 ${round + 1} 轮');
+          continuation.addAll([
+            {'role': 'assistant', 'content': _lastRoundText},
+            {
+              'role': 'user',
+              'content': '继续完成上述输出。直接从上次断点继续写，'
+                  '不要重复已经输出的内容。',
+            },
+          ]);
+          includeUsage = false;
         } on TimeoutException {
           throw LlmException('请求超时：网络连接或响应过慢，请重试');
         }
@@ -229,7 +246,7 @@ class LlmClient {
     }
   }
 
-  Future<void> _parseSse(Stream<List<int>> raw) async {
+  Future<bool> _parseSse(Stream<List<int>> raw) async {
     final denyBuffer = StringBuffer(); // line buffer
     String text = '';
     String reasoning = '';
@@ -237,7 +254,7 @@ class LlmClient {
     var doneReceived = false;
     var stoppedByUser = false;
     String? finishReason; // 最后一条 chunk 的 finish_reason：'length' = 输出被截断
-    final completer = Completer<void>();
+    final completer = Completer<bool>();
 
     void emitPartial() {
       if (text.isNotEmpty || reasoning.isNotEmpty) {
@@ -251,28 +268,36 @@ class LlmClient {
       }
     }
 
-    /// 流结束时统一检查：输出被 max_tokens/网关限制截断时视为中断（触发重试），
-    /// 避免「AI 说到一半静默结束」——例如承诺创建脚本却停在冒号后。
-    /// ① finish_reason='length'（标准 OpenAI 兼容）；
-    /// ② 启发式：思考模型已完成推理（reasoning 非空）、正文却停在半截标点
-    ///    （冒号/逗号）且没有工具调用 → 高度疑似被网关截断（网关常不发 finish_reason）。
-    bool completeIfTruncated() {
+    /// 判断本轮是否因输出截断需要续写。
+    /// 返回 true = 纯文本被截断，调用方应追加「继续」请求续写；
+    /// false = 正常完成。工具调用完整时即使 fr=length 也视为完成
+    /// （截断的只是后续文本，工具照常执行）。
+    bool decideContinue() {
       if (completer.isCompleted) return false;
+      final toolsComplete = toolBuf.isNotEmpty &&
+          toolBuf.values.every((t) {
+            final a = t['arguments'] ?? '';
+            return a.trim().isNotEmpty && _tryDecode(a) != null;
+          });
       final t = text.trim();
-      final looksHalfCut = reasoning.isNotEmpty &&
+      final halfCut = reasoning.isNotEmpty &&
           t.isNotEmpty &&
           toolBuf.isEmpty &&
           (t.endsWith('：') ||
               t.endsWith(':') ||
               t.endsWith('，') ||
               t.endsWith(','));
-      if (finishReason == 'length' || looksHalfCut) {
+      final truncated = finishReason == 'length' || halfCut;
+      if (!truncated) return false;
+      if (toolsComplete) return false; // 工具完整：截断不影响执行
+      if (toolBuf.isNotEmpty) {
+        // 工具调用不完整（参数半截）：无法续写，整轮重试。
         completer.completeError(
-          LlmInterruptedException('回复被截断：输出达到模型长度上限，已自动重试'),
+          LlmInterruptedException('工具调用被截断，正在自动重试'),
         );
-        return true;
+        return false;
       }
-      return false;
+      return true; // 纯文本截断：续写
     }
 
     void handleLine(String line) {
@@ -406,9 +431,13 @@ class LlmClient {
                 ),
               );
             }
-            // 输出被截断（finish_reason=length）：报中断触发自动重试，
-            // 避免把「说到一半」当正常完成静默结束。
-            if (completeIfTruncated()) return;
+            // 截断决策：纯文本截断 → 续写；工具完整 → 正常完成。
+            final needContinue = decideContinue();
+            _lastRoundText = text.trim();
+            onDiag?.call(
+              '[stream] needContinue=$needContinue fr=$finishReason '
+              'done=$doneReceived tools=${toolBuf.length}',
+            );
             if (!completer.isCompleted) {
               // 已收到内容但没有 [DONE]：不少网关/代理正常结束时不发 [DONE]，
               // 此时视为回复完成，避免误报"回复不完整"导致丢内容重试。
@@ -420,13 +449,13 @@ class LlmClient {
                   LlmInterruptedException('回复不完整：连接提前断开，请重试'),
                 );
               } else {
-                completer.complete();
+                completer.complete(needContinue);
               }
             }
           },
           cancelOnError: true,
         );
-    await completer.future;
+    return completer.future;
   }
 
   List<Map<String, String>> _snapshotTools(Map<int, Map<String, String>> buf) {
