@@ -1761,12 +1761,57 @@ class ShiyiState extends ChangeNotifier {
       model: settings.model,
       temperature: settings.temperature,
       toolsJson: _toolsJsonFor(def.allowedTools),
-      executeTool: _executeTool,
+      // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
+      executeTool: (name, argsJson) async {
+        if (!def.allowedTools.contains(name)) {
+          return '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
+        }
+        // 只读代理的终端调用做写操作拦截（提示词之外的技术兜底）。
+        if (name == 'run_terminal' && def.readOnlyTerminal) {
+          final denied = _rejectWriteCommand(argsJson);
+          if (denied != null) return denied;
+        }
+        return _executeTool(name, argsJson);
+      },
       workingDir: await currentWorkspace(),
       shouldStop: () => _stopRequested,
     );
     final report = await runner.run(def, prompt);
+    // 子代理消耗的 token 计入会话统计（与主循环一致）。
+    if (runner.totalTokens > 0 && currentSessionId != null) {
+      sessionTotalTokens += runner.totalTokens;
+      await _db.updateSessionTokens(currentSessionId!, sessionTotalTokens);
+    }
     return '【${def.name} 子代理报告】\n$report';
+  }
+
+  /// 只读代理的终端命令写操作拦截：命中写命令/重定向即拒绝。
+  /// 保守策略——误伤只读命令可接受（子代理可换写法），漏放写操作不可接受。
+  static String? _rejectWriteCommand(String argsJson) {
+    String cmd;
+    try {
+      final parsed = jsonDecode(argsJson);
+      cmd = ((parsed is Map) ? (parsed['command'] ?? '') : '').toString();
+    } catch (_) {
+      return null; // 参数解析失败交给 _executeTool 处理
+    }
+    final t = cmd.trim();
+    if (t.isEmpty) return null;
+    final lower = t.toLowerCase();
+    // 写操作命令（单词边界匹配，避免误伤 find 等组合）
+    final writeCmds = RegExp(
+      r'(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|chmod|chown|ln|dd|kill|pkill|'
+      r'tee|wget|nano|vim|vi|apt|pkg|install|shutdown|reboot)(\s|$)',
+    );
+    // 输出重定向（> 或 >>，排除 2>&1 这类 fd 合并——那是只读用法）
+    final redirect = RegExp(r'(^|[;&|]\s*)[12]?[>]{1,2}(?!&)\s*(\S|$)');
+    if (writeCmds.hasMatch(lower)) {
+      return '只读模式拒绝：命令含写操作（$t）；请改用 ls/find/grep/cat/head/tail/wc 等只读命令。';
+    }
+    if (redirect.hasMatch(t)) {
+      return '只读模式拒绝：命令含输出重定向（$t）；直接看输出即可，不要写文件。';
+    }
+    return null;
   }
 
   /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用。

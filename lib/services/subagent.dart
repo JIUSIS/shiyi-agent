@@ -18,12 +18,16 @@ class SubagentDefinition {
   /// 工具循环最大轮数（防失控）。
   final int maxTurns;
 
+  /// explore/plan 等只读代理置 true：run_terminal 在技术层强制只读命令。
+  final bool readOnlyTerminal;
+
   SubagentDefinition({
     required this.name,
     required this.whenToUse,
     required this.allowedTools,
     required this.systemPrompt,
     this.maxTurns = 25,
+    this.readOnlyTerminal = false,
   });
 
   static SubagentDefinition? byName(String name) {
@@ -82,6 +86,7 @@ run_terminal 只允许只读命令：ls、find、grep、cat、head、tail、wc�
         '适合广度搜索与信息收集；不适合代码审查、跨文件一致性检查或开放分析。',
     allowedTools: _readOnlyTools,
     maxTurns: 15,
+    readOnlyTerminal: true,
     systemPrompt: '''
 你是拾忆的「探索子代理」，专职在项目里定位文件、代码与信息。你只负责查找与分析，绝不修改任何东西。
 $_readOnlyBlock
@@ -104,6 +109,7 @@ $_returnProtocol''',
         '只出方案不动手，返回分步实施计划。',
     allowedTools: _readOnlyTools,
     maxTurns: 15,
+    readOnlyTerminal: true,
     systemPrompt: '''
 你是拾忆的「规划子代理」，负责探索现有资料并设计实施方案。
 $_readOnlyBlock
@@ -186,6 +192,12 @@ class SubagentRunner {
   /// 执行工具的回调（复用主循环的 _executeTool）。
   final Future<String> Function(String name, String argsJson) executeTool;
 
+  /// 本子代理累计消耗的 token（各轮 lastTotalTokens 之和）。
+  int totalTokens = 0;
+
+  /// 单个工具结果的最大字符数（防大输出撑爆子代理上下文）。
+  static const int maxToolOutputChars = 20000;
+
   /// 当前工作目录（注入子代理上下文）。
   final String workingDir;
 
@@ -229,20 +241,21 @@ class SubagentRunner {
         'role': 'assistant',
         'content': result.text,
         'tool_calls': [
-          for (final tc in result.toolCalls)
+          for (var i = 0; i < result.toolCalls.length; i++)
             {
-              'id': tc['id']?.isEmpty == true
-                  ? 'call_sub_$round'
-                  : tc['id'],
+              'id': result.toolCalls[i]['id']?.isEmpty == true
+                  ? 'call_sub_${round}_$i'
+                  : result.toolCalls[i]['id'],
               'type': 'function',
               'function': {
-                'name': tc['name'],
-                'arguments': tc['arguments'],
+                'name': result.toolCalls[i]['name'],
+                'arguments': result.toolCalls[i]['arguments'],
               },
             },
         ],
       });
-      for (final tc in result.toolCalls) {
+      for (var i = 0; i < result.toolCalls.length; i++) {
+        final tc = result.toolCalls[i];
         final name = (tc['name'] ?? '').toString();
         final args = (tc['arguments'] ?? '').toString();
         String output;
@@ -250,7 +263,11 @@ class SubagentRunner {
           output = '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
         } else {
           try {
-            output = await executeTool(name, args);
+            final raw = await executeTool(name, args);
+            // 截断超大输出，保护子代理上下文预算。
+            output = raw.length > maxToolOutputChars
+                ? '${raw.substring(0, maxToolOutputChars)}…（输出过长，已截断）'
+                : raw;
           } catch (e) {
             output = '工具执行异常: $e';
           }
@@ -259,7 +276,7 @@ class SubagentRunner {
           'role': 'tool',
           'content': output,
           'tool_call_id': (tc['id'] ?? '').isEmpty
-              ? 'call_sub_$round'
+              ? 'call_sub_${round}_$i'
               : (tc['id'] ?? ''),
         });
       }
@@ -282,6 +299,9 @@ class SubagentRunner {
       await client.send(msgs);
     } catch (e) {
       return TurnResult(text: '（子代理请求失败: $e）');
+    }
+    if (client.lastTotalTokens != null && client.lastTotalTokens! > 0) {
+      totalTokens += client.lastTotalTokens!;
     }
     return accumulated;
   }
