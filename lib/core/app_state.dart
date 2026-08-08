@@ -1375,7 +1375,10 @@ class ShiyiState extends ChangeNotifier {
       '能独立执行且无需用户交互的子任务（写文件/跑命令/批量处理）→ 派 worker；'
       '以上都不太贴合 → general-purpose。'
       '知道确切路径的单点查找（一个文件/一个值）直接 file_read/run_terminal，不要派子代理。'
-      '子代理返回报告后由你整合进最终回答；不要把需要用户交互或全局决策的主任务整体丢给子代理。',
+      '子代理返回报告后由你整合进最终回答；不要把需要用户交互或全局决策的主任务整体丢给子代理。'
+      '- 抓取/搜索失败重试规则：同一 URL 或同一来源连续失败 2 次后立即放弃，'
+      '换关键词、换站点或换工具（run_terminal curl）；不要在失败目标上反复重试浪费轮次。'
+      '若工具返回「已连续失败 N 次」的提示，必须立刻停止对该目标的调用。',
     );
     parts.add(
       '- 当前会话工作目录是 ${await currentWorkspace()}（会话未自定义时使用 '
@@ -1479,6 +1482,10 @@ class ShiyiState extends ChangeNotifier {
       output.startsWith('记录失败') ||
       output.startsWith('未知工具');
 
+  /// 各工具连续失败次数（成功清零）。
+  /// 用于在工具反复失败时强制提示模型停止重试同一目标。
+  final Map<String, int> _toolFailStreak = {};
+
   Future<String> _executeTool(String name, String argsJson) async {
     for (final t in toolRegistry) {
       if (t.name != name) continue;
@@ -1487,8 +1494,17 @@ class ShiyiState extends ChangeNotifier {
         try {
           args = jsonDecode(argsJson) as Map<String, dynamic>;
         } catch (_) {}
-        return await t.execute(this, args);
+        final out = await t.execute(this, args);
+        _toolFailStreak.remove(name);
+        return out;
       } catch (e) {
+        final streak = (_toolFailStreak[name] ?? 0) + 1;
+        _toolFailStreak[name] = streak;
+        if (streak >= 2) {
+          return '⚠️ 工具 $name 已连续失败 $streak 次，立即停止重试同一个目标：'
+              '换 URL、换搜索词，或换工具（web_search 换关键词 / run_terminal 执行 curl）。'
+              '不要继续对同一目标调用 $name。\n工具执行异常: $e';
+        }
         return '工具执行异常: $e';
       }
     }

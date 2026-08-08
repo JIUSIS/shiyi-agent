@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:http/http.dart' as http;
 
 /// 单条搜索结果。
@@ -57,18 +58,42 @@ class WebTools {
     if (u.scheme != 'http' && u.scheme != 'https') {
       throw Exception('不支持的链接：$url');
     }
-    final resp = await http
-        .get(Uri.parse('https://r.jina.ai/${u.toString()}'), headers: {
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 14) ShiYi/1.0',
-          'Accept': 'text/plain, text/markdown',
-        })
-        .timeout(_extractTimeout);
+    http.Response resp;
+    try {
+      resp = await http
+          .get(Uri.parse('https://r.jina.ai/${u.toString()}'), headers: {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 14) ShiYi/1.0',
+            'Accept': 'text/plain, text/markdown',
+          })
+          .timeout(_extractTimeout);
+    } on TimeoutException {
+      throw Exception(
+        '抓取超时（15 秒）：目标站点可能响应慢或被防爬拦截（验证码/Cloudflare 等）。'
+        '建议：换站点或换搜索词；或改用 run_terminal 执行 curl 抓取（带浏览器 UA）。',
+      );
+    }
+    if (resp.statusCode == 403) {
+      throw Exception(
+        'HTTP 403：站点启用了防爬（拒绝自动抓取）。'
+        '建议换站/换搜索词，或 run_terminal 用 curl -A 浏览器UA 抓取。',
+      );
+    }
+    if (resp.statusCode == 429) {
+      throw Exception('HTTP 429：请求频率受限。先停下，换一个目标站点。');
+    }
     if (resp.statusCode != 200) {
-      throw Exception('网页抓取失败：HTTP ${resp.statusCode}');
+      throw Exception(
+        '网页抓取失败：HTTP ${resp.statusCode}。'
+        '建议换站点或换工具（run_terminal curl）。',
+      );
     }
     var text = resp.body.trim();
-    if (text.isEmpty) throw Exception('网页内容为空');
-    return text.length <= maxChars ? text : '${text.substring(0, maxChars)}\n…（内容过长已截断）';
+    if (text.isEmpty) {
+      throw Exception('网页内容为空（可能是防爬返回的空页面）。建议换站点。');
+    }
+    return text.length <= maxChars
+        ? text
+        : '${text.substring(0, maxChars)}\n…（内容过长已截断）';
   }
 
   // ---------------- Bing ----------------
