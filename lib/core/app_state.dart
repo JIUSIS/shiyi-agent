@@ -362,12 +362,22 @@ class ShiyiState extends ChangeNotifier {
     AgentTool(
       name: 'spawn_agent',
       description:
-          '需要跨多个文件、长链调研或独立执行的任务：先考虑派子代理分头处理，'
+          '需要跨多个文件、长链调研或独立执行的任务：派子代理分头处理，'
           '不要自己逐文件读或单线程硬扛。'
+          '【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如'
+          '「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发'
+          '（最多 4 个，同时跑互不阻塞，单个失败不影响其他）；'
+          '禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。'
+          '只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。'
+          'tasks 示例：tasks=[{"agent_type":"explore","description":"查A",'
+          '"prompt":"…","max_turns":10},{"agent_type":"explore",'
+          '"description":"查B","prompt":"…","max_turns":10}]。'
           'explore 广网只读侦查（定位文件/搜符号/读多文件，返回精炼答案）；'
           'plan 只读方案设计；worker 独立执行（写文件/跑命令）；general-purpose 兜底。'
           '子代理完成后报告作为本工具结果返回，你再整合进主任务。'
-          '简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。',
+          '简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。'
+          '可选 max_turns 动态调整轮数预算（默认 explore 15 / plan 15 / worker 40 / '
+          'general 25）：简单小任务给 5~10 省钱，任务很复杂可给 40~60；1~80 之间。',
       parameters: {
         'type': 'object',
         'properties': {
@@ -384,8 +394,32 @@ class ShiyiState extends ChangeNotifier {
             'type': 'string',
             'description': '给子代理的具体任务指令，越明确越好',
           },
+          'tasks': {
+            'type': 'array',
+            'items': {
+              'type': 'object',
+              'properties': {
+                'agent_type': {'type': 'string', 'enum': ['explore', 'plan', 'worker', 'general-purpose']},
+                'description': {'type': 'string'},
+                'prompt': {'type': 'string'},
+                'max_turns': {'type': 'integer', 'description': '动态预算覆盖（1~80）'},
+                'write_paths': {'type': 'array', 'items': {'type': 'string'}, 'description': '写路径隔离：只允许 file_write 写这些路径（工作区相对或绝对）；不声明=可写整个工作区。并行多个 worker 时建议各自声明不重叠目录'},
+              },
+              'required': ['agent_type', 'description', 'prompt'],
+            },
+            'description': '批量并行派发：数组里的每个任务同时执行（最多 4 个）',
+          },
+          'max_turns': {
+            'type': 'integer',
+            'description': '动态预算：覆盖该子代理默认轮数上限（1~80；简单任务给小，复杂给大）',
+          },
+          'write_paths': {
+            'type': 'array',
+            'items': {'type': 'string'},
+            'description': '写路径隔离：只允许 file_write 写这些路径；不声明=可写整个工作区',
+          },
         },
-        'required': ['agent_type', 'description', 'prompt'],
+        'required': ['description', 'prompt'],
       },
       execute: (self, args) => self._execSpawnAgent(args),
     ),
@@ -1377,6 +1411,13 @@ class ShiyiState extends ChangeNotifier {
       '复杂方案、多步骤规划 → 派 plan；'
       '能独立执行且无需用户交互的子任务（写文件/跑命令/批量处理）→ 派 worker；'
       '以上都不太贴合 → general-purpose。'
+      '几个互不依赖的方向需要分头查 → 必须用 spawn_agent 的 tasks 数组一次并行派发'
+      '（最多 4 个，同时跑省时间）；禁止分多次调用 spawn_agent、也禁止同一轮发多个'
+      ' spawn_agent 工具调用——一次 tasks 派 N 个，界面会显示「子代理 i/N」进度。'
+      '轮数预算动态给：简单小任务 max_turns 给 5~10，复杂任务给 40~60，'
+      '不必都用默认值。'
+      '并行多个 worker 时给每个声明互不重叠的 write_paths（写路径隔离），'
+      '避免互相覆盖文件；explore/plan 只读不需要。'
       '知道确切路径的单点查找（一个文件/一个值）直接 file_read/run_terminal，不要派子代理。'
       '子代理返回报告后由你整合进最终回答；不要把需要用户交互或全局决策的主任务整体丢给子代理。'
       '- 抓取/搜索失败重试规则：同一 URL 或同一来源连续失败 2 次后立即放弃，'
@@ -1799,49 +1840,142 @@ class ShiyiState extends ChangeNotifier {
 
   /// 派发子代理：独立 LLM 对话 + 受限工具集，返回其最终文本报告。
   Future<String> _execSpawnAgent(Map<String, dynamic> args) async {
-    final type = (args['agent_type'] ?? '').toString().trim();
-    final prompt = (args['prompt'] ?? '').toString().trim();
-    if (type.isEmpty) return '派发失败：agent_type 为空';
-    if (prompt.isEmpty) return '派发失败：prompt 为空';
-    final def = SubagentDefinition.byName(type);
-    if (def == null) {
-      return '未知子代理类型：$type（可选 '
-          '${SubagentDefinition.all.map((d) => d.name).join(' / ')}）';
+    final rawTasks = args['tasks'];
+    final List<Map<String, dynamic>> tasks = <Map<String, dynamic>>[];
+    if (rawTasks is List && rawTasks.isNotEmpty) {
+      tasks.addAll(rawTasks.whereType<Map>().cast<Map<String, dynamic>>());
+    } else {
+      tasks.add(args);
     }
-    final runner = SubagentRunner(
-      baseUrl: settings.baseUrl,
-      apiKey: settings.apiKey,
-      model: settings.model,
-      temperature: settings.temperature,
-      toolsJson: _toolsJsonFor(def.allowedTools),
-      // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
-      executeTool: (name, argsJson) async {
-        if (!def.allowedTools.contains(name)) {
-          return '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
+    const maxParallel = 4;
+    if (tasks.length > maxParallel) {
+      return '一次最多并行 $maxParallel 个子代理（当前 ${tasks.length} 个），请分批派发。';
+    }
+    for (final t in tasks) {
+      final type = (t['agent_type'] ?? '').toString().trim();
+      final prompt = (t['prompt'] ?? '').toString().trim();
+      if (type.isEmpty || prompt.isEmpty) {
+        return '派发失败：tasks 每项需含非空 agent_type 与 prompt。';
+      }
+    }
+    // 动态预算：max_turns 覆盖定义默认值（1~80，硬顶防失控）。
+    int? parseBudget(Map<String, dynamic> t) {
+      final v = t['max_turns'];
+      if (v == null) return null;
+      final n = int.tryParse(v.toString());
+      if (n == null || n < 1 || n > 80) {
+        throw ArgumentError('max_turns 需为 1~80 的整数');
+      }
+      return n;
+    }
+
+    final total = tasks.length;
+    // 并发执行：每任务独立 try/catch，单个失败不影响其他（独立失败）。
+    final results = await Future.wait(
+      List.generate(total, (i) async {
+        final t = tasks[i];
+        final type = (t['agent_type'] ?? '').toString().trim();
+        final prompt = (t['prompt'] ?? '').toString().trim();
+        final def = SubagentDefinition.byName(type);
+        if (def == null) {
+          return '### 子代理 ${i + 1}/$total（$type）\n未知子代理类型：$type'
+              '（可选 ${SubagentDefinition.all.map((d) => d.name).join(' / ')}）';
         }
-        // 只读代理的终端调用做写操作拦截（提示词之外的技术兜底）。
-        if (name == 'run_terminal' && def.readOnlyTerminal) {
-          final denied = _rejectWriteCommand(argsJson);
-          if (denied != null) return denied;
+        final int? override;
+        try {
+          override = parseBudget(t);
+        } catch (e) {
+          return '### 子代理 ${i + 1}/$total（$type）\n$e';
         }
-        return _executeTool(name, argsJson);
-      },
-      workingDir: await currentWorkspace(),
-      shouldStop: () => _stopRequested,
-      // 子代理每轮进度回流到状态条（右上角胶囊仍显示工具名/读秒）。
-      onProgress: (round, max, tool) {
-        final t = tool.isEmpty ? '思考中' : '正在调用 $tool';
-        status = '子代理「${def.name}」第 ${round + 1}/$max 轮 · $t';
-        notifyListeners();
-      },
+        // 写路径隔离：声明 write_paths 后，file_write 只能写这些路径
+        //（不声明 = 允许写整个工作区）。多个并行子代理声明不重叠路径即可放心并行。
+        final workingDirAbs = await currentWorkspace();
+        final rawWp = t['write_paths'];
+        final List<String>? writePaths = rawWp is List
+            ? rawWp
+                .map((e) => _normAbsPath(e.toString(), workingDirAbs))
+                .toList()
+            : null;
+        final runner = SubagentRunner(
+          baseUrl: settings.baseUrl,
+          apiKey: settings.apiKey,
+          model: settings.model,
+          temperature: settings.temperature,
+          toolsJson: _toolsJsonFor(def.allowedTools),
+          // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
+          executeTool: (name, argsJson) async {
+            if (!def.allowedTools.contains(name)) {
+              return '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
+            }
+            // 写路径隔离：file_write 目标必须在 write_paths 允许范围内。
+            if (name == 'file_write' && writePaths != null) {
+              Map<String, dynamic> a = {};
+              try {
+                a = jsonDecode(argsJson) as Map<String, dynamic>;
+              } catch (_) {}
+              final p = (a['path'] ?? '').toString();
+              final target = _normAbsPath(p, workingDirAbs);
+              final ok = writePaths.any(
+                  (w) => target == w || target.startsWith('$w/'));
+              if (!ok) {
+                return '写入被拒绝：$p 不在本子代理允许的 write_paths 内'
+                    '（允许：${writePaths.join('、')}）。'
+                    '请把输出写到允许路径，或要求主代理调整 write_paths。';
+              }
+            }
+            // 只读代理的终端调用做写操作拦截（提示词之外的技术兜底）。
+            if (name == 'run_terminal' && def.readOnlyTerminal) {
+              final denied = _rejectWriteCommand(argsJson);
+              if (denied != null) return denied;
+            }
+            return _executeTool(name, argsJson);
+          },
+          workingDir: workingDirAbs,
+          shouldStop: () => _stopRequested,
+          // 进度回流：显示「第 i/N 个子代理 · 类型 · 第 n/m 轮 · 工具」。
+          onProgress: (round, max, tool) {
+            final t2 = tool.isEmpty ? '思考中' : '正在调用 $tool';
+            status = '子代理 ${i + 1}/$total · ${def.name} · '
+                '第 ${round + 1}/$max 轮 · $t2';
+            notifyListeners();
+          },
+        );
+        String report;
+        try {
+          report = await runner.run(def, prompt, maxTurnsOverride: override);
+        } catch (e) {
+          report = '（子代理异常：$e）';
+        }
+        // 子代理消耗的 token 计入会话统计（与主循环一致）。
+        if (runner.totalTokens > 0 && currentSessionId != null) {
+          sessionTotalTokens += runner.totalTokens;
+          await _db.updateSessionTokens(currentSessionId!, sessionTotalTokens);
+        }
+        return '### 子代理 ${i + 1}/$total（${def.name}）\n$report';
+      }),
     );
-    final report = await runner.run(def, prompt);
-    // 子代理消耗的 token 计入会话统计（与主循环一致）。
-    if (runner.totalTokens > 0 && currentSessionId != null) {
-      sessionTotalTokens += runner.totalTokens;
-      await _db.updateSessionTokens(currentSessionId!, sessionTotalTokens);
+    // 全部结束后清掉轮次状态条，避免残留「第 n/m 轮」。
+    status = null;
+    notifyListeners();
+    return results.join('\n\n');
+  }
+
+  /// 归一路径为绝对路径（相对基于 baseDir），供 write_paths 隔离比较。
+  static String _normAbsPath(String p, String baseDir) {
+    var s = p.trim().replaceAll('\\', '/');
+    if (s.isEmpty) return baseDir;
+    final isAbs = s.startsWith('/') || RegExp(r'^[A-Za-z]:/').hasMatch(s);
+    final full = isAbs ? s : '$baseDir/$s';
+    final segs = <String>[];
+    for (final seg in full.split('/')) {
+      if (seg.isEmpty || seg == '.') continue;
+      if (seg == '..') {
+        if (segs.isNotEmpty) segs.removeLast();
+      } else {
+        segs.add(seg);
+      }
     }
-    return '【${def.name} 子代理报告】\n$report';
+    return segs.join('/');
   }
 
   /// 只读代理的终端命令写操作拦截：命中写命令/重定向即拒绝。

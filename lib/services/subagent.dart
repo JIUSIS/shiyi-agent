@@ -220,7 +220,10 @@ class SubagentRunner {
   });
 
   /// 运行子代理，返回其最终文本。
-  Future<String> run(SubagentDefinition def, String prompt) async {
+  /// [maxTurnsOverride] 可动态覆盖定义里的轮数上限（动态预算，默认用定义值）。
+  Future<String> run(SubagentDefinition def, String prompt,
+      {int? maxTurnsOverride}) async {
+    final budget = (maxTurnsOverride ?? def.maxTurns).clamp(1, 80);
     final msgs = <Map<String, dynamic>>[
       {
         'role': 'system',
@@ -231,11 +234,11 @@ class SubagentRunner {
       {'role': 'user', 'content': prompt},
     ];
 
-    for (var round = 0; round < def.maxTurns; round++) {
+    for (var round = 0; round < budget; round++) {
       if (shouldStop?.call() ?? false) {
         return '（子代理已因用户停止而中断）';
       }
-      onProgress?.call(round, def.maxTurns, '');
+      onProgress?.call(round, budget, '');
       final TurnResult? result = await _round(msgs);
       if (result == null) return '（子代理生成失败）';
       if (result.toolCalls.isEmpty) {
@@ -263,7 +266,7 @@ class SubagentRunner {
         final tc = result.toolCalls[i];
         final name = (tc['name'] ?? '').toString();
         final args = (tc['arguments'] ?? '').toString();
-        onProgress?.call(round, def.maxTurns, name);
+        onProgress?.call(round, budget, name);
         String output;
         if (!def.allowedTools.contains(name)) {
           output = '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
