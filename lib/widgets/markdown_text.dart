@@ -1,8 +1,11 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// Lightweight Markdown renderer: code blocks, inline code, bold, italic,
-/// headings, bullet/numbered lists.
+/// headings, bullet/numbered lists, tables, quotes, links, task lists,
+/// strikethrough, nested indentation.
 class MarkdownText extends StatelessWidget {
   final String data;
   final TextStyle? style;
@@ -21,24 +24,27 @@ class MarkdownText extends StatelessWidget {
   }
 }
 
-/// 解析 Markdown 文本为块列表（代码块 / 标题 / 列表 / 段落）。
+/// 解析 Markdown 文本为块列表（代码块 / 标题 / 表格 / 引用 / 列表 / 段落）。
 List<String> splitMarkdownBlocks(String md) {
   final out = <String>[];
   final lines = md.split('\n');
   final buf = StringBuffer();
   var inCode = false;
+  String? tableBuf; // 连续表格行聚合缓冲
+  String? quoteBuf; // 连续引用行聚合缓冲
   for (final line in lines) {
     if (line.startsWith('```')) {
+      _flushBuf(out, buf);
+      _flushTable(out, tableBuf);
+      tableBuf = null;
+      _flushQuote(out, quoteBuf);
+      quoteBuf = null;
       if (inCode) {
         buf.writeln(line);
         out.add(buf.toString());
         buf.clear();
         inCode = false;
       } else {
-        if (buf.isNotEmpty) {
-          out.add(buf.toString());
-          buf.clear();
-        }
         buf.writeln(line);
         inCode = true;
       }
@@ -46,17 +52,69 @@ List<String> splitMarkdownBlocks(String md) {
     }
     // 标题行立即独立成块，避免混在段落里被当成普通文字原样显示
     if (!inCode && RegExp(r'^#{1,6}(?=\s|$)').hasMatch(line)) {
-      if (buf.isNotEmpty) {
-        out.add(buf.toString());
-        buf.clear();
-      }
+      _flushBuf(out, buf);
+      _flushTable(out, tableBuf);
+      tableBuf = null;
+      _flushQuote(out, quoteBuf);
+      quoteBuf = null;
       out.add('$line\n');
       continue;
     }
+    if (!inCode && _isTableRow(line)) {
+      _flushBuf(out, buf);
+      _flushQuote(out, quoteBuf);
+      quoteBuf = null;
+      tableBuf = '${tableBuf ?? ''}$line\n';
+      continue;
+    }
+    if (!inCode && line.trimLeft().startsWith('>')) {
+      _flushBuf(out, buf);
+      _flushTable(out, tableBuf);
+      tableBuf = null;
+      quoteBuf = '${quoteBuf ?? ''}$line\n';
+      continue;
+    }
+    // 普通行：结束正在聚合的表格 / 引用
+    _flushTable(out, tableBuf);
+    tableBuf = null;
+    _flushQuote(out, quoteBuf);
+    quoteBuf = null;
     buf.writeln(line);
   }
+  _flushTable(out, tableBuf);
+  _flushQuote(out, quoteBuf);
   if (buf.isNotEmpty) out.add(buf.toString());
   return out;
+}
+
+void _flushBuf(List<String> out, StringBuffer buf) {
+  if (buf.isNotEmpty) {
+    out.add(buf.toString());
+    buf.clear();
+  }
+}
+
+void _flushTable(List<String> out, String? t) {
+  if (t != null && t.trim().isNotEmpty) out.add(t);
+}
+
+void _flushQuote(List<String> out, String? q) {
+  if (q != null && q.trim().isNotEmpty) out.add(q);
+}
+
+/// 表格行判定：含 `|` 且分隔出至少 2 列（含 `| a | b |` 与无首尾竖线的写法）。
+bool _isTableRow(String line) {
+  final t = line.trim();
+  if (t.isEmpty || !t.contains('|')) return false;
+  if (t.startsWith('#') || t.startsWith('```')) return false;
+  final cells = t.replaceAll(RegExp(r'^\|'), '').replaceAll(RegExp(r'\|$'), '').split('|');
+  return cells.length >= 2;
+}
+
+bool _isTableBlock(String b) {
+  final first =
+      b.split('\n').firstWhere((l) => l.trim().isNotEmpty, orElse: () => '');
+  return first.isNotEmpty && _isTableRow(first);
 }
 
 bool _isListBlock(String b) =>
@@ -81,6 +139,12 @@ class MarkdownBlock extends StatelessWidget {
     final trimmed = block.trim();
     if (trimmed.startsWith('```')) {
       return _CodeBlock(block: block, base: base);
+    }
+    if (_isTableBlock(trimmed)) {
+      return _TableBlock(block: block, base: base, accent: accent);
+    }
+    if (trimmed.startsWith('>')) {
+      return _QuoteBlock(block: block, base: base, accent: accent);
     }
     if (_isListBlock(trimmed)) {
       return _ListBlock(block: block, base: base, accent: accent);
@@ -166,8 +230,8 @@ class MarkdownInlineText extends StatelessWidget {
 
 List<InlineSpan> _renderInline(String text, TextStyle base, Color accent) {
   final spans = <InlineSpan>[];
-  final regex =
-      RegExp(r'(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_)');
+  final regex = RegExp(
+      r'(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\[[^\]]+\]\([^)\s]+\)|\*[^*]+\*|_[^_]+_)');
   var pos = 0;
   for (final m in regex.allMatches(text)) {
     if (m.start > pos) {
@@ -188,6 +252,27 @@ List<InlineSpan> _renderInline(String text, TextStyle base, Color accent) {
       spans.add(TextSpan(
           text: group.substring(2, group.length - 2),
           style: base.copyWith(fontWeight: FontWeight.bold)));
+    } else if (group.startsWith('~~')) {
+      spans.add(TextSpan(
+          text: group.substring(2, group.length - 2),
+          style: base.copyWith(decoration: TextDecoration.lineThrough)));
+    } else if (group.startsWith('[')) {
+      final m2 = RegExp(r'^\[([^\]]+)\]\(([^)\s]+)\)$').firstMatch(group);
+      if (m2 != null) {
+        final url = m2.group(2)!;
+        spans.add(TextSpan(
+          text: m2.group(1),
+          style: base.copyWith(
+            color: accent,
+            decoration: TextDecoration.underline,
+            decorationColor: accent,
+          ),
+          recognizer: TapGestureRecognizer()
+            ..onTap = () => _openUrl(url),
+        ));
+      } else {
+        spans.add(TextSpan(text: group, style: base));
+      }
     } else if (group.startsWith('*') || group.startsWith('_')) {
       spans.add(TextSpan(
           text: group.substring(1, group.length - 1),
@@ -201,6 +286,149 @@ List<InlineSpan> _renderInline(String text, TextStyle base, Color accent) {
     spans.add(TextSpan(text: text.substring(pos), style: base));
   }
   return spans;
+}
+
+Future<void> _openUrl(String url) async {
+  final uri = Uri.tryParse(url);
+  if (uri == null) return;
+  try {
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  } catch (_) {
+    // 打不开的链接静默忽略，不阻塞消息渲染
+  }
+}
+
+/// 表格块：`| a | b |` GitHub 风格表格（含分隔行），均分列宽，表头加粗高亮。
+class _TableBlock extends StatelessWidget {
+  final String block;
+  final TextStyle base;
+  final Color accent;
+  const _TableBlock({required this.block, required this.base, required this.accent});
+
+  List<List<String>> _parseRows() {
+    final rows = <List<String>>[];
+    for (final line in block.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      var t = line.trim();
+      if (t.startsWith('|')) t = t.substring(1);
+      if (t.endsWith('|')) t = t.substring(0, t.length - 1);
+      rows.add(t.split('|').map((c) => c.trim()).toList());
+    }
+    return rows;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final outline = theme.colorScheme.outlineVariant.withValues(alpha: .5);
+    final rows = _parseRows();
+    if (rows.isEmpty) return const SizedBox.shrink();
+    var sep = -1;
+    for (var i = 0; i < rows.length; i++) {
+      final r = rows[i];
+      if (r.length >= 2 && r.every((c) => RegExp(r'^:?-+:?$').hasMatch(c))) {
+        sep = i;
+        break;
+      }
+    }
+    final header = sep > 0 ? rows[0] : rows.first;
+    final body = sep >= 0 ? rows.sublist(sep + 1) : rows.sublist(1);
+    final colCount = rows.fold<int>(0, (m, r) => r.length > m ? r.length : m);
+    if (colCount < 2) {
+      // 退化（如 `| a |`）：按普通段落渲染，避免出现奇怪的单列表格
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Text.rich(
+          TextSpan(children: _renderInline(block.trim(), base, accent)),
+          style: base,
+        ),
+      );
+    }
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: outline),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _tableRow(header, isHeader: true),
+          for (final r in body) _tableRow(r, isHeader: false),
+        ],
+      ),
+    );
+  }
+
+  Widget _tableRow(List<String> cells, {required bool isHeader}) {
+    final cellStyle =
+        isHeader ? base.copyWith(fontWeight: FontWeight.bold) : base;
+    return Container(
+      color: isHeader ? accent.withValues(alpha: .08) : null,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (var i = 0; i < cells.length; i++)
+            Expanded(
+              child: Padding(
+                padding: EdgeInsets.only(right: i == cells.length - 1 ? 0 : 8),
+                child: Text.rich(
+                  TextSpan(
+                      children: _renderInline(cells[i], cellStyle, accent)),
+                  style: cellStyle,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 引用块：`> 引用`，左侧竖线 + 浅色底。
+class _QuoteBlock extends StatelessWidget {
+  final String block;
+  final TextStyle base;
+  final Color accent;
+  const _QuoteBlock({required this.block, required this.base, required this.accent});
+
+  @override
+  Widget build(BuildContext context) {
+    final lines = block
+        .split('\n')
+        .map((l) => l.replaceFirst(RegExp(r'^>\s?'), ''))
+        .where((l) => l.trim().isNotEmpty)
+        .toList();
+    if (lines.isEmpty) return const SizedBox.shrink();
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.only(left: 10, top: 6, bottom: 6, right: 8),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: .05),
+        borderRadius: BorderRadius.circular(6),
+        border: Border(
+          left: BorderSide(color: accent.withValues(alpha: .6), width: 3),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final l in lines)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 1),
+              child: Text.rich(
+                TextSpan(children: _renderInline(l, base, accent)),
+                style: base,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }
 
 class _CodeBlock extends StatelessWidget {
@@ -261,7 +489,8 @@ class _ListBlock extends StatelessWidget {
   Widget build(BuildContext context) {
     final children = <Widget>[];
     for (final line in block.split('\n')) {
-      final m = RegExp(r'^\s*([-*•]|\d+[.)、\.])\s+(.*)$').firstMatch(line);
+      final m =
+          RegExp(r'^(\s*)([-*•]|\d+[.)、\.])\s+(.*)$').firstMatch(line);
       if (m == null) {
         // 混合块中非列表行不能丢，按普通段落保留，避免内容缺失
         if (line.trim().isNotEmpty) {
@@ -275,12 +504,43 @@ class _ListBlock extends StatelessWidget {
         }
         continue;
       }
-      final prefix = m.group(1)!;
+      final indentPx = (m.group(1) ?? '').replaceAll('\t', '    ').length * 5.0;
+      final prefix = m.group(2)!;
       final isNumbered = RegExp(r'^\d').hasMatch(prefix);
-      final bullet = isNumbered ? '${prefix.replaceAll(RegExp(r'[.)、。）]'), '')}.' : prefix;
+      final content = m.group(3)!;
+      // 任务列表：- [x] 完成 / - [ ] 待办
+      final taskM = RegExp(r'^\[([ xX])\]\s+(.*)$').firstMatch(content);
+      if (taskM != null && !isNumbered) {
+        final checked = taskM.group(1)!.toLowerCase() == 'x';
+        children.add(Padding(
+          padding: const EdgeInsets.symmetric(vertical: 1),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            SizedBox(width: indentPx),
+            Icon(
+              checked
+                  ? Icons.check_box_rounded
+                  : Icons.check_box_outline_blank_rounded,
+              size: 19,
+              color: checked ? accent : Colors.grey.shade500,
+            ),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text.rich(
+                TextSpan(
+                    children: _renderInline(taskM.group(2)!, base, accent)),
+              ),
+            ),
+          ]),
+        ));
+        continue;
+      }
+      final bullet = isNumbered
+          ? '${prefix.replaceAll(RegExp(r'[.)、。）]'), '')}.'
+          : prefix;
       children.add(Padding(
         padding: const EdgeInsets.symmetric(vertical: 1),
         child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(width: indentPx),
           SizedBox(
             width: 22,
             child: Text(bullet,
@@ -288,7 +548,7 @@ class _ListBlock extends StatelessWidget {
           ),
           Expanded(
             child: Text.rich(
-              TextSpan(children: _renderInline(m.group(2)!, base, accent)),
+              TextSpan(children: _renderInline(content, base, accent)),
             ),
           ),
         ]),
