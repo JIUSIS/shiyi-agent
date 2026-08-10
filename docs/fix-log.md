@@ -402,3 +402,13 @@
 - **修复**：统一为 token 口径（`sessionContextTokens` / `sessionContextTokenEstimate`）；估算计入 `tool_calls`；新增 `estimateApiMessageTokens` 纯函数供兜底与测试；无 usage 兜底改用统一估算；子代理并行累计后一次性落库并入「本轮」；主循环 / 子代理只在仍查看该会话时更新全局显示；弹窗单位改为「w token」。
 - **涉及**：`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`、`lib/screens/settings_screen.dart`、`test/context_budget_test.dart`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 39 项全部通过（新增 `estimateApiMessageTokens` 3 项回归用例）。
+
+### 53. 上下文裁剪提示与状态生命周期分离（裁剪是一次性事件，不是持续告警）
+- **现象**：长会话发送时出现「上下文接近上限，已自动裁剪较早历史后发送」横幅，但状态栏同时显示 `上下文 2.0w / 12.8w（剩 84%）`，两者矛盾。
+- **根因**：裁剪逻辑把「本次发生了裁剪」直接写进通用 `status` 横幅，文案表示仍接近上限；且状态栏在回合结束后用全量历史重算，会从裁剪后的 2.0w 跳回百万级。
+- **修复**：
+  1. 裁剪改为一次性 `trimNotice`：4 秒自动消失，新会话/切换会话/新一轮发送/重新生成时清除；文案改为 `历史较长，已从约 13.6w 裁剪至 2.0w token 后发送`。
+  2. 状态栏只显示裁剪后的实际值：发送时立即更新，回合结束后按同一预算口径重算，不再回跳全量。
+  3. 新增 `sessionContextTokensFull` 供压缩判断使用，避免裁剪后永不触发压缩；手动压缩弹窗仍显示全量估算。
+- **涉及**：`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 39 项全部通过。

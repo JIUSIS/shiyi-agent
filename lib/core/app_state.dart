@@ -61,6 +61,10 @@ class ShiyiState extends ChangeNotifier {
   bool isBusy = false;
   String? status;
 
+  /// 一次性的历史裁剪提示（4 秒后自动消失，不表示当前仍接近上限）。
+  String? trimNotice;
+  Timer? _trimNoticeTimer;
+
   /// 正在生成回复的会话 id（主页显示思考状态）。
   String? busySessionId;
 
@@ -81,6 +85,9 @@ class ShiyiState extends ChangeNotifier {
 
   /// 当前会话上下文估算 token 数（与 contextLimit 同口径，用于显示剩余百分比）。
   int sessionContextTokens = 0;
+
+  /// 当前会话全量历史上下文估算（用于压缩判断，不受发送前裁剪影响）。
+  int sessionContextTokensFull = 0;
 
   /// 正在流式输出的消息文本（独立通知器：流式刷新只重建这一条气泡，不重建整个列表）。
   final ValueNotifier<String> streamText = ValueNotifier('');
@@ -533,6 +540,7 @@ class ShiyiState extends ChangeNotifier {
   }
 
   Future<void> newSession() async {
+    _clearTrimNotice();
     final now = DateTime.now().millisecondsSinceEpoch;
     final id = 's${now}_${_rand()}';
     await _db.upsertSession(
@@ -553,10 +561,12 @@ class ShiyiState extends ChangeNotifier {
     sessionTotalTokens = 0;
     lastRoundTokens = 0;
     sessionContextTokens = 0;
+    sessionContextTokensFull = 0;
     await refreshSessions();
   }
 
   Future<void> selectSession(String id) async {
+    _clearTrimNotice();
     currentSessionId = id;
     viewingSessionId = id;
     unreadSessions.remove(id);
@@ -587,7 +597,7 @@ class ShiyiState extends ChangeNotifier {
     final sess = await _db.getSession(id);
     sessionTotalTokens = sess?.totalTokens ?? 0;
     lastRoundTokens = 0;
-    sessionContextTokens = await sessionContextTokenEstimate(id);
+    await _updateContextStats(id);
     // 该会话若正在生成中，把内存里实时更新的流式消息接回来，
     // 避免重进会话后「正在思考…」消失、或刷新内容与 DB 不一致。
     if (busySessionId == id && _streaming != null) {
@@ -672,8 +682,9 @@ class ShiyiState extends ChangeNotifier {
   /// 发送前按上下文预算裁剪历史：从最新往回保留，超出预算的较早消息
   /// 不发送（不动数据库），并在 system 提示里说明，避免长会话请求超限。
   Future<List<Map<String, dynamic>>> _trimApiMessages(
-    List<Map<String, dynamic>> apiMsgs,
-  ) async {
+    List<Map<String, dynamic>> apiMsgs, {
+    bool announce = true,
+  }) async {
     if (apiMsgs.length <= 1) return apiMsgs;
     final sysLen = _estimateTokens('${apiMsgs.first['content'] ?? ''}');
     final toolsLen = activeTools.isEmpty
@@ -682,11 +693,95 @@ class ShiyiState extends ChangeNotifier {
     final budget =
         (settings.contextLimit * 0.9).round() - sysLen - toolsLen - 500;
     final trimmed = trimApiMessagesForBudget(apiMsgs, budget);
-    if (trimmed.length < apiMsgs.length) {
-      status = '上下文接近上限，已自动裁剪较早历史后发送';
-      notifyListeners();
+    if (trimmed.length < apiMsgs.length && announce) {
+      final before = _estimateMessagesTokens(apiMsgs) + toolsLen;
+      final after = _estimateMessagesTokens(trimmed) + toolsLen;
+      _showTrimNotice(
+        '历史较长，已从约 ${_fmtTokens(before)} 裁剪至 ${_fmtTokens(after)} token 后发送',
+      );
     }
     return trimmed;
+  }
+
+  static int _estimateMessagesTokens(List<Map<String, dynamic>> msgs) {
+    var t = 0;
+    for (final m in msgs) {
+      t += estimateApiMessageTokens(m);
+    }
+    return t;
+  }
+
+  static String _fmtTokens(int n) {
+    if (n >= 10000) return '${(n / 10000).toStringAsFixed(1)}w';
+    return '$n';
+  }
+
+  void _showTrimNotice(String message) {
+    trimNotice = message;
+    _trimNoticeTimer?.cancel();
+    _trimNoticeTimer = Timer(const Duration(seconds: 4), () {
+      if (trimNotice == message) {
+        trimNotice = null;
+        notifyListeners();
+      }
+    });
+    notifyListeners();
+  }
+
+  void _clearTrimNotice() {
+    _trimNoticeTimer?.cancel();
+    _trimNoticeTimer = null;
+    if (trimNotice != null) {
+      trimNotice = null;
+      notifyListeners();
+    }
+  }
+
+  /// 估算下一轮请求按发送前预算裁剪后的实际上下文 token 数。
+  /// 状态栏用它展示“真正会发给模型的大小”，压缩判断仍用全量估算。
+  Future<int> trimmedContextTokenEstimate(String sessionId) async {
+    final msgs = _messagesLoadedForSessionId == sessionId
+        ? messages
+        : await _db.listMessages(sessionId);
+    final apiMsgs = <Map<String, dynamic>>[];
+    for (final m in msgs.where((m) => !m.streaming)) {
+      if (m.role == 'tool') continue;
+      if (m.role == 'user' && m.hasImages) {
+        final text = stripImageMarkers(m.content);
+        apiMsgs.add({
+          'role': 'user',
+          'content': [
+            if (text.isNotEmpty) {'type': 'text', 'text': text},
+            for (final p in extractImagePaths(m.content))
+              {
+                'type': 'image_url',
+                'image_url': {'url': 'file://$p'},
+              },
+          ],
+        });
+        continue;
+      }
+      final api = m.toApiMap();
+      if (m.role == 'assistant' && m.hasToolCalls) {
+        api.remove('tool_calls');
+      }
+      apiMsgs.add(api);
+    }
+    if (apiMsgs.isEmpty) return 0;
+    final sys = await _buildSystemPrompt('');
+    apiMsgs.insert(0, {'role': 'system', 'content': sys});
+    final trimmed = await _trimApiMessages(apiMsgs, announce: false);
+    var total = _estimateMessagesTokens(trimmed);
+    if (activeTools.isNotEmpty) {
+      total += _estimateTokens(jsonEncode(activeTools));
+    }
+    return total;
+  }
+
+  /// 同时刷新全量与裁剪后的上下文统计，供会话切换/回合结束等场景使用。
+  Future<void> _updateContextStats(String sessionId) async {
+    sessionContextTokensFull = await sessionContextTokenEstimate(sessionId);
+    sessionContextTokens = await trimmedContextTokenEstimate(sessionId);
   }
 
   /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部并给
@@ -841,6 +936,7 @@ class ShiyiState extends ChangeNotifier {
       return;
     }
 
+    _clearTrimNotice();
     isBusy = true;
     _stopRequested = false;
     _stopForGuide = false;
@@ -978,6 +1074,17 @@ class ShiyiState extends ChangeNotifier {
           ...await _historyToApi(messages, imagesAllowed: imagesAllowed),
         ];
         final trimmed = await _trimApiMessages(loopMsgs);
+        // 状态栏立即反映裁剪后的实际上下文占用，而不是裁剪前的大值；
+        // 压缩判断仍保留裁剪前的全量估算。
+        var fullTokens = _estimateMessagesTokens(loopMsgs);
+        var trimmedTokens = _estimateMessagesTokens(trimmed);
+        if (activeTools.isNotEmpty) {
+          fullTokens += _estimateTokens(jsonEncode(activeTools));
+          trimmedTokens += _estimateTokens(jsonEncode(activeTools));
+        }
+        sessionContextTokensFull = fullTokens;
+        sessionContextTokens = trimmedTokens;
+        notifyListeners();
         await _runAgentLoop(sessionId, firstAsst, trimmed);
         completed = true;
         status = null;
@@ -1097,7 +1204,7 @@ class ShiyiState extends ChangeNotifier {
     _bumpMessages();
     await _db.touchSession(sessionId, model: settings.model);
     await refreshSessions();
-    sessionContextTokens = await sessionContextTokenEstimate(sessionId);
+    await _updateContextStats(sessionId);
     notifyListeners();
   }
 
@@ -1106,6 +1213,7 @@ class ShiyiState extends ChangeNotifier {
     if (isBusy) return;
     final sessionId = currentSessionId;
     if (sessionId == null) return;
+    _clearTrimNotice();
     final idx = messages.indexWhere((m) => m.id == id);
     if (idx < 0 || messages[idx].role != 'assistant') return;
 
@@ -1433,7 +1541,7 @@ class ShiyiState extends ChangeNotifier {
     if (currentSessionId == sessionId) {
       lastRoundTokens += used;
       sessionTotalTokens = newTotal;
-      sessionContextTokens = await sessionContextTokenEstimate(sessionId);
+      await _updateContextStats(sessionId);
     }
     notifyListeners();
     return accumulated;
@@ -2143,7 +2251,7 @@ class ShiyiState extends ChangeNotifier {
   Future<void> refreshTokenStats(String sessionId) async {
     final s = await _db.getSession(sessionId);
     if (s != null) sessionTotalTokens = s.totalTokens;
-    sessionContextTokens = await sessionContextTokenEstimate(sessionId);
+    await _updateContextStats(sessionId);
     notifyListeners();
   }
 
@@ -2255,7 +2363,7 @@ class ShiyiState extends ChangeNotifier {
     await _db.insertMessage(summaryMsg);
     messages = await _db.listMessages(sessionId);
     _bumpMessages();
-    sessionContextTokens = await sessionContextTokenEstimate(sessionId);
+    await _updateContextStats(sessionId);
     notifyListeners();
     return true;
   }

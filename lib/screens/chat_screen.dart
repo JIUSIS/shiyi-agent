@@ -894,6 +894,23 @@ class _ChatScreenState extends State<ChatScreen>
                                   );
                                 },
                               ),
+                            if (widget.shiyi.trimNotice != null)
+                              Container(
+                                width: double.infinity,
+                                color: theme.colorScheme.tertiaryContainer
+                                    .withValues(alpha: .55),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 6,
+                                ),
+                                child: Text(
+                                  widget.shiyi.trimNotice!,
+                                  style: theme.textTheme.bodySmall!.copyWith(
+                                    color:
+                                        theme.colorScheme.onTertiaryContainer,
+                                  ),
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -1053,7 +1070,7 @@ class _ChatScreenState extends State<ChatScreen>
     final limit = s.settings.contextLimit;
     final pct = s.settings.compressThresholdPercent;
     if (limit <= 0 || pct <= 0) return false;
-    return s.sessionContextTokens > limit * pct / 100;
+    return s.sessionContextTokensFull > limit * pct / 100;
   }
 
   Future<void> _compressContext() async {
