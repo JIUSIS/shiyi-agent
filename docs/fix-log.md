@@ -376,3 +376,11 @@
 - **涉及**：`lib/widgets/markdown_text.dart`、`lib/core/app_state.dart`、`lib/screens/home_screen.dart`、`lib/screens/chat_screen.dart`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 29 项全部通过。
 - **提醒**：debug 包本身为 JIT 模式，体感明显慢于 release；流畅度验收建议用 release 构建覆盖安装。
+
+### 50. memories 表建表漏 type 列（新装/异常库保存记忆失败隐患）
+- **现象**：外部诊断报告称真机 `memories` 表缺 `type` 列、`user_version` 未设置，保存记忆报 `table memories has no column named type`。
+- **排查**：备份真机库后用 SQLite 实测：`PRAGMA user_version = 11`，`memories` 已有 `type TEXT NOT NULL DEFAULT 'user'`，带 `type` 插入正常；`shiyi_agent.db-journal` 为 512 字节全零残留，SQLite 打开时会自行忽略，并非热 journal。
+- **根因**：`_createBaseTables` 建 `memories` 表时漏写 `type` 列。旧库走 v10→v11 升级分支会补列，但**新装库**由 onCreate 直接建表后 `user_version` 即 11，不会再走升级分支，必然缺列——属于代码版本与 schema 不一致的隐患，真机当前库未复现。
+- **修复**：`onCreate` 建表补 `type TEXT NOT NULL DEFAULT 'user'`；新增 `_repairSchema` 在 `onOpen` 兜底检查，缺列时自动 `ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'user'`，覆盖已生成的异常库。
+- **涉及**：`lib/services/db.dart`、`CHANGELOG.md`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 全部通过；备份库插入 `type=project` 测试成功。

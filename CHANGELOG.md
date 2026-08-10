@@ -2,6 +2,12 @@
 
 详细开发修复记录见 [docs/fix-log.md](docs/fix-log.md)，此处记录对外发布版本的变化。
 
+## [未发布]
+
+### 修复
+
+- memories 表新装库缺 `type` 列：建表补列 + 启动兜底检查，缺失时自动补列，避免保存记忆报 `table memories has no column named type`。
+
 ## [1.1.4] - 2026-08-11
 
 ### 新增

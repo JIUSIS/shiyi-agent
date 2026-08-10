@@ -21,6 +21,7 @@ class AppDatabase {
       version: 11,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
+      onOpen: _repairSchema,
     );
     return _db!;
   }
@@ -55,6 +56,7 @@ Future<void> _createBaseTables(Database db, int version) async {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       content TEXT NOT NULL,
       source TEXT,
+      type TEXT NOT NULL DEFAULT 'user',
       created_at INTEGER NOT NULL
     )
   ''');
@@ -158,6 +160,14 @@ Future<void> _upgrade(Database db, int oldV, int newV) async {
     if (!cols.any((c) => c['name'] == 'type')) {
       await db.execute("ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'user'");
     }
+  }
+}
+
+/// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
+Future<void> _repairSchema(Database db) async {
+  final cols = await db.rawQuery('PRAGMA table_info(memories)');
+  if (!cols.any((c) => c['name'] == 'type')) {
+    await db.execute("ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'user'");
   }
 }
 
