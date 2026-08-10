@@ -106,6 +106,35 @@ void main() {
       final out = ShiyiState.trimApiMessagesForBudget(m, 300);
       expect(out.map((e) => e['role']).toList(), ['system', 'user']);
     });
+
+    test('工具定义占用预算，裁剪后总请求 Token 不超过总预算', () {
+      final m = [
+        {'role': 'system', 'content': '系统提示'},
+        {'role': 'user', 'content': '旧' * 90000},
+        {'role': 'user', 'content': '最新问题'},
+      ];
+      final bigTool = [
+        {
+          'type': 'function',
+          'function': {
+            'name': 'big_tool',
+            'description': 'x' * 120000,
+          },
+        },
+      ];
+      const budget = 117248;
+      final out = ShiyiState.trimApiMessagesForBudget(
+        m,
+        budget,
+        tools: bigTool,
+      );
+      final total = ShiyiState.estimateRequestTokens(
+        out,
+        tools: bigTool,
+      ).totalEstimatedTokens;
+      expect(total, lessThanOrEqualTo(budget));
+      expect(out.last['content'], '最新问题');
+    });
   });
 
   group('estimateApiMessageTokens', () {

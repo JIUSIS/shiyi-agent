@@ -982,7 +982,11 @@ class ShiyiState extends ChangeNotifier {
       );
     }
     if (!plan.shouldTrim) return apiMsgs;
-    final trimmed = trimApiMessagesForBudget(apiMsgs, plan.usableInputTokens);
+    final trimmed = trimApiMessagesForBudget(
+      apiMsgs,
+      plan.usableInputTokens,
+      tools: activeTools,
+    );
     if (trimmed.length < apiMsgs.length && announce) {
       final before = estimateRequestTokens(
         apiMsgs,
@@ -1065,11 +1069,29 @@ class ShiyiState extends ChangeNotifier {
   /// 不会拆散配对。
   static List<Map<String, dynamic>> trimApiMessagesForBudget(
     List<Map<String, dynamic>> apiMsgs,
-    int budget,
-  ) {
+    int budget, {
+    List<Map<String, dynamic>> tools = const [],
+  }) {
     if (budget <= 0 || apiMsgs.length <= 1) return apiMsgs;
 
     int sizeOf(Map<String, dynamic> m) => estimateApiMessageTokens(m);
+
+    final systemTokens = apiMsgs.first['role'] == 'system'
+        ? estimateApiMessageTokens(apiMsgs.first)
+        : 0;
+    final toolDefinitionTokens = estimateRequestTokens([], tools: tools)
+        .totalEstimatedTokens;
+    final messageBudget = budget - systemTokens - toolDefinitionTokens;
+    if (messageBudget <= 0) {
+      // 预算连 system + 工具定义都不够时，仍保留 system 与最新消息，避免空请求。
+      final kept = <Map<String, dynamic>>[
+        Map<String, dynamic>.from(apiMsgs.first),
+      ];
+      if (apiMsgs.length > 1) {
+        kept.add(Map<String, dynamic>.from(apiMsgs.last));
+      }
+      return kept;
+    }
 
     // 工具轮按「assistant tool_calls + 连续 tool 结果」整体参与预算，
     // 保证成组保留或整组裁掉。
@@ -1099,7 +1121,7 @@ class ShiyiState extends ChangeNotifier {
       for (var k = u.$1; k <= u.$2; k++) {
         size += sizeOf(apiMsgs[k]);
       }
-      if (total + size > budget) {
+      if (total + size > messageBudget) {
         keepFrom = u.$2 + 1;
         trimmedAny = true;
         break;

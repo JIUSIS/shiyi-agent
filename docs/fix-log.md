@@ -442,6 +442,7 @@
   3. 裁剪循环使用 `estimateApiMessageTokens` 逐条计 Token，不再用 `content.length` 与 Token 预算直接比较；工具轮继续整组保留/整组裁掉。
   4. UI 当前上下文、发送前阈值、裁剪后 Token 全部调用同一个估算函数。
   5. `_trimApiMessages` 在发送时写 `TrimBudget` 日志，字段包含 contextLimit/system/toolDefinition/history/currentInput/image/outputReserve/safetyReserve/totalEstimated/trimTrigger/trimTarget，全部标注 `token` 单位。
-  6. 版本提升为 `1.1.5+9`（pubspec / gradle / about / README）。
+  6. 裁剪目标预算同步扣除 system 与工具定义，保证裁剪后的 `estimatedInputTokens`（含工具定义）不超过 `usableInputTokens`，而不是只把消息裁到窗口大小。
+  7. 版本提升为 `1.1.5+9`（pubspec / gradle / about / README）。
 - **涉及**：`lib/core/app_state.dart`、`test/context_budget_test.dart`、`pubspec.yaml`、`android/app/build.gradle.kts`、`lib/screens/about_screen.dart`、`README.md`、`CHANGELOG.md`。
-- **验证**：`flutter analyze` 无告警；`flutter test` 48 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、未超预算不裁剪、超预算裁剪到合法预算、请求级 Token 估算、多轮工具与图片回归用例）。
+- **验证**：`flutter analyze` 无告警；`flutter test` 50 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、未超预算不裁剪、超预算裁剪到合法预算、工具定义占用预算、请求级 Token 估算、多轮工具与图片回归用例）。

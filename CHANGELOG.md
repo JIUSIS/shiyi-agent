@@ -12,11 +12,11 @@
 - 上下文裁剪提示改为一次性事件：不再显示“仍接近上限”的误导横幅，改为 4 秒内显示裁剪前后 token；状态栏始终显示裁剪后的实际上下文，压缩判断继续使用全量估算。
 - 上下文管理：完整工具回合按 `tool_calls` 与 `tool_call_id` 成组保留最近 3 轮，60% 起压缩旧工具结果、75% 起生成滚动任务摘要、85% 才强制裁剪；纯工具轮也落库，会话重开不丢工具记忆。
 - 新增缓存命中率显示：状态栏单行追加 `缓存 75%`，使用 API 真实 usage 按 Token 加权累计，服务端未返回缓存字段时显示 `缓存 --`。
-- 修复 128K 上下文提前裁剪：预算统一改为 Token，`usableInputTokens = contextLimit − 实际 maxOutputTokens − 2% 安全余量`；只有 `estimatedInputTokens > usableInputTokens` 才硬裁剪，并输出 `TrimBudget` 诊断日志（system/tool/history/current/image/outputReserve/trigger/target 全带 Token 单位）。
+- 修复 128K 上下文提前裁剪：预算统一改为 Token，`usableInputTokens = contextLimit − 实际 maxOutputTokens − 2% 安全余量`；只有 `estimatedInputTokens > usableInputTokens` 才硬裁剪，裁剪目标同步扣除 system 与工具定义，并输出 `TrimBudget` 诊断日志（system/tool/history/current/image/outputReserve/trigger/target 全带 Token 单位）。
 
 ### 验证
 
-- `flutter analyze` 无告警；`flutter test` 48 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、超预算裁剪、请求级 Token 估算、多轮工具与图片回归用例）。
+- `flutter analyze` 无告警；`flutter test` 50 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、超预算裁剪、工具定义占用预算、请求级 Token 估算、多轮工具与图片回归用例）。
 
 ## [1.1.4] - 2026-08-11
 
