@@ -14,7 +14,7 @@ class AboutScreen extends StatefulWidget {
   const AboutScreen({super.key});
 
   static const String appName = '拾忆 ShiYi';
-  static const String version = '1.1.4';
+  static const String version = '1.1.5';
   static const String repoUrl = 'https://github.com/JIUSIS/shiyi-agent';
   static const String apiReleaseUrl =
       'https://api.github.com/repos/JIUSIS/shiyi-agent/releases/latest';

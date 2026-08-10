@@ -60,6 +60,44 @@ class _ToolSegment {
   });
 }
 
+/// 一次请求的 Token 预算决策（所有字段单位均为 Token）。
+class ContextBudgetPlan {
+  final int contextLimit;
+  final int outputReserve;
+  final int safetyReserve;
+  final int usableInputTokens;
+  final int estimatedInputTokens;
+
+  const ContextBudgetPlan({
+    required this.contextLimit,
+    required this.outputReserve,
+    required this.safetyReserve,
+    required this.usableInputTokens,
+    required this.estimatedInputTokens,
+  });
+
+  bool get shouldTrim => estimatedInputTokens > usableInputTokens;
+}
+
+/// 一次请求的 Token 估算明细（所有字段单位均为 Token）。
+class RequestTokenEstimate {
+  final int systemTokens;
+  final int toolDefinitionTokens;
+  final int historyTokens;
+  final int currentInputTokens;
+  final int imageTokens;
+  final int totalEstimatedTokens;
+
+  const RequestTokenEstimate({
+    required this.systemTokens,
+    required this.toolDefinitionTokens,
+    required this.historyTokens,
+    required this.currentInputTokens,
+    required this.imageTokens,
+    required this.totalEstimatedTokens,
+  });
+}
+
 class ShiyiState extends ChangeNotifier {
   final AppDatabase _db = AppDatabase.instance;
   final SettingsService _settingsService = SettingsService();
@@ -917,31 +955,48 @@ class ShiyiState extends ChangeNotifier {
   Future<List<Map<String, dynamic>>> _trimApiMessages(
     List<Map<String, dynamic>> apiMsgs, {
     bool announce = true,
+    bool logBudget = false,
   }) async {
     if (apiMsgs.length <= 1) return apiMsgs;
-    final sysLen = _estimateTokens('${apiMsgs.first['content'] ?? ''}');
-    final toolsLen = activeTools.isEmpty
-        ? 0
-        : _estimateTokens(jsonEncode(activeTools));
-    final budget =
-        (settings.contextLimit * 0.9).round() - sysLen - toolsLen - 500;
-    final trimmed = trimApiMessagesForBudget(apiMsgs, budget);
+    final estimate = estimateRequestTokens(apiMsgs, tools: activeTools);
+    final plan = planContextBudget(
+      contextLimit: settings.contextLimit,
+      maxOutputTokens: settings.maxOutputTokens,
+      estimatedInputTokens: estimate.totalEstimatedTokens,
+    );
+    if (logBudget) {
+      await _logError(
+        'TrimBudget',
+        'contextLimit=${plan.contextLimit} token, '
+            'systemTokens=${estimate.systemTokens} token, '
+            'toolDefinitionTokens=${estimate.toolDefinitionTokens} token, '
+            'historyTokens=${estimate.historyTokens} token, '
+            'currentInputTokens=${estimate.currentInputTokens} token, '
+            'imageTokens=${estimate.imageTokens} token, '
+            'outputReserve=${plan.outputReserve} token, '
+            'safetyReserve=${plan.safetyReserve} token, '
+            'totalEstimatedTokens=${estimate.totalEstimatedTokens} token, '
+            'trimTriggerTokens=${plan.usableInputTokens} token, '
+            'trimTargetTokens=${plan.usableInputTokens} token, '
+            'shouldTrim=${plan.shouldTrim}',
+      );
+    }
+    if (!plan.shouldTrim) return apiMsgs;
+    final trimmed = trimApiMessagesForBudget(apiMsgs, plan.usableInputTokens);
     if (trimmed.length < apiMsgs.length && announce) {
-      final before = _estimateMessagesTokens(apiMsgs) + toolsLen;
-      final after = _estimateMessagesTokens(trimmed) + toolsLen;
+      final before = estimateRequestTokens(
+        apiMsgs,
+        tools: activeTools,
+      ).totalEstimatedTokens;
+      final after = estimateRequestTokens(
+        trimmed,
+        tools: activeTools,
+      ).totalEstimatedTokens;
       _showTrimNotice(
         '历史较长，已从约 ${_fmtTokens(before)} 裁剪至 ${_fmtTokens(after)} token 后发送',
       );
     }
     return trimmed;
-  }
-
-  static int _estimateMessagesTokens(List<Map<String, dynamic>> msgs) {
-    var t = 0;
-    for (final m in msgs) {
-      t += estimateApiMessageTokens(m);
-    }
-    return t;
   }
 
   static String _fmtTokens(int n) {
@@ -993,11 +1048,10 @@ class ShiyiState extends ChangeNotifier {
       ...payload.messages,
     ];
     final trimmed = await _trimApiMessages(apiMsgs, announce: false);
-    var total = _estimateMessagesTokens(trimmed);
-    if (activeTools.isNotEmpty) {
-      total += _estimateTokens(jsonEncode(activeTools));
-    }
-    return total;
+    return estimateRequestTokens(
+      trimmed,
+      tools: activeTools,
+    ).totalEstimatedTokens;
   }
 
   /// 同时刷新全量与裁剪后的上下文统计，供会话切换/回合结束等场景使用。
@@ -1015,21 +1069,7 @@ class ShiyiState extends ChangeNotifier {
   ) {
     if (budget <= 0 || apiMsgs.length <= 1) return apiMsgs;
 
-    String contentOf(Map<String, dynamic> m) {
-      final c = m['content'];
-      if (c is String) return c;
-      if (c is List) return jsonEncode(c);
-      return '';
-    }
-
-    int sizeOf(Map<String, dynamic> m) {
-      var size = _estimateTokens(contentOf(m));
-      final tcs = m['tool_calls'];
-      if (tcs is List && tcs.isNotEmpty) {
-        size += _estimateTokens(jsonEncode(tcs));
-      }
-      return size;
-    }
+    int sizeOf(Map<String, dynamic> m) => estimateApiMessageTokens(m);
 
     // 工具轮按「assistant tool_calls + 连续 tool 结果」整体参与预算，
     // 保证成组保留或整组裁掉。
@@ -1342,15 +1382,16 @@ class ShiyiState extends ChangeNotifier {
           {'role': 'system', 'content': sysContent},
           ...historyPayload.messages,
         ];
-        final trimmed = await _trimApiMessages(loopMsgs);
-        // 状态栏立即反映裁剪后的实际上下文占用，而不是裁剪前的大值；
-        // 压缩判断仍保留裁剪前的全量估算。
-        var fullTokens = _estimateMessagesTokens(loopMsgs);
-        var trimmedTokens = _estimateMessagesTokens(trimmed);
-        if (activeTools.isNotEmpty) {
-          fullTokens += _estimateTokens(jsonEncode(activeTools));
-          trimmedTokens += _estimateTokens(jsonEncode(activeTools));
-        }
+        final trimmed = await _trimApiMessages(loopMsgs, logBudget: true);
+        // 状态栏、发送前阈值、裁剪后数值统一走 estimateRequestTokens。
+        final fullTokens = estimateRequestTokens(
+          loopMsgs,
+          tools: activeTools,
+        ).totalEstimatedTokens;
+        final trimmedTokens = estimateRequestTokens(
+          trimmed,
+          tools: activeTools,
+        ).totalEstimatedTokens;
         sessionContextTokensFull = fullTokens;
         sessionContextTokens = trimmedTokens;
         notifyListeners();
@@ -2571,19 +2612,112 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 估算单条 API 消息的 token 数（与发送口径一致：含 tool_calls，不含 reasoning）。
-  static int estimateApiMessageTokens(Map<String, dynamic> m) {
+  /// 多模态消息按文本 token + 图片每张 1000 token 估算，不再按整个数组粗暴计 400。
+  static int estimateApiMessageTokens(Map<String, dynamic> m) =>
+      _textTokensOfMessage(m) + _imageTokensOfMessage(m);
+
+  static int _textTokensOfMessage(Map<String, dynamic> m) {
     final c = m['content'];
     var total = 0;
     if (c is String) {
       total += _estimateTokens(c);
     } else if (c is List) {
-      total += 400; // 多模态消息粗略按一段文本估算
+      for (final part in c) {
+        if (part is Map && part['type'] == 'text') {
+          final text = part['text'];
+          if (text is String) total += _estimateTokens(text);
+        }
+      }
     }
     final tcs = m['tool_calls'];
     if (tcs is List && tcs.isNotEmpty) {
       total += _estimateTokens(jsonEncode(tcs));
     }
     return total;
+  }
+
+  static int _imageTokensOfMessage(Map<String, dynamic> m) {
+    final c = m['content'];
+    if (c is! List) return 0;
+    var count = 0;
+    for (final part in c) {
+      if (part is Map && part['type'] == 'image_url') count++;
+    }
+    return count * 1000;
+  }
+
+  /// 唯一的请求级 Token 估算入口：system、工具定义、历史、当前输入、图片
+  /// 全部走同一套口径，字段和返回值单位都是 Token。
+  static RequestTokenEstimate estimateRequestTokens(
+    List<Map<String, dynamic>> apiMsgs, {
+    required List<Map<String, dynamic>> tools,
+  }) {
+    var systemTokens = 0;
+    var historyTokens = 0;
+    var currentInputTokens = 0;
+    var imageTokens = 0;
+    final n = apiMsgs.length;
+    for (var i = 0; i < n; i++) {
+      final m = apiMsgs[i];
+      if (i == 0 && m['role'] == 'system') {
+        systemTokens += _textTokensOfMessage(m);
+      } else if (i == n - 1 && m['role'] == 'user') {
+        currentInputTokens += _textTokensOfMessage(m);
+      } else {
+        historyTokens += _textTokensOfMessage(m);
+      }
+      imageTokens += _imageTokensOfMessage(m);
+    }
+    final toolDefinitionTokens = _estimateTokens(jsonEncode(tools));
+    return RequestTokenEstimate(
+      systemTokens: systemTokens,
+      toolDefinitionTokens: toolDefinitionTokens,
+      historyTokens: historyTokens,
+      currentInputTokens: currentInputTokens,
+      imageTokens: imageTokens,
+      totalEstimatedTokens:
+          systemTokens +
+          toolDefinitionTokens +
+          historyTokens +
+          currentInputTokens +
+          imageTokens,
+    );
+  }
+
+  /// 唯一的硬裁剪预算决策：usable = contextLimit - 实际输出上限 - 2% 安全余量。
+  /// 所有输入都是 Token，禁止字符数直接参与比较。
+  static ContextBudgetPlan planContextBudget({
+    required int contextLimit,
+    required int maxOutputTokens,
+    required int estimatedInputTokens,
+  }) {
+    final outputReserve = maxOutputTokens.clamp(0, contextLimit);
+    final safetyReserve = (contextLimit * 0.02).round().clamp(
+      0,
+      (contextLimit * 0.05).round(),
+    );
+    final usable = contextLimit - outputReserve - safetyReserve;
+    final usableInputTokens = usable < 0 ? 0 : usable;
+    return ContextBudgetPlan(
+      contextLimit: contextLimit,
+      outputReserve: outputReserve,
+      safetyReserve: safetyReserve,
+      usableInputTokens: usableInputTokens,
+      estimatedInputTokens: estimatedInputTokens,
+    );
+  }
+
+  /// 自动压缩开关判断：autoCompress=false 时 80% 等阈值一律不自动摘要/压缩。
+  static bool shouldAutoCompress({
+    required bool autoCompress,
+    required int tokens,
+    required int contextLimit,
+    required double thresholdPercent,
+  }) {
+    if (!autoCompress || thresholdPercent <= 0 || contextLimit <= 0) {
+      return false;
+    }
+    return tokens > contextLimit * thresholdPercent / 100;
   }
 
   /// 估算会话下一轮请求的上下文大小（token）：
@@ -2673,13 +2807,13 @@ class ShiyiState extends ChangeNotifier {
 
   /// 自动压缩：发送消息前检查上下文是否超过压缩阈值。
   Future<void> _maybeAutoCompress(String sessionId) async {
-    if (!settings.autoCompress || settings.compressThresholdPercent <= 0) {
-      return;
-    }
     final tokens = await sessionContextTokenEstimate(sessionId);
-    final threshold =
-        settings.contextLimit * settings.compressThresholdPercent / 100;
-    if (tokens > threshold) {
+    if (shouldAutoCompress(
+      autoCompress: settings.autoCompress,
+      tokens: tokens,
+      contextLimit: settings.contextLimit,
+      thresholdPercent: settings.compressThresholdPercent,
+    )) {
       await compressSession(sessionId);
     }
   }

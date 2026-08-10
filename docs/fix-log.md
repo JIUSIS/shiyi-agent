@@ -432,3 +432,16 @@
   3. 同一轮多次工具循环请求按 Token 加权累计（cached ÷ prompt），每次发送新用户消息时清零，不做百分比平均，也不按本地上下文推算。
 - **涉及**：`lib/services/llm_client.dart`、`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 41 项全部通过。
+
+### 56. 128K 上下文提前裁剪：预算统一改为 Token，禁止字符数与 Token 混比
+- **现象**：128K 配置下实际上下文约 3.3 万时触发强制裁剪，裁剪后约 2.4 万（3.2 万≈128000/4，2.4 万≈3.2万×75%）；自动压缩已关闭仍发生。
+- **排查**：全仓搜索未发现字面 `contextLimit / 4`；但旧预算公式固定 `contextLimit × 0.9 − system − tools − 500`，既没有按真实 `maxOutputTokens` 预留输出，也没有单独的安全余量，且存在把 `content.length` 与 Token 预算混算的历史风险。
+- **修复**：
+  1. 新增唯一请求级 Token 估算入口 `estimateRequestTokens`：system、工具定义、历史、当前输入、图片全部统一口径；图片按每张 1000 Token 计入。
+  2. 新增 `planContextBudget`：`usableInputTokens = contextLimit − maxOutputTokens − contextLimit × 2%`；只有 `estimatedInputTokens > usableInputTokens` 才硬裁剪。
+  3. 裁剪循环使用 `estimateApiMessageTokens` 逐条计 Token，不再用 `content.length` 与 Token 预算直接比较；工具轮继续整组保留/整组裁掉。
+  4. UI 当前上下文、发送前阈值、裁剪后 Token 全部调用同一个估算函数。
+  5. `_trimApiMessages` 在发送时写 `TrimBudget` 日志，字段包含 contextLimit/system/toolDefinition/history/currentInput/image/outputReserve/safetyReserve/totalEstimated/trimTrigger/trimTarget，全部标注 `token` 单位。
+  6. 版本提升为 `1.1.5+9`（pubspec / gradle / about / README）。
+- **涉及**：`lib/core/app_state.dart`、`test/context_budget_test.dart`、`pubspec.yaml`、`android/app/build.gradle.kts`、`lib/screens/about_screen.dart`、`README.md`、`CHANGELOG.md`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 48 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、未超预算不裁剪、超预算裁剪到合法预算、请求级 Token 估算、多轮工具与图片回归用例）。
