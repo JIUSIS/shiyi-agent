@@ -353,6 +353,9 @@ class AppSettings {
   /// 会话上下文上限（估算 token，默认 128k）。
   int contextLimit;
 
+  /// 单次请求最大输出 token（思考型模型容易把预算花在推理上，默认 8192）。
+  int maxOutputTokens;
+
   /// 上下文压缩阈值（占上下文上限的百分比，如 80 表示 80%）。
   double compressThresholdPercent;
 
@@ -381,6 +384,7 @@ class AppSettings {
     this.ttsRate = 1.0,
     this.themeMode = 'dark',
     this.contextLimit = 128000,
+    this.maxOutputTokens = 8192,
     this.compressThresholdPercent = 80,
     this.autoCompress = true,
     this.visionEnabled = false,
@@ -403,6 +407,7 @@ class AppSettings {
     double? ttsRate,
     String? themeMode,
     int? contextLimit,
+    int? maxOutputTokens,
     double? compressThresholdPercent,
     bool? autoCompress,
     bool? visionEnabled,
@@ -423,6 +428,7 @@ class AppSettings {
     ttsRate: ttsRate ?? this.ttsRate,
     themeMode: themeMode ?? this.themeMode,
     contextLimit: contextLimit ?? this.contextLimit,
+    maxOutputTokens: maxOutputTokens ?? this.maxOutputTokens,
     compressThresholdPercent:
         compressThresholdPercent ?? this.compressThresholdPercent,
     autoCompress: autoCompress ?? this.autoCompress,
@@ -446,6 +452,7 @@ class AppSettings {
     'ttsRate': ttsRate,
     'themeMode': themeMode,
     'contextLimit': contextLimit,
+    'maxOutputTokens': maxOutputTokens,
     'compressThresholdPercent': compressThresholdPercent,
     'autoCompress': autoCompress,
     'visionEnabled': visionEnabled,
@@ -468,6 +475,7 @@ class AppSettings {
     ttsRate: (j['ttsRate'] as num?)?.toDouble() ?? 1.0,
     themeMode: j['themeMode'] ?? 'dark',
     contextLimit: (j['contextLimit'] as num?)?.toInt() ?? 128000,
+    maxOutputTokens: (j['maxOutputTokens'] as num?)?.toInt() ?? 8192,
     compressThresholdPercent:
         (j['compressThresholdPercent'] as num?)?.toDouble() ?? 80,
     autoCompress: j['autoCompress'] ?? true,

@@ -335,3 +335,44 @@
   2. 代码注释中性化（公开仓库合规，fix-log #38）；
   3. 人设提示词替换机制文档化（#42）。
 - **涉及**：版本号三处（pubspec 1.1.0+4 / gradle versionCode=4 versionName=1.1.0 / about '1.1.0'）+ README 功能清单与下载链接更新。
+
+---
+
+## 2026-08-10 · 输出上限通用化与空正文截断修复
+
+### 46. 思考型模型输出上限通用化 + 空正文截断修复
+- **现象**：DeepSeek / MiMo / OpenCode Go 等思考型模型做长任务时，思考内容打满 `max_tokens`（`fr=length`），正文还没开始；续写轮又可能被网关断开（`done=false`），用户看到「回复中断，正在自动重试」。
+- **根因**：请求写死 `max_tokens: 8192`，对思考型模型偏小；`fr=length` 且正文为空时仍走「空正文续写」，没有可接断点，续写容易继续思考或被网关断开。
+- **修复**：
+  1. `AppSettings` 新增 `maxOutputTokens`，设置页「上下文」区新增「输出上限」（默认 8192，范围 512~384000），主循环与子代理统一读取；
+  2. 内置预设新增 OpenCode Go（`deepseek-v4-flash`），建议输出上限 32768；
+  3. `LlmClient` 不再写死 8192；网关拒绝过大的 `max_tokens` 时自动降级 8192 重试；
+  4. `fr=length` 且正文为空时改为整轮重试，并注入「不要长篇思考，直接输出结果/调用工具」；
+  5. `StreamDiag` 增加 `model` / `max_tokens` 字段；首包超时 30s → 60s。
+- **涉及**：`models.dart`、`model_presets.dart`、`llm_client.dart`、`subagent.dart`、`app_state.dart`、`settings_screen.dart`、版本号三处（1.1.2+6）。
+
+### 47. 长会话上下文窗口：发送前按预算裁剪历史
+- **现象**：长会话（数千条消息）继续发消息时，请求把全部历史发送，超过 `contextLimit`，继续会话第一条消息就上下文爆满/网关拒绝。
+- **根因**：`_historyToApi` 全量发送历史，没有按 `contextLimit` 裁剪；用户关闭自动压缩后没有任何兜底。
+- **修复**：发送前 `_trimApiMessages` 按 `contextLimit × 0.9 − system − 工具定义` 的预算从最新往回保留历史，超预算时保留尾部并在 system 提示里说明；上下文估算的工具开销从固定 1500 改为真实 `activeTools` JSON；新增 `trimApiMessagesForBudget` 单元测试。
+- **涉及**：`app_state.dart`、`test/context_budget_test.dart`、版本号三处（1.1.3+7）。
+
+---
+
+## 2026-08-11 · 性能与缓存优化
+
+### 48. 缓存命中优化：当前时间移到 system 尾部
+- **现象**：用量监控缓存命中率约 80%，跨分钟请求会掉一段缓存。
+- **根因**：`_buildSystemPrompt` 把「当前时间」以分钟精度插入 system 中段；跨分钟后，后面大段工具规则/工作目录/记忆/技能全部字节偏移，前缀缓存从时间处断开。
+- **修复**：时间块移到 `parts` 最末尾，base、工具规则、工作目录、记忆、技能保持稳定，跨分钟只改尾部一小截。不改变时间精度，不降低模型对时效性的感知。
+- **涉及**：`lib/core/app_state.dart`。
+
+### 49. 首轮性能优化（不砍动画与渲染）
+- **现象**：长文流式输出、全局状态变化时掉帧卡顿。
+- **根因与修复**：
+  1. **Markdown 重复解析 + 流式逐 token 重建**：`splitMarkdownBlocks` 每次 build 都重新 split，流式每 chunk 全量重解析。改为单条目解析缓存（同一文本只解析一次），并在 `_streamRound` 对 `streamText/streamReasoning` 做 80ms / 200 字符节流，视觉连续但主线程压力下降。
+  2. **HomeScreen 外层监听整个 `ShiyiState`**：任意 notify 都重建整页结构。新增 `loadedNotifier` / `initErrorNotifier`，外层只监听初始化状态，内容交给各 tab 自己的监听器。
+  3. **聊天列表随 status/token 等任意 notify 重建**：新增 `messagesRevision`，消息列表只监听消息版本；`messages` 所有变更点统一 `_bumpMessages()`，状态条、token 统计、工具事件变化不再重建整列。
+- **涉及**：`lib/widgets/markdown_text.dart`、`lib/core/app_state.dart`、`lib/screens/home_screen.dart`、`lib/screens/chat_screen.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 29 项全部通过。
+- **提醒**：debug 包本身为 JIT 模式，体感明显慢于 release；流畅度验收建议用 release 构建覆盖安装。

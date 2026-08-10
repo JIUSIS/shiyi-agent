@@ -85,10 +85,17 @@ class ShiyiState extends ChangeNotifier {
   /// 正在流式输出的消息文本（独立通知器：流式刷新只重建这一条气泡，不重建整个列表）。
   final ValueNotifier<String> streamText = ValueNotifier('');
   final ValueNotifier<String> streamReasoning = ValueNotifier('');
-  String? initError;
 
-  bool _loaded = false;
-  bool get loaded => _loaded;
+  /// 初始化状态独立通知器：主界面只在初始化完成/失败时重建外层。
+  final ValueNotifier<bool> loadedNotifier = ValueNotifier(false);
+  final ValueNotifier<String?> initErrorNotifier = ValueNotifier<String?>(null);
+  bool get loaded => loadedNotifier.value;
+  String? get initError => initErrorNotifier.value;
+
+  /// 消息列表版本号：聊天列表只监听它，避免 status/token 等变化重建整列。
+  final ValueNotifier<int> messagesRevision = ValueNotifier(0);
+
+  void _bumpMessages() => messagesRevision.value++;
 
   ChatMessage? _streaming;
   bool _stopRequested = false;
@@ -386,24 +393,26 @@ class ShiyiState extends ChangeNotifier {
             'enum': ['explore', 'plan', 'worker', 'general-purpose'],
             'description': '子代理类型（见描述）',
           },
-          'description': {
-            'type': 'string',
-            'description': '任务的简短描述（3~5 词）',
-          },
-          'prompt': {
-            'type': 'string',
-            'description': '给子代理的具体任务指令，越明确越好',
-          },
+          'description': {'type': 'string', 'description': '任务的简短描述（3~5 词）'},
+          'prompt': {'type': 'string', 'description': '给子代理的具体任务指令，越明确越好'},
           'tasks': {
             'type': 'array',
             'items': {
               'type': 'object',
               'properties': {
-                'agent_type': {'type': 'string', 'enum': ['explore', 'plan', 'worker', 'general-purpose']},
+                'agent_type': {
+                  'type': 'string',
+                  'enum': ['explore', 'plan', 'worker', 'general-purpose'],
+                },
                 'description': {'type': 'string'},
                 'prompt': {'type': 'string'},
                 'max_turns': {'type': 'integer', 'description': '动态预算覆盖（1~80）'},
-                'write_paths': {'type': 'array', 'items': {'type': 'string'}, 'description': '写路径隔离：只允许 file_write 写这些路径（工作区相对或绝对）；不声明=可写整个工作区。并行多个 worker 时建议各自声明不重叠目录'},
+                'write_paths': {
+                  'type': 'array',
+                  'items': {'type': 'string'},
+                  'description':
+                      '写路径隔离：只允许 file_write 写这些路径（工作区相对或绝对）；不声明=可写整个工作区。并行多个 worker 时建议各自声明不重叠目录',
+                },
               },
               'required': ['agent_type', 'description', 'prompt'],
             },
@@ -434,14 +443,14 @@ class ShiyiState extends ChangeNotifier {
   }
 
   Future<void> init() async {
-    if (_loaded) return;
+    if (loaded) return;
     try {
       settings = await _settingsService.load();
       await FileWorkspace.ensure();
       await _reloadAll();
-      _loaded = true;
+      loadedNotifier.value = true;
     } catch (e) {
-      initError = '$e';
+      initErrorNotifier.value = '$e';
     }
     notifyListeners();
     // 后台安装内嵌 Termux（完整 Linux 环境），不阻塞启动。
@@ -537,6 +546,7 @@ class ShiyiState extends ChangeNotifier {
     );
     currentSessionId = id;
     messages = [];
+    _bumpMessages();
     _messagesLoadedForSessionId = id;
     toolEvents = [];
     loadedSkill = null;
@@ -552,6 +562,7 @@ class ShiyiState extends ChangeNotifier {
     unreadSessions.remove(id);
     loadedSkill = null;
     messages = await _db.listMessages(id);
+    _bumpMessages();
     _messagesLoadedForSessionId = id;
     toolEvents = await _db.listToolEvents(id);
     // 兜底收尾：会话不在实时生成中时，把 DB 里残留的未完成工具事件标记为
@@ -588,6 +599,7 @@ class ShiyiState extends ChangeNotifier {
         messages.add(live);
       }
     }
+    _bumpMessages();
     notifyListeners();
   }
 
@@ -601,6 +613,7 @@ class ShiyiState extends ChangeNotifier {
     if (currentSessionId == id) {
       currentSessionId = null;
       messages = [];
+      _bumpMessages();
       _messagesLoadedForSessionId = null;
       toolEvents = [];
       loadedSkill = null;
@@ -654,6 +667,71 @@ class ShiyiState extends ChangeNotifier {
       out.add(api);
     }
     return out;
+  }
+
+  /// 发送前按上下文预算裁剪历史：从最新往回保留，超出预算的较早消息
+  /// 不发送（不动数据库），并在 system 提示里说明，避免长会话请求超限。
+  Future<List<Map<String, dynamic>>> _trimApiMessages(
+    List<Map<String, dynamic>> apiMsgs,
+  ) async {
+    if (apiMsgs.length <= 1) return apiMsgs;
+    final sysLen = _estimateTokens('${apiMsgs.first['content'] ?? ''}');
+    final toolsLen = activeTools.isEmpty
+        ? 0
+        : _estimateTokens(jsonEncode(activeTools));
+    final budget =
+        (settings.contextLimit * 0.9).round() - sysLen - toolsLen - 500;
+    final trimmed = trimApiMessagesForBudget(apiMsgs, budget);
+    if (trimmed.length < apiMsgs.length) {
+      status = '上下文接近上限，已自动裁剪较早历史后发送';
+      notifyListeners();
+    }
+    return trimmed;
+  }
+
+  /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部并给
+  /// system 追加裁剪说明。工具轮消息由调用方在循环中追加，不受影响。
+  static List<Map<String, dynamic>> trimApiMessagesForBudget(
+    List<Map<String, dynamic>> apiMsgs,
+    int budget,
+  ) {
+    if (budget <= 0 || apiMsgs.length <= 1) return apiMsgs;
+
+    String contentOf(Map<String, dynamic> m) {
+      final c = m['content'];
+      if (c is String) return c;
+      if (c is List) return jsonEncode(c);
+      return '';
+    }
+
+    var total = 0;
+    var keepFrom = 1;
+    var trimmedAny = false;
+    for (var i = apiMsgs.length - 1; i >= 1; i--) {
+      final m = apiMsgs[i];
+      var size = _estimateTokens(contentOf(m));
+      final tcs = m['tool_calls'];
+      if (tcs is List && tcs.isNotEmpty) {
+        size += _estimateTokens(jsonEncode(tcs));
+      }
+      if (total + size > budget) {
+        keepFrom = i + 1;
+        trimmedAny = true;
+        break;
+      }
+      total += size;
+    }
+    if (!trimmedAny || keepFrom >= apiMsgs.length) return apiMsgs;
+
+    final kept = <Map<String, dynamic>>[
+      for (final e in apiMsgs.sublist(keepFrom)) Map<String, dynamic>.from(e),
+    ];
+    final sys = Map<String, dynamic>.from(apiMsgs.first);
+    sys['content'] =
+        '${sys['content']}\n\n（较早对话因上下文限制未包含，'
+        '请基于现有历史继续；如需完整历史可让我读取文件或搜索记忆。）';
+    kept.insert(0, sys);
+    return kept;
   }
 
   /// 把带图片的用户消息转成 OpenAI 多模态格式，图片以 base64 data URL 内联。
@@ -795,6 +873,7 @@ class ShiyiState extends ChangeNotifier {
       );
       await _db.insertMessage(userMsg);
       messages.add(userMsg);
+      _bumpMessages();
 
       final firstAsst = ChatMessage(
         id: 'm${now}_${_rand()}',
@@ -806,6 +885,7 @@ class ShiyiState extends ChangeNotifier {
       );
       await _db.insertMessage(firstAsst);
       messages.add(firstAsst);
+      _bumpMessages();
       _streaming = firstAsst;
       notifyListeners();
 
@@ -830,6 +910,7 @@ class ShiyiState extends ChangeNotifier {
         if (st.content.isEmpty) st.content = '(生成出错)';
         await _db.updateMessageContent(st.id, st.content);
       }
+      _bumpMessages();
       notifyListeners();
     } finally {
       isBusy = false;
@@ -882,18 +963,22 @@ class ShiyiState extends ChangeNotifier {
     for (var attempt = 0; attempt < 2 && !completed; attempt++) {
       try {
         // 第二次尝试注入「直接行动」指令：上一轮常见的问题是模型
-        // 输出开场白（以冒号结尾）后就结束、不调用任何工具，重试时强制它行动。
+        // 输出开场白（以冒号结尾）后就结束、或思考过长被截断没有正文，
+        // 重试时强制它直接输出结果/调用工具，不再空转。
         final sysContent = attempt == 0
             ? systemPrompt
             : '$systemPrompt\n\n'
-                  '【注意：上一轮回复以冒号结尾就结束了，没有调用任何工具。'
-                  '这次请直接调用工具完成用户请求：不要输出开场白、承诺或计划性文字，'
-                  '第一步就调用 run_terminal（或相关工具）执行实际操作。】';
+                  '【注意：上一轮回复未正常完成（可能是开场白后结束、'
+                  '思考过长被截断或连接中断）。这次请直接输出结果或调用工具'
+                  '完成用户请求：不要输出开场白、承诺、计划性文字，'
+                  '也不要输出长篇思考过程；需要操作时第一步就调用 '
+                  'run_terminal（或相关工具）执行实际操作。】';
         final loopMsgs = <Map<String, dynamic>>[
           {'role': 'system', 'content': sysContent},
           ...await _historyToApi(messages, imagesAllowed: imagesAllowed),
         ];
-        await _runAgentLoop(sessionId, firstAsst, loopMsgs);
+        final trimmed = await _trimApiMessages(loopMsgs);
+        await _runAgentLoop(sessionId, firstAsst, trimmed);
         completed = true;
         status = null;
         notifyListeners();
@@ -952,6 +1037,7 @@ class ShiyiState extends ChangeNotifier {
         messages.remove(st);
         await _db.deleteMessage(st.id);
       }
+      _bumpMessages();
     }
   }
 
@@ -1008,6 +1094,7 @@ class ShiyiState extends ChangeNotifier {
       await _db.deleteMessage(m.id);
     }
     messages.removeWhere((m) => toDelete.any((d) => d.id == m.id));
+    _bumpMessages();
     await _db.touchSession(sessionId, model: settings.model);
     await refreshSessions();
     sessionChars = await sessionContextChars(sessionId);
@@ -1029,6 +1116,7 @@ class ShiyiState extends ChangeNotifier {
       await _db.deleteMessage(m.id);
     }
     messages.removeRange(idx, messages.length);
+    _bumpMessages();
     notifyListeners();
 
     isBusy = true;
@@ -1050,6 +1138,7 @@ class ShiyiState extends ChangeNotifier {
     );
     await _db.insertMessage(firstAsst);
     messages.add(firstAsst);
+    _bumpMessages();
     _streaming = firstAsst;
     notifyListeners();
 
@@ -1068,6 +1157,7 @@ class ShiyiState extends ChangeNotifier {
         if (st.content.isEmpty) st.content = '(生成出错)';
         await _db.updateMessageContent(st.id, st.content);
       }
+      _bumpMessages();
       notifyListeners();
     } finally {
       isBusy = false;
@@ -1163,6 +1253,7 @@ class ShiyiState extends ChangeNotifier {
         );
         await _db.insertMessage(toolMsg);
         messages.add(toolMsg);
+        _bumpMessages();
         loopMsgs.add({
           'role': 'tool',
           'content': output,
@@ -1199,6 +1290,7 @@ class ShiyiState extends ChangeNotifier {
     );
     await _db.insertMessage(m);
     messages.add(m);
+    _bumpMessages();
     _streaming = m;
     streamText.value = '';
     streamReasoning.value = '';
@@ -1228,6 +1320,7 @@ class ShiyiState extends ChangeNotifier {
     );
     streamText.value = '';
     streamReasoning.value = '';
+    _bumpMessages();
     notifyListeners();
   }
 
@@ -1256,6 +1349,7 @@ class ShiyiState extends ChangeNotifier {
       if (_stopForGuide) {
         await _db.deleteMessage(m.id);
         messages.remove(m);
+        _bumpMessages();
         notifyListeners();
         return;
       }
@@ -1263,6 +1357,7 @@ class ShiyiState extends ChangeNotifier {
     }
     streamText.value = '';
     await _db.updateMessageContent(m.id, m.content, toolCalls: m.toolCalls);
+    _bumpMessages();
     notifyListeners();
   }
 
@@ -1276,11 +1371,14 @@ class ShiyiState extends ChangeNotifier {
     ChatMessage asst,
   ) async {
     TurnResult? accumulated;
+    var lastStreamEmit = DateTime.now();
+    var lastStreamLen = 0;
     final client = LlmClient(
       baseUrl: settings.baseUrl,
       apiKey: settings.apiKey,
       model: settings.model,
       temperature: settings.temperature,
+      maxTokens: settings.maxOutputTokens,
       tools: activeTools,
       shouldStop: () => _stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
@@ -1300,8 +1398,18 @@ class ShiyiState extends ChangeNotifier {
               )
               .toList();
         }
-        // 只通知流式文本变化，让列表只重建这一条气泡。
-        streamText.value = t.text;
+        // 流式刷新节流：80ms 内且增量不大时不重复重建气泡，
+        // 保持视觉连续的同时减少长文逐 token 解析/布局开销。
+        final totalLen = t.text.length + t.reasoning.length;
+        final now = DateTime.now();
+        if (lastStreamLen == 0 ||
+            now.difference(lastStreamEmit).inMilliseconds >= 80 ||
+            totalLen - lastStreamLen >= 200) {
+          streamReasoning.value = t.reasoning;
+          streamText.value = t.text;
+          lastStreamEmit = now;
+          lastStreamLen = totalLen;
+        }
       },
       onError: (e) {
         status = '错误: $e';
@@ -1381,13 +1489,6 @@ class ShiyiState extends ChangeNotifier {
 
     final parts = <String>[];
     parts.add(base);
-    final now = DateTime.now();
-    parts.add(
-      '【当前时间】现在是 ${now.year}年${now.month}月${now.day}日 '
-      '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}。\n'
-      '涉及时效性、新闻、价格、政策等最新信息时，必须以当前时间为基准判断新旧，'
-      '只采用最近期的可靠资料；旧资料必须标注发布日期并明确提示可能已过时。',
-    );
     parts.add(
       '【工具使用规则】'
       '- 需要最新信息、实时数据或超出你知识截止日期的问题，直接用 web_search，不要先调用 search_memory。'
@@ -1484,6 +1585,15 @@ class ShiyiState extends ChangeNotifier {
         '用户确认后调用 exit_plan_mode 恢复正常能力并开始执行。',
       );
     }
+
+    // 时间放最末尾：跨分钟只改 system 尾部，保住前面大段稳定前缀的缓存命中。
+    final now = DateTime.now();
+    parts.add(
+      '【当前时间】现在是 ${now.year}年${now.month}月${now.day}日 '
+      '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}。\n'
+      '涉及时效性、新闻、价格、政策等最新信息时，必须以当前时间为基准判断新旧，'
+      '只采用最近期的可靠资料；旧资料必须标注发布日期并明确提示可能已过时。',
+    );
     return parts.join('\n\n');
   }
 
@@ -1834,9 +1944,9 @@ class ShiyiState extends ChangeNotifier {
 
   /// 按子代理白名单过滤出工具 JSON（子代理只能调白名单内的工具）。
   List<Map<String, dynamic>> _toolsJsonFor(Set<String> names) => [
-        for (final t in toolRegistry)
-          if (names.contains(t.name)) t.toJson(),
-      ];
+    for (final t in toolRegistry)
+      if (names.contains(t.name)) t.toJson(),
+  ];
 
   /// 派发子代理：独立 LLM 对话 + 受限工具集，返回其最终文本报告。
   Future<String> _execSpawnAgent(Map<String, dynamic> args) async {
@@ -1893,14 +2003,15 @@ class ShiyiState extends ChangeNotifier {
         final rawWp = t['write_paths'];
         final List<String>? writePaths = rawWp is List
             ? rawWp
-                .map((e) => _normAbsPath(e.toString(), workingDirAbs))
-                .toList()
+                  .map((e) => _normAbsPath(e.toString(), workingDirAbs))
+                  .toList()
             : null;
         final runner = SubagentRunner(
           baseUrl: settings.baseUrl,
           apiKey: settings.apiKey,
           model: settings.model,
           temperature: settings.temperature,
+          maxTokens: settings.maxOutputTokens,
           toolsJson: _toolsJsonFor(def.allowedTools),
           // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
           executeTool: (name, argsJson) async {
@@ -1916,7 +2027,8 @@ class ShiyiState extends ChangeNotifier {
               final p = (a['path'] ?? '').toString();
               final target = _normAbsPath(p, workingDirAbs);
               final ok = writePaths.any(
-                  (w) => target == w || target.startsWith('$w/'));
+                (w) => target == w || target.startsWith('$w/'),
+              );
               if (!ok) {
                 return '写入被拒绝：$p 不在本子代理允许的 write_paths 内'
                     '（允许：${writePaths.join('、')}）。'
@@ -1935,7 +2047,8 @@ class ShiyiState extends ChangeNotifier {
           // 进度回流：显示「第 i/N 个子代理 · 类型 · 第 n/m 轮 · 工具」。
           onProgress: (round, max, tool) {
             final t2 = tool.isEmpty ? '思考中' : '正在调用 $tool';
-            status = '子代理 ${i + 1}/$total · ${def.name} · '
+            status =
+                '子代理 ${i + 1}/$total · ${def.name} · '
                 '第 ${round + 1}/$max 轮 · $t2';
             notifyListeners();
           },
@@ -2057,7 +2170,7 @@ class ShiyiState extends ChangeNotifier {
     }
     final sys = await _buildSystemPrompt('');
     total += _estimateTokens(sys);
-    total += 1500; // 工具定义开销
+    total += _estimateTokens(jsonEncode(activeTools)); // 工具定义开销
     return total;
   }
 
@@ -2111,6 +2224,7 @@ class ShiyiState extends ChangeNotifier {
     );
     await _db.insertMessage(summaryMsg);
     messages = await _db.listMessages(sessionId);
+    _bumpMessages();
     sessionChars = await sessionContextChars(sessionId);
     notifyListeners();
     return true;

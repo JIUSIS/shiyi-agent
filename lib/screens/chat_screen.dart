@@ -798,7 +798,7 @@ class _ChatScreenState extends State<ChatScreen>
                     children: [
                       Expanded(
                         child: ListenableBuilder(
-                          listenable: widget.shiyi,
+                          listenable: widget.shiyi.messagesRevision,
                           builder: (context, _) {
                             final messages = widget.shiyi.messages;
                             // 工具调用已集中到右上角信息流胶囊，对话流里不再显示工具消息与纯工具回合。

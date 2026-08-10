@@ -25,7 +25,11 @@ class MarkdownText extends StatelessWidget {
 }
 
 /// 解析 Markdown 文本为块列表（代码块 / 标题 / 表格 / 引用 / 列表 / 段落）。
+String? _lastBlockSource;
+List<String>? _lastBlocks;
+
 List<String> splitMarkdownBlocks(String md) {
+  if (_lastBlockSource == md) return _lastBlocks!;
   final out = <String>[];
   final lines = md.split('\n');
   final buf = StringBuffer();
@@ -84,6 +88,8 @@ List<String> splitMarkdownBlocks(String md) {
   _flushTable(out, tableBuf);
   _flushQuote(out, quoteBuf);
   if (buf.isNotEmpty) out.add(buf.toString());
+  _lastBlockSource = md;
+  _lastBlocks = out;
   return out;
 }
 

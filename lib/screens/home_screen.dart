@@ -135,7 +135,10 @@ class _HomeScreenState extends State<HomeScreen>
         // 键盘只应压缩当前 tab 的内容，不能把悬浮侧边栏一起压矮。
         resizeToAvoidBottomInset: false,
         body: ListenableBuilder(
-          listenable: shiyi,
+          listenable: Listenable.merge([
+            shiyi.loadedNotifier,
+            shiyi.initErrorNotifier,
+          ]),
           builder: (context, _) {
             if (!shiyi.loaded) {
               if (shiyi.initError != null) {

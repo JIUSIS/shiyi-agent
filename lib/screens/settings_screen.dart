@@ -33,6 +33,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   double _ttsRate = 1.0;
   String _themeMode = 'dark';
   int _contextLimit = 128000;
+  int _maxOutputTokens = 8192;
+  late final TextEditingController _maxOutputTokensCtrl;
   double _compressThresholdPercent = 80;
   bool _autoCompress = true;
   bool _visionEnabled = false;
@@ -65,6 +67,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _ttsRate = s.ttsRate;
     _themeMode = s.themeMode;
     _contextLimit = s.contextLimit;
+    _maxOutputTokens = s.maxOutputTokens;
+    _maxOutputTokensCtrl = TextEditingController(
+      text: _maxOutputTokens.toString(),
+    );
     _compressThresholdPercent = s.compressThresholdPercent;
     _autoCompress = s.autoCompress;
     for (final preset in modelPresets) {
@@ -127,6 +133,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       _presetName = profile.name;
       _keyHint = preset?.keyHint ?? 'sk-...';
+      _maxOutputTokens = preset?.suggestedMaxTokens ?? _maxOutputTokens;
+      _maxOutputTokensCtrl.text = _maxOutputTokens.toString();
     });
     _baseCtrl.text = profile.baseUrl;
     _keyCtrl.text = profile.apiKey;
@@ -143,6 +151,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _visionKeyCtrl.dispose();
     _visionModelCtrl.dispose();
     _promptCtrl.dispose();
+    _maxOutputTokensCtrl.dispose();
     super.dispose();
   }
 
@@ -175,6 +184,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ttsRate: _ttsRate,
         themeMode: _themeMode,
         contextLimit: _contextLimit,
+        maxOutputTokens: _maxOutputTokens,
         compressThresholdPercent: _compressThresholdPercent,
         autoCompress: _autoCompress,
         visionEnabled: _visionEnabled,
@@ -836,6 +846,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const Divider(),
               _section('上下文'),
               ListTile(
+                leading: const Icon(Icons.output_outlined),
+                title: const Text('输出上限'),
+                subtitle: const Text('单次请求最大输出 token，思考型模型建议调大'),
+                trailing: SizedBox(
+                  width: 110,
+                  child: TextFormField(
+                    controller: _maxOutputTokensCtrl,
+                    keyboardType: TextInputType.number,
+                    textAlign: TextAlign.right,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 10,
+                      ),
+                    ),
+                    onChanged: (v) {
+                      final n = int.tryParse(v);
+                      if (n != null && n > 0) {
+                        setState(() => _maxOutputTokens = n.clamp(512, 384000));
+                        _autoSave();
+                      }
+                    },
+                  ),
+                ),
+              ),
+              ListTile(
                 leading: const Icon(Icons.compress_outlined),
                 title: const Text('上下文上限'),
                 subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200 万）'),
@@ -848,15 +886,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     decoration: const InputDecoration(
                       isDense: true,
                       border: OutlineInputBorder(),
-                      contentPadding:
-                          EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 10,
+                      ),
                     ),
                     onChanged: (v) {
                       final n = int.tryParse(v);
                       if (n != null && n > 0) {
-                        setState(
-                          () => _contextLimit = n.clamp(1000, 2000000),
-                        );
+                        setState(() => _contextLimit = n.clamp(1000, 2000000));
                         _autoSave();
                       }
                     },
@@ -871,22 +909,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   width: 120,
                   child: TextFormField(
                     initialValue: _compressThresholdPercent.toStringAsFixed(0),
-                    keyboardType:
-                        const TextInputType.numberWithOptions(decimal: true),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
                     textAlign: TextAlign.right,
                     decoration: const InputDecoration(
                       isDense: true,
                       border: OutlineInputBorder(),
                       suffixText: '%',
-                      contentPadding:
-                          EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 10,
+                      ),
                     ),
                     onChanged: (v) {
                       final n = double.tryParse(v);
                       if (n != null && n > 0) {
                         setState(
-                          () =>
-                              _compressThresholdPercent = n.clamp(1, 100),
+                          () => _compressThresholdPercent = n.clamp(1, 100),
                         );
                         _autoSave();
                       }

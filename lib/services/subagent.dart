@@ -185,6 +185,7 @@ class SubagentRunner {
   final String apiKey;
   final String model;
   final double temperature;
+  final int maxTokens;
 
   /// 允许的工具 JSON 列表（已按白名单过滤，模型只能调这些）。
   final List<Map<String, dynamic>> toolsJson;
@@ -212,6 +213,7 @@ class SubagentRunner {
     required this.apiKey,
     required this.model,
     required this.temperature,
+    this.maxTokens = 8192,
     required this.toolsJson,
     required this.executeTool,
     required this.workingDir,
@@ -300,6 +302,7 @@ class SubagentRunner {
       apiKey: apiKey,
       model: model,
       temperature: temperature,
+      maxTokens: maxTokens,
       tools: toolsJson,
       shouldStop: shouldStop,
       onTurn: (t) => accumulated = t,

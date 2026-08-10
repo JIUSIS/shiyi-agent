@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v1.1.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v1.1.0/shiyi-agent-v1.1.0.apk) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v1.1.4.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v1.1.4/shiyi-agent-v1.1.4.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -25,6 +25,9 @@
 - 文件 / 图片多选附件，支持视觉模型图片理解
 - 流式输出、自动重试、上下文自动压缩
 - 思考过程流式展示，长思考自动滚动跟随
+- 输出上限可调（512~384000），长任务自动续写不打断
+- 发送前按上下文预算裁剪历史，长会话稳定续聊
+- 缓存命中优化，稳定前缀跨分钟复用，首字更快更省钱
 
 ### 子代理（委派分工）
 

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../core/model_presets.dart';
 import '../core/models.dart';
 
 class SettingsService {
@@ -10,9 +11,20 @@ class SettingsService {
     final raw = prefs.getString(_key);
     if (raw == null) return AppSettings();
     try {
-      final s = AppSettings.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+      final json = jsonDecode(raw) as Map<String, dynamic>;
+      final s = AppSettings.fromJson(json);
       // 迁移旧默认：此前按“字符”计、默认 100 万；现按 token 计，默认 128k。
       if (s.contextLimit >= 500000) s.contextLimit = 128000;
+      // 旧版本没有输出上限字段：按已选预设带出建议值，
+      // 避免思考型模型继续用偏小的 8192。
+      if (!json.containsKey('maxOutputTokens')) {
+        for (final p in modelPresets) {
+          if (p.baseUrl == s.baseUrl.trim()) {
+            s.maxOutputTokens = p.suggestedMaxTokens;
+            break;
+          }
+        }
+      }
       return s;
     } catch (_) {
       return AppSettings();

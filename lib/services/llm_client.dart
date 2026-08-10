@@ -33,6 +33,7 @@ class LlmClient {
   final String apiKey;
   final String model;
   final double temperature;
+  final int maxTokens;
   final List<Map<String, dynamic>> tools;
   final void Function(TurnResult turn)? onTurn;
   final void Function(String error)? onError;
@@ -53,6 +54,7 @@ class LlmClient {
     required this.apiKey,
     required this.model,
     required this.temperature,
+    this.maxTokens = 8192,
     required this.tools,
     this.onTurn,
     this.onError,
@@ -68,6 +70,8 @@ class LlmClient {
     final client = http.Client();
     try {
       var includeUsage = true;
+      // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级到 8192 重试。
+      var outputLimit = maxTokens;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
@@ -80,8 +84,8 @@ class LlmClient {
           'temperature': temperature,
           // 显式声明输出上限：部分网关默认 max_tokens 过小，
           // 思考模型（reasoning 占 token）+ 长工具调用会导致 content 被截断。
-          // mimo-v2.5 实测支持 8192。
-          'max_tokens': 8192,
+          // 默认 8192，可在设置中按模型调大（如 OpenCode Go 的 32768）。
+          'max_tokens': outputLimit,
           if (tools.isNotEmpty) 'tools': tools,
           if (tools.isNotEmpty) 'tool_choice': 'auto',
         };
@@ -95,12 +99,18 @@ class LlmClient {
         try {
           final response = await client
               .send(request)
-              .timeout(const Duration(seconds: 30));
+              .timeout(const Duration(seconds: 60));
           if (response.statusCode != 200) {
             final err = await response.stream.bytesToString();
             // 部分网关/中转不支持 stream_options：去掉后重试一次（只少 token 统计，不影响内容）。
             if (includeUsage && _isUsageParamError(err)) {
               includeUsage = false;
+              continue;
+            }
+            // max_tokens 过大被网关拒绝：降级到 8192 再试一次。
+            if (outputLimit > 8192 && _isMaxTokensParamError(err)) {
+              outputLimit = 8192;
+              onDiag?.call('[stream] max_tokens 过大被拒绝，降级 8192 重试');
               continue;
             }
             throw LlmException('HTTP ${response.statusCode}: ${_short(err)}');
@@ -113,7 +123,8 @@ class LlmClient {
             {'role': 'assistant', 'content': _lastRoundText},
             {
               'role': 'user',
-              'content': '继续完成上述输出。直接从上次断点继续写，'
+              'content':
+                  '继续完成上述输出。直接从上次断点继续写，'
                   '不要重复已经输出的内容。',
             },
           ]);
@@ -135,6 +146,14 @@ class LlmClient {
         e.contains('unknown parameter') ||
         e.contains('unknown argument') ||
         e.contains('extra fields');
+  }
+
+  /// 判断 HTTP 400 是否由 max_tokens 参数过大/不被支持引起。
+  static bool _isMaxTokensParamError(String err) {
+    final e = err.toLowerCase();
+    return e.contains('max_tokens') ||
+        e.contains('max tokens') ||
+        e.contains('maximum output tokens');
   }
 
   String _short(String s) {
@@ -274,13 +293,15 @@ class LlmClient {
     /// （截断的只是后续文本，工具照常执行）。
     bool decideContinue() {
       if (completer.isCompleted) return false;
-      final toolsComplete = toolBuf.isNotEmpty &&
+      final toolsComplete =
+          toolBuf.isNotEmpty &&
           toolBuf.values.every((t) {
             final a = t['arguments'] ?? '';
             return a.trim().isNotEmpty && _tryDecode(a) != null;
           });
       final t = text.trim();
-      final halfCut = reasoning.isNotEmpty &&
+      final halfCut =
+          reasoning.isNotEmpty &&
           t.isNotEmpty &&
           toolBuf.isEmpty &&
           (t.endsWith('：') ||
@@ -292,8 +313,14 @@ class LlmClient {
       if (toolsComplete) return false; // 工具完整：截断不影响执行
       if (toolBuf.isNotEmpty) {
         // 工具调用不完整（参数半截）：无法续写，整轮重试。
+        completer.completeError(LlmInterruptedException('工具调用被截断，正在自动重试'));
+        return false;
+      }
+      // 思考把输出预算吃完、正文还没开始：空正文续写没有断点，
+      // 直接整轮重试，让上层提示模型输出正文而不是继续思考。
+      if (finishReason == 'length' && t.isEmpty) {
         completer.completeError(
-          LlmInterruptedException('工具调用被截断，正在自动重试'),
+          LlmInterruptedException('回复中断：模型输出被截断且没有正文，正在自动重试'),
         );
         return false;
       }
@@ -418,7 +445,8 @@ class LlmClient {
                 ? text
                 : '…${text.substring(text.length - 40)}';
             onDiag?.call(
-              '[stream] end fr=$finishReason done=$doneReceived '
+              '[stream] end model=$model max=$maxTokens '
+              'fr=$finishReason done=$doneReceived '
               'textLen=${text.length} tools=${toolBuf.length} '
               'reasoningLen=${reasoning.length} tail=${tail.trim()}',
             );
@@ -435,7 +463,8 @@ class LlmClient {
             final needContinue = decideContinue();
             _lastRoundText = text.trim();
             onDiag?.call(
-              '[stream] needContinue=$needContinue fr=$finishReason '
+              '[stream] needContinue=$needContinue model=$model '
+              'max=$maxTokens fr=$finishReason '
               'done=$doneReceived tools=${toolBuf.length}',
             );
             if (!completer.isCompleted) {
@@ -471,6 +500,3 @@ class LlmClient {
     }
   }
 }
-
-
-
