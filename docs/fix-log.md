@@ -384,3 +384,10 @@
 - **修复**：`onCreate` 建表补 `type TEXT NOT NULL DEFAULT 'user'`；新增 `_repairSchema` 在 `onOpen` 兜底检查，缺列时自动 `ALTER TABLE memories ADD COLUMN type TEXT NOT NULL DEFAULT 'user'`，覆盖已生成的异常库。
 - **涉及**：`lib/services/db.dart`、`CHANGELOG.md`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 全部通过；备份库插入 `type=project` 测试成功。
+
+### 51. 聊天代码块多出空代码框（fence 闭合被拆成独立块）
+- **现象**：同一回复显示「一个正常代码块 + 一个带复制按钮的空代码块」；数据库原文只有一个完整围栏，` ``` ` 总数仅 2。
+- **根因**：`splitMarkdownBlocks` 处理闭合 ` ``` ` 时先 `_flushBuf` 提交「开始围栏 + 正文」，再把闭合围栏单独写入新块，产生 `"```\n"` 空块；该块 trim 后为 ` ``` ` 非空，`MarkdownText` 过滤不掉，仍渲染成正文为空的 `_CodeBlock`。
+- **修复**：闭合围栏时把开始围栏、正文、结束围栏作为一个完整块提交；空围栏（如 ` ```text\n``` `）不再生成代码块；`_flushBuf` 同时过滤纯空白段；未闭合围栏有内容时保留部分块、无内容时不生成空框。
+- **涉及**：`lib/widgets/markdown_text.dart`、`test/markdown_text_test.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 36 项全部通过（新增单个代码块不产生空块 / 空代码块不渲染 / 连续两个代码块 / 未闭合围栏等回归用例）。

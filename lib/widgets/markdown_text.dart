@@ -38,17 +38,17 @@ List<String> splitMarkdownBlocks(String md) {
   String? quoteBuf; // 连续引用行聚合缓冲
   for (final line in lines) {
     if (line.startsWith('```')) {
-      _flushBuf(out, buf);
-      _flushTable(out, tableBuf);
-      tableBuf = null;
-      _flushQuote(out, quoteBuf);
-      quoteBuf = null;
       if (inCode) {
+        // 闭合围栏：连同开始围栏与正文一起提交，避免把 ``` 单独拆成空代码块。
         buf.writeln(line);
-        out.add(buf.toString());
-        buf.clear();
+        _commitCodeBlock(out, buf);
         inCode = false;
       } else {
+        _flushBuf(out, buf);
+        _flushTable(out, tableBuf);
+        tableBuf = null;
+        _flushQuote(out, quoteBuf);
+        quoteBuf = null;
         buf.writeln(line);
         inCode = true;
       }
@@ -87,17 +87,33 @@ List<String> splitMarkdownBlocks(String md) {
   }
   _flushTable(out, tableBuf);
   _flushQuote(out, quoteBuf);
-  if (buf.isNotEmpty) out.add(buf.toString());
+  if (inCode) {
+    _commitCodeBlock(out, buf);
+  } else {
+    _flushBuf(out, buf);
+  }
   _lastBlockSource = md;
   _lastBlocks = out;
   return out;
 }
 
 void _flushBuf(List<String> out, StringBuffer buf) {
-  if (buf.isNotEmpty) {
-    out.add(buf.toString());
-    buf.clear();
-  }
+  final s = buf.toString();
+  buf.clear();
+  if (s.trim().isNotEmpty) out.add(s);
+}
+
+/// 提交围栏代码块：正文为空（如 ```text\n```）时不生成空代码框。
+void _commitCodeBlock(List<String> out, StringBuffer buf) {
+  final s = buf.toString();
+  buf.clear();
+  if (_codeInner(s).isNotEmpty) out.add(s);
+}
+
+String _codeInner(String block) {
+  final nl = block.indexOf('\n');
+  final rest = nl < 0 ? '' : block.substring(nl + 1);
+  return rest.replaceAll(RegExp(r'```\s*$'), '').trim();
 }
 
 void _flushTable(List<String> out, String? t) {

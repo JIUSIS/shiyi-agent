@@ -98,4 +98,73 @@ void main() {
     expect(find.text('二级'), findsOneWidget);
     expect(find.text('三级'), findsOneWidget);
   });
+
+  test('splitMarkdownBlocks 单个代码块不产生空代码块', () {
+    const md = '''试试这个：
+
+```text
+清理结果汇总
+────────────────
+删除 26 个安装包，释放约 2.5G
+删除 yq_v1_9.APK，释放 146M
+15 个视频已移入 Download/视频/
+根目录现在只剩 8 个文件
+```
+''';
+    final blocks = splitMarkdownBlocks(md);
+    final codeBlocks = blocks.where((b) => b.trim().startsWith('```')).toList();
+    expect(codeBlocks.length, 1);
+    expect(blocks.where((b) => b.trim().isEmpty), isEmpty);
+  });
+
+  test('splitMarkdownBlocks 空代码块不渲染', () {
+    const md = '```text\n```\n后文';
+    final blocks = splitMarkdownBlocks(md);
+    expect(blocks.where((b) => b.trim().startsWith('```')), isEmpty);
+  });
+
+  test('splitMarkdownBlocks 连续两个非空代码块', () {
+    const md = '```dart\nvoid main() {}\n```\n\n```python\nprint(1)\n```';
+    final blocks = splitMarkdownBlocks(md);
+    expect(blocks.where((b) => b.trim().startsWith('```')).length, 2);
+  });
+
+  test('splitMarkdownBlocks 只有起始围栏不创建空代码块', () {
+    const md = '```text\n';
+    final blocks = splitMarkdownBlocks(md);
+    expect(blocks.where((b) => b.trim().startsWith('```')), isEmpty);
+  });
+
+  test('splitMarkdownBlocks 未闭合但有内容的围栏保留部分代码块', () {
+    const md = '```python\nprint(1)\n';
+    final blocks = splitMarkdownBlocks(md);
+    expect(blocks.where((b) => b.trim().startsWith('```')).length, 1);
+  });
+
+  testWidgets('代码块渲染：单个代码块只有一个复制按钮', (tester) async {
+    const md = '''试试这个：
+
+```text
+清理结果汇总
+```
+''';
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: AdaptiveMarkdownText(md)),
+      ),
+    );
+    expect(tester.takeException(), isNull);
+    expect(find.byIcon(Icons.copy_rounded), findsOneWidget);
+  });
+
+  testWidgets('空代码块不渲染复制按钮', (tester) async {
+    const md = '前文\n\n```text\n```\n\n后文';
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: AdaptiveMarkdownText(md)),
+      ),
+    );
+    expect(tester.takeException(), isNull);
+    expect(find.byIcon(Icons.copy_rounded), findsNothing);
+  });
 }
