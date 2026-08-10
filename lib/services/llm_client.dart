@@ -46,6 +46,12 @@ class LlmClient {
   /// 最近一次请求的 total_tokens（来自流式 usage）。
   int? lastTotalTokens;
 
+  /// 最近一次请求的 prompt_tokens（来自流式 usage）。
+  int? lastPromptTokens;
+
+  /// 最近一次请求的缓存输入 token（兼容 OpenAI / 网关 / Anthropic 风格字段）。
+  int? lastCachedTokens;
+
   /// 最近一轮收到的文本（纯文本截断续写时拼接用）。
   String _lastRoundText = '';
 
@@ -67,6 +73,8 @@ class LlmClient {
 
   Future<void> send(List<Map<String, dynamic>> messages) async {
     lastTotalTokens = null;
+    lastPromptTokens = null;
+    lastCachedTokens = null;
     final client = http.Client();
     try {
       var includeUsage = true;
@@ -341,6 +349,21 @@ class LlmClient {
         if (usage != null) {
           final total = (usage['total_tokens'] as num?)?.toInt();
           if (total != null && total > 0) lastTotalTokens = total;
+          final prompt = (usage['prompt_tokens'] as num?)?.toInt();
+          final completion = (usage['completion_tokens'] as num?)?.toInt();
+          if (prompt != null && prompt >= 0) {
+            lastPromptTokens = prompt;
+          } else if (total != null && completion != null && completion >= 0) {
+            lastPromptTokens = total - completion;
+          }
+          final details =
+              usage['prompt_tokens_details'] as Map<String, dynamic>?;
+          var cached = details?['cached_tokens'] as num?;
+          cached ??= usage['cached_tokens'] as num?;
+          cached ??= usage['cache_read_input_tokens'] as num?;
+          if (cached != null && cached >= 0) {
+            lastCachedTokens = cached.toInt();
+          }
         }
         final choices = json['choices'] as List<dynamic>? ?? [];
         if (choices.isEmpty) return;

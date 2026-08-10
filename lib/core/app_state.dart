@@ -47,6 +47,19 @@ class AgentTool {
   };
 }
 
+/// 历史中一个工具回合的索引范围（assistant tool_calls + 对应 tool 结果）。
+class _ToolSegment {
+  final int assistantIndex;
+  final List<int> toolIndices;
+  final bool complete;
+
+  const _ToolSegment({
+    required this.assistantIndex,
+    required this.toolIndices,
+    required this.complete,
+  });
+}
+
 class ShiyiState extends ChangeNotifier {
   final AppDatabase _db = AppDatabase.instance;
   final SettingsService _settingsService = SettingsService();
@@ -82,6 +95,11 @@ class ShiyiState extends ChangeNotifier {
 
   /// 当前这一轮对话（一次 send）消耗的 token。
   int lastRoundTokens = 0;
+
+  /// 本轮按 Token 加权累计的真实缓存输入与总输入（来自 API usage）。
+  int roundCachedTokens = 0;
+  int roundInputTokens = 0;
+  bool roundCacheKnown = false;
 
   /// 当前会话上下文估算 token 数（与 contextLimit 同口径，用于显示剩余百分比）。
   int sessionContextTokens = 0;
@@ -560,6 +578,9 @@ class ShiyiState extends ChangeNotifier {
     loadedSkill = null;
     sessionTotalTokens = 0;
     lastRoundTokens = 0;
+    roundCachedTokens = 0;
+    roundInputTokens = 0;
+    roundCacheKnown = false;
     sessionContextTokens = 0;
     sessionContextTokensFull = 0;
     await refreshSessions();
@@ -597,6 +618,9 @@ class ShiyiState extends ChangeNotifier {
     final sess = await _db.getSession(id);
     sessionTotalTokens = sess?.totalTokens ?? 0;
     lastRoundTokens = 0;
+    roundCachedTokens = 0;
+    roundInputTokens = 0;
+    roundCacheKnown = false;
     await _updateContextStats(id);
     // 该会话若正在生成中，把内存里实时更新的流式消息接回来，
     // 避免重进会话后「正在思考…」消失、或刷新内容与 DB 不一致。
@@ -642,19 +666,61 @@ class ShiyiState extends ChangeNotifier {
 
   // ---------------- chat ----------------
 
-  /// 把历史消息转成 API 请求体，并清理工具调用序列：
-  /// 跳过 tool 结果消息、丢弃 assistant 的 tool_calls（只留文本），
-  /// 避免“有 tool_calls 但缺 tool 结果”的非法序列导致 HTTP 400。
-  /// 带本地图片标记的用户消息会转成多模态 content 数组。
-  Future<List<Map<String, dynamic>>> _historyToApi(
+  /// 把历史消息转成 API 请求体：
+  /// - 完整工具回合按「assistant tool_calls + 对应 tool 结果」成组保留；
+  /// - compactOldTools=true 时只保留最近 3 个完整工具回合，更早的压缩成摘要；
+  /// - 不完整或已摘要的工具消息不会单独混入，避免非法序列。
+  Future<({List<Map<String, dynamic>> messages, String toolSummary})>
+  _historyToApi(
     List<ChatMessage> msgs, {
     bool imagesAllowed = true,
+    bool compactOldTools = false,
+    bool estimateMode = false,
   }) async {
+    final active = msgs.where((m) => !m.streaming).toList();
+    final segments = _planToolSegments(active);
+    final completeSegments = segments.where((s) => s.complete).toList();
+    final keepFull = compactOldTools && completeSegments.length > 3
+        ? completeSegments.sublist(completeSegments.length - 3).toSet()
+        : completeSegments.toSet();
+    final keepAssistant = <int>{};
+    final keepTool = <int>{};
+    final skip = <int>{};
+    final summaryLines = <String>[];
+    for (final seg in segments) {
+      if (seg.complete && keepFull.contains(seg)) {
+        keepAssistant.add(seg.assistantIndex);
+        keepTool.addAll(seg.toolIndices);
+      } else if (seg.complete) {
+        final tools = [for (final i in seg.toolIndices) active[i]];
+        final line = _summarizeToolSegment(active[seg.assistantIndex], tools);
+        if (line.trim().isNotEmpty) summaryLines.add(line);
+        skip.add(seg.assistantIndex);
+        skip.addAll(seg.toolIndices);
+      } else {
+        skip.addAll(seg.toolIndices);
+      }
+    }
+
     final out = <Map<String, dynamic>>[];
-    for (final m in msgs.where((m) => !m.streaming)) {
-      if (m.role == 'tool') continue;
+    for (var i = 0; i < active.length; i++) {
+      final m = active[i];
+      if (skip.contains(i)) continue;
       if (m.role == 'user' && m.hasImages) {
-        if (imagesAllowed) {
+        if (estimateMode) {
+          final text = stripImageMarkers(m.content);
+          out.add({
+            'role': 'user',
+            'content': [
+              if (text.isNotEmpty) {'type': 'text', 'text': text},
+              for (final p in extractImagePaths(m.content))
+                {
+                  'type': 'image_url',
+                  'image_url': {'url': 'file://$p'},
+                },
+            ],
+          });
+        } else if (imagesAllowed) {
           out.add(await _userMessageToApi(m));
         } else {
           final text = stripImageMarkers(m.content);
@@ -670,13 +736,180 @@ class ShiyiState extends ChangeNotifier {
         }
         continue;
       }
-      final api = m.toApiMap();
-      if (m.role == 'assistant' && m.hasToolCalls) {
-        api.remove('tool_calls');
+      if (m.role == 'tool') {
+        if (keepTool.contains(i)) out.add(m.toApiMap());
+        continue;
       }
-      out.add(api);
+      if (m.role == 'assistant' && m.hasToolCalls) {
+        if (keepAssistant.contains(i)) {
+          out.add(m.toApiMap());
+        } else if (m.content.trim().isNotEmpty) {
+          out.add({'role': 'assistant', 'content': m.content});
+        }
+        continue;
+      }
+      out.add(m.toApiMap());
     }
-    return out;
+    return (messages: out, toolSummary: summaryLines.join('\n'));
+  }
+
+  /// 扫描历史里的工具回合：assistant tool_calls 后紧跟的 tool 结果按 id 成组。
+  static List<_ToolSegment> _planToolSegments(List<ChatMessage> msgs) {
+    final segments = <_ToolSegment>[];
+    for (var i = 0; i < msgs.length; i++) {
+      final m = msgs[i];
+      if (m.role != 'assistant' || !m.hasToolCalls) continue;
+      final ids = {
+        for (final tc in m.toolCalls) tc.id.isEmpty ? 'call_${m.id}' : tc.id,
+      };
+      final toolIndices = <int>[];
+      for (var j = i + 1; j < msgs.length && msgs[j].role == 'tool'; j++) {
+        if (ids.contains(msgs[j].toolCallId)) toolIndices.add(j);
+      }
+      final complete =
+          ids.isNotEmpty &&
+          ids.every(
+            (id) => toolIndices.any((idx) => msgs[idx].toolCallId == id),
+          );
+      segments.add(
+        _ToolSegment(
+          assistantIndex: i,
+          toolIndices: toolIndices,
+          complete: complete,
+        ),
+      );
+    }
+    return segments;
+  }
+
+  static String _summarizeToolSegment(
+    ChatMessage assistant,
+    List<ChatMessage> tools,
+  ) {
+    final toolById = {for (final t in tools) t.toolCallId: t};
+    final lines = <String>[];
+    for (final tc in assistant.toolCalls) {
+      final id = tc.id.isEmpty ? 'call_${assistant.id}' : tc.id;
+      final tool = toolById[id];
+      final arg = _summarizeArgs(tc.name, tc.arguments).trim();
+      final head = arg.isEmpty ? tc.name : '${tc.name}($arg)';
+      if (tool == null) {
+        lines.add('- $head：无返回结果');
+        continue;
+      }
+      final ok = !_isToolError(tool.content);
+      final out = _summarizeOutput(tool.content);
+      lines.add('- $head：${ok ? '完成' : '失败'}，结果「$out」');
+    }
+    if (assistant.content.trim().isNotEmpty) {
+      lines.add('- 结论：${_summarizeOutput(assistant.content)}');
+    }
+    return lines.join('\n');
+  }
+
+  /// 汇总最近 3 个完整工具回合之外的所有旧工具轮（原文仍留在本地数据库）。
+  String _buildOldToolSummary(List<ChatMessage> msgs) {
+    final active = msgs.where((m) => !m.streaming).toList();
+    final complete = _planToolSegments(
+      active,
+    ).where((s) => s.complete).toList();
+    if (complete.length <= 3) return '';
+    final lines = <String>[];
+    for (final seg in complete.sublist(0, complete.length - 3)) {
+      final tools = [for (final i in seg.toolIndices) active[i]];
+      lines.add(_summarizeToolSegment(active[seg.assistantIndex], tools));
+    }
+    return lines.join('\n');
+  }
+
+  /// 按上下文占用生成发送前摘要：60% 压缩旧工具结果，75% 更新滚动任务摘要。
+  Future<String> _buildContextSummaries(
+    List<ChatMessage> msgs,
+    int fullTokens,
+  ) async {
+    final limit = settings.contextLimit;
+    if (limit <= 0) return '';
+    final ratio = fullTokens / limit;
+    final parts = <String>[];
+    if (ratio >= 0.60) {
+      final tools = _buildOldToolSummary(msgs);
+      if (tools.isNotEmpty) parts.add('【历史工具结果摘要】\n$tools');
+    }
+    if (ratio >= 0.75) {
+      final task = _buildRollingTaskSummary(msgs);
+      if (task.isNotEmpty) parts.add('【滚动任务摘要】\n$task');
+    }
+    return parts.join('\n\n');
+  }
+
+  /// 从最近 20 条非工具消息提炼目标、文件、决定、验证结果与待办。
+  static String _buildRollingTaskSummary(List<ChatMessage> msgs) {
+    final recent = <ChatMessage>[];
+    for (final m in msgs.reversed) {
+      if (m.streaming || m.role == 'tool') continue;
+      recent.add(m);
+      if (recent.length >= 20) break;
+    }
+    final goals = <String>[];
+    final decisions = <String>[];
+    final verification = <String>[];
+    final todos = <String>[];
+    for (final m in recent.reversed) {
+      final text = (m.role == 'user' ? stripImageMarkers(m.content) : m.content)
+          .trim();
+      if (text.isEmpty) continue;
+      if (m.role == 'user' && goals.length < 2) {
+        goals.add(_cutText(text, 160));
+      }
+      for (final line in text.split('\n')) {
+        final t = line.trim();
+        if (t.isEmpty || t.length > 160) continue;
+        if (RegExp(r'决定|选择|采用|改为|确认|方案').hasMatch(t) && decisions.length < 3) {
+          decisions.add(_cutText(t, 120));
+        }
+        if (RegExp(r'验证|测试通过|成功|失败|错误').hasMatch(t) &&
+            verification.length < 3) {
+          verification.add(_cutText(t, 120));
+        }
+        if (RegExp(r'接下来|待办|后续|还需要|未完成|下一步').hasMatch(t) && todos.length < 3) {
+          todos.add(_cutText(t, 120));
+        }
+      }
+    }
+    final files = _extractToolPaths(msgs);
+    final parts = <String>[];
+    if (goals.isNotEmpty) parts.add('目标：${goals.join('；')}');
+    if (files.isNotEmpty) parts.add('涉及文件：${files.take(8).join('、')}');
+    if (decisions.isNotEmpty) parts.add('重要决定：${decisions.join('；')}');
+    if (verification.isNotEmpty) {
+      parts.add('验证结果：${verification.join('；')}');
+    }
+    if (todos.isNotEmpty) parts.add('未完成事项：${todos.join('；')}');
+    return parts.join('\n');
+  }
+
+  static List<String> _extractToolPaths(List<ChatMessage> msgs) {
+    final out = <String>{};
+    for (final m in msgs) {
+      if (m.role != 'assistant') continue;
+      for (final tc in m.toolCalls) {
+        try {
+          final args = jsonDecode(tc.arguments);
+          if (args is Map) {
+            for (final k in ['path', 'file', 'dir', 'target']) {
+              final v = args[k];
+              if (v is String && v.trim().isNotEmpty) out.add(v.trim());
+            }
+          }
+        } catch (_) {}
+      }
+    }
+    return out.toList();
+  }
+
+  static String _cutText(String s, int max) {
+    final t = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return t.length > max ? '${t.substring(0, max)}…' : t;
   }
 
   /// 发送前按上下文预算裁剪历史：从最新往回保留，超出预算的较早消息
@@ -743,33 +976,22 @@ class ShiyiState extends ChangeNotifier {
     final msgs = _messagesLoadedForSessionId == sessionId
         ? messages
         : await _db.listMessages(sessionId);
-    final apiMsgs = <Map<String, dynamic>>[];
-    for (final m in msgs.where((m) => !m.streaming)) {
-      if (m.role == 'tool') continue;
-      if (m.role == 'user' && m.hasImages) {
-        final text = stripImageMarkers(m.content);
-        apiMsgs.add({
-          'role': 'user',
-          'content': [
-            if (text.isNotEmpty) {'type': 'text', 'text': text},
-            for (final p in extractImagePaths(m.content))
-              {
-                'type': 'image_url',
-                'image_url': {'url': 'file://$p'},
-              },
-          ],
-        });
-        continue;
-      }
-      final api = m.toApiMap();
-      if (m.role == 'assistant' && m.hasToolCalls) {
-        api.remove('tool_calls');
-      }
-      apiMsgs.add(api);
-    }
-    if (apiMsgs.isEmpty) return 0;
+    final full = await sessionContextTokenEstimate(sessionId);
+    final summaries = await _buildContextSummaries(msgs, full);
+    final payload = await _historyToApi(
+      msgs,
+      imagesAllowed: true,
+      compactOldTools:
+          settings.contextLimit > 0 && full / settings.contextLimit >= 0.60,
+      estimateMode: true,
+    );
+    if (payload.messages.isEmpty) return 0;
     final sys = await _buildSystemPrompt('');
-    apiMsgs.insert(0, {'role': 'system', 'content': sys});
+    final sysContent = summaries.isEmpty ? sys : '$sys\n\n$summaries';
+    final apiMsgs = <Map<String, dynamic>>[
+      {'role': 'system', 'content': sysContent},
+      ...payload.messages,
+    ];
     final trimmed = await _trimApiMessages(apiMsgs, announce: false);
     var total = _estimateMessagesTokens(trimmed);
     if (activeTools.isNotEmpty) {
@@ -785,7 +1007,8 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部并给
-  /// system 追加裁剪说明。工具轮消息由调用方在循环中追加，不受影响。
+  /// system 追加裁剪说明。assistant tool_calls 与对应 tool 结果按整组裁剪，
+  /// 不会拆散配对。
   static List<Map<String, dynamic>> trimApiMessagesForBudget(
     List<Map<String, dynamic>> apiMsgs,
     int budget,
@@ -799,18 +1022,45 @@ class ShiyiState extends ChangeNotifier {
       return '';
     }
 
-    var total = 0;
-    var keepFrom = 1;
-    var trimmedAny = false;
-    for (var i = apiMsgs.length - 1; i >= 1; i--) {
-      final m = apiMsgs[i];
+    int sizeOf(Map<String, dynamic> m) {
       var size = _estimateTokens(contentOf(m));
       final tcs = m['tool_calls'];
       if (tcs is List && tcs.isNotEmpty) {
         size += _estimateTokens(jsonEncode(tcs));
       }
+      return size;
+    }
+
+    // 工具轮按「assistant tool_calls + 连续 tool 结果」整体参与预算，
+    // 保证成组保留或整组裁掉。
+    final units = <(int, int)>[];
+    var i = 1;
+    while (i < apiMsgs.length) {
+      final m = apiMsgs[i];
+      final tcs = m['tool_calls'];
+      if (m['role'] == 'assistant' && tcs is List && tcs.isNotEmpty) {
+        var j = i + 1;
+        while (j < apiMsgs.length && apiMsgs[j]['role'] == 'tool') {
+          j++;
+        }
+        units.add((i, j - 1));
+        i = j;
+      } else {
+        units.add((i, i));
+        i++;
+      }
+    }
+
+    var total = 0;
+    var keepFrom = 1;
+    var trimmedAny = false;
+    for (final u in units.reversed) {
+      var size = 0;
+      for (var k = u.$1; k <= u.$2; k++) {
+        size += sizeOf(apiMsgs[k]);
+      }
       if (total + size > budget) {
-        keepFrom = i + 1;
+        keepFrom = u.$2 + 1;
         trimmedAny = true;
         break;
       }
@@ -953,6 +1203,9 @@ class ShiyiState extends ChangeNotifier {
       busySessionId = sessionId;
       viewingSessionId = sessionId;
       lastRoundTokens = 0;
+      roundCachedTokens = 0;
+      roundInputTokens = 0;
+      roundCacheKnown = false;
       final sessNow = await _db.getSession(sessionId);
       sessionTotalTokens = sessNow?.totalTokens ?? 0;
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -1049,6 +1302,14 @@ class ShiyiState extends ChangeNotifier {
     bool runRefine = true,
   }) async {
     final systemPrompt = await _buildSystemPrompt(systemHint);
+    final fullEstimate = await sessionContextTokenEstimate(sessionId);
+    final contextSummaries = await _buildContextSummaries(
+      messages,
+      fullEstimate,
+    );
+    final compactOldTools =
+        settings.contextLimit > 0 &&
+        fullEstimate / settings.contextLimit >= 0.60;
 
     // 配了视觉模型 = 声明主模型不看图：带图消息直接走视觉模型描述，不试多模态。
     // 未配视觉模型：先按多模态发，失败自动降级（_knownImageUnsupported）。
@@ -1061,17 +1322,25 @@ class ShiyiState extends ChangeNotifier {
         // 第二次尝试注入「直接行动」指令：上一轮常见的问题是模型
         // 输出开场白（以冒号结尾）后就结束、或思考过长被截断没有正文，
         // 重试时强制它直接输出结果/调用工具，不再空转。
-        final sysContent = attempt == 0
+        final sysWithSummaries = contextSummaries.isEmpty
             ? systemPrompt
-            : '$systemPrompt\n\n'
+            : '$systemPrompt\n\n$contextSummaries';
+        final sysContent = attempt == 0
+            ? sysWithSummaries
+            : '$sysWithSummaries\n\n'
                   '【注意：上一轮回复未正常完成（可能是开场白后结束、'
                   '思考过长被截断或连接中断）。这次请直接输出结果或调用工具'
                   '完成用户请求：不要输出开场白、承诺、计划性文字，'
                   '也不要输出长篇思考过程；需要操作时第一步就调用 '
                   'run_terminal（或相关工具）执行实际操作。】';
+        final historyPayload = await _historyToApi(
+          messages,
+          imagesAllowed: imagesAllowed,
+          compactOldTools: compactOldTools,
+        );
         final loopMsgs = <Map<String, dynamic>>[
           {'role': 'system', 'content': sysContent},
-          ...await _historyToApi(messages, imagesAllowed: imagesAllowed),
+          ...historyPayload.messages,
         ];
         final trimmed = await _trimApiMessages(loopMsgs);
         // 状态栏立即反映裁剪后的实际上下文占用，而不是裁剪前的大值；
@@ -1232,6 +1501,9 @@ class ShiyiState extends ChangeNotifier {
     _stopForGuide = false;
     status = null;
     lastRoundTokens = 0;
+    roundCachedTokens = 0;
+    roundInputTokens = 0;
+    roundCacheKnown = false;
     streamText.value = '';
     notifyListeners();
 
@@ -1304,12 +1576,34 @@ class ShiyiState extends ChangeNotifier {
         break;
       }
 
-      // 有文本的工具轮：文本作为独立消息落库；再新开「正在思考…」占位贯穿工具执行。
+      // 工具轮统一落库：有文本时文本与 tool_calls 一起保存；纯工具轮也保存
+      // 一条空正文的 tool_calls 消息，后续请求才能按完整工具回合成组恢复。
+      ChatMessage toolCallOwner;
       if (result.text.isNotEmpty) {
         await _applyTurn(asst, result);
+        toolCallOwner = asst;
         asst = await _newAssistantMessage(sessionId);
+      } else {
+        toolCallOwner = ChatMessage(
+          id: 'm${DateTime.now().millisecondsSinceEpoch}_${_rand()}',
+          sessionId: sessionId,
+          role: 'assistant',
+          content: '',
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+          toolCalls: result.toolCalls
+              .map(
+                (tc) => ToolCall(
+                  id: tc['id'] ?? '',
+                  name: tc['name'] ?? '',
+                  arguments: tc['arguments'] ?? '',
+                ),
+              )
+              .toList(),
+        );
+        await _db.insertMessage(toolCallOwner);
+        messages.add(toolCallOwner);
+        _bumpMessages();
       }
-      // 纯工具轮：asst 保持「正在思考…」占位（不落库不隐藏），执行完工具后继续复用。
 
       loopMsgs.add({
         'role': 'assistant',
@@ -1317,7 +1611,7 @@ class ShiyiState extends ChangeNotifier {
         'tool_calls': result.toolCalls
             .map(
               (t) => {
-                'id': t['id']!.isEmpty ? 'call_${asst.id}' : t['id'],
+                'id': t['id']!.isEmpty ? 'call_${toolCallOwner.id}' : t['id'],
                 'type': 'function',
                 'function': {'name': t['name'], 'arguments': t['arguments']},
               },
@@ -1355,7 +1649,7 @@ class ShiyiState extends ChangeNotifier {
           role: 'tool',
           content: output,
           toolCallId: (t['id'] ?? '').isEmpty
-              ? 'call_${asst.id}'
+              ? 'call_${toolCallOwner.id}'
               : (t['id'] ?? ''),
           createdAt: DateTime.now().millisecondsSinceEpoch,
         );
@@ -1539,6 +1833,14 @@ class ShiyiState extends ChangeNotifier {
     final newTotal = (sessNow?.totalTokens ?? 0) + used;
     await _db.updateSessionTokens(sessionId, newTotal);
     if (currentSessionId == sessionId) {
+      // 缓存命中率按本轮回合加权累计，只统计服务端明确返回缓存字段的请求。
+      final cachedInput = client.lastCachedTokens;
+      final promptInput = client.lastPromptTokens;
+      if (cachedInput != null && promptInput != null && promptInput > 0) {
+        roundCacheKnown = true;
+        roundCachedTokens += cachedInput.clamp(0, promptInput);
+        roundInputTokens += promptInput;
+      }
       lastRoundTokens += used;
       sessionTotalTokens = newTotal;
       await _updateContextStats(sessionId);
@@ -2285,16 +2587,17 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 估算会话下一轮请求的上下文大小（token）：
-  /// 历史消息（不含 tool 消息、不含流式占位；图片每张按约 1000 token 计入）
+  /// 历史消息（含完整 tool 结果、不含流式占位；图片每张按约 1000 token 计入）
   /// + 系统提示词（含注入的记忆/技能）+ 工具定义开销。
-  /// 与 _historyToApi 实际发送口径一致（tool 消息不发送）。
+  /// 工具结果压缩后由 _trimApiMessages 按实际 payload 再核算，这里用于触发
+  /// 60%/75%/85% 的压缩与裁剪阈值。
   Future<int> sessionContextTokenEstimate(String sessionId) async {
     final msgs = _messagesLoadedForSessionId == sessionId
         ? messages
         : await _db.listMessages(sessionId);
     var total = 0;
     for (final m in msgs) {
-      if (m.role == 'tool' || m.streaming) continue;
+      if (m.streaming) continue;
       total += _estimateTokens(m.content);
       if (m.role == 'assistant' && m.hasToolCalls) {
         final tc = m.toApiMap()['tool_calls'];

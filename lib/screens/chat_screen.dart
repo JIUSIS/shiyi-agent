@@ -1212,6 +1212,9 @@ class _TokenStats extends StatelessWidget {
         ? 100.0
         : ((limit - tokens) / limit * 100).clamp(0, 100);
     final remainInt = remain.round();
+    final cacheText = !shiyi.roundCacheKnown || shiyi.roundInputTokens <= 0
+        ? '缓存 --'
+        : '缓存 ${(shiyi.roundCachedTokens / shiyi.roundInputTokens * 100).round()}%';
     final color = remainInt <= 20
         ? theme.colorScheme.error
         : remainInt <= 50
@@ -1221,7 +1224,7 @@ class _TokenStats extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
       child: Text(
-        '会话 ${_fmt(total)} · 本轮 ${_fmt(round)} · 上下文 ${_fmt(tokens)}/${_fmt(limit)}（剩 $remainInt%）',
+        '会话 ${_fmt(total)} · 本轮 ${_fmt(round)} · 上下文 ${_fmt(tokens)}/${_fmt(limit)}（剩 $remainInt%）· $cacheText',
         textAlign: TextAlign.center,
         style: theme.textTheme.labelSmall!.copyWith(color: color, fontSize: 11),
       ),

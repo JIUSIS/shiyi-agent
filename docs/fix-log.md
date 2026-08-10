@@ -412,3 +412,23 @@
   3. 新增 `sessionContextTokensFull` 供压缩判断使用，避免裁剪后永不触发压缩；手动压缩弹窗仍显示全量估算。
 - **涉及**：`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 39 项全部通过。
+
+### 54. 上下文管理：保留最近 3 个完整工具回合，60/75/85 三级压缩
+- **现象**：新一轮请求无条件删除历史 `tool` 消息与 assistant `tool_calls`，模型很快忘记之前读取的文件、终端输出和报错信息。
+- **根因**：`_historyToApi` 对 `role == 'tool'` 一律 `continue`，并把 assistant 的 `tool_calls` 剥离；纯工具轮的 tool_calls 只存在于内存，重开会话后无法恢复。
+- **修复**：
+  1. 完整工具回合按 `assistant tool_calls + 对应 tool_call_id` 成组保留；达到窗口 60% 后只保留最近 3 个完整工具回合，更早的旧工具轮压缩成结构化摘要（命令/路径/关键结果/错误/结论）。
+  2. 达到 75% 生成滚动任务摘要（目标、涉及文件、重要决定、验证结果、未完成事项）并写进 system，85% 后仍由预算裁剪兜底；摘要不会因裁剪丢失。
+  3. 纯工具轮也把 assistant tool_calls 落库，会话切换/重开仍能按完整回合恢复。
+  4. `trimApiMessagesForBudget` 按工具回合成组裁剪，不拆散配对；`sessionContextTokenEstimate` 计入 tool 结果，保证 60/75/85 阈值按真实上下文触发。
+- **涉及**：`lib/core/app_state.dart`、`test/context_budget_test.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 41 项全部通过（新增工具轮成组保留/整组裁掉回归用例）。
+
+### 55. 缓存命中率显示：真实 usage 按 Token 加权
+- **现象**：没有缓存命中率信息，无法判断上下文复用效果。
+- **修复**：
+  1. `LlmClient` 解析 `usage.prompt_tokens` 与缓存字段（兼容 `prompt_tokens_details.cached_tokens` / `cached_tokens` / `cache_read_input_tokens`）。
+  2. 状态栏单行末尾追加 `· 缓存 75%`；服务端明确返回 0 显示 `缓存 0%`，没有缓存字段显示 `缓存 --`。
+  3. 同一轮多次工具循环请求按 Token 加权累计（cached ÷ prompt），每次发送新用户消息时清零，不做百分比平均，也不按本地上下文推算。
+- **涉及**：`lib/services/llm_client.dart`、`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 41 项全部通过。
