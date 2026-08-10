@@ -54,4 +54,45 @@ void main() {
       expect(out.last['content'], 'latest');
     });
   });
+
+  group('estimateApiMessageTokens', () {
+    test('中文按 1 token/字、其他按 4 字符/token 估算', () {
+      final m = {'role': 'user', 'content': '你好世界abcd'};
+      expect(ShiyiState.estimateApiMessageTokens(m), 5);
+    });
+
+    test('tool_calls 计入估算', () {
+      final m = {
+        'role': 'assistant',
+        'content': '',
+        'tool_calls': [
+          {
+            'id': '1',
+            'type': 'function',
+            'function': {
+              'name': 'file_read',
+              'arguments': '{"path":"/tmp/a.txt"}',
+            },
+          },
+        ],
+      };
+      final withTc = ShiyiState.estimateApiMessageTokens(m);
+      final without = ShiyiState.estimateApiMessageTokens({
+        'role': 'assistant',
+        'content': '',
+      });
+      expect(withTc, greaterThan(without));
+    });
+
+    test('多模态 content 列表按 400 估算', () {
+      final m = {
+        'role': 'user',
+        'content': [
+          {'type': 'text', 'text': 'hi'},
+          {'type': 'image_url', 'image_url': {'url': 'data:image/...'}},
+        ],
+      };
+      expect(ShiyiState.estimateApiMessageTokens(m), 400);
+    });
+  });
 }

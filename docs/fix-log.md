@@ -391,3 +391,14 @@
 - **修复**：闭合围栏时把开始围栏、正文、结束围栏作为一个完整块提交；空围栏（如 ` ```text\n``` `）不再生成代码块；`_flushBuf` 同时过滤纯空白段；未闭合围栏有内容时保留部分块、无内容时不生成空框。
 - **涉及**：`lib/widgets/markdown_text.dart`、`test/markdown_text_test.dart`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 36 项全部通过（新增单个代码块不产生空块 / 空代码块不渲染 / 连续两个代码块 / 未闭合围栏等回归用例）。
+
+### 52. 会话上下文统计口径不统一（漏算 tool_calls / 字符 token 混用 / 兜底估算偏差）
+- **现象**：会话统计显示「上下文」偏低、剩余百分比虚高，工具多 / agent 会话尤其明显；「会话/本轮」与「上下文」数字单位感觉对不上。
+- **根因**：
+  1. 上下文估算只算消息正文，漏掉 assistant 的 `tool_calls`；发送时 `toApiMap` 会带上，实际请求比显示大很多（真机样本：「查看忆秦app」正文约 4.1 万 token、含 `tool_calls` 约 21 万 token）。
+  2. 字段 / 函数名义是「字符」、弹窗写「万字符」，实际存的是 token 估算，单位混乱。
+  3. 网关不返回 usage 时兜底用 `chars / 2`，与 `_estimateTokens`（中文约 1 token/字）不一致，中文会话少算约一半。
+  4. 子代理 token 只加「会话」不加「本轮」；并行子代理逐个读库写库有丢更新风险；会话切走时全局统计可能写串。
+- **修复**：统一为 token 口径（`sessionContextTokens` / `sessionContextTokenEstimate`）；估算计入 `tool_calls`；新增 `estimateApiMessageTokens` 纯函数供兜底与测试；无 usage 兜底改用统一估算；子代理并行累计后一次性落库并入「本轮」；主循环 / 子代理只在仍查看该会话时更新全局显示；弹窗单位改为「w token」。
+- **涉及**：`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`、`lib/screens/settings_screen.dart`、`test/context_budget_test.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 39 项全部通过（新增 `estimateApiMessageTokens` 3 项回归用例）。

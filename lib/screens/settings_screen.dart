@@ -876,7 +876,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ListTile(
                 leading: const Icon(Icons.compress_outlined),
                 title: const Text('上下文上限'),
-                subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200 万）'),
+                subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200w）'),
                 trailing: SizedBox(
                   width: 110,
                   child: TextFormField(

@@ -79,8 +79,8 @@ class ShiyiState extends ChangeNotifier {
   /// 当前这一轮对话（一次 send）消耗的 token。
   int lastRoundTokens = 0;
 
-  /// 当前会话上下文估算字符数（用于显示剩余上下文百分比）。
-  int sessionChars = 0;
+  /// 当前会话上下文估算 token 数（与 contextLimit 同口径，用于显示剩余百分比）。
+  int sessionContextTokens = 0;
 
   /// 正在流式输出的消息文本（独立通知器：流式刷新只重建这一条气泡，不重建整个列表）。
   final ValueNotifier<String> streamText = ValueNotifier('');
@@ -552,7 +552,7 @@ class ShiyiState extends ChangeNotifier {
     loadedSkill = null;
     sessionTotalTokens = 0;
     lastRoundTokens = 0;
-    sessionChars = 0;
+    sessionContextTokens = 0;
     await refreshSessions();
   }
 
@@ -587,7 +587,7 @@ class ShiyiState extends ChangeNotifier {
     final sess = await _db.getSession(id);
     sessionTotalTokens = sess?.totalTokens ?? 0;
     lastRoundTokens = 0;
-    sessionChars = await sessionContextChars(id);
+    sessionContextTokens = await sessionContextTokenEstimate(id);
     // 该会话若正在生成中，把内存里实时更新的流式消息接回来，
     // 避免重进会话后「正在思考…」消失、或刷新内容与 DB 不一致。
     if (busySessionId == id && _streaming != null) {
@@ -1097,7 +1097,7 @@ class ShiyiState extends ChangeNotifier {
     _bumpMessages();
     await _db.touchSession(sessionId, model: settings.model);
     await refreshSessions();
-    sessionChars = await sessionContextChars(sessionId);
+    sessionContextTokens = await sessionContextTokenEstimate(sessionId);
     notifyListeners();
   }
 
@@ -1418,23 +1418,23 @@ class ShiyiState extends ChangeNotifier {
     await client.send(msgs);
     var used = client.lastTotalTokens;
     if (used == null || used <= 0) {
-      // 部分网关/中转不返回 usage：按发送内容的字符数估算兜底，
+      // 部分网关/中转不返回 usage：按发送内容与工具调用的 token 估算兜底，
       // 保证统计有真实反映，且能持久化跨会话保留。
-      var chars = 0;
+      var est = 0;
       for (final m in msgs) {
-        final c = m['content'];
-        if (c is String) {
-          chars += c.length;
-        } else if (c is List) {
-          chars += 400; // 多模态消息粗略按一段文本估算
-        }
+        est += estimateApiMessageTokens(m);
       }
-      used = (chars / 2).round().clamp(1, 1 << 30);
+      used = est.clamp(1, 1 << 30);
     }
-    lastRoundTokens += used;
-    sessionTotalTokens += used;
-    await _db.updateSessionTokens(sessionId, sessionTotalTokens);
-    sessionChars = await sessionContextChars(sessionId);
+    // 会话切走时只落库，不污染当前显示；仍在看该会话才更新全局统计。
+    final sessNow = await _db.getSession(sessionId);
+    final newTotal = (sessNow?.totalTokens ?? 0) + used;
+    await _db.updateSessionTokens(sessionId, newTotal);
+    if (currentSessionId == sessionId) {
+      lastRoundTokens += used;
+      sessionTotalTokens = newTotal;
+      sessionContextTokens = await sessionContextTokenEstimate(sessionId);
+    }
     notifyListeners();
     return accumulated;
   }
@@ -1950,6 +1950,7 @@ class ShiyiState extends ChangeNotifier {
 
   /// 派发子代理：独立 LLM 对话 + 受限工具集，返回其最终文本报告。
   Future<String> _execSpawnAgent(Map<String, dynamic> args) async {
+    final spawnSessionId = currentSessionId;
     final rawTasks = args['tasks'];
     final List<Map<String, dynamic>> tasks = <Map<String, dynamic>>[];
     if (rawTasks is List && rawTasks.isNotEmpty) {
@@ -1980,6 +1981,7 @@ class ShiyiState extends ChangeNotifier {
     }
 
     final total = tasks.length;
+    var subagentTokens = 0;
     // 并发执行：每任务独立 try/catch，单个失败不影响其他（独立失败）。
     final results = await Future.wait(
       List.generate(total, (i) async {
@@ -2059,14 +2061,20 @@ class ShiyiState extends ChangeNotifier {
         } catch (e) {
           report = '（子代理异常：$e）';
         }
-        // 子代理消耗的 token 计入会话统计（与主循环一致）。
-        if (runner.totalTokens > 0 && currentSessionId != null) {
-          sessionTotalTokens += runner.totalTokens;
-          await _db.updateSessionTokens(currentSessionId!, sessionTotalTokens);
-        }
+        if (runner.totalTokens > 0) subagentTokens += runner.totalTokens;
         return '### 子代理 ${i + 1}/$total（${def.name}）\n$report';
       }),
     );
+    // 子代理消耗的 token 统一计入发起会话（与主循环一致，并入「本轮」）。
+    if (subagentTokens > 0 && spawnSessionId != null) {
+      final sessNow = await _db.getSession(spawnSessionId);
+      final newTotal = (sessNow?.totalTokens ?? 0) + subagentTokens;
+      await _db.updateSessionTokens(spawnSessionId, newTotal);
+      if (currentSessionId == spawnSessionId) {
+        sessionTotalTokens = newTotal;
+        lastRoundTokens += subagentTokens;
+      }
+    }
     // 全部结束后清掉轮次状态条，避免残留「第 n/m 轮」。
     status = null;
     notifyListeners();
@@ -2135,7 +2143,7 @@ class ShiyiState extends ChangeNotifier {
   Future<void> refreshTokenStats(String sessionId) async {
     final s = await _db.getSession(sessionId);
     if (s != null) sessionTotalTokens = s.totalTokens;
-    sessionChars = await sessionContextChars(sessionId);
+    sessionContextTokens = await sessionContextTokenEstimate(sessionId);
     notifyListeners();
   }
 
@@ -2152,11 +2160,27 @@ class ShiyiState extends ChangeNotifier {
     return cjk + (other / 4).ceil();
   }
 
+  /// 估算单条 API 消息的 token 数（与发送口径一致：含 tool_calls，不含 reasoning）。
+  static int estimateApiMessageTokens(Map<String, dynamic> m) {
+    final c = m['content'];
+    var total = 0;
+    if (c is String) {
+      total += _estimateTokens(c);
+    } else if (c is List) {
+      total += 400; // 多模态消息粗略按一段文本估算
+    }
+    final tcs = m['tool_calls'];
+    if (tcs is List && tcs.isNotEmpty) {
+      total += _estimateTokens(jsonEncode(tcs));
+    }
+    return total;
+  }
+
   /// 估算会话下一轮请求的上下文大小（token）：
   /// 历史消息（不含 tool 消息、不含流式占位；图片每张按约 1000 token 计入）
   /// + 系统提示词（含注入的记忆/技能）+ 工具定义开销。
   /// 与 _historyToApi 实际发送口径一致（tool 消息不发送）。
-  Future<int> sessionContextChars(String sessionId) async {
+  Future<int> sessionContextTokenEstimate(String sessionId) async {
     final msgs = _messagesLoadedForSessionId == sessionId
         ? messages
         : await _db.listMessages(sessionId);
@@ -2164,6 +2188,12 @@ class ShiyiState extends ChangeNotifier {
     for (final m in msgs) {
       if (m.role == 'tool' || m.streaming) continue;
       total += _estimateTokens(m.content);
+      if (m.role == 'assistant' && m.hasToolCalls) {
+        final tc = m.toApiMap()['tool_calls'];
+        if (tc is List && tc.isNotEmpty) {
+          total += _estimateTokens(jsonEncode(tc));
+        }
+      }
       if (m.hasImages) {
         total += 1000 * extractImagePaths(m.content).length;
       }
@@ -2225,7 +2255,7 @@ class ShiyiState extends ChangeNotifier {
     await _db.insertMessage(summaryMsg);
     messages = await _db.listMessages(sessionId);
     _bumpMessages();
-    sessionChars = await sessionContextChars(sessionId);
+    sessionContextTokens = await sessionContextTokenEstimate(sessionId);
     notifyListeners();
     return true;
   }
@@ -2235,10 +2265,10 @@ class ShiyiState extends ChangeNotifier {
     if (!settings.autoCompress || settings.compressThresholdPercent <= 0) {
       return;
     }
-    final chars = await sessionContextChars(sessionId);
+    final tokens = await sessionContextTokenEstimate(sessionId);
     final threshold =
         settings.contextLimit * settings.compressThresholdPercent / 100;
-    if (chars > threshold) {
+    if (tokens > threshold) {
       await compressSession(sessionId);
     }
   }

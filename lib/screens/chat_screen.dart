@@ -1053,24 +1053,24 @@ class _ChatScreenState extends State<ChatScreen>
     final limit = s.settings.contextLimit;
     final pct = s.settings.compressThresholdPercent;
     if (limit <= 0 || pct <= 0) return false;
-    return s.sessionChars > limit * pct / 100;
+    return s.sessionContextTokens > limit * pct / 100;
   }
 
   Future<void> _compressContext() async {
     final shiyi = widget.shiyi;
     final sessionId = widget.sessionId ?? shiyi.currentSessionId;
     if (sessionId == null) return;
-    final chars = await shiyi.sessionContextChars(sessionId);
+    final tokens = await shiyi.sessionContextTokenEstimate(sessionId);
     if (!mounted) return;
     final limit = shiyi.settings.contextLimit;
-    final pct = limit <= 0 ? 0.0 : (chars / limit * 100).clamp(0, 100);
+    final pct = limit <= 0 ? 0.0 : (tokens / limit * 100).clamp(0, 100);
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('压缩上下文'),
         content: Text(
           '当前会话上下文约 ${pct.toStringAsFixed(0)}%'
-          '（${(chars / 10000).toStringAsFixed(1)} 万字符 / 上限 ${(limit / 10000).toStringAsFixed(0)} 万字符）。\n'
+          '（${(tokens / 10000).toStringAsFixed(1)}w token / 上限 ${(limit / 10000).toStringAsFixed(0)}w token）。\n'
           '压缩会把早期历史总结成摘要，只保留最近部分完整消息。',
         ),
         actions: [
@@ -1179,7 +1179,7 @@ class _TokenStats extends StatelessWidget {
 
   static String _fmt(int n) {
     if (n >= 100000000) return '${(n / 100000000).toStringAsFixed(1)}亿';
-    if (n >= 10000) return '${(n / 10000).toStringAsFixed(1)}万';
+    if (n >= 10000) return '${(n / 10000).toStringAsFixed(1)}w';
     if (n >= 1000) return '${(n / 1000).toStringAsFixed(1)}k';
     return '$n';
   }
@@ -1190,10 +1190,10 @@ class _TokenStats extends StatelessWidget {
     final total = shiyi.sessionTotalTokens;
     final round = shiyi.lastRoundTokens;
     final limit = shiyi.settings.contextLimit;
-    final chars = shiyi.sessionChars;
+    final tokens = shiyi.sessionContextTokens;
     final remain = limit <= 0
         ? 100.0
-        : ((limit - chars) / limit * 100).clamp(0, 100);
+        : ((limit - tokens) / limit * 100).clamp(0, 100);
     final remainInt = remain.round();
     final color = remainInt <= 20
         ? theme.colorScheme.error
@@ -1204,7 +1204,7 @@ class _TokenStats extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
       child: Text(
-        '会话 ${_fmt(total)} · 本轮 ${_fmt(round)} · 上下文 ${_fmt(chars)}/${_fmt(limit)}（剩 $remainInt%）',
+        '会话 ${_fmt(total)} · 本轮 ${_fmt(round)} · 上下文 ${_fmt(tokens)}/${_fmt(limit)}（剩 $remainInt%）',
         textAlign: TextAlign.center,
         style: theme.textTheme.labelSmall!.copyWith(color: color, fontSize: 11),
       ),
