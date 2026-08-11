@@ -104,6 +104,8 @@ class ShiyiState extends ChangeNotifier {
 
   AppSettings settings = AppSettings();
   List<Session> sessions = [];
+  List<Project> projects = [];
+  final Map<String, String> _projectIdBySession = {};
   List<ChatMessage> messages = [];
   String? _messagesLoadedForSessionId;
   List<MemoryEntry> memories = [];
@@ -162,6 +164,12 @@ class ShiyiState extends ChangeNotifier {
   final ValueNotifier<int> messagesRevision = ValueNotifier(0);
 
   void _bumpMessages() => messagesRevision.value++;
+
+  /// 会话列表版本号：主页会话 tab 只监听它，删除/新建/重命名后立即刷新。
+  final ValueNotifier<int> sessionsRevision = ValueNotifier(0);
+
+  /// 项目列表版本号：项目管理页只监听它。
+  final ValueNotifier<int> projectsRevision = ValueNotifier(0);
 
   ChatMessage? _streaming;
   bool _stopRequested = false;
@@ -559,12 +567,32 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> _reloadAll() async {
     sessions = await _db.listSessions();
+    projects = await _db.listProjects();
+    _rebuildProjectIndex();
     memories = await _db.listMemories();
     skills = await _db.listSkills();
   }
 
+  void _rebuildProjectIndex() {
+    _projectIdBySession
+      ..clear()
+      ..addEntries(
+        sessions
+            .where((s) => s.projectId.isNotEmpty)
+            .map((s) => MapEntry(s.id, s.projectId)),
+      );
+  }
+
   Future<void> refreshSessions() async {
     sessions = await _db.listSessions();
+    _rebuildProjectIndex();
+    sessionsRevision.value++;
+    notifyListeners();
+  }
+
+  Future<void> refreshProjects() async {
+    projects = await _db.listProjects();
+    projectsRevision.value++;
     notifyListeners();
   }
 
@@ -573,7 +601,7 @@ class ShiyiState extends ChangeNotifier {
   /// 当前会话手动加载的技能（输入 / 选择），注入到系统提示，切换会话时清空。
   final List<Skill> loadedSkills = [];
 
-  /// 当前会话的项目工作目录：会话设置了用会话的，否则用全局默认。
+  /// 当前会话的工作目录：会话单独设置 > 所属项目目录 > 全局默认。
   Future<String> currentWorkspace() async {
     final id = currentSessionId;
     if (id != null) {
@@ -581,9 +609,25 @@ class ShiyiState extends ChangeNotifier {
         if (s.id == id && s.workspaceDir.trim().isNotEmpty) {
           return s.workspaceDir.trim();
         }
+        if (s.id == id && s.projectId.isNotEmpty) {
+          final project = projectForSession(id);
+          if (project != null && project.workspaceDir.trim().isNotEmpty) {
+            return project.workspaceDir.trim();
+          }
+        }
       }
     }
     return FileWorkspace.current();
+  }
+
+  /// 会话所属项目；未分类返回 null。
+  Project? projectForSession(String sessionId) {
+    final projectId = _projectIdBySession[sessionId];
+    if (projectId == null || projectId.isEmpty) return null;
+    for (final p in projects) {
+      if (p.id == projectId) return p;
+    }
+    return null;
   }
 
   /// 设置当前会话的项目工作目录（空串 = 回到全局默认）。
@@ -598,7 +642,7 @@ class ShiyiState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> newSession() async {
+  Future<void> newSession({String projectId = ''}) async {
     _clearTrimNotice();
     final now = DateTime.now().millisecondsSinceEpoch;
     final id = 's${now}_${_rand()}';
@@ -609,6 +653,7 @@ class ShiyiState extends ChangeNotifier {
         model: settings.model,
         createdAt: now,
         updatedAt: now,
+        projectId: projectId,
       ),
     );
     currentSessionId = id;
@@ -696,6 +741,57 @@ class ShiyiState extends ChangeNotifier {
       loadedSkills.clear();
     }
     await refreshSessions();
+  }
+
+  // ---------------- projects ----------------
+
+  Future<Project> addProject(String name, {String workspaceDir = ''}) async {
+    final t = name.trim();
+    if (t.isEmpty) throw Exception('项目名不能为空');
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final p = Project(
+      id: 'p${now}_${_rand()}',
+      name: t,
+      createdAt: now,
+      workspaceDir: workspaceDir.trim(),
+    );
+    await _db.upsertProject(p);
+    await refreshProjects();
+    return p;
+  }
+
+  Future<void> renameProject(String id, String name) async {
+    final t = name.trim();
+    if (t.isEmpty) throw Exception('项目名不能为空');
+    await _db.renameProject(id, t);
+    await refreshProjects();
+  }
+
+  Future<void> deleteProject(String id) async {
+    await _db.deleteProject(id);
+    await refreshProjects();
+    await refreshSessions();
+  }
+
+  Future<void> moveSessionToProject(String sessionId, String? projectId) async {
+    await _db.updateSessionProject(sessionId, projectId);
+    await refreshSessions();
+  }
+
+  /// 设置项目级工作目录（空串 = 项目下会话回到全局默认）。
+  Future<void> setProjectWorkspace(String id, String dir) async {
+    final t = dir.trim();
+    await _db.setProjectWorkspace(id, t);
+    for (final p in projects) {
+      if (p.id == id) p.workspaceDir = t;
+    }
+    await refreshProjects();
+  }
+
+  /// 会话所属项目名；未分类返回空字符串。
+  String projectNameFor(String sessionId) {
+    final project = projectForSession(sessionId);
+    return project?.name ?? '';
   }
 
   /// 在当前会话加载/移除技能（输入 / 选择），内容注入系统提示供模型使用。

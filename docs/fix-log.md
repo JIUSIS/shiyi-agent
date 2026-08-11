@@ -483,3 +483,42 @@
 - **修复**：弹窗正文改用 `AdaptiveMarkdownText`，与聊天会话同一款式渲染标题 / 列表 / 代码块 / 表格 / 链接；更新说明区域仍保持限高可滚动。
 - **涉及**：`lib/services/update_service.dart`、`test/update_service_test.dart`、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`，直接替换 GitHub `v1.1.7` Release APK。
 - **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过（新增更新弹窗 Markdown 渲染回归用例）。
+
+### 60. 主页会话列表删除/新建后不刷新 + 会话项目分类
+- **现象**：主页左滑删除会话后会话仍留在列表，点击创建会话返回主页也不显示新会话，切换其他 tab 再回来才正常；希望用项目分类管理会话，且项目可直接在主页展开。
+- **根因**：会话 tab 被缓存在 `_tabCache` 中，删除 / 新建只更新了内存列表，页面没有监听列表变化；`_tabCache.remove(0)` 只在侧边栏新建入口生效，左滑删除不重建。
+- **修复**：
+  1. `ShiyiState` 新增 `sessionsRevision` / `projectsRevision` 两个数据版本号；`refreshSessions()` / `refreshProjects()` 各自递增并 `notifyListeners()`，主页会话 tab 与项目管理页用 `ListenableBuilder` 监听，删除 / 新建 / 重命名 / 移动后立即重建列表。
+  2. 数据库升到 v14：新增 `projects` 表，`sessions` 表加 `project_id`；未分类会话 `project_id` 为空，删除项目只把会话移回未分类，不删会话。
+  3. 主页按项目分组展示会话，项目标题可点击展开 / 收起，未分类默认展开；会话左滑新增“项目”按钮，聊天页目录面板也支持移动到项目。
+  4. 数据库升到 v15：`projects` 表加 `workspace_dir`（项目级工作目录）；工作目录优先级为“会话单独设置 > 所属项目目录 > 全局默认”，项目下未单独设置目录的会话自动继承项目目录。
+- **涉及**：`lib/core/models.dart`、`lib/services/db.dart`、`lib/core/app_state.dart`、`lib/screens/home_screen.dart`、`lib/screens/chat_screen.dart`、`lib/screens/projects_screen.dart`（新增）、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留。
+
+### 61. 新建入口改为项目优先 + 项目横幅左滑操作
+- **现象**：用户希望不再从侧边栏 / 主页直接新建会话，而是先新建项目（创建时选择文件夹位置）；项目横幅要能左滑“新建 / 文件夹 / 重命名 / 删除”，样式与会话左滑一致；主页会话卡片间距要分开，不能紧贴重合。
+- **根因**：主页只有“新建会话”入口，会话全部平铺；项目横幅只是静态标题，没有操作区；分组列表的会话卡片之间没有间距。
+- **修复**：
+  1. `_MacSidebar` 顶部按钮改为“新项目”，主页空状态按钮改为“新建项目”；新增 `lib/screens/project_actions.dart` 统一提供“新建项目（输入名称 + 选择文件夹） / 设置项目目录 / 重命名 / 删除”操作，主页、项目管理页共用。
+  2. `ShiyiState.newSession` 增加 `projectId` 参数；主页项目横幅左滑“新建”在当前项目下创建会话，创建后自动展开该项目分组并进入聊天页；未分类横幅保留“新建”入口。
+  3. `_SwipeActions` 支持自定义 `actionWidth`，项目横幅用 176dp 容纳 4 个胶囊按钮（新建 / 文件夹 / 重命名 / 删除），样式与会话左滑一致。
+  4. 主页项目分组改为显示所有项目（含空项目）；分组内会话卡片统一加 8dp 底部间距，项目横幅与会话之间也保持独立间距。
+- **涉及**：`lib/core/app_state.dart`、`lib/screens/home_screen.dart`、`lib/screens/projects_screen.dart`、`lib/screens/project_actions.dart`（新增）、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留（设备处于锁屏，未做界面截图验证）。
+
+### 62. 侧边栏精简 + 项目横幅四操作 + 左滑跟手优化
+- **现象**：侧边栏“项目”导航多余，希望只保留“新项目”；项目横幅左滑目前只看到“新建会话”，需要完整的“新建会话 / 项目文件夹 / 重命名 / 删除”；项目和会话左滑不跟手、松手容易弹回去。
+- **根因**：侧边栏仍保留“项目”tab 入口；未分类横幅只有“新建会话”一个操作，用户看到的横幅大概率是未分类；左滑用 `AnimatedContainer` 加半程阈值，重新拖动时会从吸附目标跳变，阈值过高导致轻微左滑松手就弹回。
+- **修复**：
+  1. 侧边栏 `_items` 移除“项目”导航，tab 索引恢复为 会话 / 记忆 / 技能 / 文件 / 设置 / 日志；项目操作全部集中到主页项目横幅左滑。
+  2. 项目横幅左滑按钮补全为“新建会话 / 项目文件夹 / 重命名 / 删除”，操作区加宽到 220dp；未分类横幅保留“新建会话”入口。
+  3. `_SwipeActionsState` 改用 `AnimationController` 驱动：拖动中零延迟直接位移，重新拖动立即接管当前视觉位置，不再从吸附目标跳变；松手后 200ms `easeOutCubic` 平滑吸附；展开判定阈值从 50% 降到 35%，已展开时只有快速右滑才收回。
+- **涉及**：`lib/screens/home_screen.dart`、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留。
+
+### 63. 左滑后点击空白收回
+- **现象**：左滑展开项目 / 会话操作区后，点击列表空白或其他卡片，展开的操作区不会自动收回，只能点已展开卡片本身或再滑一次。
+- **根因**：每个 `_SwipeActions` 只管理自己的 `_offset`，没有共享“当前展开卡片”的状态，外部点击没有入口触发收回。
+- **修复**：主页会话 tab 增加 `_openSwipeKey`（`ValueNotifier<String?>`），所有项目横幅与会话卡片左滑时共享展开状态；点击列表空白统一清空状态，所有已展开卡片平滑收回；拖动其他卡片或点击已展开内容也会自动收回当前操作区。
+- **涉及**：`lib/screens/home_screen.dart`、`CHANGELOG.md`；版本号保持 `1.1.7+11`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留。

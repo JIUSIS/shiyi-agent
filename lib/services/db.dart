@@ -18,7 +18,7 @@ class AppDatabase {
     final dir = await getApplicationDocumentsDirectory();
     _db = await openDatabase(
       join(dir.path, 'shiyi_agent.db'),
-      version: 13,
+      version: 15,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
       onOpen: _repairSchema,
@@ -37,6 +37,7 @@ class AppDatabase {
       total_tokens INTEGER NOT NULL DEFAULT 0,
       last_usage_total_tokens INTEGER,
       rolling_summary TEXT,
+      project_id TEXT,
       workspace_dir TEXT
     )
   ''');
@@ -92,6 +93,14 @@ class AppDatabase {
     await db.execute(
       'CREATE INDEX idx_tool_events_session ON tool_events(session_id)',
     );
+    await db.execute('''
+    CREATE TABLE projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      workspace_dir TEXT
+    )
+  ''');
   }
 
   Future<void> _upgrade(Database db, int oldV, int newV) async {
@@ -199,6 +208,28 @@ class AppDatabase {
         );
       }
     }
+    // v13 -> v14：新增 projects 表，sessions 加 project_id（未分类为空）。
+    if (oldV < 14) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS projects (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          workspace_dir TEXT
+        )
+      ''');
+      final sessionCols = await db.rawQuery('PRAGMA table_info(sessions)');
+      if (!sessionCols.any((c) => c['name'] == 'project_id')) {
+        await db.execute('ALTER TABLE sessions ADD COLUMN project_id TEXT');
+      }
+    }
+    // v14 -> v15：projects 表加 workspace_dir（项目级工作目录）。
+    if (oldV < 15) {
+      final cols = await db.rawQuery('PRAGMA table_info(projects)');
+      if (!cols.any((c) => c['name'] == 'workspace_dir')) {
+        await db.execute('ALTER TABLE projects ADD COLUMN workspace_dir TEXT');
+      }
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -223,6 +254,21 @@ class AppDatabase {
     }
     if (!sessionCols.any((c) => c['name'] == 'rolling_summary')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN rolling_summary TEXT');
+    }
+    if (!sessionCols.any((c) => c['name'] == 'project_id')) {
+      await db.execute('ALTER TABLE sessions ADD COLUMN project_id TEXT');
+    }
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        workspace_dir TEXT
+      )
+    ''');
+    final projectCols = await db.rawQuery('PRAGMA table_info(projects)');
+    if (!projectCols.any((c) => c['name'] == 'workspace_dir')) {
+      await db.execute('ALTER TABLE projects ADD COLUMN workspace_dir TEXT');
     }
   }
 
@@ -336,6 +382,71 @@ class AppDatabase {
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  /// 把会话移动到某个项目（projectId 为空 = 未分类）。
+  Future<void> updateSessionProject(String id, String? projectId) async {
+    final db = await this.db;
+    await db.update(
+      'sessions',
+      {'project_id': projectId == null || projectId.isEmpty ? null : projectId},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  // ---- projects ----
+  Future<List<Project>> listProjects() async {
+    final db = await this.db;
+    final rows = await db.rawQuery('''
+      SELECT p.*,
+             (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id) AS session_count
+      FROM projects p
+      ORDER BY p.created_at ASC
+    ''');
+    return rows.map(Project.fromMap).toList();
+  }
+
+  Future<void> upsertProject(Project p) async {
+    final db = await this.db;
+    await db.insert(
+      'projects',
+      p.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> renameProject(String id, String name) async {
+    final db = await this.db;
+    await db.update(
+      'projects',
+      {'name': name},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  /// 设置项目级工作目录（空串 = 项目下会话回到全局默认）。
+  Future<void> setProjectWorkspace(String id, String dir) async {
+    final db = await this.db;
+    await db.update(
+      'projects',
+      {'workspace_dir': dir},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  /// 删除项目但保留会话：项目下会话回到「未分类」。
+  Future<void> deleteProject(String id) async {
+    final db = await this.db;
+    await db.update(
+      'sessions',
+      {'project_id': null},
+      where: 'project_id = ?',
+      whereArgs: [id],
+    );
+    await db.delete('projects', where: 'id = ?', whereArgs: [id]);
   }
 
   Future<void> deleteSession(String id) async {

@@ -55,6 +55,9 @@ class Session {
   int messageCount;
   int totalTokens;
 
+  /// 所属项目 id；空 = 未分类。
+  String projectId;
+
   /// 最近一次请求由服务端真实返回的 total_tokens（含输入+输出）。
   /// 作为会话“当前上下文占用”的基线；null = 还没有真实 usage。
   int? lastUsageTotalTokens;
@@ -73,6 +76,7 @@ class Session {
     required this.updatedAt,
     this.messageCount = 0,
     this.totalTokens = 0,
+    this.projectId = '',
     this.lastUsageTotalTokens,
     this.rollingSummary = '',
     this.workspaceDir = '',
@@ -85,6 +89,7 @@ class Session {
     'created_at': createdAt,
     'updated_at': updatedAt,
     'total_tokens': totalTokens,
+    'project_id': projectId,
     'last_usage_total_tokens': lastUsageTotalTokens,
     'rolling_summary': rollingSummary,
     'workspace_dir': workspaceDir,
@@ -102,12 +107,49 @@ class Session {
     totalTokens: m['total_tokens'] == null
         ? 0
         : int.parse('${m['total_tokens']}'),
+    projectId: m['project_id'] == null ? '' : '${m['project_id']}',
     lastUsageTotalTokens: m['last_usage_total_tokens'] == null
         ? null
         : int.parse('${m['last_usage_total_tokens']}'),
     rollingSummary: m['rolling_summary'] == null
         ? ''
         : '${m['rolling_summary']}',
+    workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
+  );
+}
+
+/// 会话项目分组：一个项目可挂多个会话，未分类会话的 projectId 为空。
+class Project {
+  String id;
+  String name;
+  int createdAt;
+  int sessionCount;
+
+  /// 项目级工作目录：未单独设置目录的会话自动使用它。
+  String workspaceDir;
+
+  Project({
+    required this.id,
+    required this.name,
+    required this.createdAt,
+    this.sessionCount = 0,
+    this.workspaceDir = '',
+  });
+
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'name': name,
+    'created_at': createdAt,
+    'workspace_dir': workspaceDir,
+  };
+
+  factory Project.fromMap(Map<String, dynamic> m) => Project(
+    id: m['id'],
+    name: m['name'],
+    createdAt: m['created_at'],
+    sessionCount: m['session_count'] == null
+        ? 0
+        : int.parse('${m['session_count']}'),
     workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
   );
 }

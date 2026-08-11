@@ -234,6 +234,10 @@ class _ChatScreenState extends State<ChatScreen>
     await _refreshWorkspace();
     if (!mounted) return;
     final current = _workspace ?? '';
+    final sessionId = widget.sessionId ?? widget.shiyi.currentSessionId;
+    final project = sessionId == null
+        ? null
+        : widget.shiyi.projectForSession(sessionId);
     showModalBottomSheet<void>(
       context: context,
       builder: (ctx) => SafeArea(
@@ -248,6 +252,40 @@ class _ChatScreenState extends State<ChatScreen>
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+            if (sessionId != null)
+              ListTile(
+                leading: const Icon(Icons.folder_copy_outlined),
+                title: const Text('所属项目'),
+                subtitle: Text(
+                  project == null
+                      ? '未分类'
+                      : project.workspaceDir.isEmpty
+                      ? project.name
+                      : '${project.name}\n目录：${project.workspaceDir}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await _pickProjectForSession(sessionId);
+                },
+              ),
+            if (project != null)
+              ListTile(
+                leading: const Icon(Icons.folder_open_outlined),
+                title: const Text('项目工作目录'),
+                subtitle: Text(
+                  project.workspaceDir.isEmpty
+                      ? '未设置（用全局默认）'
+                      : project.workspaceDir,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await _pickProjectWorkspace(project);
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.folder_open_outlined),
               title: const Text('选择目录'),
@@ -282,6 +320,112 @@ class _ChatScreenState extends State<ChatScreen>
         ),
       ),
     );
+  }
+
+  Future<void> _pickProjectForSession(String sessionId) async {
+    final shiyi = widget.shiyi;
+    final selectedId = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              dense: true,
+              leading: Icon(Icons.folder_copy_outlined),
+              title: Text('移动到项目'),
+            ),
+            const Divider(height: 1),
+            for (final p in shiyi.projects)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.folder_outlined),
+                title: Text(
+                  p.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: Text('${p.sessionCount} 个会话'),
+                onTap: () => Navigator.pop(ctx, p.id),
+              ),
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.inbox_outlined),
+              title: const Text('未分类'),
+              onTap: () => Navigator.pop(ctx, ''),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (selectedId == null || !mounted) return;
+    await shiyi.moveSessionToProject(
+      sessionId,
+      selectedId.isEmpty ? null : selectedId,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(selectedId.isEmpty ? '已移动到未分类' : '已移动到项目')),
+    );
+  }
+
+  Future<void> _pickProjectWorkspace(Project project) async {
+    final shiyi = widget.shiyi;
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.folder_copy_outlined),
+              title: Text(
+                '「${project.name}」工作目录',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(
+                project.workspaceDir.isEmpty
+                    ? '未设置（会话用全局默认）'
+                    : project.workspaceDir,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.folder_open_outlined),
+              title: const Text('选择文件夹'),
+              subtitle: const Text('本会话未单独设置目录时自动使用'),
+              onTap: () => Navigator.pop(ctx, 'pick'),
+            ),
+            if (project.workspaceDir.isNotEmpty)
+              ListTile(
+                leading: const Icon(Icons.restart_alt),
+                title: const Text('清除项目目录'),
+                subtitle: const Text('回到全局默认目录'),
+                onTap: () => Navigator.pop(ctx, 'clear'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !mounted) return;
+    if (action == 'clear') {
+      await shiyi.setProjectWorkspace(project.id, '');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已清除项目目录')));
+      return;
+    }
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null || dir.trim().isEmpty || !mounted) return;
+    await shiyi.setProjectWorkspace(project.id, dir);
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('项目工作目录已设为：$dir')));
   }
 
   /// 上次输入 @ 触发选择器的时间（防抖）。

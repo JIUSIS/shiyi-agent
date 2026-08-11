@@ -15,6 +15,7 @@ import 'chat_screen.dart';
 import 'files_screen.dart';
 import 'memory_screen.dart';
 import 'log_screen.dart';
+import 'project_actions.dart';
 import 'settings_screen.dart';
 import 'skills_screen.dart';
 
@@ -218,7 +219,7 @@ class _HomeScreenState extends State<HomeScreen>
                     selected: _tab,
                     onSelect: _selectTab,
                     onToggle: () => _setSidebarVisible(false),
-                    onNewSession: _newSession,
+                    onNewProject: _newProject,
                     onAbout: _openAbout,
                   ),
                 ),
@@ -254,7 +255,7 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Future<void> _newSession() async {
+  Future<void> _newProject() async {
     final shiyi = widget.shiyi;
     _dismissKeyboard();
     setState(() {
@@ -262,20 +263,11 @@ class _HomeScreenState extends State<HomeScreen>
       _sessionsResetRevision++;
       _tabCache.remove(0); // 会话列表变更：强制重建会话 tab
     });
-    try {
-      await shiyi.newSession();
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('新建会话失败：$e')));
-      return;
-    }
-    if (!mounted) return;
-    Navigator.push(
+    final project = await createProjectWithFolder(context, shiyi);
+    if (project == null || !mounted) return;
+    ScaffoldMessenger.of(
       context,
-      MacPageRoute(builder: (_) => ChatScreen(shiyi: shiyi)),
-    );
+    ).showSnackBar(SnackBar(content: Text('项目「${project.name}」已创建')));
   }
 
   void _openAbout() {
@@ -315,13 +307,13 @@ class _MacSidebar extends StatelessWidget {
   final int selected;
   final ValueChanged<int> onSelect;
   final VoidCallback onToggle;
-  final VoidCallback onNewSession;
+  final VoidCallback onNewProject;
   final VoidCallback onAbout;
   const _MacSidebar({
     required this.selected,
     required this.onSelect,
     required this.onToggle,
-    required this.onNewSession,
+    required this.onNewProject,
     required this.onAbout,
   });
 
@@ -380,12 +372,12 @@ class _MacSidebar extends StatelessWidget {
           const SizedBox(height: 12),
           _SidebarItem(
             item: (
-              icon: Icons.add_comment_outlined,
-              selectedIcon: Icons.add_comment,
-              label: '新会话',
+              icon: Icons.create_new_folder_outlined,
+              selectedIcon: Icons.create_new_folder,
+              label: '新项目',
             ),
             selected: false,
-            onTap: onNewSession,
+            onTap: onNewProject,
           ),
           const SizedBox(height: 14),
           for (var i = 0; i < _items.length; i++) ...[
@@ -552,6 +544,12 @@ class _SessionsTabState extends State<_SessionsTab> {
   final FocusNode _searchFocus = FocusNode();
   String _query = '';
 
+  /// 已展开的项目分组 id；空串表示「未分类」，默认展开。
+  final Set<String> _expandedGroups = {''};
+
+  /// 当前展开的左滑卡片 key；点空白或操作其他卡片时收回。
+  final ValueNotifier<String?> _openSwipeKey = ValueNotifier(null);
+
   ShiyiState get shiyi => widget.shiyi;
 
   @override
@@ -566,6 +564,7 @@ class _SessionsTabState extends State<_SessionsTab> {
 
   @override
   void dispose() {
+    _openSwipeKey.dispose();
     _searchFocus.dispose();
     _searchCtrl.dispose();
     super.dispose();
@@ -582,63 +581,93 @@ class _SessionsTabState extends State<_SessionsTab> {
     setState(() => _query = '');
   }
 
+  void _toggleProject(String id) {
+    setState(() {
+      if (!_expandedGroups.add(id)) _expandedGroups.remove(id);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        // 左侧对称占位，让标题真正居中。
-        leading: const SizedBox(width: 48),
-        title: const Text('拾忆', style: TextStyle(fontWeight: FontWeight.bold)),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 6),
-            child: _FrostedSettingsButton(onPressed: widget.onOpenSettings),
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        widget.shiyi.sessionsRevision,
+        widget.shiyi.projectsRevision,
+      ]),
+      builder: (context, _) => Scaffold(
+        appBar: AppBar(
+          // 左侧对称占位，让标题真正居中。
+          leading: const SizedBox(width: 48),
+          title: const Text(
+            '拾忆',
+            style: TextStyle(fontWeight: FontWeight.bold),
           ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-            child: TextField(
-              controller: _searchCtrl,
-              focusNode: _searchFocus,
-              onChanged: (v) => setState(() => _query = v),
-              onTapOutside: (_) => _dismissSearch(),
-              onSubmitted: (_) => _dismissSearch(),
-              textInputAction: TextInputAction.search,
-              decoration: InputDecoration(
-                hintText: '搜索会话或消息内容',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.clear),
-                        tooltip: '清除',
-                        onPressed: () {
-                          _searchCtrl.clear();
-                          setState(() => _query = '');
-                        },
-                      ),
-                isDense: true,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-              ),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: _FrostedSettingsButton(onPressed: widget.onOpenSettings),
             ),
+          ],
+        ),
+        body: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: () => _openSwipeKey.value = null,
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                child: TextField(
+                  controller: _searchCtrl,
+                  focusNode: _searchFocus,
+                  onChanged: (v) => setState(() => _query = v),
+                  onTapOutside: (_) => _dismissSearch(),
+                  onSubmitted: (_) => _dismissSearch(),
+                  textInputAction: TextInputAction.search,
+                  decoration: InputDecoration(
+                    hintText: '搜索会话或消息内容',
+                    prefixIcon: const Icon(Icons.search),
+                    suffixIcon: _query.isEmpty
+                        ? null
+                        : IconButton(
+                            icon: const Icon(Icons.clear),
+                            tooltip: '清除',
+                            onPressed: () {
+                              _searchCtrl.clear();
+                              setState(() => _query = '');
+                            },
+                          ),
+                    isDense: true,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                  ),
+                ),
+              ),
+              Expanded(child: _buildBody(context)),
+            ],
           ),
-          Expanded(child: _buildBody(context)),
-        ],
+        ),
       ),
     );
   }
 
-  void _openNewSession() async {
+  Future<void> _newProject() async {
     final shiyi = widget.shiyi;
     _resetSearch();
+    final project = await createProjectWithFolder(context, shiyi);
+    if (project == null || !mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('项目「${project.name}」已创建')));
+  }
+
+  Future<void> _openNewSessionInProject(String projectId) async {
+    final shiyi = widget.shiyi;
+    _resetSearch();
+    setState(() => _expandedGroups.add(projectId));
     try {
-      await shiyi.newSession();
+      await shiyi.newSession(projectId: projectId);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -662,22 +691,134 @@ class _SessionsTabState extends State<_SessionsTab> {
   );
 
   Widget _buildBody(BuildContext context) {
+    final theme = Theme.of(context);
     final q = _query.trim();
     if (q.isEmpty) {
-      if (shiyi.sessions.isEmpty) {
-        return _EmptyState(onCreate: _openNewSession);
+      if (shiyi.sessions.isEmpty && shiyi.projects.isEmpty) {
+        return _EmptyState(onCreate: _newProject);
+      }
+      final byProject = <String, List<Session>>{};
+      for (final s in shiyi.sessions) {
+        byProject.putIfAbsent(s.projectId, () => []).add(s);
+      }
+      final children = <Widget>[];
+      for (final p in shiyi.projects) {
+        final list = byProject[p.id] ?? const <Session>[];
+        final expanded = _expandedGroups.contains(p.id);
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _SwipeActions(
+              key: ValueKey('project_${p.id}'),
+              openNotifier: _openSwipeKey,
+              swipeKey: 'project_${p.id}',
+              actionWidth: 220,
+              actions: [
+                _SlidablePillAction(
+                  icon: Icons.add_comment_outlined,
+                  label: '新建会话',
+                  backgroundColor: theme.colorScheme.primaryContainer,
+                  foregroundColor: theme.colorScheme.onPrimaryContainer,
+                  onTap: () => _openNewSessionInProject(p.id),
+                ),
+                _SlidablePillAction(
+                  icon: Icons.folder_open_outlined,
+                  label: '项目文件夹',
+                  backgroundColor: theme.colorScheme.secondaryContainer,
+                  foregroundColor: theme.colorScheme.onSecondaryContainer,
+                  onTap: () => showProjectFolderSheet(context, shiyi, p),
+                ),
+                _SlidablePillAction(
+                  icon: Icons.edit_outlined,
+                  label: '重命名',
+                  backgroundColor: theme.colorScheme.secondaryContainer,
+                  foregroundColor: theme.colorScheme.onSecondaryContainer,
+                  onTap: () => renameProjectDialog(context, shiyi, p),
+                ),
+                _SlidablePillAction(
+                  icon: Icons.delete_outline,
+                  label: '删除',
+                  backgroundColor: theme.colorScheme.error,
+                  foregroundColor: theme.colorScheme.onError,
+                  onTap: () => deleteProjectDialog(context, shiyi, p),
+                ),
+              ],
+              child: _ProjectHeader(
+                name: p.name,
+                count: list.length,
+                expanded: expanded,
+                onTap: () => _toggleProject(p.id),
+              ),
+            ),
+          ),
+        );
+        if (expanded) {
+          children.addAll([
+            for (final s in list)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: _SessionTile(
+                  shiyi: shiyi,
+                  session: s,
+                  openSwipeKey: _openSwipeKey,
+                  swipeKey: 'session_${s.id}',
+                  onBeforeOpen: _dismissSearch,
+                  onReturn: _resetSearch,
+                ),
+              ),
+          ]);
+        }
+      }
+      final uncat = byProject[''] ?? const <Session>[];
+      if (uncat.isNotEmpty) {
+        final expanded = _expandedGroups.contains('');
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _SwipeActions(
+              key: const ValueKey('project_uncat'),
+              openNotifier: _openSwipeKey,
+              swipeKey: 'project_uncat',
+              actionWidth: 132,
+              actions: [
+                _SlidablePillAction(
+                  icon: Icons.add_comment_outlined,
+                  label: '新建会话',
+                  backgroundColor: theme.colorScheme.primaryContainer,
+                  foregroundColor: theme.colorScheme.onPrimaryContainer,
+                  onTap: () => _openNewSessionInProject(''),
+                ),
+              ],
+              child: _ProjectHeader(
+                name: '未分类',
+                count: uncat.length,
+                expanded: expanded,
+                onTap: () => _toggleProject(''),
+              ),
+            ),
+          ),
+        );
+        if (expanded) {
+          children.addAll([
+            for (final s in uncat)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: _SessionTile(
+                  shiyi: shiyi,
+                  session: s,
+                  openSwipeKey: _openSwipeKey,
+                  swipeKey: 'session_${s.id}',
+                  onBeforeOpen: _dismissSearch,
+                  onReturn: _resetSearch,
+                ),
+              ),
+          ]);
+        }
       }
       return _centeredList(
-        ListView.separated(
+        ListView(
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-          itemCount: shiyi.sessions.length,
-          separatorBuilder: (_, _) => const SizedBox(height: 8),
-          itemBuilder: (context, i) => _SessionTile(
-            shiyi: shiyi,
-            session: shiyi.sessions[i],
-            onBeforeOpen: _dismissSearch,
-            onReturn: _resetSearch,
-          ),
+          children: children,
         ),
       );
     }
@@ -705,6 +846,8 @@ class _SessionsTabState extends State<_SessionsTab> {
               shiyi: shiyi,
               session: results[i].session,
               snippet: results[i].snippet,
+              openSwipeKey: _openSwipeKey,
+              swipeKey: 'session_${results[i].session.id}',
               onBeforeOpen: _dismissSearch,
               onReturn: _resetSearch,
             ),
@@ -715,24 +858,94 @@ class _SessionsTabState extends State<_SessionsTab> {
   }
 }
 
+class _ProjectHeader extends StatelessWidget {
+  final String name;
+  final int count;
+  final bool expanded;
+  final VoidCallback onTap;
+  const _ProjectHeader({
+    required this.name,
+    required this.count,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 6, 4, 4),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            child: Row(
+              children: [
+                Icon(
+                  expanded
+                      ? Icons.folder_open_outlined
+                      : Icons.folder_copy_outlined,
+                  size: 18,
+                  color: theme.colorScheme.primary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                Text(
+                  '$count 个会话',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(width: 4),
+                Icon(
+                  expanded ? Icons.expand_less : Icons.expand_more,
+                  size: 18,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _SessionTile extends StatelessWidget {
   final ShiyiState shiyi;
   final Session session;
   final String snippet;
   final VoidCallback onBeforeOpen;
   final VoidCallback onReturn;
+  final ValueNotifier<String?>? openSwipeKey;
+  final String? swipeKey;
   const _SessionTile({
     required this.shiyi,
     required this.session,
     required this.onBeforeOpen,
     required this.onReturn,
     this.snippet = '',
+    this.openSwipeKey,
+    this.swipeKey,
   });
 
   @override
   Widget build(BuildContext context) {
     final s = session;
     final theme = Theme.of(context);
+    final projectName = shiyi.projectNameFor(s.id);
     final busy = shiyi.isBusy && shiyi.busySessionId == s.id;
     final unread = shiyi.unreadSessions.contains(s.id);
     final tile = ListTile(
@@ -769,7 +982,9 @@ class _SessionTile extends StatelessWidget {
           : snippet.isNotEmpty
           ? Text(snippet, maxLines: 1, overflow: TextOverflow.ellipsis)
           : Text(
-              '${s.messageCount} 条消息 · ${_fmtTime(s.updatedAt)}${s.model.isEmpty ? '' : ' · ${s.model}'}',
+              '${s.messageCount} 条消息 · ${_fmtTime(s.updatedAt)}'
+              '${s.model.isEmpty ? '' : ' · ${s.model}'}'
+              '${projectName.isEmpty ? '' : ' · $projectName'}',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
@@ -787,6 +1002,8 @@ class _SessionTile extends StatelessWidget {
     );
     return _SwipeActions(
       key: ValueKey(s.id),
+      openNotifier: openSwipeKey,
+      swipeKey: swipeKey,
       // 左滑拉出拼合胶囊操作（重命名 / 删除）。
       onTap: () async {
         onBeforeOpen();
@@ -815,6 +1032,15 @@ class _SessionTile extends StatelessWidget {
           foregroundColor: theme.colorScheme.onSecondaryContainer,
           onTap: () async {
             await _rename(context, shiyi, s);
+          },
+        ),
+        _SlidablePillAction(
+          icon: Icons.folder_copy_outlined,
+          label: '项目',
+          backgroundColor: theme.colorScheme.secondaryContainer,
+          foregroundColor: theme.colorScheme.onSecondaryContainer,
+          onTap: () async {
+            await _pickProject(context, shiyi, s);
           },
         ),
         _SlidablePillAction(
@@ -861,86 +1087,147 @@ class _SwipeActions extends StatefulWidget {
   final Widget child;
   final List<Widget> actions;
   final VoidCallback? onTap;
+  final double actionWidth;
+  final ValueNotifier<String?>? openNotifier;
+  final String? swipeKey;
 
   const _SwipeActions({
     super.key,
     required this.child,
     required this.actions,
     this.onTap,
+    this.actionWidth = 132,
+    this.openNotifier,
+    this.swipeKey,
   });
 
   @override
   State<_SwipeActions> createState() => _SwipeActionsState();
 }
 
-class _SwipeActionsState extends State<_SwipeActions> {
-  static const double actionWidth = 108;
+class _SwipeActionsState extends State<_SwipeActions>
+    with SingleTickerProviderStateMixin {
+  double get actionWidth => widget.actionWidth;
+
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 200),
+  )..addStatusListener(_onAnimationStatus);
 
   double _offset = 0;
-  bool _settling = false;
-  Timer? _settleTimer;
+  bool _animating = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.openNotifier?.addListener(_onOpenChanged);
+  }
 
   @override
   void dispose() {
-    _settleTimer?.cancel();
+    widget.openNotifier?.removeListener(_onOpenChanged);
+    _controller.dispose();
     super.dispose();
   }
 
+  void _onAnimationStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed &&
+        status != AnimationStatus.dismissed) {
+      return;
+    }
+    _offset = -actionWidth * _controller.value;
+    _animating = false;
+    if (mounted) setState(() {});
+  }
+
   /// 计算松手后的目标偏移。
-  /// 规则：半程以上或快速左滑 → 展开；已完全展开时右滑收回、再左滑（双滑）也收回；
-  /// 目标与当前相同则不做动画（避免 _settling 卡死）。
+  /// 规则：左滑过 35% 或快速左滑 → 展开；已完全展开时快速右滑收回，原地松手保持展开。
   double _target(double velocity) {
     final fullyOpen = _offset <= -actionWidth + 2;
     if (fullyOpen) {
-      // 已展开：向右滑收回，向左再滑（双滑关闭）也收回，原地松手保持展开。
-      if (velocity.abs() > 300) return 0;
+      if (velocity > 200) return 0;
       return -actionWidth;
     }
-    return (_offset < -actionWidth / 2 || velocity < -300) ? -actionWidth : 0;
+    if (velocity > 250) return 0;
+    if (_offset < -actionWidth * 0.35 || velocity < -200) {
+      return -actionWidth;
+    }
+    return 0;
   }
 
   void _drag(double dx) {
-    // 用户重新拖动：立即接管，取消吸附中的锁定，保证全程跟手。
-    if (_settling) {
-      _settleTimer?.cancel();
-      _settling = false;
+    final n = widget.openNotifier;
+    final k = widget.swipeKey;
+    if (n != null && k != null && n.value != null && n.value != k) {
+      n.value = null;
+    }
+    if (_animating) {
+      _controller.stop();
+      _animating = false;
     }
     setState(() {
       _offset = (_offset + dx).clamp(-actionWidth, 0.0);
     });
   }
 
-  /// 吸附到目标位置，并启动兜底计时器确保 _settling 一定解除（防卡死导致拉不开）。
+  /// 从当前位移平滑吸附到目标位置。
   void _settle(double target) {
-    _settleTimer?.cancel();
-    _settleTimer = Timer(const Duration(milliseconds: 260), () {
-      if (mounted) setState(() => _settling = false);
-    });
-    _settling = true;
-    setState(() => _offset = target);
+    _controller.value = (_offset / -actionWidth).clamp(0.0, 1.0);
+    _animating = true;
+    _controller.animateTo(target / -actionWidth, curve: Curves.easeOutCubic);
   }
 
   void _end(double velocity) {
     final t = _target(velocity);
     if (t == _offset) {
-      _settleTimer?.cancel();
-      if (_settling) setState(() => _settling = false);
+      if (_animating) {
+        _controller.stop();
+        _animating = false;
+      }
       return;
     }
     _settle(t);
+    _syncOpenState(t);
   }
 
   void _handleTap() {
     if (_offset < 0) {
       _settle(0);
+      _syncOpenState(0);
       return;
     }
     widget.onTap?.call();
   }
 
+  void _syncOpenState(double target) {
+    final n = widget.openNotifier;
+    final k = widget.swipeKey;
+    if (n == null || k == null) return;
+    if (target < 0) {
+      n.value = k;
+    } else if (n.value == k) {
+      n.value = null;
+    }
+  }
+
+  void _onOpenChanged() {
+    final n = widget.openNotifier;
+    final k = widget.swipeKey;
+    if (n == null || k == null || n.value == k) return;
+    if (_animating) {
+      _controller.stop();
+      _animating = false;
+      _offset = -actionWidth * _controller.value;
+    }
+    if (_offset < 0) _settle(0);
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final displayOffset = _animating
+        ? -actionWidth * _controller.value
+        : _offset;
     return ClipRRect(
       borderRadius: BorderRadius.circular(14),
       child: Stack(
@@ -948,7 +1235,7 @@ class _SwipeActionsState extends State<_SwipeActions> {
           // 底层：右侧固定宽度操作区（仅滑动展开时显示，静止时完全不可见）。
           Positioned.fill(
             child: AnimatedOpacity(
-              opacity: _offset < 0 ? 1 : 0,
+              opacity: displayOffset < 0 ? 1 : 0,
               duration: const Duration(milliseconds: 100),
               child: Align(
                 alignment: Alignment.centerRight,
@@ -967,28 +1254,30 @@ class _SwipeActionsState extends State<_SwipeActions> {
           // 上层：内容。手势放在 transform 内部，命中区域随左移，
           // 右侧露出的操作区才能被点中；内容带不透明背景遮挡底层。
           // 右缘圆角跟随展开状态：静止时整卡圆角，展开时右缘变直角与胶囊拼接。
-          AnimatedContainer(
-            duration: Duration(milliseconds: _settling ? 180 : 0),
-            curve: Curves.easeOutCubic,
-            transform: Matrix4.translationValues(_offset, 0, 0),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerHigh,
-              borderRadius: BorderRadius.horizontal(
-                right: Radius.circular(_offset < 0 ? 0 : 14),
-              ),
-            ),
-            onEnd: () {
-              _settleTimer?.cancel();
-              if (mounted) setState(() => _settling = false);
+          AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) {
+              final off = _animating
+                  ? -actionWidth * _controller.value
+                  : _offset;
+              return Container(
+                transform: Matrix4.translationValues(off, 0, 0),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.horizontal(
+                    right: Radius.circular(off < 0 ? 0 : 14),
+                  ),
+                ),
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onHorizontalDragUpdate: (d) => _drag(d.delta.dx),
+                  onHorizontalDragEnd: (d) => _end(d.primaryVelocity ?? 0),
+                  onHorizontalDragCancel: () => _end(0),
+                  onTap: _handleTap,
+                  child: widget.child,
+                ),
+              );
             },
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onHorizontalDragUpdate: (d) => _drag(d.delta.dx),
-              onHorizontalDragEnd: (d) => _end(d.primaryVelocity ?? 0),
-              onHorizontalDragCancel: () => _end(0),
-              onTap: _handleTap,
-              child: widget.child,
-            ),
           ),
         ],
       ),
@@ -1063,6 +1352,58 @@ Future<void> _rename(BuildContext context, ShiyiState shiyi, Session s) async {
   }
 }
 
+Future<void> _pickProject(
+  BuildContext context,
+  ShiyiState shiyi,
+  Session s,
+) async {
+  final selectedId = await showModalBottomSheet<String>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.folder_copy_outlined),
+            title: Text(
+              '移动「${s.title}」到项目',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            dense: true,
+          ),
+          const Divider(height: 1),
+          for (final p in shiyi.projects)
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.folder_outlined),
+              title: Text(p.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text('${p.sessionCount} 个会话'),
+              trailing: s.projectId == p.id
+                  ? const Icon(Icons.check, size: 18)
+                  : null,
+              onTap: () => Navigator.pop(ctx, p.id),
+            ),
+          ListTile(
+            dense: true,
+            leading: const Icon(Icons.inbox_outlined),
+            title: const Text('未分类'),
+            trailing: s.projectId.isEmpty
+                ? const Icon(Icons.check, size: 18)
+                : null,
+            onTap: () => Navigator.pop(ctx, ''),
+          ),
+        ],
+      ),
+    ),
+  );
+  if (selectedId == null) return;
+  await shiyi.moveSessionToProject(
+    s.id,
+    selectedId.isEmpty ? null : selectedId,
+  );
+}
+
 String _fmtTime(int ms) {
   final d = DateTime.fromMillisecondsSinceEpoch(ms);
   final now = DateTime.now();
@@ -1085,17 +1426,17 @@ class _EmptyState extends StatelessWidget {
         children: [
           WelcomeAvatar(size: 240),
           const SizedBox(height: 16),
-          Text('与拾忆开始对话', style: theme.textTheme.titleLarge),
+          Text('新建一个项目开始', style: theme.textTheme.titleLarge),
           const SizedBox(height: 8),
           Text(
-            '跨会话记忆 · 技能沉淀 · 工具调用',
+            '项目分类管理会话 · 每个项目可设置工作目录',
             style: theme.textTheme.bodyMedium!.copyWith(color: theme.hintColor),
           ),
           const SizedBox(height: 28),
           FilledButton.icon(
             onPressed: onCreate,
-            icon: const Icon(Icons.add_rounded, size: 18),
-            label: const Text('创建一个会话'),
+            icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+            label: const Text('新建项目'),
             style: FilledButton.styleFrom(
               shape: const StadiumBorder(),
               padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 14),
