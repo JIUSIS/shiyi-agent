@@ -1,5 +1,7 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shiyi_agent_app/services/update_service.dart';
+import 'package:shiyi_agent_app/widgets/markdown_text.dart';
 
 void main() {
   group('UpdateService.compareVersion', () {
@@ -21,5 +23,27 @@ void main() {
       expect(UpdateService.compareVersion('v1.1.5', '1.1.5'), 0);
       expect(UpdateService.compareVersion('v1.2.0', '1.1.5'), 1);
     });
+  });
+
+  testWidgets('更新弹窗用 Markdown 渲染更新说明', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => ElevatedButton(
+            onPressed: () => UpdateService.showUpdateAvailable(
+              context,
+              '1.1.7',
+              '## 版本说明\n- 支持 Markdown',
+            ),
+            child: const Text('检查更新'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('检查更新'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AdaptiveMarkdownText), findsOneWidget);
+    expect(find.text('版本说明'), findsOneWidget);
+    expect(find.text('支持 Markdown'), findsOneWidget);
   });
 }

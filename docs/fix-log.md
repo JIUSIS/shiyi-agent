@@ -476,3 +476,10 @@
   6. 手动压缩弹窗文案改为“归档早期历史，完整历史保留在本地”；聊天列表顶部新增“已归档 N 条 · 不占用当前上下文”分隔提示。
 - **涉及**：`lib/services/db.dart`、`lib/core/models.dart`、`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`、`test/context_budget_test.dart`、`test/token_usage_test.dart`、`CHANGELOG.md`、`README.md`、版本号三处（1.1.7+11）。
 - **验证**：`flutter analyze` 无告警；`flutter test` 77 项全部通过（新增归档统计跳过、压缩边界 Token 预算、工具轮成组不拆散、归档标记落库往返回归用例）。
+
+### 59. 更新弹窗 Release 说明无 Markdown 渲染
+- **现象**：更新弹窗里 GitHub Release 的 `## v1.1.7`、列表、代码块等全部以纯文本显示，和会话里的 Markdown 款式不一致。
+- **根因**：`UpdateService.showUpdateAvailable` 用 `Text` 直接输出 `notes`，没有走项目统一的 Markdown 渲染组件。
+- **修复**：弹窗正文改用 `AdaptiveMarkdownText`，与聊天会话同一款式渲染标题 / 列表 / 代码块 / 表格 / 链接；更新说明区域仍保持限高可滚动。
+- **涉及**：`lib/services/update_service.dart`、`test/update_service_test.dart`、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`，直接替换 GitHub `v1.1.7` Release APK。
+- **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过（新增更新弹窗 Markdown 渲染回归用例）。

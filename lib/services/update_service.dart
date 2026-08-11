@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import '../widgets/markdown_text.dart';
+
 enum UpdateCheckStatus { failed, upToDate, updateAvailable }
 
 /// 版本检查、更新提示与 APK 下载安装，关于页与启动自动检查共用。
@@ -157,7 +159,9 @@ class UpdateService {
         content: ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 320),
           child: SingleChildScrollView(
-            child: Text(notes.isEmpty ? '有新版本可以更新。' : '更新说明：\n\n$notes'),
+            child: notes.isEmpty
+                ? const Text('有新版本可以更新。')
+                : AdaptiveMarkdownText(notes),
           ),
         ),
         actions: [
