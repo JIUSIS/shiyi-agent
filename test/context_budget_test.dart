@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:shiyi_agent_app/core/app_state.dart';
+import 'package:shiyi_agent_app/core/models.dart';
 
 void main() {
   group('trimApiMessagesForBudget', () {
@@ -116,10 +117,7 @@ void main() {
       final bigTool = [
         {
           'type': 'function',
-          'function': {
-            'name': 'big_tool',
-            'description': 'x' * 120000,
-          },
+          'function': {'name': 'big_tool', 'description': 'x' * 120000},
         },
       ];
       const budget = 117248;
@@ -371,6 +369,66 @@ void main() {
       final e = ShiyiState.estimateRequestTokens(msgs, tools: const []);
       expect(e.imageTokens, 2000);
       expect(e.currentInputTokens, 2);
+    });
+  });
+
+  group('compressionKeepStart', () {
+    var seq = 0;
+    ChatMessage msg(
+      String role, {
+      String content = '',
+      List<ToolCall>? toolCalls,
+      String toolCallId = '',
+    }) => ChatMessage(
+      id: 'm${DateTime.now().microsecondsSinceEpoch}_${seq++}',
+      sessionId: 's1',
+      role: role,
+      content: content,
+      toolCalls: toolCalls,
+      toolCallId: toolCallId,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+
+    test('大上下文时至少归档早期 60% 条数', () {
+      final msgs = [
+        for (var i = 0; i < 10; i++) msg('user', content: '第$i条消息'),
+      ];
+      final start = ShiyiState.compressionKeepStart(msgs, contextLimit: 128000);
+      expect(start, 6);
+    });
+
+    test('小预算按 Token 归档更多旧消息', () {
+      final msgs = [
+        for (var i = 0; i < 10; i++) msg('user', content: '中文内容' * 200),
+      ];
+      final start = ShiyiState.compressionKeepStart(msgs, contextLimit: 1200);
+      expect(start, greaterThan(6));
+    });
+
+    test('边界不拆散 assistant tool_calls 与 tool 结果', () {
+      final msgs = [
+        msg('user', content: '开始任务'),
+        msg(
+          'assistant',
+          content: '我来读取',
+          toolCalls: [
+            ToolCall(
+              id: 'c1',
+              name: 'file_read',
+              arguments: '{"path":"/tmp/a.txt"}',
+            ),
+          ],
+        ),
+        msg('tool', content: '文件内容' * 500, toolCallId: 'c1'),
+        msg('user', content: '继续' * 500),
+        msg('user', content: '最新问题'),
+      ];
+      final start = ShiyiState.compressionKeepStart(msgs, contextLimit: 600);
+      expect(
+        start == 3 || start >= 5,
+        isTrue,
+        reason: '工具回合要么整组保留，要么整组归档，不能停在 tool_calls 和 tool 结果中间',
+      );
     });
   });
 }

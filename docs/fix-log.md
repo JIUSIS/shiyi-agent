@@ -447,3 +447,32 @@
 - **涉及**：`lib/core/app_state.dart`、`test/context_budget_test.dart`、`pubspec.yaml`、`android/app/build.gradle.kts`、`lib/screens/about_screen.dart`、`README.md`、`CHANGELOG.md`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 50 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、未超预算不裁剪、超预算裁剪到合法预算、工具定义占用预算、请求级 Token 估算、多轮工具与图片回归用例）。
 - **真机验证**：`af3700b1` 用 `adb install -r` 覆盖安装 `1.1.5+9`，数据库原样保留；实测 `TrimBudget`：`contextLimit=128000 token, systemTokens=2095, toolDefinitionTokens=2538, historyTokens=17388, currentInputTokens=2, imageTokens=2000, outputReserve=8192, safetyReserve=2560, totalEstimatedTokens=24023, trimTriggerTokens=117248, trimTargetTokens=117248, shouldTrim=false`。
+
+---
+
+## 2026-08-11 · 上下文统计 Codex 口径与压缩非破坏化
+
+### 57. 上下文统计改为 Codex 口径（真实 usage 基线）
+- **现象**：本地全量估算与会话显示仍有偏差，长会话压缩/裁剪后状态栏可能回跳；缓存与上下文数字希望以服务端真实 usage 为准。
+- **修复**：
+  1. `LlmClient.applyUsage` 兼容 Chat Completions 与 Responses API 的 usage 字段，并支持 `cached_tokens` 等缓存别名。
+  2. sessions 表升到 v12，新增 `last_usage_total_tokens`；`Session` 增加 `lastUsageTotalTokens`。
+  3. 新增 `activeContextTokenEstimate` / `computeActiveContextTokens`：以最近一次真实 `total_tokens` 为基线，加上最后一次模型生成之后新增消息的本地估算；无真实 usage 时回退全量估算。
+  4. 状态栏、压缩判断、发送前阈值统一走同一统计入口；删除 / 重新生成 / 压缩历史时清空旧 usage。
+- **涉及**：`lib/services/llm_client.dart`、`lib/services/db.dart`、`lib/core/models.dart`、`lib/core/app_state.dart`、`test/token_usage_test.dart`、版本号（1.1.6+10）。
+- **验证**：`flutter analyze` 无告警；`flutter test` 72 项全部通过；`af3700b1` 覆盖安装 `1.1.6+10`。
+
+### 58. 上下文压缩非破坏化：归档不删历史，压缩后统计立即下降
+- **现象**：手动/自动压缩会把早期 60% 消息直接删除，tool 消息整段丢失；压缩完成后输入框上方的上下文数字不变，用户以为压缩没生效。
+- **根因**：
+  1. `compressSession` 用 `deleteMessagesByIds` 真删旧消息，摘要输入还跳过全部 `tool` 消息，工具记忆随压缩一起丢。
+  2. 压缩后清空真实 usage，但回退的全量估算仍把已归档消息算进去，状态栏数字不降。
+- **修复**：
+  1. messages 表升到 v13 新增 `archived` 列；压缩只把旧消息标记归档，完整原文保留在本地。
+  2. `_historyToApi`、`sessionContextTokenEstimate`、`computeActiveContextTokens`、滚动任务摘要统一跳过 `archived` 消息；压缩后状态栏立即按“未归档消息 + 滚动摘要”重新估算。
+  3. 摘要输入不再跳过工具轮：完整工具回合压缩成结构化一行（命令 / 路径 / 结果 / 错误 / 结论），不完整工具轮保留调用摘要。
+  4. 压缩边界改为 Token 预算：新增纯函数 `compressionKeepStart`，至少归档早期 60%，预算紧张时按 Token 归档更多；工具轮按 `tool_calls + tool 结果` 成组归档，不拆散配对。
+  5. 滚动摘要持久化到 `sessions.rolling_summary`，后续每轮注入系统提示，不再插入假的“【历史会话摘要】”用户消息。
+  6. 手动压缩弹窗文案改为“归档早期历史，完整历史保留在本地”；聊天列表顶部新增“已归档 N 条 · 不占用当前上下文”分隔提示。
+- **涉及**：`lib/services/db.dart`、`lib/core/models.dart`、`lib/core/app_state.dart`、`lib/screens/chat_screen.dart`、`test/context_budget_test.dart`、`test/token_usage_test.dart`、`CHANGELOG.md`、`README.md`、版本号三处（1.1.7+11）。
+- **验证**：`flutter analyze` 无告警；`flutter test` 77 项全部通过（新增归档统计跳过、压缩边界 Token 预算、工具轮成组不拆散、归档标记落库往返回归用例）。

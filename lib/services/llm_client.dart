@@ -43,11 +43,20 @@ class LlmClient {
   /// 文本尾部、tool_calls 块数等。
   final void Function(String line)? onDiag;
 
-  /// 最近一次请求的 total_tokens（来自流式 usage）。
+  /// 最近一次请求的 total_tokens（来自流式 usage，兼容 Chat Completions 与
+  /// Responses API 的 input+output 推导）。
   int? lastTotalTokens;
 
-  /// 最近一次请求的 prompt_tokens（来自流式 usage）。
+  /// 最近一次请求的输入 token：Chat Completions 的 prompt_tokens 或
+  /// Responses API 的 input_tokens。
   int? lastPromptTokens;
+
+  /// 最近一次请求的输出 token：Responses API 的 output_tokens。
+  int? lastOutputTokens;
+
+  /// 最近一次请求的输入 token（Responses API 字段，优先于 lastPromptTokens
+  /// 使用；两者值相同时只取一个）。
+  int? lastInputTokens;
 
   /// 最近一次请求的缓存输入 token（兼容 OpenAI / 网关 / Anthropic 风格字段）。
   int? lastCachedTokens;
@@ -74,6 +83,8 @@ class LlmClient {
   Future<void> send(List<Map<String, dynamic>> messages) async {
     lastTotalTokens = null;
     lastPromptTokens = null;
+    lastOutputTokens = null;
+    lastInputTokens = null;
     lastCachedTokens = null;
     final client = http.Client();
     try {
@@ -280,6 +291,7 @@ class LlmClient {
     final toolBuf = <int, Map<String, String>>{};
     var doneReceived = false;
     var stoppedByUser = false;
+    var reasoningSeeded = false;
     String? finishReason; // 最后一条 chunk 的 finish_reason：'length' = 输出被截断
     final completer = Completer<bool>();
 
@@ -346,24 +358,20 @@ class LlmClient {
         final json = _tryDecode(data);
         if (json == null) return;
         final usage = json['usage'] as Map<String, dynamic>?;
-        if (usage != null) {
-          final total = (usage['total_tokens'] as num?)?.toInt();
-          if (total != null && total > 0) lastTotalTokens = total;
-          final prompt = (usage['prompt_tokens'] as num?)?.toInt();
-          final completion = (usage['completion_tokens'] as num?)?.toInt();
-          if (prompt != null && prompt >= 0) {
-            lastPromptTokens = prompt;
-          } else if (total != null && completion != null && completion >= 0) {
-            lastPromptTokens = total - completion;
+        if (usage != null) applyUsage(usage);
+        // OpenAI Responses API 风格的事件流：推理摘要/思考文本单独作为
+        // SSE 事件推送，不经过 choices[].delta。
+        final eventType = json['type'];
+        if (eventType is String &&
+            (eventType.startsWith('response.reasoning') ||
+                eventType.startsWith('response.thinking'))) {
+          final rc = extractReasoningValue(json['delta']);
+          if (rc != null) {
+            reasoning += rc;
+            reasoningSeeded = true;
+            emitPartial();
           }
-          final details =
-              usage['prompt_tokens_details'] as Map<String, dynamic>?;
-          var cached = details?['cached_tokens'] as num?;
-          cached ??= usage['cached_tokens'] as num?;
-          cached ??= usage['cache_read_input_tokens'] as num?;
-          if (cached != null && cached >= 0) {
-            lastCachedTokens = cached.toInt();
-          }
+          return;
         }
         final choices = json['choices'] as List<dynamic>? ?? [];
         if (choices.isEmpty) return;
@@ -372,38 +380,84 @@ class LlmClient {
         final fr = first['finish_reason'];
         if (fr is String && fr.isNotEmpty) finishReason = fr;
         final delta = first['delta'] as Map<String, dynamic>?;
-        if (delta == null) return;
-        final content = delta['content'];
-        if (content is String && content.isNotEmpty) {
-          text += content;
-          emitPartial();
-        }
-        // DeepSeek 等思考模型的思考内容（reasoning_content）。
-        final rc = delta['reasoning_content'];
-        if (rc is String && rc.isNotEmpty) {
-          reasoning += rc;
-          emitPartial();
-        }
-        final toolCalls = delta['tool_calls'] as List<dynamic>?;
-        if (toolCalls != null) {
-          for (final tcRaw in toolCalls) {
-            final tc = tcRaw is Map<String, dynamic> ? tcRaw : {};
-            final i = (tc['index'] as num?)?.toInt() ?? 0;
-            final cur = toolBuf.putIfAbsent(
-              i,
-              () => {'id': '', 'name': '', 'arguments': ''},
+        final msg = first['message'] as Map<String, dynamic>?;
+        if (delta != null) {
+          final content = delta['content'];
+          if (content is String && content.isNotEmpty) {
+            text += content;
+            emitPartial();
+          }
+          // 兼容各家网关的思考字段：DeepSeek/MiMo/OpenCode Go 的
+          // reasoning_content，OpenAI/OpenRouter 的 reasoning，Anthropic
+          // 风格的 thinking、reasoning_summary，以及部分 Gemini 兼容端的 thought。
+          final rc =
+              extractReasoningValue(delta['reasoning_content']) ??
+              extractReasoningValue(delta['reasoning']) ??
+              extractReasoningValue(delta['reasoning_summary']) ??
+              extractReasoningValue(delta['reasoning_summary_text']) ??
+              extractReasoningValue(delta['thinking']) ??
+              extractReasoningValue(delta['thought']);
+          if (rc != null) {
+            reasoning += rc;
+            reasoningSeeded = true;
+            emitPartial();
+          } else if (!reasoningSeeded) {
+            // 部分网关把完整思考放在 message 而非 delta，只取一次避免重复。
+            final staticR = extractReasoningValue(
+              msg?['reasoning_content'] ??
+                  msg?['reasoning'] ??
+                  msg?['reasoning_summary'] ??
+                  msg?['reasoning_summary_text'] ??
+                  msg?['thinking'] ??
+                  msg?['thought'],
             );
-            final id = tc['id'];
-            if (id is String && id.isNotEmpty) cur['id'] = id;
-            final fn = tc['function'] as Map<String, dynamic>?;
-            if (fn != null) {
-              final name = fn['name'];
-              if (name is String && name.isNotEmpty) cur['name'] = name;
-              final args = fn['arguments'];
-              if (args is String && args.isNotEmpty) {
-                cur['arguments'] = cur['arguments']! + args;
+            if (staticR != null) {
+              reasoning = staticR;
+              reasoningSeeded = true;
+              emitPartial();
+            }
+          }
+          final toolCalls = delta['tool_calls'] as List<dynamic>?;
+          if (toolCalls != null) {
+            for (final tcRaw in toolCalls) {
+              final tc = tcRaw is Map<String, dynamic> ? tcRaw : {};
+              final i = (tc['index'] as num?)?.toInt() ?? 0;
+              final cur = toolBuf.putIfAbsent(
+                i,
+                () => {'id': '', 'name': '', 'arguments': ''},
+              );
+              final id = tc['id'];
+              if (id is String && id.isNotEmpty) cur['id'] = id;
+              final fn = tc['function'] as Map<String, dynamic>?;
+              if (fn != null) {
+                final name = fn['name'];
+                if (name is String && name.isNotEmpty) cur['name'] = name;
+                final args = fn['arguments'];
+                if (args is String && args.isNotEmpty) {
+                  cur['arguments'] = cur['arguments']! + args;
+                }
               }
             }
+          }
+        } else if (!reasoningSeeded) {
+          // 非流式 chunk：正文和思考都直接放在 message 里。
+          final content = msg?['content'];
+          if (content is String && content.isNotEmpty && text.isEmpty) {
+            text = content;
+            emitPartial();
+          }
+          final staticR = extractReasoningValue(
+            msg?['reasoning_content'] ??
+                msg?['reasoning'] ??
+                msg?['reasoning_summary'] ??
+                msg?['reasoning_summary_text'] ??
+                msg?['thinking'] ??
+                msg?['thought'],
+          );
+          if (staticR != null) {
+            reasoning = staticR;
+            reasoningSeeded = true;
+            emitPartial();
           }
         }
       }
@@ -513,6 +567,82 @@ class LlmClient {
   List<Map<String, String>> _snapshotTools(Map<int, Map<String, String>> buf) {
     final keys = buf.keys.toList()..sort();
     return keys.map((k) => Map<String, String>.from(buf[k]!)).toList();
+  }
+
+  /// 解析一次 usage：同时兼容 Chat Completions（prompt/completion/total）与
+  /// Responses API（input/output/total）字段，缓存字段支持常见网关别名。
+  /// 服务端没有明确返回缓存字段时保持 lastCachedTokens 为 null。
+  void applyUsage(Map<String, dynamic> usage) {
+    final input =
+        _intOf(usage['input_tokens']) ?? _intOf(usage['prompt_tokens']);
+    final output =
+        _intOf(usage['output_tokens']) ?? _intOf(usage['completion_tokens']);
+    final total =
+        _intOf(usage['total_tokens']) ??
+        (input != null && output != null ? input + output : null);
+    if (total != null && total > 0) lastTotalTokens = total;
+    if (input != null && input >= 0) {
+      lastInputTokens = input;
+      lastPromptTokens = input;
+    } else if (total != null && output != null && output >= 0) {
+      lastPromptTokens = total - output;
+    }
+    if (output != null && output >= 0) lastOutputTokens = output;
+
+    final promptDetails = usage['prompt_tokens_details'];
+    final inputDetails = usage['input_tokens_details'];
+    // 每次请求独立：服务端没有返回缓存字段就表示未知，不沿用上次结果。
+    lastCachedTokens = null;
+    var cached = promptDetails is Map
+        ? _intOf(promptDetails['cached_tokens'])
+        : null;
+    cached ??= inputDetails is Map
+        ? _intOf(inputDetails['cached_tokens'])
+        : null;
+    cached ??= _intOf(usage['cached_tokens']);
+    cached ??= _intOf(usage['cached_input_tokens']);
+    cached ??= _intOf(usage['cache_read_input_tokens']);
+    if (cached != null && cached >= 0) {
+      lastCachedTokens = cached;
+    }
+  }
+
+  static int? _intOf(Object? v) {
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v);
+    return null;
+  }
+
+  /// 从流式 chunk 里提取思考文本，兼容字符串、嵌套 List 和
+  /// {summary/text/content/thinking/thought/delta/value} 对象；
+  /// 空值统一返回 null，方便逐字段回退。
+  static String? extractReasoningValue(Object? value) {
+    if (value is String) {
+      return value.trim().isEmpty ? null : value;
+    }
+    if (value is List) {
+      final parts = <String>[];
+      for (final item in value) {
+        final s = extractReasoningValue(item);
+        if (s != null) parts.add(s);
+      }
+      return parts.isEmpty ? null : parts.join();
+    }
+    if (value is Map) {
+      for (final key in const [
+        'summary',
+        'text',
+        'content',
+        'thought',
+        'thinking',
+        'delta',
+        'value',
+      ]) {
+        final s = extractReasoningValue(value[key]);
+        if (s != null) return s;
+      }
+    }
+    return null;
   }
 
   Map<String, dynamic>? _tryDecode(String s) {

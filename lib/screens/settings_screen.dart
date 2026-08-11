@@ -8,6 +8,7 @@ import '../core/models.dart';
 import '../services/llm_client.dart';
 import '../services/permission_service.dart';
 import '../services/settings_service.dart';
+import '../services/update_service.dart';
 
 class SettingsScreen extends StatefulWidget {
   final ShiyiState shiyi;
@@ -552,206 +553,97 @@ class _SettingsScreenState extends State<SettingsScreen> {
       builder: (context, _) {
         return Scaffold(
           appBar: AppBar(title: const Text('设置')),
-          body: ListView(
-            children: [
-              _section('模型 API（OpenAI 兼容）'),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.auto_awesome_motion, size: 24),
-                        const SizedBox(width: 16),
-                        const Text(
-                          '模型预设',
-                          style: TextStyle(fontWeight: FontWeight.w500),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 150),
-                          child: DropdownButton<String>(
-                            value: _presetName,
-                            isExpanded: true,
-                            hint: const Text(
-                              '选择预设',
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            underline: const SizedBox.shrink(),
-                            items: [
-                              for (final profile in _allProfiles)
-                                DropdownMenuItem(
-                                  value: profile.name,
-                                  child: Text(
-                                    profile.name,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              const DropdownMenuItem(
-                                value: '__new__',
-                                child: Text('＋ 新建自定义接口（OpenAI 协议）'),
-                              ),
-                            ],
-                            onChanged: (v) {
-                              if (v == '__new__') {
-                                _createCustomProfile();
-                                return;
-                              }
-                              final profile = _allProfiles.firstWhere(
-                                (p) => p.name == v,
-                              );
-                              _applyPreset(profile);
-                              _autoSave();
-                            },
+          body: Theme(
+            data: theme.copyWith(
+              visualDensity: VisualDensity.compact,
+              listTileTheme: const ListTileThemeData(dense: true),
+            ),
+            child: ListView(
+              children: [
+                _section('模型 API（OpenAI 兼容）'),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.auto_awesome_motion, size: 24),
+                          const SizedBox(width: 16),
+                          const Text(
+                            '模型预设',
+                            style: TextStyle(fontWeight: FontWeight.w500),
                           ),
-                        ),
-                        const SizedBox(width: 4),
-                        IconButton(
-                          icon: const Icon(Icons.save_outlined, size: 20),
-                          tooltip: '保存配置',
-                          onPressed: _saveCurrentProfile,
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.delete_outline, size: 20),
-                          tooltip: '删除配置',
-                          onPressed: _deleteCurrentProfile,
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Row(
-                  children: [
-                    const SizedBox(width: 40),
-                    Expanded(
-                      child: Text(
-                        '一键切换，密钥自动带出',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
+                        ],
                       ),
-                    ),
-                  ],
-                ),
-              ),
-              ListTile(
-                leading: const Icon(Icons.link),
-                title: const Text('接口地址'),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: TextField(
-                    controller: _baseCtrl,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      hintText: 'https://api.deepseek.com/v1',
-                    ),
-                    onChanged: (_) => _autoSave(),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 150),
+                            child: DropdownButton<String>(
+                              value: _presetName,
+                              isExpanded: true,
+                              hint: const Text(
+                                '选择预设',
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              underline: const SizedBox.shrink(),
+                              items: [
+                                for (final profile in _allProfiles)
+                                  DropdownMenuItem(
+                                    value: profile.name,
+                                    child: Text(
+                                      profile.name,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                const DropdownMenuItem(
+                                  value: '__new__',
+                                  child: Text('＋ 新建自定义接口（OpenAI 协议）'),
+                                ),
+                              ],
+                              onChanged: (v) {
+                                if (v == '__new__') {
+                                  _createCustomProfile();
+                                  return;
+                                }
+                                final profile = _allProfiles.firstWhere(
+                                  (p) => p.name == v,
+                                );
+                                _applyPreset(profile);
+                                _autoSave();
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          IconButton(
+                            icon: const Icon(Icons.save_outlined, size: 20),
+                            tooltip: '保存配置',
+                            onPressed: _saveCurrentProfile,
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, size: 20),
+                            tooltip: '删除配置',
+                            onPressed: _deleteCurrentProfile,
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                 ),
-              ),
-              ListTile(
-                leading: const Icon(Icons.key),
-                title: const Text('API 密钥'),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: TextField(
-                    controller: _keyCtrl,
-                    obscureText: !_showKey,
-                    decoration: InputDecoration(
-                      border: const OutlineInputBorder(),
-                      hintText: _keyHint,
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                          _showKey
-                              ? Icons.visibility_off_outlined
-                              : Icons.visibility_outlined,
-                        ),
-                        onPressed: () => setState(() => _showKey = !_showKey),
-                        tooltip: _showKey ? '隐藏密钥' : '显示密钥',
-                      ),
-                    ),
-                    onChanged: (_) => _autoSave(),
-                  ),
-                ),
-              ),
-              ListTile(
-                leading: const Icon(Icons.model_training),
-                title: const Text('模型'),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: TextField(
-                    controller: _modelCtrl,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      hintText: '例如 deepseek-chat',
-                    ),
-                    onChanged: (_) => _autoSave(),
-                  ),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _fetchModels,
-                        icon: const Icon(Icons.list_alt, size: 18),
-                        label: const Text('获取模型 ID'),
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _testModel,
-                        icon: const Icon(Icons.wifi_tethering, size: 18),
-                        label: const Text('测试连接'),
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const Divider(),
-              _section('视觉模型'),
-              SwitchListTile(
-                secondary: const Icon(Icons.image_search_outlined),
-                title: const Text('启用视觉模型'),
-                subtitle: const Text('主模型不支持图片时，自动调用视觉模型描述图片后再继续对话'),
-                value: _visionEnabled,
-                onChanged: (v) {
-                  setState(() => _visionEnabled = v);
-                  _autoSave();
-                },
-              ),
-              if (_visionEnabled) ...[
                 ListTile(
                   leading: const Icon(Icons.link),
-                  title: const Text('视觉模型接口地址'),
+                  title: const Text('接口地址'),
                   subtitle: Padding(
                     padding: const EdgeInsets.only(top: 6),
                     child: TextField(
-                      controller: _visionUrlCtrl,
+                      controller: _baseCtrl,
                       decoration: const InputDecoration(
+                        isDense: true,
                         border: OutlineInputBorder(),
-                        hintText: '留空则与主模型同接口',
+                        hintText: 'https://api.deepseek.com/v1',
                       ),
                       onChanged: (_) => _autoSave(),
                     ),
@@ -759,24 +651,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 ListTile(
                   leading: const Icon(Icons.key),
-                  title: const Text('视觉模型密钥'),
+                  title: const Text('API 密钥'),
                   subtitle: Padding(
                     padding: const EdgeInsets.only(top: 6),
                     child: TextField(
-                      controller: _visionKeyCtrl,
-                      obscureText: !_showVisionKey,
+                      controller: _keyCtrl,
+                      obscureText: !_showKey,
                       decoration: InputDecoration(
+                        isDense: true,
                         border: const OutlineInputBorder(),
-                        hintText: '留空则与主模型同密钥',
+                        hintText: _keyHint,
                         suffixIcon: IconButton(
                           icon: Icon(
-                            _showVisionKey
+                            _showKey
                                 ? Icons.visibility_off_outlined
                                 : Icons.visibility_outlined,
                           ),
-                          onPressed: () =>
-                              setState(() => _showVisionKey = !_showVisionKey),
-                          tooltip: _showVisionKey ? '隐藏密钥' : '显示密钥',
+                          onPressed: () => setState(() => _showKey = !_showKey),
+                          tooltip: _showKey ? '隐藏密钥' : '显示密钥',
                         ),
                       ),
                       onChanged: (_) => _autoSave(),
@@ -785,297 +677,407 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 ListTile(
                   leading: const Icon(Icons.model_training),
-                  title: const Text('视觉模型'),
+                  title: const Text('模型'),
                   subtitle: Padding(
                     padding: const EdgeInsets.only(top: 6),
                     child: TextField(
-                      controller: _visionModelCtrl,
+                      controller: _modelCtrl,
                       decoration: const InputDecoration(
+                        isDense: true,
                         border: OutlineInputBorder(),
-                        hintText: '例如 gpt-4o-mini / qwen-vl-max',
+                        hintText: '例如 deepseek-chat',
                       ),
                       onChanged: (_) => _autoSave(),
                     ),
                   ),
                 ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _fetchModels,
+                          icon: const Icon(Icons.list_alt, size: 18),
+                          label: const Text('获取模型 ID'),
+                          style: OutlinedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _testModel,
+                          icon: const Icon(Icons.wifi_tethering, size: 18),
+                          label: const Text('测试连接'),
+                          style: OutlinedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(),
+                _section('视觉模型'),
+                SwitchListTile(
+                  secondary: const Icon(Icons.image_search_outlined),
+                  title: const Text('启用视觉模型'),
+                  subtitle: const Text('主模型不支持图片时，自动调用视觉模型描述图片后再继续对话'),
+                  value: _visionEnabled,
+                  onChanged: (v) {
+                    setState(() => _visionEnabled = v);
+                    _autoSave();
+                  },
+                ),
+                if (_visionEnabled) ...[
+                  ListTile(
+                    leading: const Icon(Icons.link),
+                    title: const Text('视觉模型接口地址'),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: TextField(
+                        controller: _visionUrlCtrl,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                          hintText: '留空则与主模型同接口',
+                        ),
+                        onChanged: (_) => _autoSave(),
+                      ),
+                    ),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.key),
+                    title: const Text('视觉模型密钥'),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: TextField(
+                        controller: _visionKeyCtrl,
+                        obscureText: !_showVisionKey,
+                        decoration: InputDecoration(
+                          isDense: true,
+                          border: const OutlineInputBorder(),
+                          hintText: '留空则与主模型同密钥',
+                          suffixIcon: IconButton(
+                            icon: Icon(
+                              _showVisionKey
+                                  ? Icons.visibility_off_outlined
+                                  : Icons.visibility_outlined,
+                            ),
+                            onPressed: () => setState(
+                              () => _showVisionKey = !_showVisionKey,
+                            ),
+                            tooltip: _showVisionKey ? '隐藏密钥' : '显示密钥',
+                          ),
+                        ),
+                        onChanged: (_) => _autoSave(),
+                      ),
+                    ),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.model_training),
+                    title: const Text('视觉模型'),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: TextField(
+                        controller: _visionModelCtrl,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                          hintText: '例如 gpt-4o-mini / qwen-vl-max',
+                        ),
+                        onChanged: (_) => _autoSave(),
+                      ),
+                    ),
+                  ),
+                ],
+                const Divider(),
+                _section('能力'),
+                SwitchListTile(
+                  secondary: const Icon(Icons.hub_outlined),
+                  title: const Text('启用工具调用'),
+                  subtitle: const Text(
+                    '拾忆 可调用 save_memory（保存记忆）/ search_memory（搜索记忆）/ run_skill（运行技能）工具',
+                  ),
+                  value: _tools,
+                  onChanged: (v) {
+                    setState(() => _tools = v);
+                    _autoSave();
+                  },
+                ),
+                SwitchListTile(
+                  secondary: const Icon(Icons.memory_outlined),
+                  title: const Text('启用长期记忆'),
+                  subtitle: const Text('对话前自动注入相关记忆与技能上下文'),
+                  value: _memory,
+                  onChanged: (v) {
+                    setState(() => _memory = v);
+                    _autoSave();
+                  },
+                ),
+                SwitchListTile(
+                  secondary: const Icon(Icons.auto_awesome),
+                  title: const Text('自动沉淀记忆'),
+                  subtitle: const Text('每轮对话后自动提炼重要信息存入长期记忆'),
+                  value: _autoLearn,
+                  onChanged: (v) {
+                    setState(() => _autoLearn = v);
+                    _autoSave();
+                  },
+                ),
+                SwitchListTile(
+                  secondary: const Icon(Icons.notifications_outlined),
+                  title: const Text('任务完成通知'),
+                  subtitle: const Text('切走会话/后台运行时，任务完成后推送系统通知'),
+                  value: _notifications,
+                  onChanged: (v) {
+                    setState(() => _notifications = v);
+                    _autoSave();
+                  },
+                ),
+                const Divider(),
+                _section('上下文'),
+                ListTile(
+                  leading: const Icon(Icons.output_outlined),
+                  title: const Text('输出上限'),
+                  subtitle: const Text('单次请求最大输出 token，思考型模型建议调大'),
+                  trailing: SizedBox(
+                    width: 110,
+                    child: TextFormField(
+                      controller: _maxOutputTokensCtrl,
+                      keyboardType: TextInputType.number,
+                      textAlign: TextAlign.right,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 10,
+                        ),
+                      ),
+                      onChanged: (v) {
+                        final n = int.tryParse(v);
+                        if (n != null && n > 0) {
+                          setState(
+                            () => _maxOutputTokens = n.clamp(512, 384000),
+                          );
+                          _autoSave();
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.compress_outlined),
+                  title: const Text('上下文上限'),
+                  subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200w）'),
+                  trailing: SizedBox(
+                    width: 110,
+                    child: TextFormField(
+                      initialValue: _contextLimit.toString(),
+                      keyboardType: TextInputType.number,
+                      textAlign: TextAlign.right,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 10,
+                        ),
+                      ),
+                      onChanged: (v) {
+                        final n = int.tryParse(v);
+                        if (n != null && n > 0) {
+                          setState(
+                            () => _contextLimit = n.clamp(1000, 2000000),
+                          );
+                          _autoSave();
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.filter_alt_outlined),
+                  title: const Text('压缩阈值'),
+                  subtitle: const Text('上下文达到上下文上限的该百分比时触发手动/自动压缩'),
+                  trailing: SizedBox(
+                    width: 120,
+                    child: TextFormField(
+                      initialValue: _compressThresholdPercent.toStringAsFixed(
+                        0,
+                      ),
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      textAlign: TextAlign.right,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        suffixText: '%',
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 10,
+                        ),
+                      ),
+                      onChanged: (v) {
+                        final n = double.tryParse(v);
+                        if (n != null && n > 0) {
+                          setState(
+                            () => _compressThresholdPercent = n.clamp(1, 100),
+                          );
+                          _autoSave();
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                SwitchListTile(
+                  secondary: const Icon(Icons.auto_fix_high),
+                  title: const Text('自动压缩'),
+                  subtitle: const Text('上下文超过压缩阈值时自动总结压缩历史'),
+                  value: _autoCompress,
+                  onChanged: (v) {
+                    setState(() => _autoCompress = v);
+                    _autoSave();
+                  },
+                ),
+                const Divider(),
+                _section('外观'),
+                ListTile(
+                  leading: const Icon(Icons.palette_outlined),
+                  title: const Text('主题模式'),
+                  subtitle: const Text('macOS 风格，浅色 / 深色可随时切换'),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(
+                        value: 'light',
+                        label: Text('浅色'),
+                        icon: Icon(Icons.light_mode_outlined),
+                      ),
+                      ButtonSegment(
+                        value: 'dark',
+                        label: Text('深色'),
+                        icon: Icon(Icons.dark_mode_outlined),
+                      ),
+                      ButtonSegment(
+                        value: 'system',
+                        label: Text('跟随系统'),
+                        icon: Icon(Icons.brightness_auto_outlined),
+                      ),
+                    ],
+                    selected: {_themeMode},
+                    onSelectionChanged: (v) {
+                      setState(() => _themeMode = v.first);
+                      _autoSave();
+                    },
+                  ),
+                ),
+                const Divider(),
+                _section('语音'),
+                ListTile(
+                  leading: const Icon(Icons.speed),
+                  title: const Text('语速'),
+                  trailing: Text(
+                    _ttsRate.toStringAsFixed(1),
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                  subtitle: Slider(
+                    value: _ttsRate,
+                    min: 0.5,
+                    max: 1.5,
+                    divisions: 10,
+                    label: _ttsRate.toStringAsFixed(1),
+                    onChanged: (v) {
+                      setState(() => _ttsRate = v);
+                      _autoSave();
+                    },
+                  ),
+                ),
+                const Divider(),
+                _section('高级'),
+                ListTile(
+                  leading: const Icon(Icons.thermostat),
+                  title: const Text('温度'),
+                  trailing: Text(
+                    _temperature.toStringAsFixed(2),
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                  subtitle: Slider(
+                    value: _temperature,
+                    min: 0,
+                    max: 2,
+                    divisions: 20,
+                    label: _temperature.toStringAsFixed(2),
+                    onChanged: (v) {
+                      setState(() => _temperature = v);
+                      _autoSave();
+                    },
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.folder_open_outlined),
+                  title: const Text('文件访问权限'),
+                  subtitle: Text(
+                    _fileAccessGranted
+                        ? '已开启，终端可读写手机存储'
+                        : '未开启，终端读写 /sdcard 会被拒绝',
+                  ),
+                  trailing: _fileAccessGranted
+                      ? const Icon(Icons.check_circle, color: Color(0xFF28C840))
+                      : const Icon(Icons.chevron_right),
+                  onTap: _requestFullAccess,
+                ),
+                ListTile(
+                  leading: const Icon(Icons.psychology_outlined),
+                  title: const Text('系统提示词'),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: TextField(
+                      controller: _promptCtrl,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        hintText: '（留空使用默认拾忆人设）',
+                      ),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: FilledButton.tonalIcon(
+                      onPressed: _savePrompt,
+                      icon: const Icon(Icons.save_outlined, size: 16),
+                      label: const Text('保存提示词'),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Center(
+                  child: Text(
+                    '拾忆 v${UpdateService.appVersion} · Flutter 原生',
+                    style: theme.textTheme.bodySmall!.copyWith(
+                      color: theme.hintColor,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
               ],
-              const Divider(),
-              _section('能力'),
-              SwitchListTile(
-                secondary: const Icon(Icons.hub_outlined),
-                title: const Text('启用工具调用'),
-                subtitle: const Text(
-                  '拾忆 可调用 save_memory（保存记忆）/ search_memory（搜索记忆）/ run_skill（运行技能）工具',
-                ),
-                value: _tools,
-                onChanged: (v) {
-                  setState(() => _tools = v);
-                  _autoSave();
-                },
-              ),
-              SwitchListTile(
-                secondary: const Icon(Icons.memory_outlined),
-                title: const Text('启用长期记忆'),
-                subtitle: const Text('对话前自动注入相关记忆与技能上下文'),
-                value: _memory,
-                onChanged: (v) {
-                  setState(() => _memory = v);
-                  _autoSave();
-                },
-              ),
-              SwitchListTile(
-                secondary: const Icon(Icons.auto_awesome),
-                title: const Text('自动沉淀记忆'),
-                subtitle: const Text('每轮对话后自动提炼重要信息存入长期记忆'),
-                value: _autoLearn,
-                onChanged: (v) {
-                  setState(() => _autoLearn = v);
-                  _autoSave();
-                },
-              ),
-              SwitchListTile(
-                secondary: const Icon(Icons.notifications_outlined),
-                title: const Text('任务完成通知'),
-                subtitle: const Text('切走会话/后台运行时，任务完成后推送系统通知'),
-                value: _notifications,
-                onChanged: (v) {
-                  setState(() => _notifications = v);
-                  _autoSave();
-                },
-              ),
-              const Divider(),
-              _section('上下文'),
-              ListTile(
-                leading: const Icon(Icons.output_outlined),
-                title: const Text('输出上限'),
-                subtitle: const Text('单次请求最大输出 token，思考型模型建议调大'),
-                trailing: SizedBox(
-                  width: 110,
-                  child: TextFormField(
-                    controller: _maxOutputTokensCtrl,
-                    keyboardType: TextInputType.number,
-                    textAlign: TextAlign.right,
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                      contentPadding: EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 10,
-                      ),
-                    ),
-                    onChanged: (v) {
-                      final n = int.tryParse(v);
-                      if (n != null && n > 0) {
-                        setState(() => _maxOutputTokens = n.clamp(512, 384000));
-                        _autoSave();
-                      }
-                    },
-                  ),
-                ),
-              ),
-              ListTile(
-                leading: const Icon(Icons.compress_outlined),
-                title: const Text('上下文上限'),
-                subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200w）'),
-                trailing: SizedBox(
-                  width: 110,
-                  child: TextFormField(
-                    initialValue: _contextLimit.toString(),
-                    keyboardType: TextInputType.number,
-                    textAlign: TextAlign.right,
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                      contentPadding: EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 10,
-                      ),
-                    ),
-                    onChanged: (v) {
-                      final n = int.tryParse(v);
-                      if (n != null && n > 0) {
-                        setState(() => _contextLimit = n.clamp(1000, 2000000));
-                        _autoSave();
-                      }
-                    },
-                  ),
-                ),
-              ),
-              ListTile(
-                leading: const Icon(Icons.filter_alt_outlined),
-                title: const Text('压缩阈值'),
-                subtitle: const Text('上下文达到上下文上限的该百分比时触发手动/自动压缩'),
-                trailing: SizedBox(
-                  width: 120,
-                  child: TextFormField(
-                    initialValue: _compressThresholdPercent.toStringAsFixed(0),
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    textAlign: TextAlign.right,
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                      suffixText: '%',
-                      contentPadding: EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 10,
-                      ),
-                    ),
-                    onChanged: (v) {
-                      final n = double.tryParse(v);
-                      if (n != null && n > 0) {
-                        setState(
-                          () => _compressThresholdPercent = n.clamp(1, 100),
-                        );
-                        _autoSave();
-                      }
-                    },
-                  ),
-                ),
-              ),
-              SwitchListTile(
-                secondary: const Icon(Icons.auto_fix_high),
-                title: const Text('自动压缩'),
-                subtitle: const Text('上下文超过压缩阈值时自动总结压缩历史'),
-                value: _autoCompress,
-                onChanged: (v) {
-                  setState(() => _autoCompress = v);
-                  _autoSave();
-                },
-              ),
-              const Divider(),
-              _section('外观'),
-              ListTile(
-                leading: const Icon(Icons.palette_outlined),
-                title: const Text('主题模式'),
-                subtitle: const Text('macOS 风格，浅色 / 深色可随时切换'),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: SegmentedButton<String>(
-                  segments: const [
-                    ButtonSegment(
-                      value: 'light',
-                      label: Text('浅色'),
-                      icon: Icon(Icons.light_mode_outlined),
-                    ),
-                    ButtonSegment(
-                      value: 'dark',
-                      label: Text('深色'),
-                      icon: Icon(Icons.dark_mode_outlined),
-                    ),
-                    ButtonSegment(
-                      value: 'system',
-                      label: Text('跟随系统'),
-                      icon: Icon(Icons.brightness_auto_outlined),
-                    ),
-                  ],
-                  selected: {_themeMode},
-                  onSelectionChanged: (v) {
-                    setState(() => _themeMode = v.first);
-                    _autoSave();
-                  },
-                ),
-              ),
-              const Divider(),
-              _section('语音'),
-              ListTile(
-                leading: const Icon(Icons.speed),
-                title: const Text('语速'),
-                trailing: Text(
-                  _ttsRate.toStringAsFixed(1),
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: theme.colorScheme.primary,
-                  ),
-                ),
-                subtitle: Slider(
-                  value: _ttsRate,
-                  min: 0.5,
-                  max: 1.5,
-                  divisions: 10,
-                  label: _ttsRate.toStringAsFixed(1),
-                  onChanged: (v) {
-                    setState(() => _ttsRate = v);
-                    _autoSave();
-                  },
-                ),
-              ),
-              const Divider(),
-              _section('高级'),
-              ListTile(
-                leading: const Icon(Icons.thermostat),
-                title: const Text('温度'),
-                trailing: Text(
-                  _temperature.toStringAsFixed(2),
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: theme.colorScheme.primary,
-                  ),
-                ),
-                subtitle: Slider(
-                  value: _temperature,
-                  min: 0,
-                  max: 2,
-                  divisions: 20,
-                  label: _temperature.toStringAsFixed(2),
-                  onChanged: (v) {
-                    setState(() => _temperature = v);
-                    _autoSave();
-                  },
-                ),
-              ),
-              ListTile(
-                leading: const Icon(Icons.folder_open_outlined),
-                title: const Text('文件访问权限'),
-                subtitle: Text(
-                  _fileAccessGranted
-                      ? '已开启，终端可读写手机存储'
-                      : '未开启，终端读写 /sdcard 会被拒绝',
-                ),
-                trailing: _fileAccessGranted
-                    ? const Icon(Icons.check_circle, color: Color(0xFF28C840))
-                    : const Icon(Icons.chevron_right),
-                onTap: _requestFullAccess,
-              ),
-              ListTile(
-                leading: const Icon(Icons.psychology_outlined),
-                title: const Text('系统提示词'),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: TextField(
-                    controller: _promptCtrl,
-                    maxLines: 4,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      hintText: '（留空使用默认拾忆人设）',
-                    ),
-                  ),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Align(
-                  alignment: Alignment.centerRight,
-                  child: FilledButton.tonalIcon(
-                    onPressed: _savePrompt,
-                    icon: const Icon(Icons.save_outlined, size: 16),
-                    label: const Text('保存提示词'),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 32),
-              Center(
-                child: Text(
-                  '拾忆 v0.1.0 · Flutter 原生',
-                  style: theme.textTheme.bodySmall!.copyWith(
-                    color: theme.hintColor,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 24),
-            ],
+            ),
           ),
         );
       },
@@ -1083,14 +1085,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _section(String t) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+    padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
     child: Text(
       t,
       style: TextStyle(
         color: Theme.of(context).colorScheme.primary,
         fontWeight: FontWeight.bold,
-        fontSize: 13,
-        letterSpacing: 1,
+        fontSize: 12,
+        letterSpacing: 0.5,
       ),
     ),
   );

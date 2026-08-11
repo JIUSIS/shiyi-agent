@@ -176,6 +176,10 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Future<void> _send() async {
+    if (widget.shiyi.pendingQuestion != null) {
+      _submitAnswer();
+      return;
+    }
     final text = _input.text;
     if (text.trim().isEmpty &&
         _pendingImages.isEmpty &&
@@ -198,6 +202,16 @@ class _ChatScreenState extends State<ChatScreen>
     });
     FocusScope.of(context).unfocus();
     await widget.shiyi.guideSend(sb.toString());
+    _scrollToLatest();
+  }
+
+  /// 模型提问时，主输入框直接作为回答输入：发送即把内容交回 question 工具。
+  void _submitAnswer() {
+    final text = _input.text.trim();
+    if (text.isEmpty) return;
+    _input.clear();
+    FocusScope.of(context).unfocus();
+    widget.shiyi.answerQuestion(null, custom: text);
     _scrollToLatest();
   }
 
@@ -391,52 +405,76 @@ class _ChatScreenState extends State<ChatScreen>
     }
   }
 
-  /// 输入 / 时弹出技能选择，选中后加载到当前会话（注入系统提示）。
+  /// 输入 / 时弹出技能选择，可多选，选中后加载到当前会话（注入系统提示）。
   void _pickSkillSheet() {
-    final skills = widget.shiyi.skills;
-    final loadedId = widget.shiyi.loadedSkill?.id;
+    final shiyi = widget.shiyi;
+    final skills = shiyi.skills;
     showModalBottomSheet<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: skills.isEmpty
-            ? const Padding(
-                padding: EdgeInsets.all(24),
-                child: Text('还没有技能，去「技能」页创建或导入'),
-              )
-            : ListView(
-                shrinkWrap: true,
-                children: [
-                  for (final s in skills)
-                    ListTile(
-                      leading: const Icon(Icons.bolt_outlined),
-                      title: Text(s.name),
-                      subtitle: s.description.isEmpty
-                          ? null
-                          : Text(
-                              s.description,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                      trailing: loadedId == s.id
-                          ? Icon(
-                              Icons.check_circle,
-                              size: 20,
-                              color: Theme.of(ctx).colorScheme.primary,
-                            )
-                          : null,
-                      onTap: () {
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 8, 2),
+                child: Row(
+                  children: [
+                    Text(
+                      '加载技能（可多选）',
+                      style: Theme.of(ctx).textTheme.titleSmall,
+                    ),
+                    const Spacer(),
+                    TextButton(
+                      onPressed: () {
                         Navigator.pop(ctx);
                         _stripSlash();
-                        widget.shiyi.loadSkill(s);
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('已加载技能：${s.name}，可直接提问')),
-                          );
-                        }
                       },
+                      child: const Text('完成'),
                     ),
-                ],
+                  ],
+                ),
               ),
+              Flexible(
+                child: skills.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Text('还没有技能，去「技能」页创建或导入'),
+                      )
+                    : ListView(
+                        shrinkWrap: true,
+                        children: [
+                          for (final s in skills)
+                            ListTile(
+                              dense: true,
+                              leading: const Icon(Icons.bolt_outlined),
+                              title: Text(s.name),
+                              subtitle: s.description.isEmpty
+                                  ? null
+                                  : Text(
+                                      s.description,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                              trailing: shiyi.isSkillLoaded(s)
+                                  ? Icon(
+                                      Icons.check_circle,
+                                      size: 20,
+                                      color: Theme.of(ctx).colorScheme.primary,
+                                    )
+                                  : const Icon(Icons.circle_outlined, size: 20),
+                              onTap: () {
+                                shiyi.toggleLoadedSkill(s);
+                                setSheetState(() {});
+                              },
+                            ),
+                        ],
+                      ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -710,7 +748,6 @@ class _ChatScreenState extends State<ChatScreen>
           child: RepaintBoundary(
             child: Stack(
               children: [
-                _QuestionHandler(shiyi: widget.shiyi),
                 Scaffold(
                   appBar: AppBar(
                     leadingWidth: 104,
@@ -820,14 +857,31 @@ class _ChatScreenState extends State<ChatScreen>
                               );
                             }
                             if (visible.isEmpty) return const SizedBox.shrink();
+                            final archivedCount = visible
+                                .where((m) => m.archived)
+                                .length;
+                            // 反转显示：index 0 是最新消息；归档历史放在最上方，
+                            // 与仍然活跃的消息之间插入一条分隔提示。
+                            final items = <Object>[];
+                            for (var i = visible.length - 1; i >= 0; i--) {
+                              if (archivedCount > 0 && i == archivedCount - 1) {
+                                items.add(
+                                  _ArchivedDivider(count: archivedCount),
+                                );
+                              }
+                              items.add(visible[i]);
+                            }
                             return ListView.builder(
                               controller: _scroll,
                               reverse: true,
                               padding: const EdgeInsets.all(12),
-                              itemCount: visible.length,
+                              itemCount: items.length,
                               itemBuilder: (context, i) {
-                                // 反转：index 0 是最新消息，显示在底部。
-                                final m = visible[visible.length - 1 - i];
+                                final item = items[i];
+                                if (item is _ArchivedDivider) {
+                                  return item;
+                                }
+                                final m = item as ChatMessage;
                                 // 流式消息：只监听自己的实时文本，单独重建。
                                 if (m.streaming) {
                                   return KeyedSubtree(
@@ -921,9 +975,9 @@ class _ChatScreenState extends State<ChatScreen>
                       ),
                       ListenableBuilder(
                         listenable: widget.shiyi,
-                        builder: (context, _) => _LoadedSkillChip(
-                          skill: widget.shiyi.loadedSkill,
-                          onRemove: () => widget.shiyi.loadSkill(null),
+                        builder: (context, _) => _LoadedSkillChips(
+                          skills: widget.shiyi.loadedSkills,
+                          onRemove: (s) => widget.shiyi.toggleLoadedSkill(s),
                         ),
                       ),
                       ListenableBuilder(
@@ -973,11 +1027,44 @@ class _ChatScreenState extends State<ChatScreen>
                           ),
                         ),
                       ),
+                      // 模型提问面板：内嵌在输入框上方，从下方滑入，不遮挡会话内容。
+                      ListenableBuilder(
+                        listenable: widget.shiyi,
+                        builder: (context, _) {
+                          final q = widget.shiyi.pendingQuestion;
+                          return AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 220),
+                            switchInCurve: Curves.easeOutCubic,
+                            switchOutCurve: Curves.easeInCubic,
+                            transitionBuilder: (child, animation) =>
+                                SlideTransition(
+                                  position: Tween<Offset>(
+                                    begin: const Offset(0, 0.35),
+                                    end: Offset.zero,
+                                  ).animate(animation),
+                                  child: FadeTransition(
+                                    opacity: animation,
+                                    child: child,
+                                  ),
+                                ),
+                            child: q == null
+                                ? const SizedBox.shrink(
+                                    key: ValueKey('no-question'),
+                                  )
+                                : _QuestionPanel(
+                                    key: ValueKey('question-${q.hashCode}'),
+                                    question: q,
+                                    shiyi: widget.shiyi,
+                                  ),
+                          );
+                        },
+                      ),
                       ListenableBuilder(
                         listenable: widget.shiyi,
                         builder: (context, _) => _Composer(
                           input: _input,
                           busy: widget.shiyi.isBusy,
+                          questionActive: widget.shiyi.pendingQuestion != null,
                           pendingImages: _pendingImages,
                           pendingFiles: _pendingFiles,
                           onPickAttachment: _pickAttachmentSheet,
@@ -1077,7 +1164,7 @@ class _ChatScreenState extends State<ChatScreen>
     final shiyi = widget.shiyi;
     final sessionId = widget.sessionId ?? shiyi.currentSessionId;
     if (sessionId == null) return;
-    final tokens = await shiyi.sessionContextTokenEstimate(sessionId);
+    final tokens = await shiyi.activeContextTokenEstimate(sessionId);
     if (!mounted) return;
     final limit = shiyi.settings.contextLimit;
     final pct = limit <= 0 ? 0.0 : (tokens / limit * 100).clamp(0, 100);
@@ -1088,7 +1175,8 @@ class _ChatScreenState extends State<ChatScreen>
         content: Text(
           '当前会话上下文约 ${pct.toStringAsFixed(0)}%'
           '（${(tokens / 10000).toStringAsFixed(1)}w token / 上限 ${(limit / 10000).toStringAsFixed(0)}w token）。\n'
-          '压缩会把早期历史总结成摘要，只保留最近部分完整消息。',
+          '压缩会把早期历史归档为滚动摘要，只发送摘要和最近完整消息；'
+          '完整历史仍保留在本地，不会删除。',
         ),
         actions: [
           TextButton(
@@ -1103,11 +1191,42 @@ class _ChatScreenState extends State<ChatScreen>
       ),
     );
     if (ok != true) return;
-    final done = await shiyi.compressSession(sessionId);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(done ? '压缩完成' : '压缩失败（消息太少或 API 未配置）')),
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const PopScope(
+        canPop: false,
+        child: AlertDialog(
+          content: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 3),
+              ),
+              SizedBox(width: 16),
+              Text('正在压缩上下文…'),
+            ],
+          ),
+        ),
+      ),
     );
+    final ({bool ok, int archived, int beforeTokens, int afterTokens}) result;
+    try {
+      result = await shiyi.compressSession(sessionId);
+    } finally {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+    final done = result.ok;
+    if (!mounted) return;
+    final msg = done
+        ? '压缩完成：已归档 ${result.archived} 条，上下文 '
+              '${(result.beforeTokens / 10000).toStringAsFixed(1)}w → '
+              '${(result.afterTokens / 10000).toStringAsFixed(1)}w token'
+        : '压缩失败（消息太少或 API 未配置）';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   void _saveSkillDialog(String content) {
@@ -1190,6 +1309,35 @@ class _ChatScreenState extends State<ChatScreen>
 }
 
 /// 输入框上方的 token 统计栏：本次会话累计 / 本轮对话 / 剩余上下文百分比。
+class _ArchivedDivider extends StatelessWidget {
+  final int count;
+
+  const _ArchivedDivider({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          const Expanded(child: Divider()),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Text(
+              '已归档 $count 条 · 不占用当前上下文',
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.hintColor,
+              ),
+            ),
+          ),
+          const Expanded(child: Divider()),
+        ],
+      ),
+    );
+  }
+}
+
 class _TokenStats extends StatelessWidget {
   final ShiyiState shiyi;
   const _TokenStats({required this.shiyi});
@@ -1281,157 +1429,184 @@ class _RoundIconButton extends StatelessWidget {
   }
 }
 
-/// 监听模型发起的 question 工具：pendingQuestion 非空时弹出确认对话框，
-/// 用户选择后通过 answerQuestion 把结果交回工具循环。
-class _QuestionHandler extends StatefulWidget {
+/// 模型发起的 question 工具面板：内嵌在输入框上方，从下方滑入，
+/// 不遮挡会话内容；点选项或直接在输入框填写回答后发送。
+class _QuestionPanel extends StatelessWidget {
+  final Map<String, dynamic> question;
   final ShiyiState shiyi;
-  const _QuestionHandler({required this.shiyi});
-
-  @override
-  State<_QuestionHandler> createState() => _QuestionHandlerState();
-}
-
-class _QuestionHandlerState extends State<_QuestionHandler> {
-  bool _showing = false;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.shiyi.addListener(_onChanged);
-  }
-
-  @override
-  void dispose() {
-    widget.shiyi.removeListener(_onChanged);
-    super.dispose();
-  }
-
-  void _onChanged() {
-    final q = widget.shiyi.pendingQuestion;
-    if (q == null || _showing) return;
-    _showing = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) => _show(q));
-  }
-
-  Future<void> _show(Map<String, dynamic> q) async {
-    final options =
-        (q['options'] as List?)?.cast<String>() ?? const <String>['确认', '取消'];
-    final ctrl = TextEditingController();
-    int? selectedIndex;
-    String? customAnswer;
-
-    // 点击时只记录答案并关闭弹窗。等退出动画完成后再 answerQuestion/notifyListeners，
-    // 避免 modal 仍在退场时重建整个聊天页（Flutter issue #180569 变体）。
-    // 不自动聚焦输入框：只点快捷选项时不拉起输入法，减少窗口 resize 与整页 layout。
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('拾忆 向你提问'),
-        // 键盘弹出后弹窗可用高度骤减，content 必须可滚动，
-        // 否则 TextField + 问题文字超出 → 底部 RenderFlex overflow（黄黑条）。
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(q['question']?.toString() ?? ''),
-              const SizedBox(height: 12),
-              TextField(
-                controller: ctrl,
-                maxLines: 3,
-                minLines: 1,
-                decoration: const InputDecoration(
-                  hintText: '也可以直接输入你的回答…',
-                  border: OutlineInputBorder(),
-                ),
-                onSubmitted: (v) {
-                  customAnswer = v.trim();
-                  FocusManager.instance.primaryFocus?.unfocus();
-                  Navigator.of(ctx).pop();
-                },
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          for (var i = 0; i < options.length; i++)
-            TextButton(
-              onPressed: () {
-                selectedIndex = i;
-                FocusManager.instance.primaryFocus?.unfocus();
-                Navigator.of(ctx).pop();
-              },
-              child: Text(options[i]),
-            ),
-          TextButton(
-            onPressed: () {
-              customAnswer = ctrl.text.trim();
-              FocusManager.instance.primaryFocus?.unfocus();
-              Navigator.of(ctx).pop();
-            },
-            child: const Text('确定'),
-          ),
-        ],
-      ),
-    );
-
-    await Future<void>.delayed(const Duration(milliseconds: 350));
-    ctrl.dispose();
-    _showing = false;
-    if (!mounted) return;
-    final custom = customAnswer?.trim() ?? '';
-    widget.shiyi.answerQuestion(
-      selectedIndex,
-      custom: custom.isEmpty ? null : custom,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) => const SizedBox.shrink();
-}
-
-/// 当前会话已加载技能的小提示条（输入栏上方），可一键移除。
-class _LoadedSkillChip extends StatelessWidget {
-  final Skill? skill;
-  final VoidCallback onRemove;
-  const _LoadedSkillChip({required this.skill, required this.onRemove});
+  const _QuestionPanel({
+    super.key,
+    required this.question,
+    required this.shiyi,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final s = skill;
-    if (s == null) return const SizedBox.shrink();
     final theme = Theme.of(context);
+    final qText = question['question']?.toString() ?? '';
+    final options =
+        (question['options'] as List?)?.cast<String>() ??
+        const <String>['确认', '取消'];
     return Container(
-      margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 10),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHigh,
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: theme.colorScheme.primary.withValues(alpha: .35),
+        ),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.bolt, size: 15, color: theme.colorScheme.primary),
-          const SizedBox(width: 6),
-          Flexible(
-            child: Text(
-              '技能：${s.name}',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.labelSmall,
-            ),
+          Row(
+            children: [
+              Icon(
+                Icons.help_outline,
+                size: 18,
+                color: theme.colorScheme.primary,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '拾忆 向你提问',
+                style: theme.textTheme.titleSmall!.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                onPressed: () => shiyi.answerQuestion(null),
+                icon: const Icon(Icons.close, size: 18),
+                tooltip: '取消提问',
+                visualDensity: VisualDensity.compact,
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              ),
+            ],
           ),
-          const SizedBox(width: 4),
-          InkWell(
-            onTap: onRemove,
-            borderRadius: BorderRadius.circular(8),
-            child: const Padding(
-              padding: EdgeInsets.all(2),
-              child: Icon(Icons.close, size: 15),
+          const SizedBox(height: 2),
+          Text(qText, style: theme.textTheme.bodyMedium!.copyWith(height: 1.4)),
+          if (options.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '快捷选项',
+                    style: theme.textTheme.labelMedium!.copyWith(
+                      color: theme.colorScheme.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 160),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (var i = 0; i < options.length; i++) ...[
+                            if (i > 0) const SizedBox(height: 6),
+                            FilledButton.tonal(
+                              onPressed: () => shiyi.answerQuestion(i),
+                              style: FilledButton.styleFrom(
+                                alignment: Alignment.centerLeft,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 10,
+                                ),
+                                visualDensity: VisualDensity.compact,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                              ),
+                              child: Text(
+                                options[i],
+                                textAlign: TextAlign.left,
+                                style: theme.textTheme.bodyMedium,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
+          ],
         ],
+      ),
+    );
+  }
+}
+
+/// 当前会话已加载技能的小提示条（输入栏上方，可多选），每个技能可单独移除。
+class _LoadedSkillChips extends StatelessWidget {
+  final List<Skill> skills;
+  final ValueChanged<Skill> onRemove;
+  const _LoadedSkillChips({required this.skills, required this.onRemove});
+
+  @override
+  Widget build(BuildContext context) {
+    if (skills.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(
+          spacing: 6,
+          runSpacing: 4,
+          children: [for (final s in skills) _buildChip(theme, s)],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChip(ThemeData theme, Skill s) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 240),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.bolt, size: 15, color: theme.colorScheme.primary),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                s.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelSmall,
+              ),
+            ),
+            const SizedBox(width: 4),
+            InkWell(
+              onTap: () => onRemove(s),
+              borderRadius: BorderRadius.circular(8),
+              child: const Padding(
+                padding: EdgeInsets.all(2),
+                child: Icon(Icons.close, size: 15),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1481,6 +1656,7 @@ class _PlanModeChip extends StatelessWidget {
 class _Composer extends StatelessWidget {
   final TextEditingController input;
   final bool busy;
+  final bool questionActive;
   final List<String> pendingImages;
   final List<String> pendingFiles;
   final VoidCallback onPickAttachment;
@@ -1491,6 +1667,7 @@ class _Composer extends StatelessWidget {
   const _Composer({
     required this.input,
     required this.busy,
+    required this.questionActive,
     required this.pendingImages,
     required this.pendingFiles,
     required this.onPickAttachment,
@@ -1542,7 +1719,7 @@ class _Composer extends StatelessWidget {
                     onSubmitted: (_) => onSend(),
                     style: theme.textTheme.bodyLarge,
                     decoration: InputDecoration(
-                      hintText: '输入消息…',
+                      hintText: questionActive ? '直接输入你的回答…' : '输入消息…',
                       hintStyle: TextStyle(color: theme.hintColor),
                       border: InputBorder.none,
                       contentPadding: const EdgeInsets.symmetric(
@@ -1575,7 +1752,7 @@ class _Composer extends StatelessWidget {
                             _RoundIconButton(
                               onPressed: onSend,
                               icon: Icons.send_rounded,
-                              tooltip: '发送并引导',
+                              tooltip: questionActive ? '发送回答' : '发送并引导',
                               filled: true,
                               active: true,
                             ),
@@ -1586,7 +1763,7 @@ class _Composer extends StatelessWidget {
                     return _RoundIconButton(
                       onPressed: hasInput ? onSend : null,
                       icon: Icons.send_rounded,
-                      tooltip: '发送',
+                      tooltip: questionActive ? '发送回答' : '发送',
                       filled: true,
                       active: hasInput,
                     );

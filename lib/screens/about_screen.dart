@@ -1,12 +1,7 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 
+import '../services/update_service.dart';
 import '../widgets/welcome_avatar.dart';
 
 /// 关于页：应用信息、检查更新、项目主页与版权说明。
@@ -14,10 +9,6 @@ class AboutScreen extends StatefulWidget {
   const AboutScreen({super.key});
 
   static const String appName = '拾忆 ShiYi';
-  static const String version = '1.1.5';
-  static const String repoUrl = 'https://github.com/JIUSIS/shiyi-agent';
-  static const String apiReleaseUrl =
-      'https://api.github.com/repos/JIUSIS/shiyi-agent/releases/latest';
 
   @override
   State<AboutScreen> createState() => _AboutScreenState();
@@ -36,280 +27,33 @@ const _features = <(IconData, String)>[
   (Icons.record_voice_over_outlined, '语音朗读、深浅色主题'),
 ];
 
-class _FeatureTile extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _FeatureTile({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      child: Row(
-        children: [
-          Icon(icon, size: 20, color: theme.colorScheme.primary),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(label, style: theme.textTheme.bodyMedium),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _AboutScreenState extends State<AboutScreen> {
   bool _checking = false;
-
-  /// 数字分段比较版本号：a > b 返回 1，相等 0，a < b 返回 -1。
-  int _compareVersion(String a, String b) {
-    final pa = a
-        .split(RegExp(r'[.\-]'))
-        .map(int.tryParse)
-        .whereType<int>()
-        .toList();
-    final pb = b
-        .split(RegExp(r'[.\-]'))
-        .map(int.tryParse)
-        .whereType<int>()
-        .toList();
-    final len = pa.length > pb.length ? pa.length : pb.length;
-    for (var i = 0; i < len; i++) {
-      final x = i < pa.length ? pa[i] : 0;
-      final y = i < pb.length ? pb[i] : 0;
-      if (x != y) return x > y ? 1 : -1;
-    }
-    return 0;
-  }
 
   Future<void> _checkUpdate() async {
     if (_checking) return;
     setState(() => _checking = true);
     try {
-      final latest = await _fetchLatest();
+      final result = await UpdateService.check();
       if (!mounted) return;
-      if (latest == null) {
-        _showDialog('检查更新失败', '无法获取版本信息，请检查网络后重试。');
-        return;
-      }
-      final remoteVer = latest.tag.replaceFirst(RegExp('^v'), '');
-      if (_compareVersion(remoteVer, AboutScreen.version) > 0) {
-        _showUpdateAvailable(remoteVer, latest.notes);
-      } else {
-        _showDialog('当前已是最新版本', 'v${AboutScreen.version} 已经是最新版本。');
+      switch (result.status) {
+        case UpdateCheckStatus.updateAvailable:
+          UpdateService.showUpdateAvailable(context, result.tag, result.notes);
+        case UpdateCheckStatus.upToDate:
+          UpdateService.showPlainDialog(
+            context,
+            '当前已是最新版本',
+            'v${UpdateService.appVersion} 已经是最新版本。',
+          );
+        case UpdateCheckStatus.failed:
+          UpdateService.showPlainDialog(
+            context,
+            '检查更新失败',
+            '无法获取版本信息，请检查网络后重试。',
+          );
       }
     } finally {
       if (mounted) setState(() => _checking = false);
-    }
-  }
-
-  /// 获取最新版本：优先 GitHub Releases API，403/网络失败时回退 jsDelivr 镜像。
-  /// 返回 null 表示两种来源都不可用。
-  Future<({String tag, String notes})?> _fetchLatest() async {
-    // ① GitHub Releases API（公开仓库无需鉴权；403 多为区域网络受限/限流）
-    try {
-      final res = await http
-          .get(
-            Uri.parse(AboutScreen.apiReleaseUrl),
-            headers: const {'User-Agent': 'ShiYi'},
-          )
-          .timeout(const Duration(seconds: 8));
-      if (res.statusCode == 200) {
-        final d = jsonDecode(res.body) as Map<String, dynamic>;
-        return (
-          tag: (d['tag_name'] ?? '') as String,
-          notes: (d['body'] as String? ?? '').trim(),
-        );
-      }
-      if (res.statusCode == 404) {
-        // 仓库没有任何 Release：视为当前版本即最新。
-        return (tag: 'v${AboutScreen.version}', notes: '');
-      }
-    } catch (_) {}
-    // ② jsDelivr 镜像（国内可达，不受 GitHub API 限流影响）
-    try {
-      final res = await http
-          .get(
-            Uri.parse('https://data.jsdelivr.com/v1/packages/gh/JIUSIS/shiyi-agent'),
-          )
-          .timeout(const Duration(seconds: 8));
-      if (res.statusCode == 200) {
-        final d = jsonDecode(res.body) as Map<String, dynamic>;
-        final versions = (d['versions'] as List? ?? []);
-        String? best;
-        for (final v in versions) {
-          final s = (v is Map ? v['version'] : v)?.toString() ?? '';
-          final tag = s.replaceFirst(RegExp('^v'), '');
-          if (tag.isEmpty || int.tryParse(tag.split('.').first) == null) {
-            continue;
-          }
-          if (best == null || _compareVersion(tag, best) > 0) best = tag;
-        }
-        if (best != null) return (tag: 'v$best', notes: '');
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  void _showDialog(String title, String message) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(title),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('确定'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showUpdateAvailable(String ver, String notes) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('发现新版本 v$ver'),
-        content: Text(
-          notes.isEmpty ? '有新版本可以更新。' : '更新说明：\n\n$notes',
-          maxLines: 12,
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('稍后'),
-          ),
-          FilledButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              _downloadAndInstall(ver);
-            },
-            child: const Text('下载更新'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 下载并安装新版本 APK。
-  /// 优先 GitHub 官方直链，首字节无响应或下载过慢时自动切换国内镜像源。
-  Future<void> _downloadAndInstall(String ver) async {
-    final direct =
-        'https://github.com/JIUSIS/shiyi-agent/releases/download/'
-        'v$ver/shiyi-agent-v$ver.apk';
-    const mirrors = [
-      'https://gh-proxy.com/',
-      'https://ghfast.top/',
-    ];
-    final progress = ValueNotifier<double>(0);
-    var cancelled = false;
-    final dir = await getTemporaryDirectory();
-    final file = File('${dir.path}/shiyi-agent-v$ver.apk');
-
-    if (!mounted) return;
-    final dialogCtx = context;
-    if (!dialogCtx.mounted) return;
-    showDialog<void>(
-      context: dialogCtx,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('正在下载更新…'),
-        content: ValueListenableBuilder<double>(
-          valueListenable: progress,
-          builder: (_, p, _) => Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              LinearProgressIndicator(
-                value: p > 0 ? p.clamp(0.0, 1.0) : null,
-              ),
-              const SizedBox(height: 10),
-              Text(
-                p > 0 ? '${(p * 100).toStringAsFixed(0)}%' : '连接中…',
-                style: Theme.of(ctx).textTheme.bodySmall,
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              cancelled = true;
-              Navigator.pop(ctx);
-            },
-            child: const Text('取消'),
-          ),
-        ],
-      ),
-    );
-
-    var ok = false;
-    for (final base in ['', ...mirrors]) {
-      if (cancelled) break;
-      final url = '$base$direct';
-      try {
-        final req = http.Request('GET', Uri.parse(url));
-        final res = await http
-            .Client()
-            .send(req)
-            .timeout(const Duration(seconds: 15));
-        if (res.statusCode != 200) continue;
-        final total = res.contentLength ?? 0;
-        final sink = file.openWrite();
-        var received = 0;
-        var lastChunk = DateTime.now();
-        var slow = false;
-        try {
-          await for (final chunk in res.stream) {
-            if (cancelled) break;
-            sink.add(chunk);
-            received += chunk.length;
-            final now = DateTime.now();
-            if (now.difference(lastChunk) >
-                const Duration(seconds: 30)) {
-              slow = true; // 30 秒无进度：判定源太慢，换镜像
-              break;
-            }
-            lastChunk = now;
-            if (total > 0) progress.value = received / total;
-          }
-        } finally {
-          await sink.close();
-        }
-        if (slow || received == 0) continue;
-        if (total == 0 || received >= total) {
-          ok = true;
-          progress.value = 1;
-          break;
-        }
-      } catch (_) {
-        continue;
-      }
-    }
-
-    if (!mounted) return;
-    if (!dialogCtx.mounted) return;
-    Navigator.of(dialogCtx, rootNavigator: true).pop();
-    if (cancelled) return;
-    if (!ok) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('下载失败：所有下载源均不可用，请稍后再试')),
-      );
-      return;
-    }
-    // 交给系统安装器
-    try {
-      const channel = MethodChannel('shiyi/skillpack');
-      await channel.invokeMethod('installApk', {'path': file.path});
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('打开安装器失败：$e')),
-        );
-      }
     }
   }
 
@@ -322,38 +66,55 @@ class _AboutScreenState extends State<AboutScreen> {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 640),
           child: ListView(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
             children: [
               Center(
-                child: WelcomeAvatar(size: 84, asset: 'assets/avatar.png'),
+                child: WelcomeAvatar(size: 100, asset: 'assets/avatar.png'),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
               Center(
-                child: Text(
-                  AboutScreen.appName,
-                  style: theme.textTheme.titleLarge!.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      AboutScreen.appName,
+                      style: theme.textTheme.titleLarge!.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.surfaceContainerHigh,
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: theme.colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: Text(
+                        'v${UpdateService.appVersion}',
+                        style: theme.textTheme.labelSmall!.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 4),
-              Center(
-                child: Text(
-                  'v${AboutScreen.version}',
-                  style: theme.textTheme.bodySmall!.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 12),
               Text(
-                '拾忆是一款运行在 Android 手机上的个人 AI 工作台。\n'
-                '它将大语言模型、长期记忆、项目文件管理、内置终端和技能系统整合到一个应用中，'
-                '让 AI 不只是回答问题，还能读取资料、修改文件、运行命令、整理项目。',
-                style: theme.textTheme.bodyMedium!.copyWith(height: 1.6),
+                '个人 AI 工作台：对话、长期记忆、项目文件、内置终端与技能系统，一站式完成。',
                 textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium!.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  height: 1.5,
+                ),
               ),
-              const SizedBox(height: 28),
+              const SizedBox(height: 18),
               Text(
                 '功能特性',
                 style: theme.textTheme.bodySmall!.copyWith(
@@ -362,78 +123,110 @@ class _AboutScreenState extends State<AboutScreen> {
                 ),
               ),
               const SizedBox(height: 8),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final itemWidth = (constraints.maxWidth - 8) / 2;
+                  return Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final f in _features)
+                        SizedBox(
+                          width: itemWidth,
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.only(top: 2),
+                                child: Icon(
+                                  f.$1,
+                                  size: 16,
+                                  color: theme.colorScheme.primary,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  f.$2,
+                                  style: theme.textTheme.bodySmall!.copyWith(
+                                    height: 1.35,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+              const SizedBox(height: 18),
               Card(
                 color: theme.colorScheme.surfaceContainerHigh,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(14),
                 ),
+                clipBehavior: Clip.antiAlias,
                 child: Column(
                   children: [
-                    for (final f in _features) ...[
-                      _FeatureTile(icon: f.$1, label: f.$2),
-                      if (f != _features.last) const Divider(height: 1, indent: 48),
-                    ],
+                    ListTile(
+                      dense: true,
+                      leading: Icon(
+                        Icons.link,
+                        color: theme.colorScheme.primary,
+                        size: 20,
+                      ),
+                      title: const Text(
+                        'github.com/JIUSIS/shiyi-agent',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: const Text('点击复制链接'),
+                      trailing: const Icon(Icons.copy, size: 16),
+                      onTap: () async {
+                        await Clipboard.setData(
+                          const ClipboardData(text: UpdateService.repoUrl),
+                        );
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('链接已复制')),
+                          );
+                        }
+                      },
+                    ),
+                    const Divider(height: 1, indent: 16, endIndent: 16),
+                    ListTile(
+                      dense: true,
+                      leading: Icon(
+                        Icons.system_update_alt,
+                        color: theme.colorScheme.primary,
+                        size: 20,
+                      ),
+                      title: const Text('检查更新'),
+                      subtitle: Text(
+                        _checking ? '正在检查…' : '从 GitHub Releases 检查新版本',
+                      ),
+                      trailing: _checking
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : null,
+                      onTap: _checkUpdate,
+                    ),
                   ],
                 ),
               ),
-              const SizedBox(height: 28),
-              Card(
-                color: theme.colorScheme.surfaceContainerHigh,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: ListTile(
-                  leading: Icon(Icons.link, color: theme.colorScheme.primary),
-                  title: const Text(
-                    'github.com/JIUSIS/shiyi-agent',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: const Text('点击复制链接'),
-                  onTap: () async {
-                    await Clipboard.setData(
-                      const ClipboardData(text: AboutScreen.repoUrl),
-                    );
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('链接已复制')),
-                      );
-                    }
-                  },
-                ),
-              ),
-              const SizedBox(height: 8),
-              Card(
-                color: theme.colorScheme.surfaceContainerHigh,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: ListTile(
-                  leading: Icon(
-                    Icons.system_update_alt,
-                    color: theme.colorScheme.primary,
-                  ),
-                  title: const Text('检查更新'),
-                  subtitle: Text(
-                    _checking ? '正在检查…' : '从 GitHub Releases 检查新版本',
-                  ),
-                  trailing: _checking
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : null,
-                  onTap: _checkUpdate,
-                ),
-              ),
-              const SizedBox(height: 28),
+              const SizedBox(height: 18),
               Center(
                 child: Text(
                   '本项目基于 GPL-3.0 协议开源\n使用、修改与分发请遵守 GPL-3.0 条款',
                   textAlign: TextAlign.center,
                   style: theme.textTheme.bodySmall!.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant.withValues(alpha: .7),
+                    color: theme.colorScheme.onSurfaceVariant.withValues(
+                      alpha: .7,
+                    ),
                     height: 1.5,
                   ),
                 ),

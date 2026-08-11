@@ -55,6 +55,13 @@ class Session {
   int messageCount;
   int totalTokens;
 
+  /// 最近一次请求由服务端真实返回的 total_tokens（含输入+输出）。
+  /// 作为会话“当前上下文占用”的基线；null = 还没有真实 usage。
+  int? lastUsageTotalTokens;
+
+  /// 会话级滚动任务摘要：上下文压缩时生成，后续请求注入系统提示。
+  String rollingSummary;
+
   /// 会话级项目工作目录（空 = 用全局默认工作目录）。
   String workspaceDir;
 
@@ -66,6 +73,8 @@ class Session {
     required this.updatedAt,
     this.messageCount = 0,
     this.totalTokens = 0,
+    this.lastUsageTotalTokens,
+    this.rollingSummary = '',
     this.workspaceDir = '',
   });
 
@@ -76,6 +85,8 @@ class Session {
     'created_at': createdAt,
     'updated_at': updatedAt,
     'total_tokens': totalTokens,
+    'last_usage_total_tokens': lastUsageTotalTokens,
+    'rolling_summary': rollingSummary,
     'workspace_dir': workspaceDir,
   };
 
@@ -91,6 +102,12 @@ class Session {
     totalTokens: m['total_tokens'] == null
         ? 0
         : int.parse('${m['total_tokens']}'),
+    lastUsageTotalTokens: m['last_usage_total_tokens'] == null
+        ? null
+        : int.parse('${m['last_usage_total_tokens']}'),
+    rollingSummary: m['rolling_summary'] == null
+        ? ''
+        : '${m['rolling_summary']}',
     workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
   );
 }
@@ -145,6 +162,7 @@ class ChatMessage {
   String toolCallId; // for tool results
   int createdAt;
   bool streaming;
+  bool archived;
 
   ChatMessage({
     required this.id,
@@ -156,6 +174,7 @@ class ChatMessage {
     this.toolCallId = '',
     required this.createdAt,
     this.streaming = false,
+    this.archived = false,
   }) : toolCalls = toolCalls ?? [];
 
   bool get hasToolCalls => toolCalls.isNotEmpty;
@@ -170,6 +189,7 @@ class ChatMessage {
     'tool_calls': jsonEncode(toolCalls.map((t) => t.toJson()).toList()),
     'tool_call_id': toolCallId,
     'created_at': createdAt,
+    'archived': archived ? 1 : 0,
   };
 
   factory ChatMessage.fromMap(Map<String, dynamic> m) {
@@ -202,6 +222,7 @@ class ChatMessage {
       toolCalls: toolCalls,
       toolCallId: m['tool_call_id'] ?? '',
       createdAt: m['created_at'],
+      archived: (m['archived'] as num?)?.toInt() == 1,
     );
   }
 
@@ -213,6 +234,7 @@ class ChatMessage {
       return {
         'role': 'assistant',
         'content': content,
+        if (reasoning.isNotEmpty) 'reasoning_content': reasoning,
         'tool_calls': toolCalls
             .map(
               (t) => {
@@ -224,7 +246,12 @@ class ChatMessage {
             .toList(),
       };
     }
-    return {'role': role, 'content': content};
+    return {
+      'role': role,
+      'content': content,
+      if (role == 'assistant' && reasoning.isNotEmpty)
+        'reasoning_content': reasoning,
+    };
   }
 }
 

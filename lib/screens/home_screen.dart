@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../services/update_service.dart';
 import '../widgets/welcome_avatar.dart';
 import 'about_screen.dart';
 import 'chat_screen.dart';
@@ -47,12 +48,31 @@ class _HomeScreenState extends State<HomeScreen>
     super.initState();
     _fadeController.value = 1;
     _prebuildTabs();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scheduleLaunchUpdateCheck();
+    });
   }
 
   @override
   void dispose() {
+    widget.shiyi.loadedNotifier.removeListener(_onLoadedForUpdateCheck);
     _fadeController.dispose();
     super.dispose();
+  }
+
+  /// 启动自动检查更新：等 app 初始化完成后触发，避免弹窗压住加载页。
+  void _scheduleLaunchUpdateCheck() {
+    if (!widget.shiyi.loaded) {
+      widget.shiyi.loadedNotifier.addListener(_onLoadedForUpdateCheck);
+      return;
+    }
+    unawaited(UpdateService.checkOnLaunch(context));
+  }
+
+  void _onLoadedForUpdateCheck() {
+    if (!widget.shiyi.loaded) return;
+    widget.shiyi.loadedNotifier.removeListener(_onLoadedForUpdateCheck);
+    if (mounted) unawaited(UpdateService.checkOnLaunch(context));
   }
 
   // 启动后逐帧预构建其余 tab，首次切换不再卡顿（构建成本分摊到空闲帧）。
@@ -172,7 +192,9 @@ class _HomeScreenState extends State<HomeScreen>
                       children: [
                         for (var i = 0; i <= 5; i++)
                           _tabCache[i] ??
-                              (i == _tab ? _buildTabFor(i) : const SizedBox.shrink()),
+                              (i == _tab
+                                  ? _buildTabFor(i)
+                                  : const SizedBox.shrink()),
                       ],
                     ),
                   ),

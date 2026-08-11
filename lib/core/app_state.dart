@@ -131,6 +131,9 @@ class ShiyiState extends ChangeNotifier {
   /// 本次会话累计消耗的 token（持久化到 sessions.total_tokens）。
   int sessionTotalTokens = 0;
 
+  /// 最近一次请求由服务端真实返回的 total_tokens（会话上下文统计基线）。
+  int? sessionLastUsageTokens;
+
   /// 当前这一轮对话（一次 send）消耗的 token。
   int lastRoundTokens = 0;
 
@@ -568,7 +571,7 @@ class ShiyiState extends ChangeNotifier {
   // ---------------- sessions ----------------
 
   /// 当前会话手动加载的技能（输入 / 选择），注入到系统提示，切换会话时清空。
-  Skill? loadedSkill;
+  final List<Skill> loadedSkills = [];
 
   /// 当前会话的项目工作目录：会话设置了用会话的，否则用全局默认。
   Future<String> currentWorkspace() async {
@@ -613,8 +616,9 @@ class ShiyiState extends ChangeNotifier {
     _bumpMessages();
     _messagesLoadedForSessionId = id;
     toolEvents = [];
-    loadedSkill = null;
+    loadedSkills.clear();
     sessionTotalTokens = 0;
+    sessionLastUsageTokens = null;
     lastRoundTokens = 0;
     roundCachedTokens = 0;
     roundInputTokens = 0;
@@ -629,7 +633,7 @@ class ShiyiState extends ChangeNotifier {
     currentSessionId = id;
     viewingSessionId = id;
     unreadSessions.remove(id);
-    loadedSkill = null;
+    loadedSkills.clear();
     messages = await _db.listMessages(id);
     _bumpMessages();
     _messagesLoadedForSessionId = id;
@@ -655,6 +659,7 @@ class ShiyiState extends ChangeNotifier {
     }
     final sess = await _db.getSession(id);
     sessionTotalTokens = sess?.totalTokens ?? 0;
+    sessionLastUsageTokens = sess?.lastUsageTotalTokens;
     lastRoundTokens = 0;
     roundCachedTokens = 0;
     roundInputTokens = 0;
@@ -688,16 +693,23 @@ class ShiyiState extends ChangeNotifier {
       _bumpMessages();
       _messagesLoadedForSessionId = null;
       toolEvents = [];
-      loadedSkill = null;
+      loadedSkills.clear();
     }
     await refreshSessions();
   }
 
   /// 在当前会话加载/移除技能（输入 / 选择），内容注入系统提示供模型使用。
-  void loadSkill(Skill? s) {
-    loadedSkill = s;
+  void toggleLoadedSkill(Skill s) {
+    final i = loadedSkills.indexWhere((x) => x.id == s.id);
+    if (i >= 0) {
+      loadedSkills.removeAt(i);
+    } else {
+      loadedSkills.add(s);
+    }
     notifyListeners();
   }
+
+  bool isSkillLoaded(Skill s) => loadedSkills.any((x) => x.id == s.id);
 
   Future<List<SessionSearchResult>> searchSessions(String query) =>
       _db.searchSessions(query);
@@ -715,7 +727,7 @@ class ShiyiState extends ChangeNotifier {
     bool compactOldTools = false,
     bool estimateMode = false,
   }) async {
-    final active = msgs.where((m) => !m.streaming).toList();
+    final active = msgs.where((m) => !m.streaming && !m.archived).toList();
     final segments = _planToolSegments(active);
     final completeSegments = segments.where((s) => s.complete).toList();
     final keepFull = compactOldTools && completeSegments.length > 3
@@ -782,7 +794,11 @@ class ShiyiState extends ChangeNotifier {
         if (keepAssistant.contains(i)) {
           out.add(m.toApiMap());
         } else if (m.content.trim().isNotEmpty) {
-          out.add({'role': 'assistant', 'content': m.content});
+          out.add({
+            'role': 'assistant',
+            'content': m.content,
+            if (m.reasoning.isNotEmpty) 'reasoning_content': m.reasoning,
+          });
         }
         continue;
       }
@@ -847,7 +863,7 @@ class ShiyiState extends ChangeNotifier {
 
   /// 汇总最近 3 个完整工具回合之外的所有旧工具轮（原文仍留在本地数据库）。
   String _buildOldToolSummary(List<ChatMessage> msgs) {
-    final active = msgs.where((m) => !m.streaming).toList();
+    final active = msgs.where((m) => !m.streaming && !m.archived).toList();
     final complete = _planToolSegments(
       active,
     ).where((s) => s.complete).toList();
@@ -884,7 +900,7 @@ class ShiyiState extends ChangeNotifier {
   static String _buildRollingTaskSummary(List<ChatMessage> msgs) {
     final recent = <ChatMessage>[];
     for (final m in msgs.reversed) {
-      if (m.streaming || m.role == 'tool') continue;
+      if (m.streaming || m.archived || m.role == 'tool') continue;
       recent.add(m);
       if (recent.length >= 20) break;
     }
@@ -929,7 +945,7 @@ class ShiyiState extends ChangeNotifier {
   static List<String> _extractToolPaths(List<ChatMessage> msgs) {
     final out = <String>{};
     for (final m in msgs) {
-      if (m.role != 'assistant') continue;
+      if (m.archived || m.role != 'assistant') continue;
       for (final tc in m.toolCalls) {
         try {
           final args = jsonDecode(tc.arguments);
@@ -1029,39 +1045,75 @@ class ShiyiState extends ChangeNotifier {
     }
   }
 
-  /// 估算下一轮请求按发送前预算裁剪后的实际上下文 token 数。
-  /// 状态栏用它展示“真正会发给模型的大小”，压缩判断仍用全量估算。
-  Future<int> trimmedContextTokenEstimate(String sessionId) async {
+  /// 按 Codex 口径计算当前会话上下文占用：最近一次服务端真实 total_tokens
+  /// 作为基线，加上最后一次模型生成之后新增消息的本地估算。服务端没返回过
+  /// usage 时回退到全量本地估算。
+  Future<int> activeContextTokenEstimate(String sessionId) async {
+    final sess = await _db.getSession(sessionId);
     final msgs = _messagesLoadedForSessionId == sessionId
         ? messages
         : await _db.listMessages(sessionId);
-    final full = await sessionContextTokenEstimate(sessionId);
-    final summaries = await _buildContextSummaries(msgs, full);
-    final payload = await _historyToApi(
-      msgs,
-      imagesAllowed: true,
-      compactOldTools:
-          settings.contextLimit > 0 && full / settings.contextLimit >= 0.60,
-      estimateMode: true,
+    final active = computeActiveContextTokens(
+      lastUsageTotalTokens: sess?.lastUsageTotalTokens,
+      messages: msgs,
     );
-    if (payload.messages.isEmpty) return 0;
-    final sys = await _buildSystemPrompt('');
-    final sysContent = summaries.isEmpty ? sys : '$sys\n\n$summaries';
-    final apiMsgs = <Map<String, dynamic>>[
-      {'role': 'system', 'content': sysContent},
-      ...payload.messages,
-    ];
-    final trimmed = await _trimApiMessages(apiMsgs, announce: false);
-    return estimateRequestTokens(
-      trimmed,
-      tools: activeTools,
-    ).totalEstimatedTokens;
+    if (active != null) return active;
+    return sessionContextTokenEstimate(sessionId);
   }
 
-  /// 同时刷新全量与裁剪后的上下文统计，供会话切换/回合结束等场景使用。
+  /// 纯函数：真实 usage 基线 + 最后一条模型生成项之后新增消息的估算。
+  /// 返回 null 表示还没有真实 usage，调用方应回退到全量估算。
+  static int? computeActiveContextTokens({
+    int? lastUsageTotalTokens,
+    required List<ChatMessage> messages,
+  }) {
+    if (lastUsageTotalTokens == null || lastUsageTotalTokens <= 0) {
+      return null;
+    }
+    final lastModel = _lastModelGeneratedIndex(messages);
+    var extra = 0;
+    for (var i = lastModel + 1; i < messages.length; i++) {
+      final m = messages[i];
+      if (m.streaming || m.archived) continue;
+      extra += estimateChatMessageTokens(m);
+    }
+    return lastUsageTotalTokens + extra;
+  }
+
+  static int _lastModelGeneratedIndex(List<ChatMessage> messages) {
+    for (var i = messages.length - 1; i >= 0; i--) {
+      final m = messages[i];
+      if (m.role != 'assistant') continue;
+      if (m.content.trim().isNotEmpty ||
+          m.reasoning.trim().isNotEmpty ||
+          m.toolCalls.isNotEmpty) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /// 估算单条本地聊天消息的 token（与 API 消息口径一致：含 tool_calls 与图片）。
+  static int estimateChatMessageTokens(ChatMessage m) {
+    var total = _estimateTokens(m.content);
+    if (m.role == 'assistant' && m.hasToolCalls) {
+      final tc = m.toApiMap()['tool_calls'];
+      if (tc is List && tc.isNotEmpty) {
+        total += _estimateTokens(jsonEncode(tc));
+      }
+    }
+    if (m.hasImages) {
+      total += 1000 * extractImagePaths(m.content).length;
+    }
+    return total;
+  }
+
+  /// 同时刷新上下文统计：状态栏、压缩判断与发送前阈值统一走真实 usage
+  /// 基线（无 usage 时全量估算兜底）。
   Future<void> _updateContextStats(String sessionId) async {
-    sessionContextTokensFull = await sessionContextTokenEstimate(sessionId);
-    sessionContextTokens = await trimmedContextTokenEstimate(sessionId);
+    final active = await activeContextTokenEstimate(sessionId);
+    sessionContextTokens = active;
+    sessionContextTokensFull = active;
   }
 
   /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部并给
@@ -1079,8 +1131,10 @@ class ShiyiState extends ChangeNotifier {
     final systemTokens = apiMsgs.first['role'] == 'system'
         ? estimateApiMessageTokens(apiMsgs.first)
         : 0;
-    final toolDefinitionTokens = estimateRequestTokens([], tools: tools)
-        .totalEstimatedTokens;
+    final toolDefinitionTokens = estimateRequestTokens(
+      [],
+      tools: tools,
+    ).totalEstimatedTokens;
     final messageBudget = budget - systemTokens - toolDefinitionTokens;
     if (messageBudget <= 0) {
       // 预算连 system + 工具定义都不够时，仍保留 system 与最新消息，避免空请求。
@@ -1270,10 +1324,8 @@ class ShiyiState extends ChangeNotifier {
       roundCacheKnown = false;
       final sessNow = await _db.getSession(sessionId);
       sessionTotalTokens = sessNow?.totalTokens ?? 0;
+      sessionLastUsageTokens = sessNow?.lastUsageTotalTokens;
       final now = DateTime.now().millisecondsSinceEpoch;
-
-      // 发送前检查是否需要自动压缩历史上下文。
-      await _maybeAutoCompress(sessionId);
 
       final userMsg = ChatMessage(
         id: 'm${now}_${_rand()}',
@@ -1285,6 +1337,9 @@ class ShiyiState extends ChangeNotifier {
       await _db.insertMessage(userMsg);
       messages.add(userMsg);
       _bumpMessages();
+
+      // 发送前检查是否需要自动压缩历史上下文（此时新用户消息已计入统计）。
+      await _maybeAutoCompress(sessionId);
 
       final firstAsst = ChatMessage(
         id: 'm${now}_${_rand()}',
@@ -1363,8 +1418,12 @@ class ShiyiState extends ChangeNotifier {
     required String systemHint,
     bool runRefine = true,
   }) async {
-    final systemPrompt = await _buildSystemPrompt(systemHint);
-    final fullEstimate = await sessionContextTokenEstimate(sessionId);
+    final sess = await _db.getSession(sessionId);
+    final systemPrompt = await _buildSystemPrompt(
+      systemHint,
+      rollingSummary: sess?.rollingSummary ?? '',
+    );
+    final fullEstimate = await activeContextTokenEstimate(sessionId);
     final contextSummaries = await _buildContextSummaries(
       messages,
       fullEstimate,
@@ -1405,17 +1464,11 @@ class ShiyiState extends ChangeNotifier {
           ...historyPayload.messages,
         ];
         final trimmed = await _trimApiMessages(loopMsgs, logBudget: true);
-        // 状态栏、发送前阈值、裁剪后数值统一走 estimateRequestTokens。
-        final fullTokens = estimateRequestTokens(
-          loopMsgs,
-          tools: activeTools,
-        ).totalEstimatedTokens;
-        final trimmedTokens = estimateRequestTokens(
-          trimmed,
-          tools: activeTools,
-        ).totalEstimatedTokens;
-        sessionContextTokensFull = fullTokens;
-        sessionContextTokens = trimmedTokens;
+        // 状态栏、发送前阈值、压缩判断统一走 activeContextTokenEstimate：
+        // 有真实 usage 时用「上次真实 total + 新增消息」，没有时才全量估算。
+        final active = await activeContextTokenEstimate(sessionId);
+        sessionContextTokensFull = active;
+        sessionContextTokens = active;
         notifyListeners();
         await _runAgentLoop(sessionId, firstAsst, trimmed);
         completed = true;
@@ -1534,6 +1587,9 @@ class ShiyiState extends ChangeNotifier {
     }
     messages.removeWhere((m) => toDelete.any((d) => d.id == m.id));
     _bumpMessages();
+    // 历史被修改后旧 usage 不再有效，回退到估算。
+    await _db.updateSessionLastUsage(sessionId, null);
+    sessionLastUsageTokens = null;
     await _db.touchSession(sessionId, model: settings.model);
     await refreshSessions();
     await _updateContextStats(sessionId);
@@ -1558,6 +1614,9 @@ class ShiyiState extends ChangeNotifier {
     messages.removeRange(idx, messages.length);
     _bumpMessages();
     notifyListeners();
+    // 删除回复及其后历史后，旧 usage 不再代表当前上下文，回退到估算。
+    await _db.updateSessionLastUsage(sessionId, null);
+    sessionLastUsageTokens = null;
 
     isBusy = true;
     _stopRequested = false;
@@ -1725,6 +1784,9 @@ class ShiyiState extends ChangeNotifier {
           'tool_call_id': toolMsg.toolCallId,
         });
       }
+      // 工具结果已落库但尚未进入下一次请求：按 Codex 口径补上
+      // 「最后一次模型生成之后的本地新增」估算，让等待期间状态栏也准确。
+      await _updateContextStats(sessionId);
 
       if (round == _maxToolRounds - 1) {
         // 已达轮次上限：强制请求最终文本，复用当前思考占位气泡。
@@ -1881,6 +1943,15 @@ class ShiyiState extends ChangeNotifier {
       },
     );
     await client.send(msgs);
+    // 以服务端真实 usage 作为会话上下文统计基线（Codex 口径）。
+    // 工具多轮循环时每次请求都会覆盖为最新一轮的真实 total。
+    final usageTotal = client.lastTotalTokens;
+    if (usageTotal != null && usageTotal > 0) {
+      await _db.updateSessionLastUsage(sessionId, usageTotal);
+      if (currentSessionId == sessionId) {
+        sessionLastUsageTokens = usageTotal;
+      }
+    }
     var used = client.lastTotalTokens;
     if (used == null || used <= 0) {
       // 部分网关/中转不返回 usage：按发送内容与工具调用的 token 估算兜底，
@@ -1898,7 +1969,7 @@ class ShiyiState extends ChangeNotifier {
     if (currentSessionId == sessionId) {
       // 缓存命中率按本轮回合加权累计，只统计服务端明确返回缓存字段的请求。
       final cachedInput = client.lastCachedTokens;
-      final promptInput = client.lastPromptTokens;
+      final promptInput = client.lastPromptTokens ?? client.lastInputTokens;
       if (cachedInput != null && promptInput != null && promptInput > 0) {
         roundCacheKnown = true;
         roundCachedTokens += cachedInput.clamp(0, promptInput);
@@ -1912,7 +1983,10 @@ class ShiyiState extends ChangeNotifier {
     return accumulated;
   }
 
-  Future<String> _buildSystemPrompt(String userText) async {
+  Future<String> _buildSystemPrompt(
+    String userText, {
+    String rollingSummary = '',
+  }) async {
     final base = settings.systemPrompt.isNotEmpty
         ? settings.systemPrompt
         : '你是「拾忆」，运行在 Android 手机上的个人 AI 工作台。你帮用户完成实际工作，而不只是聊天：\n'
@@ -2035,9 +2109,8 @@ class ShiyiState extends ChangeNotifier {
       );
     }
 
-    // 用户手动加载的技能（输入 / 选择）：完整内容直接注入，无需 run_skill。
-    final loaded = loadedSkill;
-    if (loaded != null) {
+    // 用户手动加载的技能（输入 / 选择，可多选）：完整内容直接注入，无需 run_skill。
+    for (final loaded in loadedSkills) {
       final sb = StringBuffer('【已加载技能：${loaded.name}】\n${loaded.content}');
       for (final e in loaded.files.entries) {
         sb.writeln('\n--- ${e.key} ---\n${e.value}');
@@ -2056,6 +2129,14 @@ class ShiyiState extends ChangeNotifier {
         '不得写文件、执行终端命令、保存记忆或创建技能。'
         '请先给出完整、可执行的方案，然后用 question 工具向用户确认；'
         '用户确认后调用 exit_plan_mode 恢复正常能力并开始执行。',
+      );
+    }
+
+    if (rollingSummary.trim().isNotEmpty) {
+      parts.add(
+        '【历史任务摘要】\n${rollingSummary.trim()}\n'
+        '（这是本会话早期历史的压缩归档，完整历史仍保存在本地；'
+        '需要查看原文时可用搜索或文件读取找回。）',
       );
     }
 
@@ -2615,7 +2696,10 @@ class ShiyiState extends ChangeNotifier {
   /// 从 DB 重新加载当前会话的 token 统计与上下文估算（聊天页打开时调用）。
   Future<void> refreshTokenStats(String sessionId) async {
     final s = await _db.getSession(sessionId);
-    if (s != null) sessionTotalTokens = s.totalTokens;
+    if (s != null) {
+      sessionTotalTokens = s.totalTokens;
+      sessionLastUsageTokens = s.lastUsageTotalTokens;
+    }
     await _updateContextStats(sessionId);
     notifyListeners();
   }
@@ -2751,9 +2835,10 @@ class ShiyiState extends ChangeNotifier {
     final msgs = _messagesLoadedForSessionId == sessionId
         ? messages
         : await _db.listMessages(sessionId);
+    final sess = await _db.getSession(sessionId);
     var total = 0;
     for (final m in msgs) {
-      if (m.streaming) continue;
+      if (m.streaming || m.archived) continue;
       total += _estimateTokens(m.content);
       if (m.role == 'assistant' && m.hasToolCalls) {
         final tc = m.toApiMap()['tool_calls'];
@@ -2765,27 +2850,30 @@ class ShiyiState extends ChangeNotifier {
         total += 1000 * extractImagePaths(m.content).length;
       }
     }
-    final sys = await _buildSystemPrompt('');
+    final sys = await _buildSystemPrompt(
+      '',
+      rollingSummary: sess?.rollingSummary ?? '',
+    );
     total += _estimateTokens(sys);
     total += _estimateTokens(jsonEncode(activeTools)); // 工具定义开销
     return total;
   }
 
-  /// 手动压缩会话历史：把早期 60% 的消息总结成摘要并替换，
-  /// 保留最近 40% 的完整消息。返回是否压缩成功。
-  Future<bool> compressSession(String sessionId) async {
-    if (settings.apiKey.isEmpty || settings.model.isEmpty) return false;
+  /// 手动压缩会话历史：按 Token 预算把早期消息归档为滚动摘要。
+  /// 完整原文保留在本地数据库，只从请求与上下文统计中排除。
+  Future<({bool ok, int archived, int beforeTokens, int afterTokens})>
+  compressSession(String sessionId) async {
+    final fail = (ok: false, archived: 0, beforeTokens: 0, afterTokens: 0);
+    if (settings.apiKey.isEmpty || settings.model.isEmpty) return fail;
     final msgs = await _db.listMessages(sessionId);
-    final keep = msgs.where((m) => !m.streaming).toList();
-    if (keep.length < 6) return false;
-    final compressCount = (keep.length * 0.6).floor();
-    if (compressCount < 3) return false;
-    final toCompress = keep.sublist(0, compressCount);
-    final transcript = toCompress
-        .where((m) => m.role != 'tool')
-        .map((m) => '${m.role}: ${stripImageMarkers(m.content)}')
-        .join('\n');
-    if (transcript.trim().isEmpty) return false;
+    final keep = msgs.where((m) => !m.streaming && !m.archived).toList();
+    if (keep.length < 6) return fail;
+    final beforeTokens = await activeContextTokenEstimate(sessionId);
+    final keepStart = _compressionKeepStart(keep);
+    final toCompress = keep.sublist(0, keepStart);
+    if (toCompress.length < 3) return fail;
+    final transcript = _buildCompressionTranscript(toCompress);
+    if (transcript.trim().isEmpty) return fail;
     final limited = transcript.length <= 12000
         ? transcript
         : transcript.substring(transcript.length - 12000);
@@ -2808,28 +2896,130 @@ class ShiyiState extends ChangeNotifier {
       {'role': 'user', 'content': limited},
     ], temperature: 0.2);
     final clean = summary.trim();
-    if (clean.isEmpty || clean == '【无】') return false;
+    if (clean.isEmpty || clean == '【无】') return fail;
 
-    // 删除被压缩的旧消息，在最前插入摘要消息。
-    await _db.deleteMessagesByIds(toCompress.map((m) => m.id).toList());
-    final summaryMsg = ChatMessage(
-      id: 'm${DateTime.now().millisecondsSinceEpoch}_${_rand()}',
-      sessionId: sessionId,
-      role: 'user',
-      content: '【历史会话摘要】\n$clean',
-      createdAt: toCompress.first.createdAt,
-    );
-    await _db.insertMessage(summaryMsg);
+    // 归档旧消息并把新摘要合并进会话滚动摘要；不删除原文、不插入假用户消息。
+    final sess = await _db.getSession(sessionId);
+    final previous = sess?.rollingSummary.trim() ?? '';
+    final merged = [if (previous.isNotEmpty) previous, clean].join('\n\n');
+    final rolling = merged.length <= 1600
+        ? merged
+        : merged.substring(merged.length - 1600);
+    await _db.updateSessionRollingSummary(sessionId, rolling);
+    await _db.markMessagesArchived(toCompress.map((m) => m.id).toList());
+    // 旧的真实 usage 不再代表归档后的 payload，回退到本地估算。
+    await _db.updateSessionLastUsage(sessionId, null);
+    sessionLastUsageTokens = null;
     messages = await _db.listMessages(sessionId);
     _bumpMessages();
+    final afterTokens = await activeContextTokenEstimate(sessionId);
     await _updateContextStats(sessionId);
     notifyListeners();
-    return true;
+    return (
+      ok: true,
+      archived: toCompress.length,
+      beforeTokens: beforeTokens,
+      afterTokens: afterTokens,
+    );
+  }
+
+  /// 选压缩边界：优先按 Token 预算从最新往回保留，至少归档早期 60% 条数。
+  /// 工具轮按「assistant tool_calls + 连续 tool 结果」成组归档，不拆散配对。
+  int _compressionKeepStart(List<ChatMessage> keep) {
+    return compressionKeepStart(keep, contextLimit: settings.contextLimit);
+  }
+
+  /// 纯函数版压缩边界：供自动/手动压缩与测试共用。
+  static int compressionKeepStart(
+    List<ChatMessage> keep, {
+    required int contextLimit,
+  }) {
+    final n = keep.length;
+    final minKeepStart = (n * 0.6).floor();
+    final target = contextLimit <= 0 ? 0 : (contextLimit * 0.60).round();
+    var keepStart = n;
+    var hitTarget = false;
+    if (target > 0) {
+      final units = <(int, int)>[];
+      var i = 0;
+      while (i < n) {
+        final m = keep[i];
+        if (m.role == 'assistant' && m.hasToolCalls) {
+          var j = i + 1;
+          while (j < n && keep[j].role == 'tool') {
+            j++;
+          }
+          units.add((i, j - 1));
+          i = j;
+        } else {
+          units.add((i, i));
+          i++;
+        }
+      }
+      var keptTokens = 0;
+      for (final u in units.reversed) {
+        var size = 0;
+        for (var k = u.$1; k <= u.$2; k++) {
+          size += estimateChatMessageTokens(keep[k]);
+        }
+        if (keptTokens + size >= target) {
+          keepStart = u.$1;
+          hitTarget = true;
+          break;
+        }
+        keptTokens += size;
+      }
+      if (hitTarget) {
+        // 预算要求归档更多时按 Token 边界走；否则至少归档早期 60%。
+        if (keepStart < minKeepStart) keepStart = minKeepStart;
+      } else {
+        keepStart = minKeepStart;
+      }
+    } else {
+      keepStart = minKeepStart;
+    }
+    return keepStart > n ? n : keepStart;
+  }
+
+  /// 把待归档消息转成摘要输入：完整工具轮压缩成结构化一行，正文直接保留。
+  static String _buildCompressionTranscript(List<ChatMessage> toCompress) {
+    final segments = _planToolSegments(toCompress);
+    final segByAssistant = {for (final s in segments) s.assistantIndex: s};
+    final skipTool = <int>{
+      for (final s in segments)
+        if (s.complete) ...s.toolIndices,
+    };
+    final lines = <String>[];
+    for (var i = 0; i < toCompress.length; i++) {
+      final m = toCompress[i];
+      if (m.role == 'tool') {
+        if (!skipTool.contains(i)) {
+          lines.add('tool: ${_summarizeOutput(m.content)}');
+        }
+        continue;
+      }
+      final seg = segByAssistant[i];
+      if (seg != null && seg.complete) {
+        final tools = [for (final t in seg.toolIndices) toCompress[t]];
+        lines.add(_summarizeToolSegment(m, tools));
+        continue;
+      }
+      final text = stripImageMarkers(m.content).trim();
+      if (text.isNotEmpty) {
+        lines.add('${m.role}: $text');
+      } else if (m.role == 'assistant' && m.hasToolCalls) {
+        final calls = m.toolCalls
+            .map((tc) => '${tc.name}(${_summarizeArgs(tc.name, tc.arguments)})')
+            .join(', ');
+        lines.add('assistant(tool_calls): $calls');
+      }
+    }
+    return lines.join('\n');
   }
 
   /// 自动压缩：发送消息前检查上下文是否超过压缩阈值。
   Future<void> _maybeAutoCompress(String sessionId) async {
-    final tokens = await sessionContextTokenEstimate(sessionId);
+    final tokens = await activeContextTokenEstimate(sessionId);
     if (shouldAutoCompress(
       autoCompress: settings.autoCompress,
       tokens: tokens,
