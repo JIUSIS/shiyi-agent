@@ -501,9 +501,9 @@
 - **修复**：
   1. `_MacSidebar` 顶部按钮改为“新项目”，主页空状态按钮改为“新建项目”；新增 `lib/screens/project_actions.dart` 统一提供“新建项目（输入名称 + 选择文件夹） / 设置项目目录 / 重命名 / 删除”操作，主页、项目管理页共用。
   2. `ShiyiState.newSession` 增加 `projectId` 参数；主页项目横幅左滑“新建”在当前项目下创建会话，创建后自动展开该项目分组并进入聊天页；未分类横幅保留“新建”入口。
-  3. `_SwipeActions` 支持自定义 `actionWidth`，项目横幅用 176dp 容纳 4 个胶囊按钮（新建 / 文件夹 / 重命名 / 删除），样式与会话左滑一致。
+  3. `_SwipeActions` 支持自定义 `actionWidth`，项目横幅用 220dp 容纳 4 个胶囊按钮（新建 / 文件夹 / 重命名 / 删除），样式与会话左滑一致。
   4. 主页项目分组改为显示所有项目（含空项目）；分组内会话卡片统一加 8dp 底部间距，项目横幅与会话之间也保持独立间距。
-- **涉及**：`lib/core/app_state.dart`、`lib/screens/home_screen.dart`、`lib/screens/projects_screen.dart`、`lib/screens/project_actions.dart`（新增）、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`。
+- **涉及**：`lib/core/app_state.dart`、`lib/screens/home_screen.dart`、`lib/screens/projects_screen.dart`、`lib/screens/project_actions.dart`（新增）、`CHANGELOG.md`、`README.md`；版本号升为 `1.1.8+12`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留（设备处于锁屏，未做界面截图验证）。
 
 ### 62. 侧边栏精简 + 项目横幅四操作 + 左滑跟手优化
@@ -513,12 +513,17 @@
   1. 侧边栏 `_items` 移除“项目”导航，tab 索引恢复为 会话 / 记忆 / 技能 / 文件 / 设置 / 日志；项目操作全部集中到主页项目横幅左滑。
   2. 项目横幅左滑按钮补全为“新建会话 / 项目文件夹 / 重命名 / 删除”，操作区加宽到 220dp；未分类横幅保留“新建会话”入口。
   3. `_SwipeActionsState` 改用 `AnimationController` 驱动：拖动中零延迟直接位移，重新拖动立即接管当前视觉位置，不再从吸附目标跳变；松手后 200ms `easeOutCubic` 平滑吸附；展开判定阈值从 50% 降到 35%，已展开时只有快速右滑才收回。
-- **涉及**：`lib/screens/home_screen.dart`、`CHANGELOG.md`、`README.md`；版本号保持 `1.1.7+11`。
+- **涉及**：`lib/screens/home_screen.dart`、`CHANGELOG.md`、`README.md`；版本号升为 `1.1.8+12`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留。
 
 ### 63. 左滑后点击空白收回
 - **现象**：左滑展开项目 / 会话操作区后，点击列表空白或其他卡片，展开的操作区不会自动收回，只能点已展开卡片本身或再滑一次。
 - **根因**：每个 `_SwipeActions` 只管理自己的 `_offset`，没有共享“当前展开卡片”的状态，外部点击没有入口触发收回。
 - **修复**：主页会话 tab 增加 `_openSwipeKey`（`ValueNotifier<String?>`），所有项目横幅与会话卡片左滑时共享展开状态；点击列表空白统一清空状态，所有已展开卡片平滑收回；拖动其他卡片或点击已展开内容也会自动收回当前操作区。
-- **涉及**：`lib/screens/home_screen.dart`、`CHANGELOG.md`；版本号保持 `1.1.7+11`。
+- **涉及**：`lib/screens/home_screen.dart`、`CHANGELOG.md`；版本号升为 `1.1.8+12`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留。
+
+### 64. 发布 1.1.8
+- **内容**：汇总 61~63 的项目分类、项目级工作目录、新建项目优先入口、项目横幅四操作、侧边栏精简、会话列表即时刷新、左滑跟手与点空白收回，作为正式版本发布。
+- **涉及**：`pubspec.yaml`（1.1.8+12）、`android/app/build.gradle.kts`（versionCode 12 / versionName 1.1.8）、`CHANGELOG.md`、`README.md`、`docs/fix-log.md`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留；推送 GitHub 源码并创建 `v1.1.8` Release。
