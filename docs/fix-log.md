@@ -446,3 +446,4 @@
   7. 版本提升为 `1.1.5+9`（pubspec / gradle / about / README）。
 - **涉及**：`lib/core/app_state.dart`、`test/context_budget_test.dart`、`pubspec.yaml`、`android/app/build.gradle.kts`、`lib/screens/about_screen.dart`、`README.md`、`CHANGELOG.md`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 50 项全部通过（新增 128K/33K 不裁剪、100K 不裁剪、未超预算不裁剪、超预算裁剪到合法预算、工具定义占用预算、请求级 Token 估算、多轮工具与图片回归用例）。
+- **真机验证**：`af3700b1` 用 `adb install -r` 覆盖安装 `1.1.5+9`，数据库原样保留；实测 `TrimBudget`：`contextLimit=128000 token, systemTokens=2095, toolDefinitionTokens=2538, historyTokens=17388, currentInputTokens=2, imageTokens=2000, outputReserve=8192, safetyReserve=2560, totalEstimatedTokens=24023, trimTriggerTokens=117248, trimTargetTokens=117248, shouldTrim=false`。
