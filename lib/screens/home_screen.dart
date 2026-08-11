@@ -719,28 +719,40 @@ class _SessionsTabState extends State<_SessionsTab> {
                   label: '新建会话',
                   backgroundColor: theme.colorScheme.primaryContainer,
                   foregroundColor: theme.colorScheme.onPrimaryContainer,
-                  onTap: () => _openNewSessionInProject(p.id),
+                  onTap: () async {
+                    await _openNewSessionInProject(p.id);
+                    _openSwipeKey.value = null;
+                  },
                 ),
                 _SlidablePillAction(
                   icon: Icons.folder_open_outlined,
                   label: '项目文件夹',
                   backgroundColor: theme.colorScheme.secondaryContainer,
                   foregroundColor: theme.colorScheme.onSecondaryContainer,
-                  onTap: () => showProjectFolderSheet(context, shiyi, p),
+                  onTap: () async {
+                    await showProjectFolderSheet(context, shiyi, p);
+                    _openSwipeKey.value = null;
+                  },
                 ),
                 _SlidablePillAction(
                   icon: Icons.edit_outlined,
                   label: '重命名',
                   backgroundColor: theme.colorScheme.secondaryContainer,
                   foregroundColor: theme.colorScheme.onSecondaryContainer,
-                  onTap: () => renameProjectDialog(context, shiyi, p),
+                  onTap: () async {
+                    await renameProjectDialog(context, shiyi, p);
+                    _openSwipeKey.value = null;
+                  },
                 ),
                 _SlidablePillAction(
                   icon: Icons.delete_outline,
                   label: '删除',
                   backgroundColor: theme.colorScheme.error,
                   foregroundColor: theme.colorScheme.onError,
-                  onTap: () => deleteProjectDialog(context, shiyi, p),
+                  onTap: () async {
+                    await deleteProjectDialog(context, shiyi, p);
+                    _openSwipeKey.value = null;
+                  },
                 ),
               ],
               child: _ProjectHeader(
@@ -786,7 +798,10 @@ class _SessionsTabState extends State<_SessionsTab> {
                   label: '新建会话',
                   backgroundColor: theme.colorScheme.primaryContainer,
                   foregroundColor: theme.colorScheme.onPrimaryContainer,
-                  onTap: () => _openNewSessionInProject(''),
+                  onTap: () async {
+                    await _openNewSessionInProject('');
+                    _openSwipeKey.value = null;
+                  },
                 ),
               ],
               child: _ProjectHeader(
@@ -1032,6 +1047,7 @@ class _SessionTile extends StatelessWidget {
           foregroundColor: theme.colorScheme.onSecondaryContainer,
           onTap: () async {
             await _rename(context, shiyi, s);
+            openSwipeKey?.value = null;
           },
         ),
         _SlidablePillAction(
@@ -1041,6 +1057,7 @@ class _SessionTile extends StatelessWidget {
           foregroundColor: theme.colorScheme.onSecondaryContainer,
           onTap: () async {
             await _pickProject(context, shiyi, s);
+            openSwipeKey?.value = null;
           },
         ),
         _SlidablePillAction(
@@ -1073,6 +1090,7 @@ class _SessionTile extends StatelessWidget {
               ),
             );
             if (ok == true) await shiyi.deleteSession(s.id);
+            openSwipeKey?.value = null;
           },
         ),
       ],

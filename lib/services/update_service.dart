@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../widgets/markdown_text.dart';
@@ -14,13 +15,30 @@ enum UpdateCheckStatus { failed, upToDate, updateAvailable }
 class UpdateService {
   UpdateService._();
 
-  static const String appVersion = '1.1.7';
+  /// 读取 PackageInfo 失败时的兜底版本；正常情况以包内真实版本为准。
+  static const String appVersion = '1.1.8';
   static const String repoUrl = 'https://github.com/JIUSIS/shiyi-agent';
   static const String apiReleaseUrl =
       'https://api.github.com/repos/JIUSIS/shiyi-agent/releases/latest';
 
   /// 本次启动里用户点过「稍后」后，自动检查不再重复弹窗。
   static bool _autoCheckDismissed = false;
+
+  static String? _cachedVersion;
+
+  /// 当前 App 真实版本：优先 PackageInfo，读取失败时回退到常量。
+  static Future<String> currentVersion() async {
+    final cached = _cachedVersion;
+    if (cached != null) return cached;
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (info.version.trim().isNotEmpty) {
+        _cachedVersion = info.version.trim();
+        return _cachedVersion!;
+      }
+    } catch (_) {}
+    return appVersion;
+  }
 
   /// 数字分段比较版本号：a > b 返回 1，相等 0，a < b 返回 -1。
   static int compareVersion(String a, String b) {
@@ -99,15 +117,16 @@ class UpdateService {
     if (latest == null) {
       return (status: UpdateCheckStatus.failed, tag: '', notes: '');
     }
+    final localVer = await currentVersion();
     final remoteVer = latest.tag.replaceFirst(RegExp('^v'), '');
-    if (compareVersion(remoteVer, appVersion) > 0) {
+    if (compareVersion(remoteVer, localVer) > 0) {
       return (
         status: UpdateCheckStatus.updateAvailable,
         tag: remoteVer,
         notes: latest.notes,
       );
     }
-    return (status: UpdateCheckStatus.upToDate, tag: appVersion, notes: '');
+    return (status: UpdateCheckStatus.upToDate, tag: localVer, notes: '');
   }
 
   /// 启动自动检查：只有发现新版本才提示；点「稍后」本次启动不再弹。
@@ -288,6 +307,17 @@ class UpdateService {
     // 交给系统安装器
     try {
       const channel = MethodChannel('shiyi/skillpack');
+      final verified = await channel.invokeMethod<bool>('verifyApk', {
+        'path': file.path,
+      });
+      if (verified != true) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('APK 签名校验失败，已取消安装')));
+        }
+        return;
+      }
       await channel.invokeMethod('installApk', {'path': file.path});
     } catch (e) {
       if (context.mounted) {

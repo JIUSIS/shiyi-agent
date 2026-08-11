@@ -29,6 +29,18 @@ const _features = <(IconData, String)>[
 
 class _AboutScreenState extends State<AboutScreen> {
   bool _checking = false;
+  String _version = UpdateService.appVersion;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVersion();
+  }
+
+  Future<void> _loadVersion() async {
+    final v = await UpdateService.currentVersion();
+    if (mounted) setState(() => _version = v);
+  }
 
   Future<void> _checkUpdate() async {
     if (_checking) return;
@@ -43,7 +55,7 @@ class _AboutScreenState extends State<AboutScreen> {
           UpdateService.showPlainDialog(
             context,
             '当前已是最新版本',
-            'v${UpdateService.appVersion} 已经是最新版本。',
+            'v$_version 已经是最新版本。',
           );
         case UpdateCheckStatus.failed:
           UpdateService.showPlainDialog(
@@ -96,7 +108,7 @@ class _AboutScreenState extends State<AboutScreen> {
                         ),
                       ),
                       child: Text(
-                        'v${UpdateService.appVersion}',
+                        'v$_version',
                         style: theme.textTheme.labelSmall!.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),

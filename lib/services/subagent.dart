@@ -310,7 +310,8 @@ class SubagentRunner {
     try {
       await client.send(msgs);
     } catch (e) {
-      return TurnResult(text: '（子代理请求失败: $e）');
+      // 请求失败必须让上层看到异常，不能伪装成“成功生成”的最终报告。
+      throw LlmException('子代理请求失败: $e');
     }
     if (client.lastTotalTokens != null && client.lastTotalTokens! > 0) {
       totalTokens += client.lastTotalTokens!;

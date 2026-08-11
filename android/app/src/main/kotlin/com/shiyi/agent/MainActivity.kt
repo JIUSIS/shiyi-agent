@@ -1,6 +1,7 @@
 package com.shiyi.agent
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -90,6 +91,11 @@ class MainActivity : FlutterActivity() {
                                 ?: throw IllegalArgumentException("destDir missing")
                             result.success(extractTermux(assetPath, destDir))
                         }
+                        "verifyApk" -> {
+                            val path = call.argument<String>("path")
+                                ?: throw IllegalArgumentException("path missing")
+                            result.success(verifyApk(path))
+                        }
                         "installApk" -> {
                             val path = call.argument<String>("path")
                                 ?: throw IllegalArgumentException("path missing")
@@ -108,6 +114,9 @@ class MainActivity : FlutterActivity() {
     private fun installApk(path: String) {
         val apk = File(path)
         if (!apk.exists()) throw IllegalStateException("APK 不存在: $path")
+        if (!verifyApk(path)) {
+            throw SecurityException("APK 签名校验失败，已取消安装")
+        }
         val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
@@ -115,6 +124,25 @@ class MainActivity : FlutterActivity() {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         startActivity(intent)
+    }
+
+    /** 校验下载 APK 与当前已安装应用签名一致，防止镜像源篡改包。 */
+    private fun verifyApk(path: String): Boolean {
+        return try {
+            val pm = packageManager
+            val current = pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+                ?: return false
+            val candidate = pm.getPackageArchiveInfo(path, PackageManager.GET_SIGNATURES)
+                ?: return false
+            val cur = current.signatures ?: return false
+            val cand = candidate.signatures ?: return false
+            if (cur.isEmpty() || cur.size != cand.size) return false
+            cur.indices.all { i ->
+                cur[i].toByteArray().contentEquals(cand[i].toByteArray())
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /** 流式解压 zip 到目标目录，返回条目清单 [{path, size}]，全程不把压缩包读进内存。 */

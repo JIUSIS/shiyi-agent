@@ -36,6 +36,17 @@ class SkillPack {
 class SkillPackIO {
   static const MethodChannel _channel = MethodChannel('shiyi/skillpack');
 
+  /// 只允许安全的正斜杠相对路径：拒绝空路径、绝对路径、盘符、`.`/`..` 与反斜杠。
+  static bool isSafeRelativeEntry(String path) {
+    final p = path.trim();
+    if (p.isEmpty || p.startsWith('/') || p.startsWith('\\')) return false;
+    if (RegExp(r'^[A-Za-z]:').hasMatch(p)) return false;
+    if (p.contains('\\')) return false;
+    final parts = p.split('/');
+    if (parts.any((s) => s.isEmpty || s == '.' || s == '..')) return false;
+    return true;
+  }
+
   /// 文本小文件大小上限。
   static const int _maxTextFile = 256 * 1024;
 
@@ -75,7 +86,7 @@ class SkillPackIO {
     for (final e in rawEntries) {
       final path = e['path']?.toString() ?? '';
       final size = int.tryParse('${e['size']}') ?? 0;
-      if (path.isNotEmpty) fileMap[path] = size;
+      if (isSafeRelativeEntry(path)) fileMap[path] = size;
     }
     if (fileMap.isEmpty) throw const FormatException('压缩包里没有文件');
 
@@ -153,7 +164,7 @@ class SkillPackIO {
     for (final k in fileMap.keys) {
       if (k == mdKey || rel(k).toLowerCase() == 'description.md') continue;
       final r = rel(k);
-      if (r.isEmpty) continue;
+      if (!isSafeRelativeEntry(r)) continue;
       final size = fileMap[k]!;
       if (size <= _maxTextFile && _isTextPath(r)) {
         final text = _readText(File('$destDir/$r'));
@@ -201,6 +212,16 @@ class SkillPackIO {
     );
     tmp.createSync(recursive: true);
     try {
+      for (final key in skill.files.keys) {
+        if (!isSafeRelativeEntry(key)) {
+          throw FormatException('技能辅助文件路径不合法: $key');
+        }
+      }
+      for (final key in skill.largeFiles.keys) {
+        if (!isSafeRelativeEntry(key)) {
+          throw FormatException('技能大文件路径不合法: $key');
+        }
+      }
       File('${tmp.path}/SKILL.md').writeAsStringSync(skill.content);
       if (skill.description.isNotEmpty) {
         File('${tmp.path}/description.md').writeAsStringSync(skill.description);
@@ -308,7 +329,3 @@ class SkillPackIO {
     return m == null ? t : t.substring(m.end);
   }
 }
-
-
-
-

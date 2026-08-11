@@ -527,3 +527,17 @@
 - **内容**：汇总 61~63 的项目分类、项目级工作目录、新建项目优先入口、项目横幅四操作、侧边栏精简、会话列表即时刷新、左滑跟手与点空白收回，作为正式版本发布。
 - **涉及**：`pubspec.yaml`（1.1.8+12）、`android/app/build.gradle.kts`（versionCode 12 / versionName 1.1.8）、`CHANGELOG.md`、`README.md`、`docs/fix-log.md`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 78 项全部通过；release 真机覆盖安装（`adb install -r`）通过，设备 `f29c6ad8` 的 `firstInstallTime` 未变化，数据保留；推送 GitHub 源码并创建 `v1.1.8` Release。
+
+### 65. 全量代码审查后的安全与健壮性修复（替换 v1.1.8）
+- **现象**：审查发现版本号写死 `1.1.7`、API Key 明文存 SharedPreferences、更新包未校验签名、技能包路径穿越风险、硬裁剪后状态栏仍显示全量、子代理失败被当成功文本、左滑动作执行后不收、技能列表运行时静默删除超大行。
+- **修复**：
+  1. 版本检查改用 `package_info_plus` 读取包内真实版本，`appVersion` 只作读取失败兜底；关于页 / 设置页 / 更新提示统一显示真实版本。
+  2. 主密钥、视觉密钥、API 配置密钥迁入 `flutter_secure_storage`（Android Keystore 加密），SharedPreferences 不再保存明文；旧明文首次加载自动迁移并删除。
+  3. 更新 APK 增加签名一致性校验：原生层比对下载 APK 与当前安装包签名，不一致直接取消安装；`installApk` 入口二次校验。
+  4. `SkillPackIO` 新增 `isSafeRelativeEntry`，导入 / 导出 / `create_skill` 统一拒绝 `..`、绝对路径、反斜杠、盘符等不安全路径。
+  5. 硬裁剪后 `sessionContextTokens` 改为估算实际发送 payload，不再显示裁剪前全量。
+  6. 子代理 `_round` 请求异常改为抛 `LlmException`，由 `_execSpawnAgent` 统一标记“（子代理异常）”。
+  7. 项目 / 会话左滑操作执行完统一清空 `_openSwipeKey`，操作区自动收回。
+  8. `listSkills` 运行时只筛出可安全加载的行，超大行不再被静默删除；Session / Project 数字字段改 `tryParse` 兜底。
+- **涉及**：`lib/services/update_service.dart`、`lib/screens/about_screen.dart`、`lib/screens/settings_screen.dart`、`pubspec.yaml`（新增 package_info_plus / flutter_secure_storage）、`lib/services/settings_service.dart`、`android/app/src/main/kotlin/com/shiyi/agent/MainActivity.kt`、`lib/services/skill_pack.dart`、`lib/core/app_state.dart`、`lib/services/subagent.dart`、`lib/screens/home_screen.dart`、`lib/services/db.dart`、`lib/core/models.dart`、`test/skill_pack_test.dart`；版本号保持 `1.1.8+12`，直接替换 GitHub `v1.1.8` Release APK。
+- **验证**：`flutter analyze` 无告警；`flutter test` 81 项全部通过（新增技能路径安全回归 3 项）；`flutter build apk --debug` 与 release 构建通过。

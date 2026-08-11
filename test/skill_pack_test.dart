@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/services/skill_pack.dart';
 
 void main() {
@@ -30,6 +31,55 @@ void main() {
   tearDown(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
+  });
+
+  test('相对路径校验拒绝目录穿越与绝对路径', () {
+    expect(SkillPackIO.isSafeRelativeEntry('a/b.md'), isTrue);
+    expect(SkillPackIO.isSafeRelativeEntry('../evil.md'), isFalse);
+    expect(SkillPackIO.isSafeRelativeEntry('/abs.md'), isFalse);
+    expect(SkillPackIO.isSafeRelativeEntry(r'a\..\evil.md'), isFalse);
+    expect(SkillPackIO.isSafeRelativeEntry('a/./b.md'), isFalse);
+    expect(SkillPackIO.isSafeRelativeEntry(''), isFalse);
+  });
+
+  test('导入时跳过目录穿越条目', () async {
+    final tmp = Directory.systemTemp.createTempSync('skillpack_traversal_');
+    addTearDown(() => tmp.deleteSync(recursive: true));
+
+    mockExtract([
+      {'path': '../evil.md', 'size': 10, 'content': '恶意文件'},
+      {
+        'path': 'skill/SKILL.md',
+        'size': 200,
+        'content': '---\nname: 安全技能\n---\n# 正文',
+      },
+    ]);
+
+    final pack = await SkillPackIO.importZip(
+      zipPath: '${tmp.path}/fake.zip',
+      destDir: '${tmp.path}/dest',
+    );
+
+    expect(pack.name, '安全技能');
+    expect(pack.files.containsKey('../evil.md'), isFalse);
+  });
+
+  test('导出时拒绝不合法辅助文件路径', () async {
+    final tmp = Directory.systemTemp.createTempSync('skillpack_safe_');
+    addTearDown(() => tmp.deleteSync(recursive: true));
+
+    final skill = Skill(
+      id: 1,
+      name: 'x',
+      description: '',
+      content: '# x',
+      createdAt: 1,
+      files: {'../evil.md': 'x'},
+    );
+    await expectLater(
+      SkillPackIO.exportZip(skill: skill, zipPath: '${tmp.path}/out.zip'),
+      throwsA(isA<FormatException>()),
+    );
   });
 
   test('大技能包：文本文件总量超预算时降级为大文件，files 列保持受控', () async {
@@ -134,4 +184,3 @@ void main() {
     expect(pack.largeFiles, isEmpty);
   });
 }
-

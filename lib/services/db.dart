@@ -657,8 +657,17 @@ class AppDatabase {
 
   Future<List<Skill>> listSkills() async {
     final db = await this.db;
-    await _pruneOversizedSkills(db);
-    final rows = await db.query('skills', orderBy: 'created_at DESC');
+    // 运行时只筛出能安全读取的行，不再静默删除：超大行留在库里，
+    // 由迁移期清理处理，避免把“导入超大技能”误当成删除理由。
+    final rows = await db.query(
+      'skills',
+      where:
+          'length(content) <= 800000 AND '
+          'length(description) <= 800000 AND '
+          'length(files) <= 800000 AND '
+          'length(large_files) <= 800000',
+      orderBy: 'created_at DESC',
+    );
     return rows.map(Skill.fromMap).toList();
   }
 

@@ -10,6 +10,7 @@ import '../services/db.dart';
 import '../services/llm_client.dart';
 import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
+import '../services/skill_pack.dart';
 import '../services/subagent.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
@@ -816,8 +817,7 @@ class ShiyiState extends ChangeNotifier {
   /// - 完整工具回合按「assistant tool_calls + 对应 tool 结果」成组保留；
   /// - compactOldTools=true 时只保留最近 3 个完整工具回合，更早的压缩成摘要；
   /// - 不完整或已摘要的工具消息不会单独混入，避免非法序列。
-  Future<({List<Map<String, dynamic>> messages, String toolSummary})>
-  _historyToApi(
+  Future<List<Map<String, dynamic>>> _historyToApi(
     List<ChatMessage> msgs, {
     bool imagesAllowed = true,
     bool compactOldTools = false,
@@ -832,15 +832,11 @@ class ShiyiState extends ChangeNotifier {
     final keepAssistant = <int>{};
     final keepTool = <int>{};
     final skip = <int>{};
-    final summaryLines = <String>[];
     for (final seg in segments) {
       if (seg.complete && keepFull.contains(seg)) {
         keepAssistant.add(seg.assistantIndex);
         keepTool.addAll(seg.toolIndices);
       } else if (seg.complete) {
-        final tools = [for (final i in seg.toolIndices) active[i]];
-        final line = _summarizeToolSegment(active[seg.assistantIndex], tools);
-        if (line.trim().isNotEmpty) summaryLines.add(line);
         skip.add(seg.assistantIndex);
         skip.addAll(seg.toolIndices);
       } else {
@@ -900,7 +896,7 @@ class ShiyiState extends ChangeNotifier {
       }
       out.add(m.toApiMap());
     }
-    return (messages: out, toolSummary: summaryLines.join('\n'));
+    return out;
   }
 
   /// 扫描历史里的工具回合：assistant tool_calls 后紧跟的 tool 结果按 id 成组。
@@ -1557,14 +1553,18 @@ class ShiyiState extends ChangeNotifier {
         );
         final loopMsgs = <Map<String, dynamic>>[
           {'role': 'system', 'content': sysContent},
-          ...historyPayload.messages,
+          ...historyPayload,
         ];
         final trimmed = await _trimApiMessages(loopMsgs, logBudget: true);
         // 状态栏、发送前阈值、压缩判断统一走 activeContextTokenEstimate：
         // 有真实 usage 时用「上次真实 total + 新增消息」，没有时才全量估算。
         final active = await activeContextTokenEstimate(sessionId);
         sessionContextTokensFull = active;
-        sessionContextTokens = active;
+        // 硬裁剪后状态栏显示实际发送 payload，不再用裁剪前的全量估算。
+        sessionContextTokens = estimateRequestTokens(
+          trimmed,
+          tools: activeTools,
+        ).totalEstimatedTokens;
         notifyListeners();
         await _runAgentLoop(sessionId, firstAsst, trimmed);
         completed = true;
@@ -2551,7 +2551,9 @@ class ShiyiState extends ChangeNotifier {
     final filesMap = <String, String>{};
     if (filesArg is Map) {
       for (final e in filesArg.entries) {
-        filesMap[e.key.toString()] = e.value.toString();
+        final key = e.key.toString();
+        if (!SkillPackIO.isSafeRelativeEntry(key)) continue;
+        filesMap[key] = e.value.toString();
       }
     }
     try {

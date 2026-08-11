@@ -1068,10 +1068,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 20),
                 Center(
-                  child: Text(
-                    '拾忆 v${UpdateService.appVersion} · Flutter 原生',
-                    style: theme.textTheme.bodySmall!.copyWith(
-                      color: theme.hintColor,
+                  child: FutureBuilder<String>(
+                    future: UpdateService.currentVersion(),
+                    builder: (context, snap) => Text(
+                      '拾忆 v${snap.data ?? UpdateService.appVersion} · Flutter 原生',
+                      style: theme.textTheme.bodySmall!.copyWith(
+                        color: theme.hintColor,
+                      ),
                     ),
                   ),
                 ),

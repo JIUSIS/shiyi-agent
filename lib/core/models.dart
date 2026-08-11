@@ -103,14 +103,14 @@ class Session {
     updatedAt: m['updated_at'],
     messageCount: m['message_count'] == null
         ? 0
-        : int.parse('${m['message_count']}'),
+        : int.tryParse('${m['message_count']}') ?? 0,
     totalTokens: m['total_tokens'] == null
         ? 0
-        : int.parse('${m['total_tokens']}'),
+        : int.tryParse('${m['total_tokens']}') ?? 0,
     projectId: m['project_id'] == null ? '' : '${m['project_id']}',
     lastUsageTotalTokens: m['last_usage_total_tokens'] == null
         ? null
-        : int.parse('${m['last_usage_total_tokens']}'),
+        : int.tryParse('${m['last_usage_total_tokens']}'),
     rollingSummary: m['rolling_summary'] == null
         ? ''
         : '${m['rolling_summary']}',
@@ -149,7 +149,7 @@ class Project {
     createdAt: m['created_at'],
     sessionCount: m['session_count'] == null
         ? 0
-        : int.parse('${m['session_count']}'),
+        : int.tryParse('${m['session_count']}') ?? 0,
     workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
   );
 }
