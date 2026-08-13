@@ -253,45 +253,51 @@ class UpdateService {
     );
 
     var ok = false;
-    for (final base in ['', ...mirrors]) {
-      if (cancelled) break;
-      final url = '$base$direct';
-      try {
-        final req = http.Request('GET', Uri.parse(url));
-        final res = await http.Client()
-            .send(req)
-            .timeout(const Duration(seconds: 15));
-        if (res.statusCode != 200) continue;
-        final total = res.contentLength ?? 0;
-        final sink = file.openWrite();
-        var received = 0;
-        var lastChunk = DateTime.now();
-        var slow = false;
+    // 复用同一个 client（每个下载源都新建会泄漏连接/FD），用完关闭。
+    final client = http.Client();
+    try {
+      for (final base in ['', ...mirrors]) {
+        if (cancelled) break;
+        final url = '$base$direct';
         try {
-          await for (final chunk in res.stream) {
-            if (cancelled) break;
-            sink.add(chunk);
-            received += chunk.length;
-            final now = DateTime.now();
-            if (now.difference(lastChunk) > const Duration(seconds: 30)) {
-              slow = true; // 30 秒无进度：判定源太慢，换镜像
-              break;
+          final req = http.Request('GET', Uri.parse(url));
+          final res = await client
+              .send(req)
+              .timeout(const Duration(seconds: 15));
+          if (res.statusCode != 200) continue;
+          final total = res.contentLength ?? 0;
+          final sink = file.openWrite();
+          var received = 0;
+          var lastChunk = DateTime.now();
+          var slow = false;
+          try {
+            await for (final chunk in res.stream) {
+              if (cancelled) break;
+              sink.add(chunk);
+              received += chunk.length;
+              final now = DateTime.now();
+              if (now.difference(lastChunk) > const Duration(seconds: 30)) {
+                slow = true; // 30 秒无进度：判定源太慢，换镜像
+                break;
+              }
+              lastChunk = now;
+              if (total > 0) progress.value = received / total;
             }
-            lastChunk = now;
-            if (total > 0) progress.value = received / total;
+          } finally {
+            await sink.close();
           }
-        } finally {
-          await sink.close();
+          if (slow || received == 0) continue;
+          if (total == 0 || received >= total) {
+            ok = true;
+            progress.value = 1;
+            break;
+          }
+        } catch (_) {
+          continue;
         }
-        if (slow || received == 0) continue;
-        if (total == 0 || received >= total) {
-          ok = true;
-          progress.value = 1;
-          break;
-        }
-      } catch (_) {
-        continue;
       }
+    } finally {
+      client.close();
     }
 
     if (!context.mounted) return;

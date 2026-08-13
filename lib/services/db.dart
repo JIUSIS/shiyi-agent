@@ -13,17 +13,33 @@ class AppDatabase {
 
   Database? _db;
 
-  Future<Database> get db async {
-    if (_db != null) return _db!;
+  /// 首次打开连接的共享 future：并发首次调用只打开一次（见 [db]）。
+  Future<Database>? _opening;
+
+  Future<Database> get db {
+    final existing = _db;
+    if (existing != null) return Future.value(existing);
+    // 缓存首次打开的 future：两个并发调用不会各自 openDatabase（双开会
+    // 竞争写锁并泄漏一个连接）。
+    return _opening ??= _open();
+  }
+
+  Future<Database> _open() async {
     final dir = await getApplicationDocumentsDirectory();
-    _db = await openDatabase(
+    final db = await openDatabase(
       join(dir.path, 'shiyi_agent.db'),
       version: 15,
       onCreate: _createBaseTables,
       onUpgrade: _upgrade,
       onOpen: _repairSchema,
+      onConfigure: (db) async {
+        // WAL 提升并发读写；busy_timeout 让偶发写竞争等待而非立即失败。
+        await db.execute('PRAGMA journal_mode=WAL');
+        await db.execute('PRAGMA busy_timeout=5000');
+      },
     );
-    return _db!;
+    _db = db;
+    return db;
   }
 
   Future<void> _createBaseTables(Database db, int version) async {
@@ -440,20 +456,26 @@ class AppDatabase {
   /// 删除项目但保留会话：项目下会话回到「未分类」。
   Future<void> deleteProject(String id) async {
     final db = await this.db;
-    await db.update(
-      'sessions',
-      {'project_id': null},
-      where: 'project_id = ?',
-      whereArgs: [id],
-    );
-    await db.delete('projects', where: 'id = ?', whereArgs: [id]);
+    // 两步写放同一事务：中途失败不留半删状态。
+    await db.transaction((txn) async {
+      await txn.update(
+        'sessions',
+        {'project_id': null},
+        where: 'project_id = ?',
+        whereArgs: [id],
+      );
+      await txn.delete('projects', where: 'id = ?', whereArgs: [id]);
+    });
   }
 
   Future<void> deleteSession(String id) async {
     final db = await this.db;
-    await db.delete('messages', where: 'session_id = ?', whereArgs: [id]);
-    await db.delete('tool_events', where: 'session_id = ?', whereArgs: [id]);
-    await db.delete('sessions', where: 'id = ?', whereArgs: [id]);
+    // 三步删放同一事务：中途失败不留孤儿 tool_events / 半删会话。
+    await db.transaction((txn) async {
+      await txn.delete('messages', where: 'session_id = ?', whereArgs: [id]);
+      await txn.delete('tool_events', where: 'session_id = ?', whereArgs: [id]);
+      await txn.delete('sessions', where: 'id = ?', whereArgs: [id]);
+    });
   }
 
   /// 按标题或消息内容搜索会话，返回每个会话及一段命中内容片段。
