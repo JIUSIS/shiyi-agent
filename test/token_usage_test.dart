@@ -94,6 +94,7 @@ void main() {
     ChatMessage msg(
       String role, {
       String content = '',
+      String reasoning = '',
       List<ToolCall>? toolCalls,
       bool streaming = false,
       bool archived = false,
@@ -103,6 +104,7 @@ void main() {
       role: role,
       content: content,
       toolCalls: toolCalls,
+      reasoning: reasoning,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       streaming: streaming,
       archived: archived,
@@ -194,6 +196,22 @@ void main() {
       final restored = ChatMessage.fromMap(m.toMap());
       expect(restored.archived, isTrue);
       expect(restored.content, '历史');
+    });
+
+    test('reasoning 计入估算（与发送口径一致，压缩判断不再低估）', () {
+      final m = msg('assistant', content: '正文', reasoning: '思考内容' * 200);
+      // 发送时回传 reasoning_content
+      final api = m.toApiMap();
+      expect(api['reasoning_content'], isNotNull);
+      // 含 reasoning（400 字 ≈ 400 token）后估算应显著大于纯正文
+      final tokens = ShiyiState.estimateChatMessageTokens(m);
+      expect(tokens, greaterThan(300));
+    });
+
+    test('纯正文消息估算不受影响（无 reasoning 时与旧口径一致）', () {
+      final m = msg('assistant', content: '正文');
+      final tokens = ShiyiState.estimateChatMessageTokens(m);
+      expect(tokens, 2);
     });
   });
 }

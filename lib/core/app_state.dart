@@ -565,25 +565,58 @@ class ShiyiState extends ChangeNotifier {
   Future<void> _ensureTermux() async {
     try {
       await TermuxRuntime.ensureInstalled();
-      // 自检：确认 bash 能启动（SELinux exec 是否放行），结果写日志便于诊断。
+      // 自检：确认 shell 能启动（Android 检查 SELinux exec 是否放行，
+      // Windows 按设置探测实际后端 wsl2/pwsh/cmd），结果写日志便于诊断。
       try {
         final shell = await TermuxRuntime.shellPath();
-        final probe = await Process.run(
-          shell,
-          [
-            '-c',
-            'echo probe-ok; '
-                'curl -s -o /dev/null -m 8 -w " net=%{http_code}" '
-                'https://mirrors.tuna.tsinghua.edu.cn/apt/termux-main/dists/stable/InRelease '
-                '|| echo net=fail',
-          ],
-          environment: await TermuxRuntime.environment(),
-        ).timeout(const Duration(seconds: 20));
-        await _logError(
-          'TermuxProbe',
-          'exit=${probe.exitCode} out=${probe.stdout.toString().trim()} '
-              'err=${probe.stderr.toString().trim()}',
-        );
+        if (Platform.isWindows) {
+          final backend = await TermuxRuntime.resolveWindowsBackend(
+            settings.terminalBackend,
+          );
+          final probe = backend == 'wsl2'
+              ? await Process.run(
+                  'wsl.exe',
+                  ['-e', 'bash', '-lc', 'uname -r'],
+                  environment: const {'WSL_UTF8': '1'},
+                ).timeout(const Duration(seconds: 20))
+              : backend == 'cmd'
+                  ? await Process.run(
+                      'cmd',
+                      ['/c', 'echo probe-ok'],
+                    ).timeout(const Duration(seconds: 20))
+                  : await Process.run(
+                      shell,
+                      [
+                        '-NoProfile',
+                        '-NoLogo',
+                        '-Command',
+                        'echo probe-ok; \$PSVersionTable.PSVersion.ToString()',
+                      ],
+                    ).timeout(const Duration(seconds: 20));
+          await _logError(
+            'TermuxProbe',
+            'backend=$backend exit=${probe.exitCode} '
+                'out=${probe.stdout.toString().trim()} '
+                'err=${probe.stderr.toString().trim()}',
+          );
+        } else {
+          final probe = await Process.run(
+            shell,
+            [
+              '-c',
+              'echo probe-ok; '
+                  'curl -s -o /dev/null -m 8 -w " net=%{http_code}" '
+                  'https://mirrors.tuna.tsinghua.edu.cn/apt/termux-main/dists/stable/InRelease '
+                  '|| echo net=fail',
+            ],
+            environment: await TermuxRuntime.environment(),
+          ).timeout(const Duration(seconds: 20));
+          await _logError(
+            'TermuxProbe',
+            'exit=${probe.exitCode} out=${probe.stdout.toString().trim()} '
+                'err=${probe.stderr.toString().trim()}',
+          );
+        }
       } catch (e) {
         await _logError('TermuxProbe', 'EXEC_FAILED: $e');
       }
@@ -1217,9 +1250,13 @@ class ShiyiState extends ChangeNotifier {
     return -1;
   }
 
-  /// 估算单条本地聊天消息的 token（与 API 消息口径一致：含 tool_calls 与图片）。
+  /// 估算单条本地聊天消息的 token（与 API 消息口径一致：含 tool_calls、
+  /// reasoning 与图片——reasoning 随请求回传，漏算会让压缩判断失效）。
   static int estimateChatMessageTokens(ChatMessage m) {
     var total = _estimateTokens(m.content);
+    if (m.role == 'assistant' && m.reasoning.isNotEmpty) {
+      total += _estimateTokens(m.reasoning);
+    }
     if (m.role == 'assistant' && m.hasToolCalls) {
       final tc = m.toApiMap()['tool_calls'];
       if (tc is List && tc.isNotEmpty) {
@@ -2187,8 +2224,22 @@ class ShiyiState extends ChangeNotifier {
     planMode: () => planMode,
     currentWorkspace: currentWorkspace,
     memories: (t) => _db.recentMemoriesWithTerms(_keywords(t), 8),
+    terminalBackend: _actualTerminalBackend,
   );
   PromptBuilder? _promptBuilder;
+
+  /// 实际生效的终端后端（供提示词【平台环境】段落使用）：
+  /// Android 恒为 android；Windows 由设置 + WSL2/pwsh 探测决定。
+  Future<String> _actualTerminalBackend() async {
+    if (!Platform.isWindows) return 'android';
+    try {
+      return await TermuxRuntime.resolveWindowsBackend(
+        settings.terminalBackend,
+      );
+    } catch (_) {
+      return 'pwsh';
+    }
+  }
 
   /// 测试专用：与 [_buildSystemPrompt] 行为完全一致，仅暴露给快照测试
   /// （改动人设/工具规则/注入段落会触发 test/system_prompt_snapshot_test.dart 的 diff）。
@@ -2386,15 +2437,55 @@ class ShiyiState extends ChangeNotifier {
           Directory(cwd).createSync(recursive: true);
         } catch (_) {}
       }
-      // 优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用）；
-      // 其次系统 Termux；都没有则用系统精简 shell。
+      // 平台执行后端：
+      // - Android：优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用），
+      //   其次系统 Termux；都没有则用系统精简 shell；
+      // - Windows：按设置选择 WSL2（Linux 环境）/ pwsh / cmd，
+      //   auto = WSL2 优先 → pwsh → cmd。
       const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
       final embeddedShell = await TermuxRuntime.shellPath();
       final embedded = !isWin && File(embeddedShell).existsSync();
       final systemTermux = !isWin && File(systemTermuxShell).existsSync();
-      final shell = embedded
-          ? embeddedShell
-          : (systemTermux ? systemTermuxShell : (isWin ? 'cmd' : 'sh'));
+      final String shell;
+      final List<String> shellArgs;
+      Map<String, String>? winEnv;
+      var backendWarn = '';
+      if (isWin) {
+        final want = settings.terminalBackend;
+        final backend = await TermuxRuntime.resolveWindowsBackend(want);
+        switch (backend) {
+          case 'wsl2':
+            shell = 'wsl.exe';
+            shellArgs = ['-e', 'bash', '-lc', command];
+            // WSL_UTF8=1：wsl.exe 管道输出默认 UTF-16LE，强制 UTF-8 防乱码。
+            winEnv = const {'WSL_UTF8': '1'};
+            if (want == 'wsl2') {
+              // 显式选了 WSL2：无需告警（探测一致才走到这里）。
+            }
+          case 'cmd':
+            shell = 'cmd';
+            shellArgs = ['/c', command];
+          default:
+            shell = 'pwsh';
+            shellArgs = [
+              '-NoProfile',
+              '-NoLogo',
+              '-NonInteractive',
+              '-Command',
+              command,
+            ];
+        }
+        if (want == 'wsl2' && backend != 'wsl2') {
+          backendWarn = '（你选择了 WSL2，但当前不可用，已回退 $backend）';
+        } else if (want == 'auto' && backend == 'wsl2') {
+          await _logError('Termux', 'run_terminal 使用 WSL2 后端');
+        }
+      } else {
+        shell = embedded
+            ? embeddedShell
+            : (systemTermux ? systemTermuxShell : 'sh');
+        shellArgs = ['-c', command];
+      }
       // 内嵌 Termux：先自检 bash 能否启动，失败时给出可诊断的错误。
       if (embedded) {
         try {
@@ -2424,9 +2515,11 @@ class ShiyiState extends ChangeNotifier {
       // 只是放弃等待，不会终止子进程（bash 会一直挂着、转圈不停、僵尸堆积）。
       final proc = await Process.start(
         shell,
-        shell == 'cmd' ? ['/c', command] : ['-c', command],
+        shellArgs,
         workingDirectory: cwd,
-        environment: embedded ? await TermuxRuntime.environment() : null,
+        environment: embedded
+            ? await TermuxRuntime.environment()
+            : winEnv,
       );
       final stdout = _CappedByteBuffer(256 * 1024);
       final stderr = _CappedByteBuffer(64 * 1024);
@@ -2451,6 +2544,9 @@ class ShiyiState extends ChangeNotifier {
       }
       // 掐头去尾裁剪（原 4000 字符一刀切改为头尾保留，结尾报错/摘要不丢）。
       text = _terminalPruner.prune(text);
+      if (backendWarn.isNotEmpty) {
+        text = text.isEmpty ? backendWarn : '$text\n$backendWarn';
+      }
       if (exitCode == null) {
         return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
             '如需长任务请拆分命令或增加耗时。';
@@ -2834,7 +2930,9 @@ class ShiyiState extends ChangeNotifier {
     return cjk + (other / 4).ceil();
   }
 
-  /// 估算单条 API 消息的 token 数（与发送口径一致：含 tool_calls，不含 reasoning）。
+  /// 估算单条 API 消息的 token 数（与发送口径一致：含 tool_calls 与
+  /// reasoning_content——思考内容随请求回传，体积常比正文还大，漏算会
+  /// 让压缩/裁剪判断严重低估；2026-08-14 真机实测偏差约 5 倍）。
   /// 多模态消息按文本 token + 图片每张 1000 token 估算，不再按整个数组粗暴计 400。
   static int estimateApiMessageTokens(Map<String, dynamic> m) =>
       _textTokensOfMessage(m) + _imageTokensOfMessage(m);
@@ -2852,6 +2950,10 @@ class ShiyiState extends ChangeNotifier {
         }
       }
     }
+    // 思考内容：toApiMap 回传 reasoning_content（thinking 模式网关要求），
+    // 估算必须计入，与发送口径对齐。
+    final r = m['reasoning_content'];
+    if (r is String && r.isNotEmpty) total += _estimateTokens(r);
     final tcs = m['tool_calls'];
     if (tcs is List && tcs.isNotEmpty) {
       total += _estimateTokens(jsonEncode(tcs));
