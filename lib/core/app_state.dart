@@ -2783,6 +2783,10 @@ class ShiyiState extends ChangeNotifier {
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
           toolsJson: _toolsJsonFor(def.allowedTools),
+          // 子代理上下文预算：主会话 contextLimit 的 75%（留出输出与工具定义空间）。
+          contextBudgetTokens: settings.contextLimit > 0
+              ? (settings.contextLimit * 3) ~/ 4
+              : 0,
           // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
           executeTool: (name, argsJson) async {
             if (!def.allowedTools.contains(name)) {
@@ -2823,14 +2827,18 @@ class ShiyiState extends ChangeNotifier {
             notifyListeners();
           },
         );
-        String report;
+        SubagentResult result;
         try {
-          report = await runner.run(def, prompt, maxTurnsOverride: override);
+          result = await runner.run(def, prompt, maxTurnsOverride: override);
         } catch (e) {
-          report = '（子代理异常：$e）';
+          // 兜底：run 之外的意外异常也统一为失败结果，不伪装成功。
+          result = SubagentResult.requestFailed(
+            '$e',
+            totalTokens: runner.totalTokens,
+          );
         }
-        if (runner.totalTokens > 0) subagentTokens += runner.totalTokens;
-        return '### 子代理 ${i + 1}/$total（${def.name}）\n$report';
+        if (result.totalTokens > 0) subagentTokens += result.totalTokens;
+        return '### 子代理 ${i + 1}/$total（${def.name}）\n${result.toModelText()}';
       }),
     );
     // 子代理消耗的 token 统一计入发起会话（与主循环一致，并入「本轮」）。

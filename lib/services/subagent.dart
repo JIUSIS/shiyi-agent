@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import 'llm_client.dart';
 import '../core/tool_result_pruner.dart';
 
@@ -179,8 +181,84 @@ $_returnProtocol''',
   );
 }
 
+/// 子代理执行状态（借鉴 DeepSeek Harness assistant-output / run-settlement 的思路）：
+/// 状态类型化，主循环按类型决策，不再靠字符串括号标记区分成败。
+enum SubagentStatus {
+  /// 正常完成，[SubagentResult.report] 为最终报告。
+  success,
+
+  /// 用户停止生成。
+  stopped,
+
+  /// 达到轮数上限未完成。
+  turnLimit,
+
+  /// 单轮生成失败（无有效回合结果）。
+  generationFailed,
+
+  /// LLM 请求失败（网络/网关/鉴权等）。
+  requestFailed,
+}
+
+/// 子代理执行结果：状态 + 报告 + 失败原因 + token 统计（内聚，不靠外部累加）。
+class SubagentResult {
+  final SubagentStatus status;
+
+  /// 成功时：子代理最终文本（报告）。失败时为空串。
+  final String report;
+
+  /// 失败原因（人类可读，供日志/UI 展示）。
+  final String? error;
+
+  /// 本子代理累计消耗的 token。
+  final int totalTokens;
+
+  SubagentResult.success(this.report, {this.totalTokens = 0})
+      : status = SubagentStatus.success,
+        error = null;
+
+  SubagentResult.stopped({this.totalTokens = 0})
+      : status = SubagentStatus.stopped,
+        report = '',
+        error = null;
+
+  SubagentResult.turnLimit(int maxTurns, {this.totalTokens = 0})
+      : status = SubagentStatus.turnLimit,
+        report = '',
+        error = '达到轮数上限 $maxTurns';
+
+  SubagentResult.generationFailed({this.totalTokens = 0})
+      : status = SubagentStatus.generationFailed,
+        report = '',
+        error = '单轮生成失败';
+
+  SubagentResult.requestFailed(String message, {this.totalTokens = 0})
+      : status = SubagentStatus.requestFailed,
+        report = '',
+        error = message;
+
+  bool get isSuccess => status == SubagentStatus.success;
+
+  /// 展示给模型的文本：成功 = 报告原文；失败 = 带括号标记的失败说明
+  /// （与历史文本一致，避免破坏既有行为；类型化让主循环可以进一步决策）。
+  String toModelText() {
+    switch (status) {
+      case SubagentStatus.success:
+        return report;
+      case SubagentStatus.stopped:
+        return '（子代理已因用户停止而中断）';
+      case SubagentStatus.turnLimit:
+        return '（子代理$error，未完成，请简化任务或改用主循环执行）';
+      case SubagentStatus.generationFailed:
+        return '（子代理生成失败）';
+      case SubagentStatus.requestFailed:
+        return '（子代理异常：$error）';
+    }
+  }
+}
+
 /// 子代理执行器：以独立的 LLM 对话 + 受限工具集跑完一个子任务，
-/// 返回子代理的最终文本（作为报告回给主循环）。
+/// 返回 [SubagentResult]（状态类型化，不再返回裸字符串报告）。
 class SubagentRunner {
   final String baseUrl;
   final String apiKey;
@@ -218,6 +296,14 @@ class SubagentRunner {
   /// 每轮开始前的进度回调（供 UI 展示子代理内部状态）。
   final void Function(int round, int maxTurns, String lastTool)? onProgress;
 
+  /// 子代理上下文预算（token，与主循环估算口径一致）。
+  /// <= 0 表示不裁剪；超预算时裁剪早期工具轮，防复杂任务撑爆上下文。
+  final int contextBudgetTokens;
+
+  /// 测试专用：覆盖单轮执行（默认 null 走真实 LlmClient）。
+  @visibleForTesting
+  Future<TurnResult?> Function(List<Map<String, dynamic>> msgs)? roundOverride;
+
   SubagentRunner({
     required this.baseUrl,
     required this.apiKey,
@@ -230,11 +316,13 @@ class SubagentRunner {
     required this.workingDir,
     this.shouldStop,
     this.onProgress,
+    this.contextBudgetTokens = 0,
+    this.roundOverride,
   });
 
-  /// 运行子代理，返回其最终文本。
+  /// 运行子代理，返回类型化结果。
   /// [maxTurnsOverride] 可动态覆盖定义里的轮数上限（动态预算，默认用定义值）。
-  Future<String> run(SubagentDefinition def, String prompt,
+  Future<SubagentResult> run(SubagentDefinition def, String prompt,
       {int? maxTurnsOverride}) async {
     final budget = (maxTurnsOverride ?? def.maxTurns).clamp(1, 80);
     final msgs = <Map<String, dynamic>>[
@@ -249,14 +337,30 @@ class SubagentRunner {
 
     for (var round = 0; round < budget; round++) {
       if (shouldStop?.call() ?? false) {
-        return '（子代理已因用户停止而中断）';
+        return SubagentResult.stopped(totalTokens: totalTokens);
       }
       onProgress?.call(round, budget, '');
-      final TurnResult? result = await _round(msgs);
-      if (result == null) return '（子代理生成失败）';
+      final TurnResult? result;
+      try {
+        result = roundOverride != null
+            ? await roundOverride!(msgs)
+            : await _round(msgs);
+      } on LlmException catch (e) {
+        // 请求失败必须如实返回失败状态，不能伪装成成功报告。
+        return SubagentResult.requestFailed(
+          '子代理请求失败: $e',
+          totalTokens: totalTokens,
+        );
+      }
+      if (result == null) {
+        return SubagentResult.generationFailed(totalTokens: totalTokens);
+      }
       if (result.toolCalls.isEmpty) {
         // 无工具调用 = 任务完成，最终文本即报告。
-        return result.text.trim();
+        return SubagentResult.success(
+          result.text.trim(),
+          totalTokens: totalTokens,
+        );
       }
       msgs.add({
         'role': 'assistant',
@@ -300,8 +404,60 @@ class SubagentRunner {
               : (tc['id'] ?? ''),
         });
       }
+      // 超预算时裁剪早期工具轮（保留 system + user + 最近轮）。
+      _enforceContextBudget(msgs);
     }
-    return '（子代理达到轮数上限 ${def.maxTurns}，未完成，请简化任务或改用主循环执行）';
+    return SubagentResult.turnLimit(def.maxTurns, totalTokens: totalTokens);
+  }
+
+  /// 上下文预算裁剪：估算超预算时从最早的工具轮开始成组删除
+  /// （assistant 的 tool_calls + 其后的 tool 结果），直到预算内或无可删轮。
+  /// 只删完整组，不会留下孤儿 tool 消息（孤儿 tool 消息会让 API 报 400）。
+  void _enforceContextBudget(List<Map<String, dynamic>> msgs) {
+    if (contextBudgetTokens <= 0) return;
+    var guard = 0;
+    while (_estimateMessagesTokens(msgs) > contextBudgetTokens && guard++ < 20) {
+      int? groupStart;
+      for (var i = 1; i < msgs.length; i++) {
+        if (msgs[i]['role'] == 'assistant' && msgs[i]['tool_calls'] != null) {
+          groupStart = i;
+          break;
+        }
+      }
+      if (groupStart == null) break; // 没有可删的工具轮
+      var groupEnd = groupStart + 1;
+      while (groupEnd < msgs.length && msgs[groupEnd]['role'] == 'tool') {
+        groupEnd++;
+      }
+      msgs.removeRange(groupStart, groupEnd);
+    }
+  }
+
+  /// 估算消息列表 token（与主循环口径一致：中文约 1 token/字，英文约 4 字符/token）。
+  static int _estimateMessagesTokens(List<Map<String, dynamic>> msgs) {
+    var total = 0;
+    for (final m in msgs) {
+      final c = m['content'];
+      if (c is String) total += _estimateTokens(c);
+      final tcs = m['tool_calls'];
+      if (tcs is List && tcs.isNotEmpty) {
+        total += _estimateTokens(tcs.join());
+      }
+    }
+    return total;
+  }
+
+  /// 估算文本 token 数（与 ShiyiState._estimateTokens 同口径）。
+  static int _estimateTokens(String text) {
+    var cjk = 0, other = 0;
+    for (final r in text.runes) {
+      if (r >= 0x4E00 && r <= 0x9FFF) {
+        cjk++;
+      } else {
+        other++;
+      }
+    }
+    return cjk + (other / 4).ceil();
   }
 
   Future<TurnResult?> _round(List<Map<String, dynamic>> msgs) async {
