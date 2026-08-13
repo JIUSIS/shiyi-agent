@@ -2,8 +2,10 @@ package com.shiyi.agent
 
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.Signature
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.system.Os
 import android.view.WindowManager
@@ -24,6 +26,12 @@ import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     private val ioExecutor = Executors.newSingleThreadExecutor()
+
+    companion object {
+        /** zip 炸弹防护：单包解压总量与条目上限（技能包导入、Termux 引导都适用）。 */
+        private const val MAX_ZIP_TOTAL_BYTES = 512L * 1024 * 1024 // 512MB
+        private const val MAX_ZIP_ENTRIES = 20000
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -103,13 +111,17 @@ class MainActivity : FlutterActivity() {
                         "verifyApk" -> {
                             val path = call.argument<String>("path")
                                 ?: throw IllegalArgumentException("path missing")
-                            result.success(verifyApk(path))
+                            // 校验要解析整个 APK，放后台线程避免主线程卡 UI/ANR。
+                            runInBackground(result) { verifyApk(path) }
                         }
                         "installApk" -> {
                             val path = call.argument<String>("path")
                                 ?: throw IllegalArgumentException("path missing")
-                            installApk(path)
-                            result.success(true)
+                            // 校验耗时长，放后台；startActivity 由 installApk 内部回主线程。
+                            runInBackground(result) {
+                                installApk(path)
+                                true
+                            }
                         }
                         else -> result.notImplemented()
                     }
@@ -247,9 +259,12 @@ class MainActivity : FlutterActivity() {
         val dest = File(destDirPath)
         if (dest.exists()) dest.deleteRecursively()
         dest.mkdirs()
+        val destCanonical = dest.canonicalPath
         val symlinks = mutableListOf<Pair<String, String>>()
         val assets = assets
         var fileCount = 0
+        var totalBytes = 0L
+        var entryCount = 0
         assets.open("flutter_assets/$assetPath").use { input ->
             ZipInputStream(BufferedInputStream(input)).use { zis ->
                 var entry = zis.nextEntry
@@ -260,16 +275,32 @@ class MainActivity : FlutterActivity() {
                         for (line in content.lineSequence()) {
                             val parts = line.split("←")
                             if (parts.size == 2) {
-                                symlinks.add(parts[0] to "$destDirPath/${parts[1]}")
+                                val target = File("$destDirPath/${parts[1]}")
+                                // 符号链接目标也必须在解压目录内（防穿越）
+                                if (target.canonicalPath.startsWith(destCanonical + File.separator)) {
+                                    symlinks.add(parts[0] to target.canonicalPath)
+                                }
                             }
                         }
                     } else if (!entry.isDirectory) {
+                        if (++entryCount > MAX_ZIP_ENTRIES) {
+                            throw IllegalStateException("压缩包条目过多（超过 $MAX_ZIP_ENTRIES），已中止解压")
+                        }
+                        // 防目录穿越（与 extractZip 对齐）：只允许解压到目标目录内
                         val outFile = File(dest, name)
+                        val canonical = outFile.canonicalPath
+                        if (!canonical.startsWith(destCanonical + File.separator)) {
+                            throw IllegalStateException("非法解压路径: $name")
+                        }
                         outFile.parentFile?.mkdirs()
                         BufferedOutputStream(FileOutputStream(outFile)).use { out ->
                             val buf = ByteArray(64 * 1024)
                             var n = zis.read(buf)
                             while (n > 0) {
+                                totalBytes += n
+                                if (totalBytes > MAX_ZIP_TOTAL_BYTES) {
+                                    throw IllegalStateException("压缩包解压总量超限（> $MAX_ZIP_TOTAL_BYTES 字节），已中止")
+                                }
                                 out.write(buf, 0, n)
                                 n = zis.read(buf)
                             }
