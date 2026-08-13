@@ -48,6 +48,16 @@ class SettingsService {
           }
         }
       }
+      // 自定义 OpenAI 兼容接口缺 /v1 时自动补上，避免请求打到错误路径。
+      final isPreset = modelPresets.any((p) => p.baseUrl == s.baseUrl.trim());
+      if (s.apiProtocol == 'openai' && !isPreset) {
+        final normalized = normalizeOpenAiBaseUrl(s.baseUrl);
+        if (normalized != s.baseUrl.trim()) {
+          s.baseUrl = normalized;
+          json['baseUrl'] = normalized;
+          await prefs.setString(_key, jsonEncode(json));
+        }
+      }
       return s;
     } catch (_) {
       return AppSettings();
@@ -78,20 +88,28 @@ class SettingsService {
       final out = <ApiProfile>[];
       for (final e in list) {
         final j = (e as Map<String, dynamic>);
-        final baseUrl = (j['baseUrl'] ?? '').toString();
+        final p = ApiProfile.fromJson(j);
+        final isPreset = modelPresets.any((m) => m.name == p.name);
+        final baseUrl = isPreset || p.apiProtocol != 'openai'
+            ? p.baseUrl
+            : normalizeOpenAiBaseUrl(p.baseUrl);
+        if (baseUrl != p.baseUrl) {
+          j['baseUrl'] = baseUrl;
+          dirty = true;
+        }
         final legacy = (j['apiKey'] ?? '').toString();
         if (legacy.isNotEmpty) {
           await _writeKey(_profileKey(baseUrl), legacy);
           j.remove('apiKey');
           dirty = true;
         }
-        final p = ApiProfile.fromJson(j);
         out.add(
           ApiProfile(
             name: p.name,
-            baseUrl: p.baseUrl,
+            baseUrl: baseUrl,
             apiKey: await _readKey(_profileKey(baseUrl)),
             model: p.model,
+            apiProtocol: p.apiProtocol,
           ),
         );
       }

@@ -49,8 +49,8 @@ android {
         // Android 15/16 的标准策略对 targetSdk<35 也有同样豁免（主测试机可用）。
         // 坚果等国产 ROM 的 untrusted_app 域无此权限，必须走旧域才能跑终端。
         targetSdk = 27
-        versionCode = 12
-        versionName = "1.1.8"
+        versionCode = 13
+        versionName = "2.0.0"
     }
 
     signingConfigs {

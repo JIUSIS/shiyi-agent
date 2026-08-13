@@ -5,6 +5,126 @@
 
 ---
 
+## 2026-08-13 · iOS 化重构、Anthropic 协议与内置 API 预设
+
+### 66. 浅色 / 深色切换不即时
+- **现象**：设置页切到「浅色 / 深色」后，页面标题、列表背景、二级页主题没有及时跟随；外观分段控件还带着 600ms 防抖保存，体感像“点了没反应”。
+- **根因**：`SettingsScreen` 的 `CupertinoTheme` 在外层按当前设置计算一次，内部 `ListenableBuilder` 只重建列表，主题本身没有随 `ShiyiState` 重建；外观页保存走防抖，切换不是立即生效。
+- **修复**：
+  1. `SettingsScreen` 改为外层 `ListenableBuilder` 包住 `CupertinoTheme`，主题、页面背景、大标题、列表内容随 `ShiyiState` 一起刷新；
+  2. 外观页分段控件点击后立即 `updateSettings(copyWith(themeMode: v))`，不再等 600ms；
+  3. `_IosSettingsPage` 二级页外壳统一监听 `shiyi`，同一入口切色即时生效。
+- **涉及**：`lib/screens/settings_screen.dart`、`test/settings_ui_test.dart`。
+
+### 67. 新增 Anthropic Messages 协议自定义接口
+- **现象**：自定义接口只支持 OpenAI Chat Completions，无法接入 Anthropic 官方 API。
+- **根因**：`LlmClient` 请求体、鉴权头、SSE 解析全部写死 OpenAI 格式。
+- **修复**：
+  1. `AppSettings` / `ApiProfile` 新增 `apiProtocol`（`openai` / `anthropic`），旧数据缺失时默认 `openai`；
+  2. `LlmClient` 增加 `protocol`：Anthropic 走 `/v1/messages`，鉴权用 `x-api-key` + `anthropic-version: 2023-06-01`，system 拆到 `system` 字段，工具转 `tool_use` / `tool_result`；
+  3. 新增 `_parseAnthropicSse`，支持 `content_block_delta`、`thinking_delta`、`input_json_delta`、`message_delta`、`message_stop`；
+  4. `completeOne` / `testChat` / `listModels` 统一按协议构建请求，`SubagentRunner` 同步带协议。
+- **涉及**：`lib/core/models.dart`、`lib/services/llm_client.dart`、`lib/core/app_state.dart`、`lib/services/settings_service.dart`、`lib/services/subagent.dart`、`lib/screens/settings_screen.dart`。
+
+### 68. 内置常见 API 预设 + 配置管理新建接口
+- **现象**：设置页模型预设入口太少，没有常见国内 / 国际服务商；预设菜单里还混着「新建自定义接口」，二级入口和配置管理职责重叠。
+- **修复**：
+  1. `model_presets.dart` 扩展为 OpenAI、Anthropic Claude、Google Gemini、DeepSeek、Kimi、通义千问、智谱 GLM、豆包、OpenRouter、Groq、MiMo 两种计费方式、OpenCode Go；
+  2. 模型 API 二级页新增「协议」行，OpenAI / Anthropic 分段切换并立即保存；
+  3. 预设 ActionSheet 去掉「新建自定义接口」，统一收口到「配置管理 > 新建接口」；
+  4. 新建接口弹窗可选择 OpenAI / Anthropic，保存 / 删除 / 测试连接都带协议；
+  5. 新增 `apiProtocol` JSON 往返与 Anthropic 预设回归测试。
+- **涉及**：`lib/core/model_presets.dart`、`lib/screens/settings_screen.dart`、`test/settings_model_test.dart`。
+
+### 69. 关于页按 Apple HIG 重设计
+- **现象**：关于页还是旧的 Material 排版，功能清单不全，和 iOS 化设置页风格脱节。
+- **修复**：整页重写为 Cupertino Inset Grouped：
+  1. 头像保持 96px，不缩小；应用名、版本、一句话介绍放在分组上方；
+  2. 功能特性完整列出：多模型 API、多轮对话、项目分类、文件管理、长期记忆、技能系统、内置终端、网页搜索、图片 / 视觉模型、上下文压缩、缓存命中率、回车发送、语音朗读、深浅色主题、自动检查更新；
+  3. 「项目 / 检查更新」分组、GPL 说明、版本读取沿用现有逻辑；
+  4. 不存在的 Cupertino 图标换成等价图标（终端 / 网页搜索），`flutter analyze` 干净。
+- **涉及**：`lib/screens/about_screen.dart`、`lib/screens/settings_screen.dart`（关于入口传 `shiyi`）。
+
+### 70. 主页 iOS 化：大标题居中 + 底部三 Tab 重设计
+- **现象**：主页标题偏小，底部仍是 Material 胶囊 NavigationBar，三个 Tab 页面观感不一致。
+- **修复**：
+  1. 会话页「拾忆」、功能页「功能」、文件页「文件」统一为 28px 粗体大标题并居中；
+  2. 左上角红绿灯胶囊、右上角设置入口保持原位不动；
+  3. 底部 Tab 换成自绘 iOS 毛玻璃栏：图标 + 文字、选中系统蓝、未选中灰、半透明背景与顶部发丝线，切换仍走原有 IndexedStack 缓存与淡入。
+- **涉及**：`lib/screens/home_screen.dart`、`lib/screens/features_screen.dart`、`lib/screens/files_screen.dart`。
+
+### 71. 设置页深色模式大标题仍显示黑色
+- **现象**：切到深色后，设置页大标题「设置」与背景同为黑色，几乎看不见。
+- **根因**：手动 `TextStyle(color: CupertinoColors.label)` 不会自动按 `CupertinoTheme` 解析深浅色，直接落到浅色黑色；只把主题包进 `ListenableBuilder` 仍解决不了手动写死颜色的问题。
+- **修复**：
+  1. 设置页大标题与底部版本文字改为按 `dark` 显式取白 / 黑（含透明度）；
+  2. 关于页的版本、简介、GPL 说明，以及设置二级页的语速 / 温度 / 后缀文字等同类手动颜色一起修正；
+  3. `_IosValueField` 改用 `CupertinoTheme.brightnessOf(context)` 判断。
+- **涉及**：`lib/screens/settings_screen.dart`、`lib/screens/about_screen.dart`。
+
+### 验证
+- `flutter analyze` 无告警；`flutter test` 88 项全部通过（新增 `apiProtocol` 与 Anthropic 预设回归）。
+- `flutter build apk --debug` 成功；`adb install -r` 覆盖安装到 `emulator-5556`，数据保留。
+- release 真机覆盖安装（`f29c6ad8`）成功：debug 包因与手机现有正式签名不一致被系统拒绝，改用同一 `keystore.jks` 打 release 后 `adb install -r` 通过，`firstInstallTime` 未变化、数据保留，已启动应用。
+- 实机验证：深色下设置大标题像素为白色；主页 / 功能 / 文件大标题居中；底部三 Tab 正常切换；关于页功能列表、模型 API 协议行、配置管理「新建接口」均正常打开，无异常日志。
+- 版本号未提升，仍为 `1.1.8+12`，本轮为源码维护记录。
+
+---
+
+## 2026-08-13 · Apple 设计理念统一重构（第二批）
+
+### 72. 主页红绿灯 / 设置按钮 / 大标题同一水平线居中
+- **现象**：主页左上角红绿灯由悬浮层叠放，和标题、右上角设置按钮不在同一条水平线，标题视觉也不居中。
+- **修复**：红绿灯从 `HomeScreen` 悬浮层移入会话页 `AppBar.leading`，左侧 `leadingWidth=66`（6dp 边距 + 60dp 胶囊），右侧设置按钮同为 60dp + 6dp 边距，左右完全对称；标题 `centerTitle: true`，三者同处导航栏中线；删除旧的悬浮红绿灯与私有圆点组件，统一改用共享 `TrafficLightsButton`。
+- **涉及**：`lib/screens/home_screen.dart`、`lib/widgets/traffic_lights_button.dart`（新增）。
+
+### 73. 功能 / 文件 / 长期记忆 / 技能 / 日志页 iOS UI 重做
+- **现象**：五个页面仍是 Material 卡片、Material 弹窗、默认搜索框，和 iOS 化设置页风格脱节。
+- **修复**：
+  1. 功能页改为 Cupertino Inset Grouped 列表，图标色块 + 数量 + chevron；
+  2. 文件页改为 iOS 分组文件列表，路径改为圆角胶囊，操作菜单 / 新建文件夹 / 删除 / 预览 / 目录选择全部换成 `CupertinoActionSheet` / `CupertinoAlertDialog`；
+  3. 长期记忆页使用 `CupertinoSearchTextField` + 分组列表，右上角新增「多选」，进入多选后每行显示选择圆点、底部出现红色批量删除栏，点红绿灯可新建记忆；
+  4. 技能页改为 iOS 分组列表与操作菜单，新建 / 编辑 / 导入确认 / 文件管理弹窗统一 Cupertino，右上角磨砂导入按钮设计保持不变；
+  5. 日志页改为 `CupertinoNavigationBar` + 分组背景 + iOS 清空确认弹窗，自动刷新状态用图标颜色区分。
+- **涉及**：`lib/screens/features_screen.dart`、`lib/screens/files_screen.dart`、`lib/screens/memory_screen.dart`、`lib/screens/skills_screen.dart`、`lib/screens/log_screen.dart`。
+
+### 74. 获取模型 ID / 测试连接增加加载反馈
+- **现象**：点「获取模型 ID」和「测试连接」后没有任何反馈，接口慢时像没反应。
+- **修复**：两个操作统一走 `_runWithLoading`，先收起输入法并弹出「正在获取模型 ID / 正在测试连接，请稍后…」的 iOS 弹窗（含活动指示器），请求完成后关闭再展示模型列表或测试结果；异常时同样先关闭加载框再报错。
+- **涉及**：`lib/screens/settings_screen.dart`。
+
+### 75. 选择弹窗选项后输入法不再自动跳出
+- **现象**：从 API 配置输入框点到模型预设 / 模型 ID 等弹窗选择后，输入法会重新弹出。
+- **修复**：`_pickProfile` 与 `_fetchModels` 在选择前和选择返回后都执行 `FocusScope.of(context).unfocus()`；`_runWithLoading` 内部也统一收起输入法，弹窗选择不再把焦点交回输入框。
+- **涉及**：`lib/screens/settings_screen.dart`。
+
+### 76. 协议切换改为竖排 iOS 选择
+- **现象**：模型 API 页的 OpenAI / Anthropic 用横向 `CupertinoSegmentedControl`，观感像分段按钮而非设置选项。
+- **修复**：新增独立「协议」Inset Grouped 分组，两行分别显示「OpenAI 兼容」和「Anthropic Messages」，带图标、说明与选中蓝色勾；点击立即保存并更新；新建自定义接口弹窗内的协议选择也同步改为竖排单选行。
+- **涉及**：`lib/screens/settings_screen.dart`。
+
+### 77. 主题模式改为三项竖排选择
+- **现象**：外观页浅色 / 深色 / 跟随系统仍是横向分段控件，与 iOS 设置选择样式不一致。
+- **修复**：改为「主题模式」分组的三个竖排 `CupertinoListTile`，分别带太阳 / 月亮 / 半圆图标与蓝色勾，点击立即生效并保存。
+- **涉及**：`lib/screens/settings_screen.dart`。
+
+### 78. 温度 / 语速滑块重排，不再溢出
+- **现象**：高级页「温度」把数值与 `CupertinoSlider` 全塞进一个 `CupertinoListTile`，滑块溢出、观感拥挤；语音页「语速」存在同类问题。
+- **修复**：两个页面都改成独立 Inset Grouped 分组：首行图标 + 名称 + 当前值，中间为横向 `CupertinoSlider`，底部标注最小 / 最大值，不再依赖 ListTile 的 subtitle 承载滑块。
+- **涉及**：`lib/screens/settings_screen.dart`。
+
+### 79. 红绿灯全页面显示与功能入口
+- **现象**：红绿灯只有主页可见，进入功能 / 文件 / 记忆 / 技能等页面就消失，缺少统一入口视觉。
+- **修复**：除设置页及其内部菜单外，主页、功能页、文件页、长期记忆页、技能页均显示红绿灯；主页点击新建项目、技能页点击新建技能、记忆页点击新建记忆，功能页 / 文件页保持纯视觉展示。
+- **涉及**：`lib/screens/home_screen.dart`、`lib/screens/features_screen.dart`、`lib/screens/files_screen.dart`、`lib/screens/memory_screen.dart`、`lib/screens/skills_screen.dart`、`lib/widgets/traffic_lights_button.dart`。
+
+### 验证
+- `flutter analyze` 无告警；`flutter test` 88 项全部通过。
+- `flutter build apk --release` 成功（93.9MB）。
+- `adb -s f29c6ad8 install -r` 覆盖安装成功：`firstInstallTime=2026-08-11 02:25:15` 未变化，`lastUpdateTime=2026-08-13 05:26:37`，版本仍为 `1.1.8+12`，数据保留；应用已启动。
+
+---
+
 ## 2026-08-04 · 项目初始化与首版发布
 
 ### 1. 品牌与包名统一
@@ -541,3 +661,143 @@
   8. `listSkills` 运行时只筛出可安全加载的行，超大行不再被静默删除；Session / Project 数字字段改 `tryParse` 兜底。
 - **涉及**：`lib/services/update_service.dart`、`lib/screens/about_screen.dart`、`lib/screens/settings_screen.dart`、`pubspec.yaml`（新增 package_info_plus / flutter_secure_storage）、`lib/services/settings_service.dart`、`android/app/src/main/kotlin/com/shiyi/agent/MainActivity.kt`、`lib/services/skill_pack.dart`、`lib/core/app_state.dart`、`lib/services/subagent.dart`、`lib/screens/home_screen.dart`、`lib/services/db.dart`、`lib/core/models.dart`、`test/skill_pack_test.dart`；版本号保持 `1.1.8+12`，直接替换 GitHub `v1.1.8` Release APK。
 - **验证**：`flutter analyze` 无告警；`flutter test` 81 项全部通过（新增技能路径安全回归 3 项）；`flutter build apk --debug` 与 release 构建通过。
+
+## 2026-08-13 · 交互细节修复（第三批）
+
+### 80. 左滑圆形图标 + 空白收回 + 关于页背景 + 设置淡入淡出 + 思考红绿灯 + 项目逐条展开 + 技能弹窗限高
+- **现象**：项目 / 会话左滑操作还是长条胶囊样式；会话左滑后点列表空白不收回；关于页深色模式顶部一片白；设置二级菜单仍用横滑转场；思考中右上角没有明确状态指示；项目展开收起是整体擦除动画；技能描述弹窗内容太长。
+- **修复**：
+  1. `_SlidablePillAction` 改为 `_CircularSwipeAction` 圆形图标按钮（44dp 圆底 + 图标 + 小字标签），项目 / 会话左滑操作区同步调整宽度。
+  2. 主页增加 `_openSwipeRect` 与透明 `Listener` 点击层：左滑展开后，点卡片区域外任意空白立即收回，不参与手势竞技场，不挡卡片与圆形按钮；原 `_closeOnBlankTap` 保留兜底。
+  3. 关于页 `CupertinoPageScaffold` / `CupertinoNavigationBar` 显式按深浅主题设置背景，深色模式顶部不再露白。
+  4. 设置页 `_open` 改用 `PageRouteBuilder` 纯淡入淡出，进出二级菜单不再横滑。
+  5. 聊天页右上角工具胶囊替换为红绿灯状态胶囊：思考中红黄绿三盏灯依次闪烁，完成后全部亮起，点击仍可展开工具调用信息流。
+  6. `_AnimatedProjectSessions` 改为 `_StaggeredProjectSessions`：会话卡片按顺序逐条淡入 + 高度展开 / 收回，不再是整体擦除。
+  7. 技能查看弹窗内容高度从 `0.72 * 屏高 / 最大 620dp` 收紧到 `0.56 * 屏高 / 最大 440dp`，超长内容继续滚动。
+- **涉及**：`lib/screens/home_screen.dart`、`lib/screens/about_screen.dart`、`lib/screens/settings_screen.dart`、`lib/screens/chat_screen.dart`、`lib/screens/skills_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 89 项全部通过；模拟器实测左滑圆形按钮、会话空白收回、思考红绿灯依次闪烁 / 完成后全亮、关于页深色背景、技能弹窗限高；release 真机覆盖安装待验证。
+
+### 81. 红绿灯归位 + 左滑空白收回修复 + 会话按钮统一 + 卡片圆角 + 全局换图 + 输入框对齐
+- **现象**：思考状态被放到了右上角工具胶囊，用户要的是左上角返回按钮红绿灯，且要“高亮闪烁”不是渐隐；主页项目 / 会话左滑后点任意空白仍不收回；会话左滑按钮样式和项目不统一；左滑展开后卡片右端变直角；所有图片素材仍是旧图；真机输入框和左右图标 / 背景不在同一条水平线上。
+- **根因**：左滑拖满上限时 `_SwipeActionsState._end()` 判定 `t == _offset` 直接 return，未调用 `_syncOpenState`，导致 `_openSwipeKey` / `_openSwipeRect` 一直为空，全页透明点击层根本没渲染；输入栏三个控件高度 / 内部对齐不统一。
+- **修复**：
+  1. 思考红绿灯移回左上角返回按钮，右上角工具胶囊只保留最近工具图标 / 文字，点击展开信息流功能不变；`TrafficLightsButton` 增加 `busy` 参数，思考中红→黄→绿“高亮循环”（当前灯放大 + 光晕，其余两盏变暗），空闲 / 完成三灯全亮；主页、聊天、功能、文件、记忆、技能页全部接入 `shiyi.isBusy` 全局同步。
+  2. `_end()` 位移已到目标值时也同步展开 / 收回状态；透明点击层提升到整页 Stack（含标题栏、搜索栏、卡片间缝隙），露出操作区的空白背景也点击即收回。
+  3. 会话左滑圆形按钮配色 / 图标与项目统一：重命名、项目为灰色 + 白色图标（`folder_open`），删除为红色 + 白色图标。
+  4. 左滑展开后内容卡右缘保持 `14` 圆角，不再随展开变直角。
+  5. `assets/welcome.png`、`assets/avatar.png`、Android `mdpi~xxxhdpi` 五档启动图标全部替换为 `shiyi-icon.png`；关于页头像 `96 → 112dp`，avatar 资源从 96px 升级为 512px 高清版。
+  6. 聊天输入栏统一为 40dp 等高控件：加号按钮、输入框、发送按钮约束统一，TextField 设 `textAlignVertical: center`，垂直中心线对齐。
+- **涉及**：`lib/widgets/traffic_lights_button.dart`、`lib/screens/chat_screen.dart`、`lib/screens/home_screen.dart`、`lib/screens/features_screen.dart`、`lib/screens/files_screen.dart`、`lib/screens/memory_screen.dart`、`lib/screens/skills_screen.dart`、`lib/screens/about_screen.dart`、`assets/welcome.png`、`assets/avatar.png`、`android/app/src/main/res/mipmap-*/ic_launcher.png`；版本号保持 `1.1.8+12`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 89 项全部通过；模拟器实测项目 / 会话左滑后点空白均收回、思考中红黄绿高亮循环（每帧只有一盏高亮）、输入栏三条中心线同一水平（y≈2253）、关于页新头像正常；release 已覆盖安装真机 `d82faf5e`，`firstInstallTime` 未变，数据保留。
+
+### 82. 工具胶囊回归 + 输入栏贴底 + 左滑防溢出 + 弹窗统一淡入淡出 + 主页对称居中 + 新建项目深色适配
+- **现象**：右上角工具胶囊被改成带图标的方块，用户要求恢复原来的胶囊和阴影；聊天输入栏整体偏上，底部露出一条背景；真机会话左滑按钮文字溢出被裁剪、模拟器项目左滑图标下方出现 RenderFlex 溢出条；各类弹窗仍用飞入 / 上滑动画，低端设备卡；主页红绿灯与设置胶囊对标题不居中、距离不一致；深色模式下新建项目弹窗的“选择文件夹”按钮仍保持浅色。
+- **根因**：工具胶囊类被替换为 `_ToolStatusPill` 的 104dp 图标方块；输入栏的 `SafeArea` 包在装饰容器外，底部安全区背景不随输入栏延伸；左滑圆形按钮固定 44dp 圆 + 10dp 字，超过项目卡片高度触发纵向溢出；各页 `showCupertinoDialog` / `showModalBottomSheet` 使用系统默认转场；AppBar 左右两侧内边距不一致；文件夹按钮直接用 `CupertinoColors` 动态色，在自定义主题下未按应用深浅模式解析。
+- **修复**：
+  1. 恢复 `_ToolPillIdle` / `_ToolPill` 原版胶囊：待机为灰点 + 「工具」+ `0.0s`，运行中显示步骤计数 / 读秒与状态图标，宽度 92dp，点击仍展开工具信息流；聊天页 AppBar 左右区统一为 104dp 居中，标题保持对称。
+  2. 输入栏改为 `Container` 外框承载背景与顶部分隔线，`SafeArea` + 8dp 内边距收进背景内部，底部安全区随输入栏背景延伸，不再浮起。
+  3. `_CircularSwipeAction` 圆底从 44dp 收为 40dp、图标 18dp、字距 4dp，整体套 `FittedBox(scaleDown)`，卡片高度不足时自动等比缩放，文字与图标不再溢出 / 被裁剪。
+  4. `lib/widgets/ios_style.dart` 新增 `showIosFadeDialog` / `showIosFadeModalPopup` / `showIosFadeSheet`，全部弹窗统一 180ms 纯淡入淡出；各页 `showCupertinoDialog`、`showCupertinoModalPopup`、Material `showDialog` / `showModalBottomSheet` 调用全部迁移。
+  5. 主页 AppBar 左右各固定 66dp 并 `Center` 对齐，红绿灯与设置胶囊相对标题严格对称；聊天页同法对称。
+  6. 新建项目文件夹按钮背景改用 `iosSectionBackground(context)`，文字 / 箭头改用 `Theme.of(context)` 深浅色，深色模式正常转换。
+- **涉及**：`lib/widgets/ios_style.dart`、`lib/screens/chat_screen.dart`、`lib/screens/home_screen.dart`、`lib/screens/project_actions.dart`、`lib/screens/about_screen.dart`、`lib/screens/files_screen.dart`、`lib/screens/log_screen.dart`、`lib/screens/memory_screen.dart`、`lib/screens/settings_screen.dart`、`lib/screens/skills_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart analyze` 无告警；`flutter test` 89 项全部通过；release 构建成功并覆盖安装真机 `d82faf5e`，`adb install -r` 输出 Success，数据保留。
+
+### 83. 主页红绿灯与设置图标内收
+- **现象**：主页左上角红绿灯和右上角设置胶囊贴屏幕边缘太近，视觉上离大标题也偏远。
+- **修复**：AppBar 左右操作区从 66dp 加宽到 84dp，两个胶囊保持居中对齐，整体向中间收拢约 9dp；标题仍严格居中，左右距离一致。
+- **涉及**：`lib/screens/home_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart analyze` 无告警；release 构建成功，覆盖安装手机 `f29c6ad8` 与模拟器 `emulator-5556`，均 Success，`firstInstallTime` 未变。
+
+### 84. 主页红绿灯 / 设置图标与项目卡片对齐
+- **现象**：上一版把胶囊整体内收后，红绿灯与设置图标变成在宽槽里居中，用户要求直接左对齐 / 右对齐项目卡片左右边缘。
+- **修复**：AppBar 左右操作区从 84dp 收为 72dp，红绿灯靠左 12dp、设置胶囊靠右 12dp，与主页列表 `horizontal: 12` 的项目卡片边缘严格对齐；左右宽度相等，标题保持居中。
+- **涉及**：`lib/screens/home_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart analyze` 无告警；release 构建成功，覆盖安装手机 `f29c6ad8` 与模拟器 `emulator-5556`，均 Success，数据保留。
+
+### 85. 输入条在底栏内垂直居中
+- **现象**：聊天输入栏弹出键盘后，灰色圆角输入条相对白色底栏偏上（上约 10px / 下约 20px），与背景圆角矩形不对齐。
+- **根因**：`_Composer` 外层内边距上 6 / 下 0，内部又额外垫了底部 8px，导致输入条在底栏内上重下轻。
+- **修复**：`_Composer` 外层内边距改为上下对称的 `fromLTRB(10, 8, 10, 8)`，去掉内部额外底部 Padding，输入条在底栏内垂直居中；底部安全区仍由 `SafeArea` 收进背景内部。
+- **涉及**：`lib/screens/chat_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart analyze` 无告警；release 构建成功，覆盖安装手机 `f29c6ad8` 与模拟器 `emulator-5556`，均 Success，数据保留。
+
+### 86. 各页红绿灯边距统一 + 会话文件路径弹窗 iOS 化
+- **现象**：文件 / 功能 / 长期记忆 / 技能 / 会话页的红绿灯到屏幕边缘距离与主页不一致；会话输入框上方点击文件路径后，弹窗仍是 Material 列表样式，与整套 iOS 设计不统一。
+- **修复**：
+  1. 各页 AppBar 左侧操作区统一为 `leadingWidth: 72` + `left: 12`，红绿灯左边缘与主页项目卡片对齐；会话页右侧工具胶囊同步为 `width: 72` + `right: 12`，标题保持居中对称。
+  2. 会话文件路径弹窗改为 iOS Inset Grouped 圆角分组列表：当前项目目录、所属项目、项目工作目录一组，选择目录、使用全局默认目录一组；统一 31dp 圆角图标方块、副标题与 `CupertinoListTileChevron` 箭头。
+  3. “移动到项目”与“项目工作目录”两个二级弹窗同步改为同一套 iOS 分组样式，弹窗超出半屏时改为可滚动，不再裁掉底部操作。
+- **涉及**：`lib/screens/chat_screen.dart`、`lib/screens/files_screen.dart`、`lib/screens/features_screen.dart`、`lib/screens/memory_screen.dart`、`lib/screens/skills_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart format` 5 个页面通过；`flutter analyze` 无告警；`flutter test` 94 项全部通过；release 构建成功，覆盖安装手机 `f29c6ad8`，`adb install -r` 输出 Success，数据保留。
+
+### 87. 会话文件路径弹窗视觉重设计
+- **现象**：第 86 条改成 Cupertino 分组列表后，弹窗表面仍是白色，白色圆角卡片贴在白底上，两组之间没有层次感，整体像一整块白板，用户反馈太丑。
+- **根因**：`showIosFadeSheet` 固定使用 `colorScheme.surface`（白色）作为面板底色，`CupertinoListSection.insetGrouped` 的卡片也是白色，浅色模式下卡片与面板融在一起，分组和留白都看不出来。
+- **修复**：
+  1. `showIosFadeSheet` 新增可选 `backgroundColor` 参数，默认行为不变；会话文件路径弹窗传入 `iosGroupedBackground(context)`，浅色 `#F2F2F7` / 深色纯黑，白色圆角卡片独立成组、间距清晰。
+  2. 弹窗顶部新增 iOS 抓握横条，主弹窗加居中小标题「工作目录」，看起来更像系统级底部面板。
+  3. “移动到项目”“项目工作目录”两个二级弹窗同步使用灰底 + 抓握横条，三处弹窗视觉一致。
+- **涉及**：`lib/widgets/ios_style.dart`、`lib/screens/chat_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart format` 2 个文件通过；`flutter analyze` 无告警；`flutter test` 94 项全部通过；release 构建成功，覆盖安装手机 `f29c6ad8`，`adb install -r` 输出 Success，`firstInstallTime` 未变，数据保留。
+
+### 88. 文件路径弹窗卡片与设置页统一 + 深浅色跟随
+- **现象**：第 87 条把弹窗改成灰底后，卡片底色仍用 `colorScheme.surface`，浅色 / 深色下的观感与设置页的 Inset Grouped 卡片不完全一致，用户要求卡片设计与设置统一、灰底、深浅模式正常切换。
+- **修复**：三个弹窗内 `CupertinoListSection.insetGrouped` 的 `backgroundColor` 统一改为 `iosGroupedBackground(ctx)`，与设置页 `_iosGroupedBackground(dark)` 同款（浅色 `#F2F2F7` / 深色纯黑）；卡片装饰继续用 `iosSectionDecoration(ctx)`（浅色白卡 / 深色 `#1C1C1E`），随应用主题即时切换。
+- **涉及**：`lib/screens/chat_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`dart format` 通过；`flutter analyze` 无告警；`flutter test` 94 项全部通过；release 构建成功，覆盖安装手机 `f29c6ad8`，`adb install -r` 输出 Success，`firstInstallTime` 未变，数据保留。
+
+### 89. 工具胶囊底色与红绿灯同款
+- **现象**：工具胶囊底色用的是 `surfaceContainerHigh` 半透明色，和左上角红绿灯的半透明白胶囊观感不一致；仅换颜色值后，半透明白仍会透出自身阴影，看起来比红绿灯深一档。
+- **修复**：新增 `_toolPillBackground`，与红绿灯共用同一底色（浅色 `Colors.white` 40% 透明度 / 深色 10% 透明度）；工具胶囊外壳改为与红绿灯完全相同的 `ClipRRect + BackdropFilter(16px) + Material` 结构，阴影参数同款（浅色 `black 0.16` / 深色 `black 0.35`，12px 模糊、向下 3px）；待机与运行中两个胶囊统一调用同一外壳。宽度保持 92，标题居中不变。
+- **涉及**：`lib/screens/chat_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`flutter analyze` 无告警；debug 构建成功，覆盖安装模拟器 `emulator-5556`，`adb install -r` 输出 Success；截图像素采样确认工具胶囊与红绿灯同位置填充色一致（均约 235~237），UI 坐标确认胶囊宽度仍为 242px（92dp）。
+
+### 90. 长按气泡操作面板 iOS 化重设计
+- **现象**：长按气泡弹出的「消息操作」使用默认 `CupertinoActionSheet`，只有平铺文字行，视觉上偏简陋，与整套 iOS 设置页 / 弹窗风格不统一。
+- **修复**：改为 `showIosFadeModalPopup` 自绘底部面板：顶部抓握横条 + 居中小标题；操作项放入 Inset Grouped 白卡，每项使用与设置页同款的 31px 彩色圆角图标方块；删除单独成红色卡片，取消按钮独立白色圆角卡；面板超高时允许滚动。
+- **涉及**：`lib/widgets/message_bubble.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`flutter analyze` 无告警；`flutter test test/message_bubble_test.dart` 3 项全部通过；debug 构建成功，覆盖安装模拟器 `emulator-5556`，长按气泡弹出后 UI 正常，OCR 识别到「消息操作 / 选择文字 / 取消」等完整项。
+
+### 91. 工具胶囊字体与居中统一
+- **现象**：待机胶囊「工具」用 `labelMedium` + `w500` + 灰色，运行中胶囊「终端」用 `labelMedium` + `w600` + 默认文字色，粗细、颜色观感不一致；待机用 `spaceBetween` 撑满，运行中用收缩行，内容居中位置也不同。
+- **修复**：待机与运行中两个胶囊统一使用 `labelMedium` + `w600` + `hintColor`，右侧时长统一 `labelSmall` + `hintColor`；布局保持原样，待机继续 `spaceBetween` 左右排布、运行中继续收缩行，不再额外居中。
+- **涉及**：`lib/screens/chat_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`flutter analyze` 无告警；debug 构建成功，覆盖安装模拟器 `emulator-5556`；截图确认两个胶囊文字粗细、颜色一致，布局恢复原样。
+
+### 92. 长按弹窗不透明底修复 + 工具胶囊布局还原
+- **现象**：第 90 条用 `showIosFadeModalPopup` 自绘浮动卡片后，卡片间隙透明，能透出底层聊天内容和一条黄色内容条；工具胶囊把内容改成居中后观感变差，用户要求改回原布局并保留新字体。
+- **修复**：长按面板改回 `showIosFadeSheet` 不透明底部表面（浅色灰底 / 深色黑底），卡片间隙不再透明，黄条被表面完全遮住；工具胶囊布局还原为待机 `spaceBetween`、运行中收缩行，字体粗细 / 颜色保持第 91 条的新样式。
+- **涉及**：`lib/widgets/message_bubble.dart`、`lib/screens/chat_screen.dart`；版本号保持 `1.1.8+12`。
+- **验证**：`flutter analyze` 无告警；`flutter test test/message_bubble_test.dart` 3 项全部通过；debug 构建成功，覆盖安装模拟器 `emulator-5556`；长按弹出后像素扫描无黄色横条、面板底色不透明，工具胶囊宽度仍为 242px（92dp）。
+
+---
+
+## 2026-08-13 · v2.0.0 UI 大更新（引入 Apple 设计思路）
+
+### 93. 全量代码审查后的性能与健壮性修复
+- **现象**：原生 zip 解压 / 打包在 MethodChannel 主线程同步执行，大目录或 Termux 引导包可能卡顿甚至 ANR；文件页大目录使用 `listSync()` 冻结 UI；`run_terminal` 全量缓冲 stdout / stderr，命令疯狂输出可能吃满内存；Anthropic 自定义网关填 `/v1` 会拼成 `/v1/v1/messages`。
+- **修复**：
+  1. `MainActivity` 新增 `ioExecutor`，`extractZip` / `createZip` / `extractTermux` 移到后台线程，完成后回主线程回传结果。
+  2. `files_screen.dart` 改用异步 `dir.list()` / `readAsString()` / `length()`，目录选择器异步加载；`file_workspace.dart` 目录复制改为异步递归。
+  3. `run_terminal` 输出限流：stdout 最多保留 256KB、stderr 64KB，超出后继续丢弃但不阻塞管道，不再无上限缓存。
+  4. 新增 `LlmClient.normalizeAnthropicBaseUrl`，去掉结尾 `/v1`；保存自定义接口时同步归一化。
+- **涉及**：`android/app/src/main/kotlin/com/shiyi/agent/MainActivity.kt`、`lib/screens/files_screen.dart`、`lib/services/file_workspace.dart`、`lib/core/app_state.dart`、`lib/services/llm_client.dart`、`lib/screens/settings_screen.dart`、`test/settings_model_test.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 100 项全部通过（新增 Anthropic 地址归一化回归）；debug / release 构建成功。
+
+### 94. 移除会话页自绘返回手势
+- **现象**：会话页同时存在系统预测性返回（`MacPageRoute` 转发）与自绘左边缘 `GestureDetector`，可能双触发返回手势。
+- **修复**：删除 `_onDragStart` / `_onDragUpdate` / `_onDragEnd` / `_onDragCancel` 与不再使用的 `_dragging` / `_screenWidth`；页面只保留 `MacPageRoute` 转发的系统预测性返回。
+- **涉及**：`lib/screens/chat_screen.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 100 项全部通过；debug / release 构建成功。
+
+### 95. 会话气泡加宽
+- **现象**：消息气泡最宽只有屏幕 72%，左右留白太大，整体偏窄。
+- **修复**：气泡最大宽度改为「屏幕宽 − 列表两侧留白 − 一个工具栏图标宽度（34dp）」，气泡内侧留白从 48 收到 34，用户 / 助手气泡都明显变宽。
+- **涉及**：`lib/widgets/message_bubble.dart`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 100 项全部通过；debug / release 构建成功。
+
+### 96. 发布 2.0.0 UI 大更新
+- **内容**：汇总第 66~95 条的 Apple 设计理念统一重构、底部三 Tab、设置 / 关于 / 功能 / 文件 / 记忆 / 技能 / 日志 iOS 化、Anthropic 协议与内置 API 预设、红绿灯全局状态、消息气泡与工具栏、项目 / 会话左滑交互、性能与健壮性修复，作为 `2.0.0` 正式发布。
+- **涉及**：`pubspec.yaml`（2.0.0+13）、`android/app/build.gradle.kts`（versionCode 13 / versionName 2.0.0）、`lib/services/update_service.dart`、`CHANGELOG.md`、`README.md`、`docs/fix-log.md`。
+- **验证**：`flutter analyze` 无告警；`flutter test` 100 项全部通过；release 构建成功；真机 `f29c6ad8` 覆盖安装（`adb install -r`）Success，`firstInstallTime` 未变化，数据保留；推送 GitHub 源码并创建 `v2.0.0` Release。

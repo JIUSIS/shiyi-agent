@@ -1,86 +1,153 @@
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/models.dart';
+import '../widgets/ios_style.dart';
+
+const _iosBlue = Color(0xFF0A84FF);
 
 /// 新建项目：输入名称并选择工作目录后创建。
 Future<Project?> createProjectWithFolder(
   BuildContext context,
   ShiyiState shiyi,
-) async {
-  final controller = TextEditingController();
-  String? folder;
-  final created = await showDialog<Project>(
+) {
+  return showIosFadeDialog<Project>(
     context: context,
-    builder: (ctx) => StatefulBuilder(
-      builder: (ctx, setState) {
-        void showError(String message) {
-          ScaffoldMessenger.of(
-            ctx,
-          ).showSnackBar(SnackBar(content: Text(message)));
-        }
-
-        return AlertDialog(
-          title: const Text('新建项目'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              TextField(
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(hintText: '项目名称'),
-              ),
-              const SizedBox(height: 12),
-              OutlinedButton.icon(
-                onPressed: () async {
-                  final dir = await FilePicker.platform.getDirectoryPath();
-                  if (dir == null || dir.trim().isEmpty) return;
-                  if (!ctx.mounted) return;
-                  setState(() => folder = dir.trim());
-                },
-                icon: const Icon(Icons.folder_open_outlined),
-                label: Text(
-                  folder ?? '选择文件夹位置',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () async {
-                final name = controller.text.trim();
-                if (name.isEmpty) {
-                  showError('请输入项目名称');
-                  return;
-                }
-                if (folder == null || folder!.trim().isEmpty) {
-                  showError('请选择文件夹位置');
-                  return;
-                }
-                try {
-                  final p = await shiyi.addProject(name, workspaceDir: folder!);
-                  if (ctx.mounted) Navigator.pop(ctx, p);
-                } catch (e) {
-                  showError('创建项目失败：$e');
-                }
-              },
-              child: const Text('创建'),
-            ),
-          ],
-        );
-      },
+    builder: (_) => CupertinoTheme(
+      data: iosCupertinoTheme(context),
+      child: _NewProjectDialog(shiyi: shiyi),
     ),
   );
-  controller.dispose();
-  return created;
+}
+
+class _NewProjectDialog extends StatefulWidget {
+  final ShiyiState shiyi;
+  const _NewProjectDialog({required this.shiyi});
+
+  @override
+  State<_NewProjectDialog> createState() => _NewProjectDialogState();
+}
+
+class _NewProjectDialogState extends State<_NewProjectDialog> {
+  final TextEditingController _controller = TextEditingController();
+  String? _folder;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _showError(String message) {
+    showIosFadeDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('无法创建项目'),
+        content: Text(message),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('好'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickFolder() async {
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null || dir.trim().isEmpty) return;
+    if (!mounted) return;
+    setState(() => _folder = dir.trim());
+  }
+
+  Future<void> _create() async {
+    final name = _controller.text.trim();
+    if (name.isEmpty) {
+      _showError('请输入项目名称');
+      return;
+    }
+    if (_folder == null || _folder!.trim().isEmpty) {
+      _showError('请选择文件夹位置');
+      return;
+    }
+    try {
+      final p = await widget.shiyi.addProject(name, workspaceDir: _folder!);
+      if (mounted) Navigator.pop(context, p);
+    } catch (e) {
+      _showError('创建项目失败：$e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoAlertDialog(
+      title: const Text('新建项目'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          CupertinoTextField(
+            controller: _controller,
+            autofocus: true,
+            placeholder: '项目名称',
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            clearButtonMode: OverlayVisibilityMode.editing,
+            onSubmitted: (_) => _create(),
+          ),
+          const SizedBox(height: 12),
+          CupertinoButton(
+            padding: EdgeInsets.zero,
+            onPressed: _pickFolder,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              decoration: BoxDecoration(
+                color: iosSectionBackground(context),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  const Icon(CupertinoIcons.folder, size: 18, color: _iosBlue),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _folder ?? '选择文件夹位置',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: _folder == null
+                            ? Theme.of(context).colorScheme.onSurfaceVariant
+                            : Theme.of(context).colorScheme.onSurface,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    CupertinoIcons.chevron_right,
+                    size: 14,
+                    color: Theme.of(context).hintColor,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        CupertinoDialogAction(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        CupertinoDialogAction(
+          isDefaultAction: true,
+          onPressed: _create,
+          child: const Text('创建'),
+        ),
+      ],
+    );
+  }
 }
 
 /// 设置 / 清除项目级工作目录。
@@ -89,42 +156,36 @@ Future<void> showProjectFolderSheet(
   ShiyiState shiyi,
   Project project,
 ) async {
-  final action = await showModalBottomSheet<String>(
+  final action = await showIosFadeModalPopup<String>(
     context: context,
-    builder: (ctx) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            leading: const Icon(Icons.folder_copy_outlined),
-            title: Text(
-              '「${project.name}」工作目录',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            subtitle: Text(
-              project.workspaceDir.isEmpty
-                  ? '未设置（会话用全局默认）'
-                  : project.workspaceDir,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          const Divider(height: 1),
-          ListTile(
-            leading: const Icon(Icons.folder_open_outlined),
-            title: const Text('选择文件夹'),
-            subtitle: const Text('项目下会话未单独设置时自动使用'),
-            onTap: () => Navigator.pop(ctx, 'pick'),
+    builder: (ctx) => CupertinoTheme(
+      data: iosCupertinoTheme(context),
+      child: CupertinoActionSheet(
+        title: Text(
+          '「${project.name}」工作目录',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        message: Text(
+          project.workspaceDir.isEmpty ? '未设置（会话用全局默认）' : project.workspaceDir,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx, 'pick'),
+            child: const Text('选择文件夹'),
           ),
           if (project.workspaceDir.isNotEmpty)
-            ListTile(
-              leading: const Icon(Icons.restart_alt),
-              title: const Text('清除项目目录'),
-              subtitle: const Text('回到全局默认目录'),
-              onTap: () => Navigator.pop(ctx, 'clear'),
+            CupertinoActionSheetAction(
+              onPressed: () => Navigator.pop(ctx, 'clear'),
+              child: const Text('清除项目目录'),
             ),
         ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
+        ),
       ),
     ),
   );
@@ -144,31 +205,60 @@ Future<void> renameProjectDialog(
   ShiyiState shiyi,
   Project project,
 ) async {
-  final controller = TextEditingController(text: project.name);
-  final name = await showDialog<String>(
+  final name = await showIosFadeDialog<String>(
     context: context,
-    builder: (ctx) => AlertDialog(
+    builder: (ctx) => CupertinoTheme(
+      data: iosCupertinoTheme(context),
+      child: _RenameProjectDialog(project: project),
+    ),
+  );
+  if (name == null || name.isEmpty) return;
+  await shiyi.renameProject(project.id, name);
+}
+
+class _RenameProjectDialog extends StatefulWidget {
+  final Project project;
+  const _RenameProjectDialog({required this.project});
+
+  @override
+  State<_RenameProjectDialog> createState() => _RenameProjectDialogState();
+}
+
+class _RenameProjectDialogState extends State<_RenameProjectDialog> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.project.name,
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoAlertDialog(
       title: const Text('重命名项目'),
-      content: TextField(
-        controller: controller,
+      content: CupertinoTextField(
+        controller: _controller,
         autofocus: true,
-        onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        clearButtonMode: OverlayVisibilityMode.editing,
+        onSubmitted: (v) => Navigator.pop(context, v.trim()),
       ),
       actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx),
+        CupertinoDialogAction(
+          onPressed: () => Navigator.pop(context),
           child: const Text('取消'),
         ),
-        FilledButton(
-          onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+        CupertinoDialogAction(
+          isDefaultAction: true,
+          onPressed: () => Navigator.pop(context, _controller.text.trim()),
           child: const Text('确定'),
         ),
       ],
-    ),
-  );
-  controller.dispose();
-  if (name == null || name.isEmpty) return;
-  await shiyi.renameProject(project.id, name);
+    );
+  }
 }
 
 /// 删除项目；项目下会话移回未分类，不删除会话。
@@ -177,24 +267,25 @@ Future<void> deleteProjectDialog(
   ShiyiState shiyi,
   Project project,
 ) async {
-  final ok = await showDialog<bool>(
+  final ok = await showIosFadeDialog<bool>(
     context: context,
-    builder: (ctx) => AlertDialog(
-      title: const Text('删除项目'),
-      content: Text('删除项目「${project.name}」？项目下会话会移到「未分类」，不会删除会话。'),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, false),
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(ctx, true),
-          style: FilledButton.styleFrom(
-            backgroundColor: Theme.of(ctx).colorScheme.error,
+    builder: (ctx) => CupertinoTheme(
+      data: iosCupertinoTheme(context),
+      child: CupertinoAlertDialog(
+        title: const Text('删除项目'),
+        content: Text('删除项目「${project.name}」？项目下会话会移到「未分类」，不会删除会话。'),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
           ),
-          child: const Text('删除'),
-        ),
-      ],
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
     ),
   );
   if (ok == true) await shiyi.deleteProject(project.id);

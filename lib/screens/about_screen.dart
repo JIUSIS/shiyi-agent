@@ -1,12 +1,31 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart' show Material, MaterialType;
 import 'package:flutter/services.dart';
 
+import '../core/app_state.dart';
 import '../services/update_service.dart';
+import '../widgets/ios_style.dart';
 import '../widgets/welcome_avatar.dart';
 
-/// 关于页：应用信息、检查更新、项目主页与版权说明。
+const _iosBlue = Color(0xFF0A84FF);
+const _iosGreen = Color(0xFF34C759);
+const _iosPurple = Color(0xFFAF52DE);
+const _iosOrange = Color(0xFFFF9500);
+const _iosPink = Color(0xFFFF2D55);
+const _iosTeal = Color(0xFF64D2FF);
+const _iosIndigo = Color(0xFF5856D6);
+const _iosGray = Color(0xFF8E8E93);
+
+bool _aboutIsDark(BuildContext context, String themeMode) {
+  final platformDark =
+      MediaQuery.platformBrightnessOf(context) == Brightness.dark;
+  return themeMode == 'dark' || (themeMode == 'system' && platformDark);
+}
+
+/// 关于页：iOS Inset Grouped 分组列表，完整列出拾忆现有功能。
 class AboutScreen extends StatefulWidget {
-  const AboutScreen({super.key});
+  final ShiyiState shiyi;
+  const AboutScreen({super.key, required this.shiyi});
 
   static const String appName = '拾忆 ShiYi';
 
@@ -14,17 +33,38 @@ class AboutScreen extends StatefulWidget {
   State<AboutScreen> createState() => _AboutScreenState();
 }
 
-/// 功能特性列表（与 README 保持一致）。
-const _features = <(IconData, String)>[
-  (Icons.api, '接入不同 LLM API，自由切换模型'),
-  (Icons.forum_outlined, '多轮对话与独立会话管理'),
-  (Icons.folder_outlined, '每个会话可设置独立项目工作目录'),
-  (Icons.attach_file_outlined, '文件 / 图片附件，支持视觉模型'),
-  (Icons.terminal, '内置免 root 终端（bash / python3 / apt 装包）'),
-  (Icons.psychology_outlined, '长期记忆：记住偏好与项目背景'),
-  (Icons.bolt_outlined, '技能系统：输入 / 快速选择技能'),
-  (Icons.travel_explore, '网页搜索与网页内容提取'),
-  (Icons.record_voice_over_outlined, '语音朗读、深浅色主题'),
+/// 功能特性（完整功能名 + 一句话说明）。
+const _features = <(IconData, Color, String, String)>[
+  (
+    CupertinoIcons.square_stack_3d_up_fill,
+    _iosBlue,
+    '多模型 API',
+    'OpenAI / Anthropic / Gemini / DeepSeek 等常见接口',
+  ),
+  (
+    CupertinoIcons.chat_bubble_2_fill,
+    _iosGreen,
+    '多轮对话与会话管理',
+    '独立会话、历史消息与滚动上下文摘要',
+  ),
+  (CupertinoIcons.folder_fill, _iosOrange, '项目分类管理', '项目文件夹统一管理会话与工作目录'),
+  (CupertinoIcons.doc_text_fill, _iosTeal, '文件管理', '会话文件附件与文件页浏览'),
+  (CupertinoIcons.bookmark_fill, _iosPink, '长期记忆', '自动沉淀偏好、决定与项目背景'),
+  (CupertinoIcons.bolt_fill, _iosIndigo, '技能系统', '内置技能与自定义技能包'),
+  (CupertinoIcons.desktopcomputer, _iosGray, '内置终端', 'bash / python3 / apt 装包'),
+  (CupertinoIcons.globe, _iosBlue, '网页搜索与内容提取', '联网搜索、抓取网页正文'),
+  (CupertinoIcons.photo_fill, _iosPurple, '图片与视觉模型', '图片附件、视觉模型辅助看图'),
+  (CupertinoIcons.square_on_square, _iosTeal, '上下文压缩', '大上下文自动压缩与裁剪保护'),
+  (CupertinoIcons.speedometer, _iosGreen, '缓存命中率', '服务端缓存 Token 统计显示'),
+  (CupertinoIcons.return_icon, _iosIndigo, '回车发送', '可开关的回车发送消息'),
+  (CupertinoIcons.speaker_3_fill, _iosPink, '语音朗读', '可调节语速的文本朗读'),
+  (CupertinoIcons.paintbrush_fill, _iosPurple, '深浅色主题', '浅色 / 深色 / 跟随系统'),
+  (
+    CupertinoIcons.cloud_download_fill,
+    _iosBlue,
+    '自动检查更新',
+    '启动时检查 GitHub Releases',
+  ),
 ];
 
 class _AboutScreenState extends State<AboutScreen> {
@@ -69,184 +109,212 @@ class _AboutScreenState extends State<AboutScreen> {
     }
   }
 
+  Future<void> _copyRepoUrl() async {
+    await Clipboard.setData(const ClipboardData(text: UpdateService.repoUrl));
+    if (mounted) {
+      _showIosAlert(context, '完成', '项目链接已复制');
+    }
+  }
+
+  Future<void> _showIosAlert(
+    BuildContext context,
+    String title,
+    String message,
+  ) {
+    return showIosFadeDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('好'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(title: const Text('关于')),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 640),
-          child: ListView(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-            children: [
-              Center(
-                child: WelcomeAvatar(size: 100, asset: 'assets/avatar.png'),
-              ),
-              const SizedBox(height: 12),
-              Center(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      AboutScreen.appName,
-                      style: theme.textTheme.titleLarge!.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.surfaceContainerHigh,
-                        borderRadius: BorderRadius.circular(999),
-                        border: Border.all(
-                          color: theme.colorScheme.outlineVariant,
-                        ),
-                      ),
-                      child: Text(
-                        'v$_version',
-                        style: theme.textTheme.labelSmall!.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                '个人 AI 工作台：对话、长期记忆、项目文件、内置终端与技能系统，一站式完成。',
-                textAlign: TextAlign.center,
-                style: theme.textTheme.bodyMedium!.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  height: 1.5,
-                ),
-              ),
-              const SizedBox(height: 18),
-              Text(
-                '功能特性',
-                style: theme.textTheme.bodySmall!.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 8),
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  final itemWidth = (constraints.maxWidth - 8) / 2;
-                  return Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      for (final f in _features)
-                        SizedBox(
-                          width: itemWidth,
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Padding(
-                                padding: const EdgeInsets.only(top: 2),
-                                child: Icon(
-                                  f.$1,
-                                  size: 16,
-                                  color: theme.colorScheme.primary,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  f.$2,
-                                  style: theme.textTheme.bodySmall!.copyWith(
-                                    height: 1.35,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                    ],
-                  );
-                },
-              ),
-              const SizedBox(height: 18),
-              Card(
-                color: theme.colorScheme.surfaceContainerHigh,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                clipBehavior: Clip.antiAlias,
-                child: Column(
-                  children: [
-                    ListTile(
-                      dense: true,
-                      leading: Icon(
-                        Icons.link,
-                        color: theme.colorScheme.primary,
-                        size: 20,
-                      ),
-                      title: const Text(
-                        'github.com/JIUSIS/shiyi-agent',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      subtitle: const Text('点击复制链接'),
-                      trailing: const Icon(Icons.copy, size: 16),
-                      onTap: () async {
-                        await Clipboard.setData(
-                          const ClipboardData(text: UpdateService.repoUrl),
-                        );
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('链接已复制')),
-                          );
-                        }
-                      },
-                    ),
-                    const Divider(height: 1, indent: 16, endIndent: 16),
-                    ListTile(
-                      dense: true,
-                      leading: Icon(
-                        Icons.system_update_alt,
-                        color: theme.colorScheme.primary,
-                        size: 20,
-                      ),
-                      title: const Text('检查更新'),
-                      subtitle: Text(
-                        _checking ? '正在检查…' : '从 GitHub Releases 检查新版本',
-                      ),
-                      trailing: _checking
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : null,
-                      onTap: _checkUpdate,
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 18),
-              Center(
-                child: Text(
-                  '本项目基于 GPL-3.0 协议开源\n使用、修改与分发请遵守 GPL-3.0 条款',
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.bodySmall!.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant.withValues(
-                      alpha: .7,
-                    ),
-                    height: 1.5,
-                  ),
-                ),
-              ),
-            ],
+    return ListenableBuilder(
+      listenable: widget.shiyi,
+      builder: (context, _) {
+        final dark = _aboutIsDark(context, widget.shiyi.settings.themeMode);
+        return CupertinoTheme(
+          data: CupertinoThemeData(
+            brightness: dark ? Brightness.dark : Brightness.light,
           ),
-        ),
+          child: Material(
+            type: MaterialType.transparency,
+            child: CupertinoPageScaffold(
+              backgroundColor: dark
+                  ? const Color(0xFF000000)
+                  : const Color(0xFFF2F2F7),
+              navigationBar: CupertinoNavigationBar(
+                backgroundColor: dark
+                    ? const Color(0xE6000000)
+                    : const Color(0xE6F2F2F7),
+                middle: const Text('关于'),
+              ),
+              child: SafeArea(
+                bottom: false,
+                child: ListView(
+                  padding: const EdgeInsets.only(top: 8, bottom: 36),
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+                      child: Center(
+                        child: WelcomeAvatar(
+                          size: 112,
+                          asset: 'assets/avatar.png',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Center(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            AboutScreen.appName,
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: dark
+                                  ? const Color(0xFF2C2C2E)
+                                  : CupertinoColors.systemGrey5,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Text(
+                              'v$_version',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: dark
+                                    ? CupertinoColors.white.withValues(
+                                        alpha: .6,
+                                      )
+                                    : CupertinoColors.black.withValues(
+                                        alpha: .55,
+                                      ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 32),
+                      child: Text(
+                        '个人 AI 工作台：对话、长期记忆、项目文件、内置终端与技能系统，一站式完成。',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: dark
+                              ? CupertinoColors.white.withValues(alpha: .6)
+                              : CupertinoColors.black.withValues(alpha: .55),
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                    CupertinoListSection.insetGrouped(
+                      header: const Text('功能特性'),
+                      children: [
+                        for (final f in _features)
+                          CupertinoListTile(
+                            leading: _AboutIconTile(icon: f.$1, color: f.$2),
+                            title: Text(f.$3),
+                            subtitle: Text(f.$4),
+                          ),
+                      ],
+                    ),
+                    CupertinoListSection.insetGrouped(
+                      header: const Text('项目'),
+                      children: [
+                        CupertinoListTile(
+                          leading: const _AboutIconTile(
+                            icon: CupertinoIcons.link,
+                            color: _iosBlue,
+                          ),
+                          title: const Text(
+                            'github.com/JIUSIS/shiyi-agent',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: const Text('点击复制项目链接'),
+                          trailing: const CupertinoListTileChevron(),
+                          onTap: _copyRepoUrl,
+                        ),
+                        CupertinoListTile(
+                          leading: _AboutIconTile(
+                            icon: _checking
+                                ? CupertinoIcons.hourglass
+                                : CupertinoIcons.cloud_download_fill,
+                            color: _iosGreen,
+                          ),
+                          title: const Text('检查更新'),
+                          subtitle: Text(
+                            _checking ? '正在检查…' : '从 GitHub Releases 检查新版本',
+                          ),
+                          trailing: _checking
+                              ? const CupertinoActivityIndicator()
+                              : const CupertinoListTileChevron(),
+                          onTap: _checkUpdate,
+                        ),
+                      ],
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 18),
+                      child: Text(
+                        '本项目基于 GPL-3.0 协议开源\n使用、修改与分发请遵守 GPL-3.0 条款',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: dark
+                              ? CupertinoColors.white.withValues(alpha: .5)
+                              : CupertinoColors.black.withValues(alpha: .5),
+                          height: 1.5,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _AboutIconTile extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  const _AboutIconTile({required this.icon, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 31,
+      height: 31,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(7),
       ),
+      child: Icon(icon, size: 17, color: CupertinoColors.white),
     );
   }
 }

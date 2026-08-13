@@ -3,12 +3,14 @@ class ModelPreset {
   final String name;
   final String baseUrl;
   final String model;
+  final String apiProtocol; // openai | anthropic
   final String keyHint; // API Key 格式提示
   final int suggestedMaxTokens; // 该模型推荐的单次输出上限
   const ModelPreset({
     required this.name,
     required this.baseUrl,
     required this.model,
+    this.apiProtocol = 'openai',
     required this.keyHint,
     this.suggestedMaxTokens = 8192,
   });
@@ -16,10 +18,74 @@ class ModelPreset {
 
 const List<ModelPreset> modelPresets = [
   ModelPreset(
+    name: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o',
+    keyHint: 'sk-...（OpenAI 控制台创建）',
+    suggestedMaxTokens: 16384,
+  ),
+  ModelPreset(
+    name: 'Anthropic Claude',
+    baseUrl: 'https://api.anthropic.com',
+    model: 'claude-sonnet-4-5',
+    apiProtocol: 'anthropic',
+    keyHint: 'sk-ant-...（Anthropic Console 创建）',
+    suggestedMaxTokens: 16384,
+  ),
+  ModelPreset(
+    name: 'Google Gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model: 'gemini-2.5-flash',
+    keyHint: 'AIza...（Google AI Studio API Key）',
+    suggestedMaxTokens: 8192,
+  ),
+  ModelPreset(
     name: 'DeepSeek',
     baseUrl: 'https://api.deepseek.com/v1',
     model: 'deepseek-chat',
     keyHint: 'sk-...',
+    suggestedMaxTokens: 8192,
+  ),
+  ModelPreset(
+    name: 'Kimi（Moonshot）',
+    baseUrl: 'https://api.moonshot.cn/v1',
+    model: 'moonshot-v1-8k',
+    keyHint: 'sk-...（Moonshot 开放平台创建）',
+    suggestedMaxTokens: 8192,
+  ),
+  ModelPreset(
+    name: '通义千问（DashScope）',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-plus',
+    keyHint: 'sk-...（阿里云百炼创建）',
+    suggestedMaxTokens: 8192,
+  ),
+  ModelPreset(
+    name: '智谱 GLM',
+    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    model: 'glm-4-plus',
+    keyHint: 'id/Key（智谱开放平台创建）',
+    suggestedMaxTokens: 16384,
+  ),
+  ModelPreset(
+    name: '豆包（火山方舟）',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    model: 'doubao-1-5-pro-32k-250115',
+    keyHint: 'ARK_...（火山方舟控制台创建）',
+    suggestedMaxTokens: 8192,
+  ),
+  ModelPreset(
+    name: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    model: 'openai/gpt-4o',
+    keyHint: 'sk-or-...（OpenRouter Keys 创建）',
+    suggestedMaxTokens: 16384,
+  ),
+  ModelPreset(
+    name: 'Groq',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    model: 'llama-3.3-70b-versatile',
+    keyHint: 'gsk_...（Groq Console 创建）',
     suggestedMaxTokens: 8192,
   ),
   ModelPreset(

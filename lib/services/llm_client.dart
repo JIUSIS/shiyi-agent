@@ -32,6 +32,7 @@ class LlmClient {
   final String baseUrl;
   final String apiKey;
   final String model;
+  final String protocol; // openai | anthropic
   final double temperature;
   final int maxTokens;
   final List<Map<String, dynamic>> tools;
@@ -68,6 +69,7 @@ class LlmClient {
     required this.baseUrl,
     required this.apiKey,
     required this.model,
+    this.protocol = 'openai',
     required this.temperature,
     this.maxTokens = 8192,
     required this.tools,
@@ -77,8 +79,47 @@ class LlmClient {
     this.onDiag,
   });
 
-  String get _endpoint =>
-      '${baseUrl.replaceAll(RegExp(r'/*$'), '')}/chat/completions';
+  String get _endpoint {
+    final root = protocol == 'anthropic'
+        ? normalizeAnthropicBaseUrl(baseUrl)
+        : baseUrl.replaceAll(RegExp(r'/*$'), '');
+    return protocol == 'anthropic'
+        ? '$root/v1/messages'
+        : '$root/chat/completions';
+  }
+
+  /// Anthropic 自定义网关兼容：去掉结尾的 /v1，避免拼成 /v1/v1/messages。
+  static String normalizeAnthropicBaseUrl(String url) {
+    return url
+        .replaceAll(RegExp(r'/*$'), '')
+        .replaceFirst(RegExp(r'/v1$', caseSensitive: false), '');
+  }
+
+  Map<String, String> _headers({required bool streaming}) => <String, String>{
+    'Content-Type': 'application/json',
+    if (streaming) 'Accept': 'text/event-stream',
+    if (apiKey.isNotEmpty && protocol == 'openai')
+      'Authorization': 'Bearer $apiKey',
+    if (apiKey.isNotEmpty && protocol == 'anthropic') 'x-api-key': apiKey,
+    if (protocol == 'anthropic') 'anthropic-version': '2023-06-01',
+  };
+
+  /// 续写指令：上一轮只输出了计划且没有实际工具调用时，改用“工具唤醒”提示，
+  /// 避免模型把“继续写文字”理解成继续描述计划而不是执行工具。
+  static String buildContinuationPrompt(
+    String lastText, {
+    bool hasTools = false,
+  }) {
+    final t = lastText.trim();
+    final toolKick = hasTools && (t.endsWith('：') || t.endsWith(':'));
+    return toolKick
+        ? '你刚才只输出了计划或开场白，还没有实际执行任何工具。'
+              '不要继续输出计划、承诺或重复文字；'
+              '现在直接调用需要的工具完成用户请求，'
+              '全部执行完后再给出最终结果。'
+        : '继续完成上述输出。直接从上次断点继续写，'
+              '不要重复已经输出的内容。';
+  }
 
   Future<void> send(List<Map<String, dynamic>> messages) async {
     lastTotalTokens = null;
@@ -95,25 +136,14 @@ class LlmClient {
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
       for (var round = 0; round < 3; round++) {
-        final body = <String, dynamic>{
-          'model': model,
-          'messages': [...messages, ...continuation],
-          'stream': true,
-          if (includeUsage) 'stream_options': {'include_usage': true},
-          'temperature': temperature,
-          // 显式声明输出上限：部分网关默认 max_tokens 过小，
-          // 思考模型（reasoning 占 token）+ 长工具调用会导致 content 被截断。
-          // 默认 8192，可在设置中按模型调大（如 OpenCode Go 的 32768）。
-          'max_tokens': outputLimit,
-          if (tools.isNotEmpty) 'tools': tools,
-          if (tools.isNotEmpty) 'tool_choice': 'auto',
-        };
+        final body = _buildRequestBody(
+          messages: [...messages, ...continuation],
+          stream: true,
+          includeUsage: includeUsage,
+          maxTokens: outputLimit,
+        );
         final request = http.Request('POST', Uri.parse(_endpoint))
-          ..headers.addAll(<String, String>{
-            'Content-Type': 'application/json',
-            'Accept': 'text/event-stream',
-            if (apiKey.isNotEmpty) 'Authorization': 'Bearer $apiKey',
-          })
+          ..headers.addAll(_headers(streaming: true))
           ..body = jsonEncode(body);
         try {
           final response = await client
@@ -134,17 +164,26 @@ class LlmClient {
             }
             throw LlmException('HTTP ${response.statusCode}: ${_short(err)}');
           }
-          final needContinue = await _parseSse(response.stream);
+          final needContinue = protocol == 'anthropic'
+              ? await _parseAnthropicSse(response.stream)
+              : await _parseOpenAiSse(response.stream);
           if (!needContinue) return;
           // 纯文本截断：追加已输出 + 继续指令，发起续写请求。
-          onDiag?.call('[stream] 续写第 ${round + 1} 轮');
+          final lastText = _lastRoundText.trim();
+          final toolKick =
+              tools.isNotEmpty &&
+              (lastText.endsWith('：') || lastText.endsWith(':'));
+          onDiag?.call(
+            '[stream] 续写第 ${round + 1} 轮${toolKick ? ' (工具唤醒)' : ''}',
+          );
           continuation.addAll([
             {'role': 'assistant', 'content': _lastRoundText},
             {
               'role': 'user',
-              'content':
-                  '继续完成上述输出。直接从上次断点继续写，'
-                  '不要重复已经输出的内容。',
+              'content': buildContinuationPrompt(
+                lastText,
+                hasTools: tools.isNotEmpty,
+              ),
             },
           ]);
           includeUsage = false;
@@ -158,6 +197,122 @@ class LlmClient {
   }
 
   /// 判断 HTTP 400 是否由 stream_options/include_usage 参数不被支持引起。
+  Map<String, dynamic> _buildRequestBody({
+    required List<Map<String, dynamic>> messages,
+    required bool stream,
+    required bool includeUsage,
+    required int maxTokens,
+  }) {
+    if (protocol == 'anthropic') {
+      final systemParts = <String>[];
+      final apiMessages = <Map<String, dynamic>>[];
+      for (final m in messages) {
+        if (m['role'] == 'system') {
+          final c = (m['content'] ?? '').toString().trim();
+          if (c.isNotEmpty) systemParts.add(c);
+        } else {
+          apiMessages.add(m);
+        }
+      }
+      return <String, dynamic>{
+        'model': model,
+        if (systemParts.isNotEmpty) 'system': systemParts.join('\n\n'),
+        'messages': _toAnthropicMessages(apiMessages),
+        'max_tokens': maxTokens,
+        'stream': stream,
+        'temperature': temperature,
+        if (tools.isNotEmpty) 'tools': _toAnthropicTools(tools),
+        if (tools.isNotEmpty)
+          'tool_choice': {'type': 'auto', 'disable_parallel_tool_use': false},
+      };
+    }
+    return <String, dynamic>{
+      'model': model,
+      'messages': messages,
+      'stream': stream,
+      if (includeUsage) 'stream_options': {'include_usage': true},
+      'temperature': temperature,
+      'max_tokens': maxTokens,
+      if (tools.isNotEmpty) 'tools': tools,
+      if (tools.isNotEmpty) 'tool_choice': 'auto',
+    };
+  }
+
+  List<Map<String, dynamic>> _toAnthropicMessages(
+    List<Map<String, dynamic>> messages,
+  ) {
+    final out = <Map<String, dynamic>>[];
+    for (final m in messages) {
+      final role = m['role'];
+      if (role == 'tool') {
+        out.add({
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': (m['tool_call_id'] ?? '').toString(),
+              'content': (m['content'] ?? '').toString(),
+            },
+          ],
+        });
+        continue;
+      }
+      final toolCalls = m['tool_calls'];
+      if (role == 'assistant' && toolCalls is List && toolCalls.isNotEmpty) {
+        final content = <Map<String, dynamic>>[];
+        final text = (m['content'] ?? '').toString();
+        if (text.trim().isNotEmpty) {
+          content.add({'type': 'text', 'text': text});
+        }
+        for (final raw in toolCalls) {
+          final tc = raw is Map<String, dynamic> ? raw : <String, dynamic>{};
+          final fn = tc['function'] is Map<String, dynamic>
+              ? tc['function'] as Map<String, dynamic>
+              : <String, dynamic>{};
+          content.add({
+            'type': 'tool_use',
+            'id': (tc['id'] ?? '').toString(),
+            'name': (fn['name'] ?? '').toString(),
+            'input': _decodeArguments(fn['arguments']),
+          });
+        }
+        out.add({'role': 'assistant', 'content': content});
+        continue;
+      }
+      out.add({'role': role, 'content': (m['content'] ?? '').toString()});
+    }
+    return out;
+  }
+
+  Map<String, dynamic> _decodeArguments(Object? raw) {
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is String && raw.trim().isNotEmpty) {
+      try {
+        final d = jsonDecode(raw);
+        if (d is Map<String, dynamic>) return d;
+      } catch (_) {}
+    }
+    return const {};
+  }
+
+  List<Map<String, dynamic>> _toAnthropicTools(
+    List<Map<String, dynamic>> tools,
+  ) {
+    return tools.map((t) {
+      final fn = t['function'] is Map<String, dynamic>
+          ? t['function'] as Map<String, dynamic>
+          : <String, dynamic>{};
+      final params = fn['parameters'];
+      return <String, dynamic>{
+        'name': (fn['name'] ?? '').toString(),
+        'description': (fn['description'] ?? '').toString(),
+        'input_schema': params is Map<String, dynamic>
+            ? params
+            : const <String, dynamic>{'type': 'object', 'properties': {}},
+      };
+    }).toList();
+  }
+
   static bool _isUsageParamError(String err) {
     final e = err.toLowerCase();
     return e.contains('stream_options') ||
@@ -186,19 +341,14 @@ class LlmClient {
     double? temperature,
     int? maxTokens,
   }) async {
-    final body = <String, dynamic>{
-      'model': model,
-      'messages': messages,
-      'stream': false,
-      'temperature': temperature ?? this.temperature,
-    };
-    if (maxTokens != null) body['max_tokens'] = maxTokens;
-
+    final body = _buildRequestBody(
+      messages: messages,
+      stream: false,
+      includeUsage: false,
+      maxTokens: maxTokens ?? this.maxTokens,
+    );
     final request = http.Request('POST', Uri.parse(_endpoint))
-      ..headers.addAll(<String, String>{
-        'Content-Type': 'application/json',
-        if (apiKey.isNotEmpty) 'Authorization': 'Bearer $apiKey',
-      })
+      ..headers.addAll(_headers(streaming: false))
       ..body = jsonEncode(body);
 
     final client = http.Client();
@@ -212,6 +362,17 @@ class LlmClient {
       }
       final json = _tryDecode(raw);
       if (json == null) throw LlmException('响应解析失败');
+      if (protocol == 'anthropic') {
+        final blocks = json['content'] as List<dynamic>? ?? [];
+        final parts = <String>[];
+        for (final b in blocks) {
+          if (b is Map<String, dynamic> && b['type'] == 'text') {
+            final t = (b['text'] ?? '').toString().trim();
+            if (t.isNotEmpty) parts.add(t);
+          }
+        }
+        return parts.join('\n');
+      }
       final choices = json['choices'] as List<dynamic>? ?? [];
       if (choices.isEmpty) return '';
       final msg = choices.first['message'] as Map<String, dynamic>?;
@@ -223,17 +384,14 @@ class LlmClient {
 
   /// 获取模型列表（GET /models），返回模型 id 列表。
   Future<List<String>> listModels() async {
+    if (protocol == 'anthropic') {
+      throw LlmException('Anthropic 协议不提供模型列表，请手动填写模型名');
+    }
     final url = '${baseUrl.replaceAll(RegExp(r'/*$'), '')}/models';
     final client = http.Client();
     try {
       final res = await client
-          .get(
-            Uri.parse(url),
-            headers: <String, String>{
-              'Content-Type': 'application/json',
-              if (apiKey.isNotEmpty) 'Authorization': 'Bearer $apiKey',
-            },
-          )
+          .get(Uri.parse(url), headers: _headers(streaming: false))
           .timeout(const Duration(seconds: 30));
       if (res.statusCode != 200) {
         throw LlmException('HTTP ${res.statusCode}: ${_short(res.body)}');
@@ -255,19 +413,16 @@ class LlmClient {
 
   /// 测试模型连通性：发送 hi，返回 HTTP 状态与简要结果。
   Future<String> testChat() async {
-    final body = <String, dynamic>{
-      'model': model,
-      'messages': [
+    final body = _buildRequestBody(
+      messages: [
         {'role': 'user', 'content': 'hi'},
       ],
-      'max_tokens': 8,
-      'stream': false,
-    };
+      stream: false,
+      includeUsage: false,
+      maxTokens: 8,
+    );
     final request = http.Request('POST', Uri.parse(_endpoint))
-      ..headers.addAll(<String, String>{
-        'Content-Type': 'application/json',
-        if (apiKey.isNotEmpty) 'Authorization': 'Bearer $apiKey',
-      })
+      ..headers.addAll(_headers(streaming: false))
       ..body = jsonEncode(body);
     final client = http.Client();
     try {
@@ -284,7 +439,7 @@ class LlmClient {
     }
   }
 
-  Future<bool> _parseSse(Stream<List<int>> raw) async {
+  Future<bool> _parseOpenAiSse(Stream<List<int>> raw) async {
     final denyBuffer = StringBuffer(); // line buffer
     String text = '';
     String reasoning = '';
@@ -547,6 +702,211 @@ class LlmClient {
             if (!completer.isCompleted) {
               // 已收到内容但没有 [DONE]：不少网关/代理正常结束时不发 [DONE]，
               // 此时视为回复完成，避免误报"回复不完整"导致丢内容重试。
+              if (!doneReceived &&
+                  !stoppedByUser &&
+                  text.isEmpty &&
+                  toolBuf.isEmpty) {
+                completer.completeError(
+                  LlmInterruptedException('回复不完整：连接提前断开，请重试'),
+                );
+              } else {
+                completer.complete(needContinue);
+              }
+            }
+          },
+          cancelOnError: true,
+        );
+    return completer.future;
+  }
+
+  /// Anthropic Messages API 流式解析（SSE event + data）。
+  Future<bool> _parseAnthropicSse(Stream<List<int>> raw) async {
+    final buffer = StringBuffer();
+    String text = '';
+    String reasoning = '';
+    final toolBuf = <int, Map<String, String>>{};
+    var doneReceived = false;
+    var stoppedByUser = false;
+    String? stopReason;
+    final completer = Completer<bool>();
+
+    void emitPartial() {
+      if (text.isNotEmpty || reasoning.isNotEmpty) {
+        onTurn?.call(
+          TurnResult(
+            text: text,
+            reasoning: reasoning,
+            toolCalls: _snapshotTools(toolBuf),
+          ),
+        );
+      }
+    }
+
+    bool decideContinue() {
+      if (completer.isCompleted) return false;
+      final toolsComplete =
+          toolBuf.isNotEmpty &&
+          toolBuf.values.every((t) {
+            final a = t['arguments'] ?? '';
+            return a.trim().isNotEmpty && _tryDecode(a) != null;
+          });
+      final t = text.trim();
+      final halfCut =
+          reasoning.isNotEmpty &&
+          t.isNotEmpty &&
+          toolBuf.isEmpty &&
+          (t.endsWith('：') ||
+              t.endsWith(':') ||
+              t.endsWith('，') ||
+              t.endsWith(','));
+      final truncated = stopReason == 'max_tokens' || halfCut;
+      if (!truncated) return false;
+      if (toolsComplete) return false;
+      if (toolBuf.isNotEmpty) {
+        completer.completeError(LlmInterruptedException('工具调用被截断，正在自动重试'));
+        return false;
+      }
+      if (stopReason == 'max_tokens' && t.isEmpty) {
+        completer.completeError(
+          LlmInterruptedException('回复中断：模型输出被截断且没有正文，正在自动重试'),
+        );
+        return false;
+      }
+      return true;
+    }
+
+    void handleLine(String line) {
+      if (line.isEmpty) return;
+      if (line.startsWith('data:')) {
+        final data = line.substring(5).trim();
+        if (data.isEmpty) return;
+        final json = _tryDecode(data);
+        if (json == null) return;
+        final type = json['type'];
+        if (type == 'message_start') {
+          final message = json['message'];
+          if (message is Map<String, dynamic>) {
+            final usage = message['usage'];
+            if (usage is Map<String, dynamic>) applyUsage(usage);
+          }
+        } else if (type == 'content_block_start') {
+          final index = (json['index'] as num?)?.toInt() ?? 0;
+          final cb = json['content_block'];
+          if (cb is Map<String, dynamic> && cb['type'] == 'tool_use') {
+            toolBuf[index] = {
+              'id': (cb['id'] ?? '').toString(),
+              'name': (cb['name'] ?? '').toString(),
+              'arguments': '',
+            };
+          }
+        } else if (type == 'content_block_delta') {
+          final index = (json['index'] as num?)?.toInt() ?? 0;
+          final delta = json['delta'];
+          if (delta is Map<String, dynamic>) {
+            final deltaType = delta['type'];
+            if (deltaType == 'text_delta') {
+              final chunk = delta['text'];
+              if (chunk is String && chunk.isNotEmpty) {
+                text += chunk;
+                emitPartial();
+              }
+            } else if (deltaType == 'thinking_delta') {
+              final chunk = delta['thinking'];
+              if (chunk is String && chunk.isNotEmpty) {
+                reasoning += chunk;
+                emitPartial();
+              }
+            } else if (deltaType == 'input_json_delta') {
+              final cur = toolBuf[index];
+              if (cur != null) {
+                final partial = delta['partial_json'];
+                if (partial is String && partial.isNotEmpty) {
+                  cur['arguments'] = cur['arguments']! + partial;
+                }
+              }
+            }
+          }
+        } else if (type == 'message_delta') {
+          final delta = json['delta'];
+          if (delta is Map<String, dynamic>) {
+            final sr = delta['stop_reason'];
+            if (sr is String && sr.isNotEmpty) stopReason = sr;
+          }
+          final usage = json['usage'];
+          if (usage is Map<String, dynamic>) applyUsage(usage);
+        } else if (type == 'message_stop') {
+          doneReceived = true;
+        }
+      }
+    }
+
+    StreamSubscription<String>? sub;
+    Timer? idleTimer;
+    void resetIdleTimer() {
+      idleTimer?.cancel();
+      idleTimer = Timer(const Duration(seconds: 180), () {
+        idleTimer = null;
+        sub?.cancel();
+        onDiag?.call('[stream] idle 超时断开');
+        if (!completer.isCompleted) {
+          completer.completeError(LlmInterruptedException('回复中断：连接长时间无数据，请重试'));
+        }
+      });
+    }
+
+    sub = raw
+        .transform(utf8.decoder)
+        .listen(
+          (chunk) {
+            if (shouldStop?.call() ?? false) {
+              stoppedByUser = true;
+              idleTimer?.cancel();
+              sub?.cancel();
+              if (!completer.isCompleted) completer.complete(false);
+              return;
+            }
+            resetIdleTimer();
+            buffer.write(chunk);
+            var s = buffer.toString();
+            int idx;
+            while ((idx = s.indexOf('\n')) != -1) {
+              final line = s.substring(0, idx).trimRight();
+              s = s.substring(idx + 1);
+              handleLine(line);
+            }
+            buffer.clear();
+            buffer.write(s);
+          },
+          onError: (Object e) {
+            idleTimer?.cancel();
+            onDiag?.call('[stream] onError: $e');
+            if (!completer.isCompleted) {
+              completer.completeError(LlmInterruptedException('回复中断（连接断开）：$e'));
+            }
+          },
+          onDone: () {
+            idleTimer?.cancel();
+            if (buffer.isNotEmpty) {
+              final rest = buffer.toString();
+              if (rest.trim().isNotEmpty) {
+                for (final line in rest.split('\n')) {
+                  handleLine(line);
+                }
+              }
+              buffer.clear();
+            }
+            if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
+              onTurn?.call(
+                TurnResult(
+                  text: text.trim(),
+                  reasoning: reasoning,
+                  toolCalls: _snapshotTools(toolBuf),
+                ),
+              );
+            }
+            final needContinue = decideContinue();
+            _lastRoundText = text.trim();
+            if (!completer.isCompleted) {
               if (!doneReceived &&
                   !stoppedByUser &&
                   text.isEmpty &&

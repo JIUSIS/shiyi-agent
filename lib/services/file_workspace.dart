@@ -71,22 +71,24 @@ class FileWorkspace {
       final name = p.basename(srcPath);
       final dest = Directory('${dir.path}/$name');
       if (dest.existsSync()) return null;
-      _copyDirRecursive(src, dest);
+      await _copyDirRecursive(src, dest);
       return dest.path;
     } catch (_) {
       return null;
     }
   }
 
-  static void _copyDirRecursive(Directory src, Directory dest) {
+  static Future<void> _copyDirRecursive(Directory src, Directory dest) async {
     dest.createSync(recursive: true);
-    for (final e in src.listSync(recursive: false)) {
+    await for (final e in src.list(followLinks: false)) {
       if (e is Directory) {
-        _copyDirRecursive(e, Directory('${dest.path}/${p.basename(e.path)}'));
+        await _copyDirRecursive(
+          e,
+          Directory('${dest.path}/${p.basename(e.path)}'),
+        );
       } else if (e is File) {
-        e.copySync('${dest.path}/${p.basename(e.path)}');
+        await e.copy('${dest.path}/${p.basename(e.path)}');
       }
     }
   }
 }
-

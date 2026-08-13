@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show ImageFilter;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -12,8 +14,17 @@ import '../core/models.dart';
 import '../services/file_workspace.dart';
 import '../services/image_service.dart';
 import '../services/tts_service.dart';
+import '../widgets/ios_style.dart';
 import '../widgets/message_bubble.dart';
+import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
+
+const _iosBlue = Color(0xFF0A84FF);
+const _iosRed = Color(0xFFFF3B30);
+const _iosGreen = Color(0xFF34C759);
+const _iosOrange = Color(0xFFFF9500);
+const _iosGray = Color(0xFF8E8E93);
+const _iosIndigo = Color(0xFF5856D6);
 
 class ChatScreen extends StatefulWidget {
   final ShiyiState shiyi;
@@ -38,9 +49,7 @@ class _ChatScreenState extends State<ChatScreen>
     duration: const Duration(milliseconds: 260),
     value: 0,
   );
-  bool _dragging = false;
   MacPageRoute? _route;
-  double _screenWidth = 0;
   bool _showToolLog = false;
   bool _autoScrollScheduled = false;
 
@@ -71,7 +80,6 @@ class _ChatScreenState extends State<ChatScreen>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _screenWidth = MediaQuery.sizeOf(context).width;
     final route = ModalRoute.of(context);
     if (route is MacPageRoute) {
       _route = route;
@@ -238,83 +246,127 @@ class _ChatScreenState extends State<ChatScreen>
     final project = sessionId == null
         ? null
         : widget.shiyi.projectForSession(sessionId);
-    showModalBottomSheet<void>(
+    showIosFadeSheet<void>(
       context: context,
+      isScrollControlled: true,
+      backgroundColor: iosGroupedBackground(context),
       builder: (ctx) => SafeArea(
-        child: Wrap(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            ListTile(
-              leading: const Icon(Icons.folder_outlined),
-              title: const Text('当前项目目录'),
-              subtitle: Text(
-                current.isEmpty ? '（读取中…）' : current,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+            const _IosSheetHeader(title: '工作目录'),
+            SingleChildScrollView(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CupertinoListSection.insetGrouped(
+                    decoration: iosSectionDecoration(ctx),
+                    backgroundColor: iosGroupedBackground(ctx),
+                    children: [
+                      CupertinoListTile(
+                        leading: _IosWorkspaceIconTile(
+                          icon: CupertinoIcons.folder_fill,
+                          color: _iosBlue,
+                        ),
+                        title: const Text('当前项目目录'),
+                        subtitle: Text(
+                          current.isEmpty ? '（读取中…）' : current,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (sessionId != null)
+                        CupertinoListTile(
+                          leading: _IosWorkspaceIconTile(
+                            icon: CupertinoIcons.folder_badge_plus,
+                            color: _iosIndigo,
+                          ),
+                          title: const Text('所属项目'),
+                          subtitle: Text(
+                            project == null
+                                ? '未分类'
+                                : project.workspaceDir.isEmpty
+                                ? project.name
+                                : '${project.name}\n目录：${project.workspaceDir}',
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: const CupertinoListTileChevron(),
+                          onTap: () async {
+                            Navigator.pop(ctx);
+                            await _pickProjectForSession(sessionId);
+                          },
+                        ),
+                      if (project != null)
+                        CupertinoListTile(
+                          leading: _IosWorkspaceIconTile(
+                            icon: CupertinoIcons.folder_open,
+                            color: _iosOrange,
+                          ),
+                          title: const Text('项目工作目录'),
+                          subtitle: Text(
+                            project.workspaceDir.isEmpty
+                                ? '未设置（用全局默认）'
+                                : project.workspaceDir,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: const CupertinoListTileChevron(),
+                          onTap: () async {
+                            Navigator.pop(ctx);
+                            await _pickProjectWorkspace(project);
+                          },
+                        ),
+                    ],
+                  ),
+                  CupertinoListSection.insetGrouped(
+                    decoration: iosSectionDecoration(ctx),
+                    backgroundColor: iosGroupedBackground(ctx),
+                    children: [
+                      CupertinoListTile(
+                        leading: _IosWorkspaceIconTile(
+                          icon: CupertinoIcons.folder,
+                          color: _iosGreen,
+                        ),
+                        title: const Text('选择目录'),
+                        subtitle: const Text('把本会话的工作目录设为选中的文件夹'),
+                        trailing: const CupertinoListTileChevron(),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          final p = await FilePicker.platform
+                              .getDirectoryPath();
+                          if (p == null || !mounted) return;
+                          await widget.shiyi.setCurrentSessionWorkspace(p);
+                          await _refreshWorkspace();
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('本会话项目目录已设为：$p')),
+                          );
+                        },
+                      ),
+                      CupertinoListTile(
+                        leading: _IosWorkspaceIconTile(
+                          icon: CupertinoIcons.arrow_counterclockwise,
+                          color: _iosGray,
+                        ),
+                        title: const Text('使用全局默认目录'),
+                        subtitle: const Text('清除本会话的自定义目录'),
+                        trailing: const CupertinoListTileChevron(),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          await widget.shiyi.setCurrentSessionWorkspace('');
+                          await _refreshWorkspace();
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('已恢复全局默认工作目录')),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ],
               ),
-            ),
-            if (sessionId != null)
-              ListTile(
-                leading: const Icon(Icons.folder_copy_outlined),
-                title: const Text('所属项目'),
-                subtitle: Text(
-                  project == null
-                      ? '未分类'
-                      : project.workspaceDir.isEmpty
-                      ? project.name
-                      : '${project.name}\n目录：${project.workspaceDir}',
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                onTap: () async {
-                  Navigator.pop(ctx);
-                  await _pickProjectForSession(sessionId);
-                },
-              ),
-            if (project != null)
-              ListTile(
-                leading: const Icon(Icons.folder_open_outlined),
-                title: const Text('项目工作目录'),
-                subtitle: Text(
-                  project.workspaceDir.isEmpty
-                      ? '未设置（用全局默认）'
-                      : project.workspaceDir,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                onTap: () async {
-                  Navigator.pop(ctx);
-                  await _pickProjectWorkspace(project);
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.folder_open_outlined),
-              title: const Text('选择目录'),
-              subtitle: const Text('把本会话的工作目录设为选中的文件夹'),
-              onTap: () async {
-                Navigator.pop(ctx);
-                final p = await FilePicker.platform.getDirectoryPath();
-                if (p == null || !mounted) return;
-                await widget.shiyi.setCurrentSessionWorkspace(p);
-                await _refreshWorkspace();
-                if (!mounted) return;
-                ScaffoldMessenger.of(
-                  context,
-                ).showSnackBar(SnackBar(content: Text('本会话项目目录已设为：$p')));
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.restart_alt),
-              title: const Text('使用全局默认目录'),
-              subtitle: const Text('清除本会话的自定义目录'),
-              onTap: () async {
-                Navigator.pop(ctx);
-                await widget.shiyi.setCurrentSessionWorkspace('');
-                await _refreshWorkspace();
-                if (!mounted) return;
-                ScaffoldMessenger.of(
-                  context,
-                ).showSnackBar(const SnackBar(content: Text('已恢复全局默认工作目录')));
-              },
             ),
           ],
         ),
@@ -324,35 +376,54 @@ class _ChatScreenState extends State<ChatScreen>
 
   Future<void> _pickProjectForSession(String sessionId) async {
     final shiyi = widget.shiyi;
-    final selectedId = await showModalBottomSheet<String>(
+    final selectedId = await showIosFadeSheet<String>(
       context: context,
+      isScrollControlled: true,
+      backgroundColor: iosGroupedBackground(context),
       builder: (ctx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const ListTile(
-              dense: true,
-              leading: Icon(Icons.folder_copy_outlined),
-              title: Text('移动到项目'),
-            ),
-            const Divider(height: 1),
-            for (final p in shiyi.projects)
-              ListTile(
-                dense: true,
-                leading: const Icon(Icons.folder_outlined),
-                title: Text(
-                  p.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: Text('${p.sessionCount} 个会话'),
-                onTap: () => Navigator.pop(ctx, p.id),
+            const _IosSheetHeader(),
+            SingleChildScrollView(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: CupertinoListSection.insetGrouped(
+                decoration: iosSectionDecoration(ctx),
+                backgroundColor: iosGroupedBackground(ctx),
+                children: [
+                  CupertinoListTile(
+                    leading: _IosWorkspaceIconTile(
+                      icon: CupertinoIcons.folder_badge_plus,
+                      color: _iosIndigo,
+                    ),
+                    title: const Text('移动到项目'),
+                  ),
+                  for (final p in shiyi.projects)
+                    CupertinoListTile(
+                      leading: _IosWorkspaceIconTile(
+                        icon: CupertinoIcons.folder_fill,
+                        color: _iosBlue,
+                      ),
+                      title: Text(
+                        p.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text('${p.sessionCount} 个会话'),
+                      trailing: const CupertinoListTileChevron(),
+                      onTap: () => Navigator.pop(ctx, p.id),
+                    ),
+                  CupertinoListTile(
+                    leading: _IosWorkspaceIconTile(
+                      icon: CupertinoIcons.tray,
+                      color: _iosGray,
+                    ),
+                    title: const Text('未分类'),
+                    trailing: const CupertinoListTileChevron(),
+                    onTap: () => Navigator.pop(ctx, ''),
+                  ),
+                ],
               ),
-            ListTile(
-              dense: true,
-              leading: const Icon(Icons.inbox_outlined),
-              title: const Text('未分类'),
-              onTap: () => Navigator.pop(ctx, ''),
             ),
           ],
         ),
@@ -371,41 +442,63 @@ class _ChatScreenState extends State<ChatScreen>
 
   Future<void> _pickProjectWorkspace(Project project) async {
     final shiyi = widget.shiyi;
-    final action = await showModalBottomSheet<String>(
+    final action = await showIosFadeSheet<String>(
       context: context,
+      isScrollControlled: true,
+      backgroundColor: iosGroupedBackground(context),
       builder: (ctx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            ListTile(
-              leading: const Icon(Icons.folder_copy_outlined),
-              title: Text(
-                '「${project.name}」工作目录',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              subtitle: Text(
-                project.workspaceDir.isEmpty
-                    ? '未设置（会话用全局默认）'
-                    : project.workspaceDir,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+            const _IosSheetHeader(),
+            SingleChildScrollView(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: CupertinoListSection.insetGrouped(
+                decoration: iosSectionDecoration(ctx),
+                backgroundColor: iosGroupedBackground(ctx),
+                children: [
+                  CupertinoListTile(
+                    leading: _IosWorkspaceIconTile(
+                      icon: CupertinoIcons.folder_fill,
+                      color: _iosIndigo,
+                    ),
+                    title: Text(
+                      '「${project.name}」工作目录',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      project.workspaceDir.isEmpty
+                          ? '未设置（会话用全局默认）'
+                          : project.workspaceDir,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  CupertinoListTile(
+                    leading: _IosWorkspaceIconTile(
+                      icon: CupertinoIcons.folder,
+                      color: _iosGreen,
+                    ),
+                    title: const Text('选择文件夹'),
+                    subtitle: const Text('本会话未单独设置目录时自动使用'),
+                    trailing: const CupertinoListTileChevron(),
+                    onTap: () => Navigator.pop(ctx, 'pick'),
+                  ),
+                  if (project.workspaceDir.isNotEmpty)
+                    CupertinoListTile(
+                      leading: _IosWorkspaceIconTile(
+                        icon: CupertinoIcons.arrow_counterclockwise,
+                        color: _iosGray,
+                      ),
+                      title: const Text('清除项目目录'),
+                      subtitle: const Text('回到全局默认目录'),
+                      trailing: const CupertinoListTileChevron(),
+                      onTap: () => Navigator.pop(ctx, 'clear'),
+                    ),
+                ],
               ),
             ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.folder_open_outlined),
-              title: const Text('选择文件夹'),
-              subtitle: const Text('本会话未单独设置目录时自动使用'),
-              onTap: () => Navigator.pop(ctx, 'pick'),
-            ),
-            if (project.workspaceDir.isNotEmpty)
-              ListTile(
-                leading: const Icon(Icons.restart_alt),
-                title: const Text('清除项目目录'),
-                subtitle: const Text('回到全局默认目录'),
-                onTap: () => Navigator.pop(ctx, 'clear'),
-              ),
           ],
         ),
       ),
@@ -553,7 +646,7 @@ class _ChatScreenState extends State<ChatScreen>
   void _pickSkillSheet() {
     final shiyi = widget.shiyi;
     final skills = shiyi.skills;
-    showModalBottomSheet<void>(
+    showIosFadeSheet<void>(
       context: context,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
@@ -633,30 +726,32 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   void _pickAtTarget() {
-    showModalBottomSheet<void>(
+    showIosFadeModalPopup<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.insert_drive_file_outlined),
-              title: const Text('选择文件'),
-              subtitle: const Text('复制到工作目录，模型可读取'),
-              onTap: () {
+      builder: (ctx) => CupertinoTheme(
+        data: iosCupertinoTheme(context),
+        child: CupertinoActionSheet(
+          title: const Text('选择附件'),
+          actions: [
+            CupertinoActionSheetAction(
+              onPressed: () {
                 Navigator.pop(ctx);
                 _pickFile();
               },
+              child: const Text('选择文件'),
             ),
-            ListTile(
-              leading: const Icon(Icons.folder_outlined),
-              title: const Text('选择文件夹'),
-              subtitle: const Text('整体复制到工作目录，模型可浏览'),
-              onTap: () {
+            CupertinoActionSheetAction(
+              onPressed: () {
                 Navigator.pop(ctx);
                 _pickFolder();
               },
+              child: const Text('选择文件夹'),
             ),
           ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
         ),
       ),
     );
@@ -672,37 +767,39 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   void _pickAttachmentSheet() {
-    showModalBottomSheet<void>(
+    showIosFadeModalPopup<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.photo_library_outlined),
-              title: const Text('从相册选择'),
-              onTap: () {
+      builder: (ctx) => CupertinoTheme(
+        data: iosCupertinoTheme(context),
+        child: CupertinoActionSheet(
+          title: const Text('添加附件'),
+          actions: [
+            CupertinoActionSheetAction(
+              onPressed: () {
                 Navigator.pop(ctx);
                 _pickImage(fromCamera: false);
               },
+              child: const Text('从相册选择'),
             ),
-            ListTile(
-              leading: const Icon(Icons.photo_camera_outlined),
-              title: const Text('拍照'),
-              onTap: () {
+            CupertinoActionSheetAction(
+              onPressed: () {
                 Navigator.pop(ctx);
                 _pickImage(fromCamera: true);
               },
+              child: const Text('拍照'),
             ),
-            ListTile(
-              leading: const Icon(Icons.insert_drive_file_outlined),
-              title: const Text('发送文件'),
-              subtitle: const Text('文档 / 代码 / 压缩包等，模型可读取'),
-              onTap: () {
+            CupertinoActionSheetAction(
+              onPressed: () {
                 Navigator.pop(ctx);
                 _pickFile();
               },
+              child: const Text('发送文件'),
             ),
           ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
         ),
       ),
     );
@@ -736,7 +833,7 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Future<void> _confirmDelete(ChatMessage msg) async {
-    final ok = await showDialog<bool>(
+    final ok = await showIosFadeDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('删除这条消息？'),
@@ -763,7 +860,7 @@ class _ChatScreenState extends State<ChatScreen>
     final idx = widget.shiyi.messages.indexWhere((m) => m.id == msg.id);
     final hasAfter = idx >= 0 && idx < widget.shiyi.messages.length - 1;
     if (hasAfter) {
-      final ok = await showDialog<bool>(
+      final ok = await showIosFadeDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('重新生成这条回复？'),
@@ -809,49 +906,6 @@ class _ChatScreenState extends State<ChatScreen>
     );
   }
 
-  // ---------- 预测性返回手势 ----------
-  void _onDragStart(DragStartDetails d) {
-    // 只响应屏幕左边缘（约 60px 内）开始的拖动。
-    if (d.localPosition.dx > 60) return;
-    _dragging = true;
-    _dragCtrl.stop();
-  }
-
-  void _onDragUpdate(DragUpdateDetails d) {
-    if (!_dragging) return;
-    final width = _screenWidth <= 0
-        ? MediaQuery.sizeOf(context).width
-        : _screenWidth;
-    _dragCtrl.value = (d.localPosition.dx / (width * 0.6))
-        .clamp(0.0, 1.0)
-        .toDouble();
-  }
-
-  void _onDragEnd(DragEndDetails d) {
-    if (!_dragging) return;
-    _dragging = false;
-    // 超过阈值或快速甩动 -> 返回；否则回弹复原。
-    if (_dragCtrl.value > 0.45 || (d.primaryVelocity ?? 0) > 600) {
-      _performPop();
-    } else {
-      _dragCtrl.animateBack(
-        0,
-        duration: const Duration(milliseconds: 240),
-        curve: Curves.easeOutCubic,
-      );
-    }
-  }
-
-  void _onDragCancel() {
-    if (!_dragging) return;
-    _dragging = false;
-    _dragCtrl.animateBack(
-      0,
-      duration: const Duration(milliseconds: 240),
-      curve: Curves.easeOutCubic,
-    );
-  }
-
   /// 执行返回：先补完缩小悬浮动画，再真正 pop。
   Future<void> _performPop() async {
     // 工具信息流是当前页面上的临时层，优先响应系统返回。
@@ -873,45 +927,41 @@ class _ChatScreenState extends State<ChatScreen>
         if (didPop) return;
         _performPop();
       },
-      child: GestureDetector(
-        // 屏幕左边缘按住右滑 = 预测性返回：页面淡出，底层预览上一页（省资源）。
-        behavior: HitTestBehavior.translucent,
-        onHorizontalDragStart: _onDragStart,
-        onHorizontalDragUpdate: _onDragUpdate,
-        onHorizontalDragEnd: _onDragEnd,
-        onHorizontalDragCancel: _onDragCancel,
-        child: AnimatedBuilder(
-          animation: _dragCtrl,
-          builder: (context, child) {
-            final t = _dragCtrl.value;
-            // 静止状态零开销：直接透传，不套变换/裁剪层。
-            if (t <= 0.001) return child!;
-            // 淡入淡出代替缩小悬浮：无缩放/裁剪绘制开销。
-            return Opacity(opacity: 1.0 - t * 0.45, child: child);
-          },
-          child: RepaintBoundary(
-            child: Stack(
-              children: [
-                Scaffold(
-                  appBar: AppBar(
-                    leadingWidth: 104,
-                    leading: Row(
-                      children: [
-                        IconButton(
-                          icon: const Icon(
-                            Icons.arrow_back_ios_new_rounded,
-                            size: 18,
-                          ),
+      child: AnimatedBuilder(
+        animation: _dragCtrl,
+        builder: (context, child) {
+          final t = _dragCtrl.value;
+          // 静止状态零开销：直接透传，不套变换/裁剪层。
+          if (t <= 0.001) return child!;
+          // 淡入淡出代替缩小悬浮：无缩放/裁剪绘制开销。
+          return Opacity(opacity: 1.0 - t * 0.45, child: child);
+        },
+        child: RepaintBoundary(
+          child: Stack(
+            children: [
+              Scaffold(
+                appBar: AppBar(
+                  leadingWidth: 104,
+                  leading: Padding(
+                    padding: const EdgeInsets.only(left: 12),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: ListenableBuilder(
+                        listenable: widget.shiyi,
+                        builder: (context, _) => TrafficLightsButton(
+                          busy: widget.shiyi.isBusy,
                           tooltip: '返回',
-                          onPressed: _performPop,
+                          onTap: _performPop,
                         ),
-                        const _TrafficLights(),
-                      ],
+                      ),
                     ),
-                    // 右侧对称占位放工具调用信息流胶囊（与左侧返回区等宽），标题保持居中。
-                    actions: [
-                      SizedBox(
-                        width: 104,
+                  ),
+                  // 右侧对称占位放工具调用信息流胶囊（与左侧返回区等宽），标题保持居中。
+                  actions: [
+                    SizedBox(
+                      width: 104,
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 12),
                         child: ListenableBuilder(
                           listenable: widget.shiyi,
                           builder: (context, _) {
@@ -935,360 +985,356 @@ class _ChatScreenState extends State<ChatScreen>
                           },
                         ),
                       ),
-                    ],
-                    title: ListenableBuilder(
-                      listenable: widget.shiyi,
-                      builder: (context, _) {
-                        if (widget.shiyi.currentSessionId == null) {
-                          return const Text('新会话');
-                        }
-                        final s = widget.shiyi.sessions.firstWhere(
-                          (e) => e.id == widget.shiyi.currentSessionId,
-                          orElse: () => Session(
-                            id: '',
-                            title: '新会话',
-                            model: '',
-                            createdAt: 0,
-                            updatedAt: 0,
+                    ),
+                  ],
+                  title: ListenableBuilder(
+                    listenable: widget.shiyi,
+                    builder: (context, _) {
+                      if (widget.shiyi.currentSessionId == null) {
+                        return const Text('新会话');
+                      }
+                      final s = widget.shiyi.sessions.firstWhere(
+                        (e) => e.id == widget.shiyi.currentSessionId,
+                        orElse: () => Session(
+                          id: '',
+                          title: '新会话',
+                          model: '',
+                          createdAt: 0,
+                          updatedAt: 0,
+                        ),
+                      );
+                      return Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          Text(
+                            s.title,
+                            style: const TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
-                        );
-                        return Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.center,
-                          children: [
+                          if (widget.shiyi.settings.model.isNotEmpty)
                             Text(
-                              s.title,
-                              style: const TextStyle(
-                                fontSize: 17,
-                                fontWeight: FontWeight.w600,
+                              widget.shiyi.settings.model,
+                              style: theme.textTheme.bodySmall!.copyWith(
+                                color: theme.hintColor,
                               ),
                             ),
-                            if (widget.shiyi.settings.model.isNotEmpty)
-                              Text(
-                                widget.shiyi.settings.model,
-                                style: theme.textTheme.bodySmall!.copyWith(
-                                  color: theme.hintColor,
-                                ),
-                              ),
-                          ],
-                        );
-                      },
-                    ),
+                        ],
+                      );
+                    },
                   ),
-                  body: Column(
-                    children: [
-                      Expanded(
-                        child: ListenableBuilder(
-                          listenable: widget.shiyi.messagesRevision,
-                          builder: (context, _) {
-                            final messages = widget.shiyi.messages;
-                            // 工具调用已集中到右上角信息流胶囊，对话流里不再显示工具消息与纯工具回合。
-                            final visible = messages
-                                .where(
-                                  (m) =>
-                                      m.role != 'tool' &&
-                                      !(m.role == 'assistant' &&
-                                          m.hasToolCalls &&
-                                          m.content.trim().isEmpty &&
-                                          !m.streaming),
-                                )
-                                .toList();
-                            _maybeAutoScroll(visible);
-                            if (messages.isEmpty) {
-                              return _Welcome(
-                                shiyi: widget.shiyi,
-                                onPick: _sendSuggestion,
-                              );
+                ),
+                body: Column(
+                  children: [
+                    Expanded(
+                      child: ListenableBuilder(
+                        listenable: Listenable.merge([
+                          widget.shiyi.messagesRevision,
+                          widget.shiyi,
+                        ]),
+                        builder: (context, _) {
+                          final messages = widget.shiyi.messages;
+                          // 工具调用已集中到右上角信息流胶囊，对话流里不再显示工具消息与纯工具回合。
+                          final visible = messages
+                              .where(
+                                (m) =>
+                                    m.role != 'tool' &&
+                                    !(m.role == 'assistant' &&
+                                        m.hasToolCalls &&
+                                        m.content.trim().isEmpty &&
+                                        !m.streaming),
+                              )
+                              .toList();
+                          _maybeAutoScroll(visible);
+                          if (messages.isEmpty) {
+                            return _Welcome(
+                              shiyi: widget.shiyi,
+                              onPick: _sendSuggestion,
+                            );
+                          }
+                          if (visible.isEmpty) return const SizedBox.shrink();
+                          final archivedCount = visible
+                              .where((m) => m.archived)
+                              .length;
+                          // 反转显示：index 0 是最新消息；归档历史放在最上方，
+                          // 与仍然活跃的消息之间插入一条分隔提示。
+                          final items = <Object>[];
+                          for (var i = visible.length - 1; i >= 0; i--) {
+                            if (archivedCount > 0 && i == archivedCount - 1) {
+                              items.add(_ArchivedDivider(count: archivedCount));
                             }
-                            if (visible.isEmpty) return const SizedBox.shrink();
-                            final archivedCount = visible
-                                .where((m) => m.archived)
-                                .length;
-                            // 反转显示：index 0 是最新消息；归档历史放在最上方，
-                            // 与仍然活跃的消息之间插入一条分隔提示。
-                            final items = <Object>[];
-                            for (var i = visible.length - 1; i >= 0; i--) {
-                              if (archivedCount > 0 && i == archivedCount - 1) {
-                                items.add(
-                                  _ArchivedDivider(count: archivedCount),
-                                );
+                            items.add(visible[i]);
+                          }
+                          return ListView.builder(
+                            controller: _scroll,
+                            reverse: true,
+                            padding: const EdgeInsets.all(12),
+                            itemCount: items.length,
+                            itemBuilder: (context, i) {
+                              final item = items[i];
+                              if (item is _ArchivedDivider) {
+                                return item;
                               }
-                              items.add(visible[i]);
-                            }
-                            return ListView.builder(
-                              controller: _scroll,
-                              reverse: true,
-                              padding: const EdgeInsets.all(12),
-                              itemCount: items.length,
-                              itemBuilder: (context, i) {
-                                final item = items[i];
-                                if (item is _ArchivedDivider) {
-                                  return item;
-                                }
-                                final m = item as ChatMessage;
-                                // 流式消息：只监听自己的实时文本，单独重建。
-                                if (m.streaming) {
-                                  return KeyedSubtree(
-                                    key: ValueKey(m.id),
-                                    child: ValueListenableBuilder<String>(
-                                      valueListenable:
-                                          widget.shiyi.streamReasoning,
-                                      builder: (context, reasoning, _) =>
-                                          ValueListenableBuilder<String>(
-                                            valueListenable:
-                                                widget.shiyi.streamText,
-                                            builder: (context, text, _) =>
-                                                _messageItem(
-                                                  m,
-                                                  liveContent: text,
-                                                  liveReasoning: reasoning,
-                                                ),
-                                          ),
-                                    ),
-                                  );
-                                }
-                                // 历史消息：稳定不变，隔离重绘。
+                              final m = item as ChatMessage;
+                              // 流式消息：只监听自己的实时文本，单独重建。
+                              if (m.streaming) {
                                 return KeyedSubtree(
                                   key: ValueKey(m.id),
-                                  child: RepaintBoundary(
-                                    child: _messageItem(m),
+                                  child: ValueListenableBuilder<String>(
+                                    valueListenable:
+                                        widget.shiyi.streamReasoning,
+                                    builder: (context, reasoning, _) =>
+                                        ValueListenableBuilder<String>(
+                                          valueListenable:
+                                              widget.shiyi.streamText,
+                                          builder: (context, text, _) =>
+                                              _messageItem(
+                                                m,
+                                                liveContent: text,
+                                                liveReasoning: reasoning,
+                                              ),
+                                        ),
+                                  ),
+                                );
+                              }
+                              // 历史消息：稳定不变，隔离重绘。
+                              return KeyedSubtree(
+                                key: ValueKey(m.id),
+                                child: RepaintBoundary(child: _messageItem(m)),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                    ListenableBuilder(
+                      listenable: widget.shiyi,
+                      builder: (context, _) => Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (widget.shiyi.status != null)
+                            Builder(
+                              builder: (context) {
+                                final s = widget.shiyi.status!;
+                                final isError = s.startsWith('错误');
+                                final bg = isError
+                                    ? theme.colorScheme.errorContainer
+                                          .withValues(alpha: .4)
+                                    : theme.colorScheme.surfaceContainerHigh
+                                          .withValues(alpha: .7);
+                                final fg = isError
+                                    ? theme.colorScheme.onErrorContainer
+                                    : theme.colorScheme.onSurfaceVariant;
+                                return Container(
+                                  width: double.infinity,
+                                  color: bg,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 6,
+                                  ),
+                                  child: Text(
+                                    s,
+                                    style: theme.textTheme.bodySmall!.copyWith(
+                                      color: fg,
+                                    ),
                                   ),
                                 );
                               },
-                            );
-                          },
-                        ),
+                            ),
+                          if (widget.shiyi.trimNotice != null)
+                            Container(
+                              width: double.infinity,
+                              color: theme.colorScheme.tertiaryContainer
+                                  .withValues(alpha: .55),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 6,
+                              ),
+                              child: Text(
+                                widget.shiyi.trimNotice!,
+                                style: theme.textTheme.bodySmall!.copyWith(
+                                  color: theme.colorScheme.onTertiaryContainer,
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
-                      ListenableBuilder(
-                        listenable: widget.shiyi,
-                        builder: (context, _) => Column(
-                          mainAxisSize: MainAxisSize.min,
+                    ),
+                    ListenableBuilder(
+                      listenable: widget.shiyi,
+                      builder: (context, _) => _TokenStats(shiyi: widget.shiyi),
+                    ),
+                    ListenableBuilder(
+                      listenable: widget.shiyi,
+                      builder: (context, _) => _LoadedSkillChips(
+                        skills: widget.shiyi.loadedSkills,
+                        onRemove: (s) => widget.shiyi.toggleLoadedSkill(s),
+                      ),
+                    ),
+                    ListenableBuilder(
+                      listenable: widget.shiyi,
+                      builder: (context, _) =>
+                          _PlanModeChip(planMode: widget.shiyi.planMode),
+                    ),
+                    // 当前会话项目目录条：点击可修改。
+                    GestureDetector(
+                      onTap: _pickWorkspace,
+                      child: Container(
+                        margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerHigh
+                              .withValues(alpha: .6),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
                           children: [
-                            if (widget.shiyi.status != null)
-                              Builder(
-                                builder: (context) {
-                                  final s = widget.shiyi.status!;
-                                  final isError = s.startsWith('错误');
-                                  final bg = isError
-                                      ? theme.colorScheme.errorContainer
-                                            .withValues(alpha: .4)
-                                      : theme.colorScheme.surfaceContainerHigh
-                                            .withValues(alpha: .7);
-                                  final fg = isError
-                                      ? theme.colorScheme.onErrorContainer
-                                      : theme.colorScheme.onSurfaceVariant;
-                                  return Container(
-                                    width: double.infinity,
-                                    color: bg,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 12,
-                                      vertical: 6,
-                                    ),
-                                    child: Text(
-                                      s,
-                                      style: theme.textTheme.bodySmall!
-                                          .copyWith(color: fg),
-                                    ),
-                                  );
-                                },
-                              ),
-                            if (widget.shiyi.trimNotice != null)
-                              Container(
-                                width: double.infinity,
-                                color: theme.colorScheme.tertiaryContainer
-                                    .withValues(alpha: .55),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 6,
-                                ),
-                                child: Text(
-                                  widget.shiyi.trimNotice!,
-                                  style: theme.textTheme.bodySmall!.copyWith(
-                                    color:
-                                        theme.colorScheme.onTertiaryContainer,
-                                  ),
+                            Icon(
+                              Icons.folder_outlined,
+                              size: 14,
+                              color: theme.colorScheme.primary,
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                _workspace ?? '项目目录…',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.labelSmall!.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
                                 ),
                               ),
+                            ),
+                            const SizedBox(width: 4),
+                            Icon(
+                              Icons.edit_outlined,
+                              size: 13,
+                              color: theme.hintColor,
+                            ),
                           ],
                         ),
                       ),
-                      ListenableBuilder(
-                        listenable: widget.shiyi,
-                        builder: (context, _) =>
-                            _TokenStats(shiyi: widget.shiyi),
-                      ),
-                      ListenableBuilder(
-                        listenable: widget.shiyi,
-                        builder: (context, _) => _LoadedSkillChips(
-                          skills: widget.shiyi.loadedSkills,
-                          onRemove: (s) => widget.shiyi.toggleLoadedSkill(s),
-                        ),
-                      ),
-                      ListenableBuilder(
-                        listenable: widget.shiyi,
-                        builder: (context, _) =>
-                            _PlanModeChip(planMode: widget.shiyi.planMode),
-                      ),
-                      // 当前会话项目目录条：点击可修改。
-                      GestureDetector(
-                        onTap: _pickWorkspace,
-                        child: Container(
-                          margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 5,
-                          ),
-                          decoration: BoxDecoration(
-                            color: theme.colorScheme.surfaceContainerHigh
-                                .withValues(alpha: .6),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.folder_outlined,
-                                size: 14,
-                                color: theme.colorScheme.primary,
-                              ),
-                              const SizedBox(width: 6),
-                              Expanded(
-                                child: Text(
-                                  _workspace ?? '项目目录…',
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.labelSmall!.copyWith(
-                                    color: theme.colorScheme.onSurfaceVariant,
-                                  ),
+                    ),
+                    // 模型提问面板：内嵌在输入框上方，从下方滑入，不遮挡会话内容。
+                    ListenableBuilder(
+                      listenable: widget.shiyi,
+                      builder: (context, _) {
+                        final q = widget.shiyi.pendingQuestion;
+                        return AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 220),
+                          switchInCurve: Curves.easeOutCubic,
+                          switchOutCurve: Curves.easeInCubic,
+                          transitionBuilder: (child, animation) =>
+                              SlideTransition(
+                                position: Tween<Offset>(
+                                  begin: const Offset(0, 0.35),
+                                  end: Offset.zero,
+                                ).animate(animation),
+                                child: FadeTransition(
+                                  opacity: animation,
+                                  child: child,
                                 ),
                               ),
-                              const SizedBox(width: 4),
+                          child: q == null
+                              ? const SizedBox.shrink(
+                                  key: ValueKey('no-question'),
+                                )
+                              : _QuestionPanel(
+                                  key: ValueKey('question-${q.hashCode}'),
+                                  question: q,
+                                  shiyi: widget.shiyi,
+                                ),
+                        );
+                      },
+                    ),
+                    ListenableBuilder(
+                      listenable: widget.shiyi,
+                      builder: (context, _) => _Composer(
+                        input: _input,
+                        busy: widget.shiyi.isBusy,
+                        questionActive: widget.shiyi.pendingQuestion != null,
+                        pendingImages: _pendingImages,
+                        pendingFiles: _pendingFiles,
+                        onPickAttachment: _pickAttachmentSheet,
+                        onRemoveImage: _removeImage,
+                        onRemoveFile: _removeFile,
+                        onSend: _send,
+                        onStop: widget.shiyi.stop,
+                        enterToSend: widget.shiyi.settings.enterToSend,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // 操作信息流面板：默认收起，点右上角胶囊手动展开/收起。
+              ListenableBuilder(
+                listenable: widget.shiyi,
+                builder: (context, _) {
+                  if (!_showToolLog) return const SizedBox.shrink();
+                  return Positioned(
+                    top: MediaQuery.paddingOf(context).top + kToolbarHeight + 8,
+                    right: 8,
+                    width: 280,
+                    child: _ToolLogPanel(
+                      events: widget.shiyi.toolEvents,
+                      onClose: () => setState(() => _showToolLog = false),
+                    ),
+                  );
+                },
+              ),
+              // 上下文达到压缩阈值后，右下角悬浮「压缩上下文」胶囊。
+              Positioned(
+                right: 14,
+                bottom: 110,
+                child: ListenableBuilder(
+                  listenable: widget.shiyi,
+                  builder: (context, _) {
+                    if (!_compressNeeded()) return const SizedBox.shrink();
+                    final theme = Theme.of(context);
+                    return Material(
+                      color: theme.colorScheme.primary,
+                      borderRadius: BorderRadius.circular(20),
+                      elevation: 3,
+                      shadowColor: Colors.black.withValues(alpha: .3),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(20),
+                        onTap: _compressContext,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 9,
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
                               Icon(
-                                Icons.edit_outlined,
-                                size: 13,
-                                color: theme.hintColor,
+                                Icons.compress_outlined,
+                                size: 16,
+                                color: theme.colorScheme.onPrimary,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                '压缩上下文',
+                                style: TextStyle(
+                                  color: theme.colorScheme.onPrimary,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
                               ),
                             ],
                           ),
                         ),
                       ),
-                      // 模型提问面板：内嵌在输入框上方，从下方滑入，不遮挡会话内容。
-                      ListenableBuilder(
-                        listenable: widget.shiyi,
-                        builder: (context, _) {
-                          final q = widget.shiyi.pendingQuestion;
-                          return AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 220),
-                            switchInCurve: Curves.easeOutCubic,
-                            switchOutCurve: Curves.easeInCubic,
-                            transitionBuilder: (child, animation) =>
-                                SlideTransition(
-                                  position: Tween<Offset>(
-                                    begin: const Offset(0, 0.35),
-                                    end: Offset.zero,
-                                  ).animate(animation),
-                                  child: FadeTransition(
-                                    opacity: animation,
-                                    child: child,
-                                  ),
-                                ),
-                            child: q == null
-                                ? const SizedBox.shrink(
-                                    key: ValueKey('no-question'),
-                                  )
-                                : _QuestionPanel(
-                                    key: ValueKey('question-${q.hashCode}'),
-                                    question: q,
-                                    shiyi: widget.shiyi,
-                                  ),
-                          );
-                        },
-                      ),
-                      ListenableBuilder(
-                        listenable: widget.shiyi,
-                        builder: (context, _) => _Composer(
-                          input: _input,
-                          busy: widget.shiyi.isBusy,
-                          questionActive: widget.shiyi.pendingQuestion != null,
-                          pendingImages: _pendingImages,
-                          pendingFiles: _pendingFiles,
-                          onPickAttachment: _pickAttachmentSheet,
-                          onRemoveImage: _removeImage,
-                          onRemoveFile: _removeFile,
-                          onSend: _send,
-                          onStop: widget.shiyi.stop,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                // 操作信息流面板：默认收起，点右上角胶囊手动展开/收起。
-                ListenableBuilder(
-                  listenable: widget.shiyi,
-                  builder: (context, _) {
-                    if (!_showToolLog) return const SizedBox.shrink();
-                    return Positioned(
-                      top:
-                          MediaQuery.paddingOf(context).top +
-                          kToolbarHeight +
-                          8,
-                      right: 8,
-                      width: 280,
-                      child: _ToolLogPanel(
-                        events: widget.shiyi.toolEvents,
-                        onClose: () => setState(() => _showToolLog = false),
-                      ),
                     );
                   },
                 ),
-                // 上下文达到压缩阈值后，右下角悬浮「压缩上下文」胶囊。
-                Positioned(
-                  right: 14,
-                  bottom: 110,
-                  child: ListenableBuilder(
-                    listenable: widget.shiyi,
-                    builder: (context, _) {
-                      if (!_compressNeeded()) return const SizedBox.shrink();
-                      final theme = Theme.of(context);
-                      return Material(
-                        color: theme.colorScheme.primary,
-                        borderRadius: BorderRadius.circular(20),
-                        elevation: 3,
-                        shadowColor: Colors.black.withValues(alpha: .3),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(20),
-                          onTap: _compressContext,
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 9,
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.compress_outlined,
-                                  size: 16,
-                                  color: theme.colorScheme.onPrimary,
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  '压缩上下文',
-                                  style: TextStyle(
-                                    color: theme.colorScheme.onPrimary,
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -1312,7 +1358,7 @@ class _ChatScreenState extends State<ChatScreen>
     if (!mounted) return;
     final limit = shiyi.settings.contextLimit;
     final pct = limit <= 0 ? 0.0 : (tokens / limit * 100).clamp(0, 100);
-    final ok = await showDialog<bool>(
+    final ok = await showIosFadeDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('压缩上下文'),
@@ -1336,7 +1382,7 @@ class _ChatScreenState extends State<ChatScreen>
     );
     if (ok != true) return;
     if (!mounted) return;
-    showDialog<void>(
+    showIosFadeDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => const PopScope(
@@ -1377,7 +1423,7 @@ class _ChatScreenState extends State<ChatScreen>
     final nameCtrl = TextEditingController();
     final descCtrl = TextEditingController();
     final contentCtrl = TextEditingController(text: content);
-    showDialog(
+    showIosFadeDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('保存为技能'),
@@ -1519,55 +1565,6 @@ class _TokenStats extends StatelessWidget {
         '会话 ${_fmt(total)} · 本轮 ${_fmt(round)} · 上下文 ${_fmt(tokens)}/${_fmt(limit)}（剩 $remainInt%）· $cacheText',
         textAlign: TextAlign.center,
         style: theme.textTheme.labelSmall!.copyWith(color: color, fontSize: 11),
-      ),
-    );
-  }
-}
-
-/// 输入栏圆形图标按钮：有内容时主题色实心、无内容时浅色禁用。
-class _RoundIconButton extends StatelessWidget {
-  final VoidCallback? onPressed;
-  final IconData icon;
-  final String tooltip;
-  final bool filled;
-  final bool active;
-  const _RoundIconButton({
-    required this.onPressed,
-    required this.icon,
-    required this.tooltip,
-    required this.filled,
-    required this.active,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final enabled = onPressed != null;
-    final Color bg;
-    final Color fg;
-    if (filled && active) {
-      bg = cs.primary;
-      fg = cs.onPrimary;
-    } else {
-      bg = enabled
-          ? cs.surfaceContainerHighest
-          : cs.surfaceContainerHighest.withValues(alpha: .45);
-      fg = enabled
-          ? cs.onSurfaceVariant
-          : cs.onSurfaceVariant.withValues(alpha: .35);
-    }
-    return Tooltip(
-      message: tooltip,
-      child: IconButton(
-        onPressed: onPressed,
-        icon: Icon(icon, size: 18),
-        style: IconButton.styleFrom(
-          backgroundColor: bg,
-          foregroundColor: fg,
-          minimumSize: const Size(32, 32),
-          maximumSize: const Size(32, 32),
-          shape: const CircleBorder(),
-        ),
       ),
     );
   }
@@ -1808,6 +1805,7 @@ class _Composer extends StatelessWidget {
   final ValueChanged<int> onRemoveFile;
   final VoidCallback onSend;
   final VoidCallback onStop;
+  final bool enterToSend;
   const _Composer({
     required this.input,
     required this.busy,
@@ -1819,21 +1817,27 @@ class _Composer extends StatelessWidget {
     required this.onRemoveFile,
     required this.onSend,
     required this.onStop,
+    required this.enterToSend,
   });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return SafeArea(
-      top: false,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(12, 6, 12, 8),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainer.withValues(alpha: .92),
-          border: Border(
-            top: BorderSide(color: theme.dividerColor.withValues(alpha: .4)),
+    final dark = theme.brightness == Brightness.dark;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: dark ? const Color(0xCC1C1C1E) : const Color(0xD9F2F2F7),
+        border: Border(
+          top: BorderSide(
+            color: dark
+                ? Colors.white.withValues(alpha: .12)
+                : Colors.black.withValues(alpha: .08),
           ),
         ),
+      ),
+      child: SafeArea(
+        top: false,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1841,38 +1845,82 @@ class _Composer extends StatelessWidget {
               _previewRow(theme),
             const SizedBox(height: 6),
             Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                IconButton(
-                  onPressed: onPickAttachment,
-                  icon: const Icon(Icons.attach_file, size: 22),
-                  tooltip: '添加附件',
-                  color: theme.colorScheme.primary,
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints(
-                    minWidth: 36,
-                    minHeight: 36,
+                SizedBox(
+                  width: 40,
+                  height: 40,
+                  child: IconButton(
+                    onPressed: onPickAttachment,
+                    icon: const Icon(
+                      CupertinoIcons.plus_circle,
+                      size: 24,
+                      color: _iosBlue,
+                    ),
+                    tooltip: '添加附件',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 40,
+                      height: 40,
+                    ),
                   ),
                 ),
+                const SizedBox(width: 4),
                 Expanded(
-                  child: TextField(
-                    controller: input,
-                    minLines: 1,
-                    maxLines: 5,
-                    textInputAction: TextInputAction.newline,
-                    onSubmitted: (_) => onSend(),
-                    style: theme.textTheme.bodyLarge,
-                    decoration: InputDecoration(
-                      hintText: questionActive ? '直接输入你的回答…' : '输入消息…',
-                      hintStyle: TextStyle(color: theme.hintColor),
-                      border: InputBorder.none,
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 6,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      color: dark
+                          ? const Color(0xFF2C2C2E)
+                          : const Color(0xFFE5E5EA),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Focus(
+                      onKeyEvent: (node, event) {
+                        if (!enterToSend ||
+                            event is! KeyDownEvent ||
+                            (event.logicalKey != LogicalKeyboardKey.enter &&
+                                event.logicalKey !=
+                                    LogicalKeyboardKey.numpadEnter)) {
+                          return KeyEventResult.ignored;
+                        }
+                        onSend();
+                        return KeyEventResult.handled;
+                      },
+                      child: TextField(
+                        controller: input,
+                        minLines: 1,
+                        maxLines: 5,
+                        textInputAction: enterToSend
+                            ? TextInputAction.send
+                            : TextInputAction.newline,
+                        onSubmitted: enterToSend ? (_) => onSend() : null,
+                        style: theme.textTheme.bodyLarge?.copyWith(
+                          fontSize: 16,
+                          height: 1.25,
+                        ),
+                        decoration: InputDecoration(
+                          hintText: questionActive ? '直接输入你的回答…' : '输入消息…',
+                          hintStyle: TextStyle(color: theme.hintColor),
+                          filled: false,
+                          border: InputBorder.none,
+                          enabledBorder: InputBorder.none,
+                          focusedBorder: InputBorder.none,
+                          disabledBorder: InputBorder.none,
+                          errorBorder: InputBorder.none,
+                          focusedErrorBorder: InputBorder.none,
+                          isDense: true,
+                          contentPadding: EdgeInsets.zero,
+                        ),
+                        textAlignVertical: TextAlignVertical.center,
                       ),
                     ),
                   ),
                 ),
+                const SizedBox(width: 6),
                 ValueListenableBuilder<TextEditingValue>(
                   valueListenable: input,
                   builder: (context, value, _) {
@@ -1880,37 +1928,7 @@ class _Composer extends StatelessWidget {
                         value.text.trim().isNotEmpty ||
                         pendingImages.isNotEmpty ||
                         pendingFiles.isNotEmpty;
-                    if (busy) {
-                      return Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          _RoundIconButton(
-                            onPressed: onStop,
-                            icon: Icons.stop_rounded,
-                            tooltip: '停止',
-                            filled: false,
-                            active: true,
-                          ),
-                          if (hasInput) ...[
-                            const SizedBox(width: 4),
-                            _RoundIconButton(
-                              onPressed: onSend,
-                              icon: Icons.send_rounded,
-                              tooltip: questionActive ? '发送回答' : '发送并引导',
-                              filled: true,
-                              active: true,
-                            ),
-                          ],
-                        ],
-                      );
-                    }
-                    return _RoundIconButton(
-                      onPressed: hasInput ? onSend : null,
-                      icon: Icons.send_rounded,
-                      tooltip: questionActive ? '发送回答' : '发送',
-                      filled: true,
-                      active: hasInput,
-                    );
+                    return _sendControl(dark: dark, hasInput: hasInput);
                   },
                 ),
               ],
@@ -1918,6 +1936,58 @@ class _Composer extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _sendControl({required bool dark, required bool hasInput}) {
+    if (busy) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _roundIconButton(
+            onPressed: onStop,
+            icon: CupertinoIcons.stop_circle_fill,
+            color: _iosRed,
+            tooltip: '停止',
+          ),
+          if (hasInput) ...[
+            const SizedBox(width: 2),
+            _roundIconButton(
+              onPressed: onSend,
+              icon: CupertinoIcons.arrow_up_circle_fill,
+              color: _iosBlue,
+              tooltip: questionActive ? '发送回答' : '发送并引导',
+            ),
+          ],
+        ],
+      );
+    }
+    return _roundIconButton(
+      onPressed: hasInput ? onSend : null,
+      icon: hasInput
+          ? CupertinoIcons.arrow_up_circle_fill
+          : CupertinoIcons.arrow_up_circle,
+      color: hasInput
+          ? _iosBlue
+          : dark
+          ? const Color(0xFF48484A)
+          : const Color(0xFFC7C7CC),
+      tooltip: questionActive ? '发送回答' : '发送',
+    );
+  }
+
+  Widget _roundIconButton({
+    required VoidCallback? onPressed,
+    required IconData icon,
+    required Color color,
+    required String tooltip,
+  }) {
+    return IconButton(
+      onPressed: onPressed,
+      icon: Icon(icon, size: 34, color: color),
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+      tooltip: tooltip,
     );
   }
 
@@ -2070,37 +2140,6 @@ class _Welcome extends StatelessWidget {
   }
 }
 
-/// macOS 窗口红绿灯装饰（AppBar 左侧）。
-class _TrafficLights extends StatelessWidget {
-  const _TrafficLights();
-  @override
-  Widget build(BuildContext context) {
-    return const Center(
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _MacDot(Color(0xFFFF5F57)),
-          SizedBox(width: 5),
-          _MacDot(Color(0xFFFEBC2E)),
-          SizedBox(width: 5),
-          _MacDot(Color(0xFF28C840)),
-        ],
-      ),
-    );
-  }
-}
-
-class _MacDot extends StatelessWidget {
-  final Color color;
-  const _MacDot(this.color);
-  @override
-  Widget build(BuildContext context) => Container(
-    width: 7,
-    height: 7,
-    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-  );
-}
-
 // ---------- 工具调用信息流（右上角胶囊 + 展开面板） ----------
 
 String _toolLabel(String name) => switch (name) {
@@ -2122,6 +2161,43 @@ IconData _toolIcon(String name) => switch (name) {
   _ => Icons.construction,
 };
 
+BoxShadow _toolPillShadow(BuildContext context) {
+  final isLight = Theme.of(context).brightness == Brightness.light;
+  return BoxShadow(
+    color: Colors.black.withValues(alpha: isLight ? 0.16 : 0.35),
+    blurRadius: 12,
+    offset: const Offset(0, 3),
+  );
+}
+
+Color _toolPillBackground(BuildContext context) {
+  final isLight = Theme.of(context).brightness == Brightness.light;
+  return Colors.white.withValues(alpha: isLight ? 0.40 : 0.10);
+}
+
+Widget _toolPillShell({
+  required BuildContext context,
+  required VoidCallback onTap,
+  required Widget child,
+}) {
+  return Container(
+    decoration: BoxDecoration(
+      borderRadius: BorderRadius.circular(14),
+      boxShadow: [_toolPillShadow(context)],
+    ),
+    child: ClipRRect(
+      borderRadius: BorderRadius.circular(14),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+        child: Material(
+          color: _toolPillBackground(context),
+          child: InkWell(onTap: onTap, child: child),
+        ),
+      ),
+    ),
+  );
+}
+
 /// 待机状态的工具胶囊：灰色圆点 + 「工具」字样，点击展开信息流面板。
 class _ToolPillIdle extends StatelessWidget {
   final VoidCallback onTap;
@@ -2131,50 +2207,46 @@ class _ToolPillIdle extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
-    return Material(
-      color: cs.surfaceContainerHigh.withValues(alpha: .5),
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(14),
-        child: SizedBox(
-          width: 92,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 8,
-                      height: 8,
-                      decoration: BoxDecoration(
-                        color: cs.outlineVariant,
-                        shape: BoxShape.circle,
-                      ),
+    return _toolPillShell(
+      context: context,
+      onTap: onTap,
+      child: SizedBox(
+        width: 92,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: cs.outlineVariant,
+                      shape: BoxShape.circle,
                     ),
-                    const SizedBox(width: 5),
-                    Text(
-                      '工具',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.labelMedium?.copyWith(
-                        color: theme.hintColor,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
-                ),
-                Text(
-                  '0.0s',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: theme.hintColor,
                   ),
+                  const SizedBox(width: 5),
+                  Text(
+                    '工具',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: theme.hintColor,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+              Text(
+                '0.0s',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.hintColor,
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -2185,8 +2257,8 @@ class _ToolPillIdle extends StatelessWidget {
 /// 右上角胶囊：显示最近一条工具调用状态（含步骤计数/读秒），点击展开信息流面板。
 class _ToolPill extends StatefulWidget {
   final ToolEvent event;
-  final int index; // 当前事件序号（1-based）
-  final int total; // 本轮事件总数
+  final int index;
+  final int total;
   final VoidCallback onTap;
   const _ToolPill({
     required this.event,
@@ -2205,7 +2277,6 @@ class _ToolPillState extends State<_ToolPill> {
   @override
   void initState() {
     super.initState();
-    // 工具运行中：每秒刷新读秒。
     if (!widget.event.done) {
       _timer = Timer.periodic(const Duration(seconds: 1), (_) {
         if (mounted) setState(() {});
@@ -2226,61 +2297,58 @@ class _ToolPillState extends State<_ToolPill> {
     final event = widget.event;
     final elapsedSec =
         (DateTime.now().millisecondsSinceEpoch - event.startedAt) / 1000;
-    return Material(
-      color: cs.surfaceContainerHigh.withValues(alpha: .92),
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        onTap: widget.onTap,
-        borderRadius: BorderRadius.circular(14),
-        child: SizedBox(
-          width: 92,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (!event.done)
-                  SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: cs.primary,
-                    ),
-                  )
-                else
-                  Icon(
-                    event.ok ? Icons.check_circle : Icons.error,
-                    size: 14,
-                    color: event.ok ? const Color(0xFF28C840) : cs.error,
+    return _toolPillShell(
+      context: context,
+      onTap: widget.onTap,
+      child: SizedBox(
+        width: 92,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (!event.done)
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: cs.primary,
                   ),
-                const SizedBox(width: 5),
-                Flexible(
-                  child: Text(
-                    event.done
-                        ? _toolLabel(event.name)
-                        : '${_toolLabel(event.name)} ${widget.index}/${widget.total}',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                    ),
+                )
+              else
+                Icon(
+                  event.ok ? Icons.check_circle : Icons.error,
+                  size: 14,
+                  color: event.ok ? const Color(0xFF28C840) : cs.error,
+                ),
+              const SizedBox(width: 5),
+              Flexible(
+                child: Text(
+                  event.done
+                      ? _toolLabel(event.name)
+                      : '${_toolLabel(event.name)} ${widget.index}/${widget.total}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: theme.hintColor,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
-                if (event.durationMs != null ||
-                    (!event.done && elapsedSec >= 1)) ...[
-                  const SizedBox(width: 4),
-                  Text(
-                    event.done
-                        ? '${(event.durationMs! / 1000).toStringAsFixed(1)}s'
-                        : '${elapsedSec.toStringAsFixed(0)}s',
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: theme.hintColor,
-                    ),
+              ),
+              if (event.durationMs != null ||
+                  (!event.done && elapsedSec >= 1)) ...[
+                const SizedBox(width: 4),
+                Text(
+                  event.done
+                      ? '${(event.durationMs! / 1000).toStringAsFixed(1)}s'
+                      : '${elapsedSec.toStringAsFixed(0)}s',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.hintColor,
                   ),
-                ],
+                ),
               ],
-            ),
+            ],
           ),
         ),
       ),
@@ -2465,6 +2533,63 @@ class _ToolLogItem extends StatelessWidget {
               ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _IosWorkspaceIconTile extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  const _IosWorkspaceIconTile({required this.icon, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 31,
+      height: 31,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(7),
+      ),
+      child: Icon(icon, size: 17, color: CupertinoColors.white),
+    );
+  }
+}
+
+class _IosSheetHeader extends StatelessWidget {
+  final String? title;
+  const _IosSheetHeader({this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 36,
+            height: 5,
+            decoration: BoxDecoration(
+              color: dark ? Colors.white24 : Colors.black26,
+              borderRadius: BorderRadius.circular(3),
+            ),
+          ),
+          if (title != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              title!,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: dark ? Colors.white54 : Colors.black54,
+              ),
+            ),
+          ],
         ],
       ),
     );

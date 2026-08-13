@@ -184,6 +184,7 @@ class SubagentRunner {
   final String baseUrl;
   final String apiKey;
   final String model;
+  final String protocol;
   final double temperature;
   final int maxTokens;
 
@@ -212,6 +213,7 @@ class SubagentRunner {
     required this.baseUrl,
     required this.apiKey,
     required this.model,
+    this.protocol = 'openai',
     required this.temperature,
     this.maxTokens = 8192,
     required this.toolsJson,
@@ -301,6 +303,7 @@ class SubagentRunner {
       baseUrl: baseUrl,
       apiKey: apiKey,
       model: model,
+      protocol: protocol,
       temperature: temperature,
       maxTokens: maxTokens,
       tools: toolsJson,

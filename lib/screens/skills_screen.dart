@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:ui' show ImageFilter;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -9,7 +10,9 @@ import 'package:path_provider/path_provider.dart';
 import '../core/app_state.dart';
 import '../core/models.dart';
 import '../services/skill_pack.dart';
+import '../widgets/ios_style.dart';
 import '../widgets/markdown_text.dart';
+import '../widgets/traffic_lights_button.dart';
 
 class SkillsScreen extends StatelessWidget {
   final ShiyiState shiyi;
@@ -17,88 +20,66 @@ class SkillsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: shiyi,
-      builder: (context, _) {
-        return Scaffold(
-          appBar: AppBar(
-            title: const Text('技能'),
-            actions: [
-              Padding(
-                padding: const EdgeInsets.only(right: 6),
-                child: _FrostedImportButton(onPressed: () => _importSkill(context)),
-              ),
-            ],
-          ),
-          body: shiyi.skills.isEmpty
-              ? const Center(
-                  child: Text(
-                    '还没有技能\n点右上角导入技能包 zip',
-                    textAlign: TextAlign.center,
-                  ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.only(bottom: 16),
-                  itemCount: shiyi.skills.length,
-                  itemBuilder: (context, i) {
-                    final s = shiyi.skills[i];
-                    return Card(
-                      margin: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 4,
-                      ),
-                      child: ListTile(
-                        leading: const Icon(Icons.rocket_launch_outlined),
-                        title: Text(
-                          s.name,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            s.description.isEmpty
-                                ? const Text('（无描述）')
-                                : MarkdownInlineText(
-                                    s.description,
-                                    style: const TextStyle(
-                                      fontSize: 13,
-                                      height: 1.3,
-                                    ),
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                            Text(
-                              '${s.content.isEmpty ? '0' : '1'} 个文档${s.files.isEmpty ? '' : ' · ${s.files.length} 个辅助文件'}${s.largeFiles.isEmpty ? '' : ' · ${s.largeFiles.length} 个大文件'}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: Theme.of(context).hintColor,
-                              ),
-                            ),
-                          ],
-                        ),
-                        trailing: PopupMenuButton<String>(
-                          onSelected: (v) async {
-                            if (v == 'edit') {
-                              _editSkill(context, s);
-                            } else if (v == 'copy') {
-                              _copy(context, s);
-                            } else if (v == 'export') {
-                              await _exportSkill(context, s);
-                            }
-                          },
-                          itemBuilder: (_) => const [
-                            PopupMenuItem(value: 'edit', child: Text('编辑')),
-                            PopupMenuItem(value: 'copy', child: Text('复制内容')),
-                            PopupMenuItem(value: 'export', child: Text('导出为 zip')),
-                          ],
-                        ),
-                        onTap: () => _view(context, s),
-                      ),
-                    );
-                  },
+    final theme = Theme.of(context);
+    return CupertinoTheme(
+      data: CupertinoThemeData(brightness: theme.brightness),
+      child: ListenableBuilder(
+        listenable: shiyi,
+        builder: (context, _) {
+          return Scaffold(
+            backgroundColor: iosGroupedBackground(context),
+            appBar: AppBar(
+              leadingWidth: 72,
+              leading: Padding(
+                padding: const EdgeInsets.only(left: 12),
+                child: TrafficLightsButton(
+                  busy: shiyi.isBusy,
+                  tooltip: '新建技能',
+                  onTap: () => _editSkill(context, null),
                 ),
-        );
-      },
+              ),
+              toolbarHeight: 64,
+              centerTitle: true,
+              backgroundColor: theme.scaffoldBackgroundColor,
+              surfaceTintColor: Colors.transparent,
+              elevation: 0,
+              scrolledUnderElevation: 0,
+              clipBehavior: Clip.none,
+              title: const Text(
+                '技能',
+                style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
+              ),
+              actions: [
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: _FrostedImportButton(
+                    onPressed: () => _importSkill(context),
+                  ),
+                ),
+              ],
+            ),
+            body: shiyi.skills.isEmpty
+                ? _EmptySkills(onCreate: () => _editSkill(context, null))
+                : ListView(
+                    padding: const EdgeInsets.only(top: 4, bottom: 20),
+                    children: [
+                      CupertinoListSection.insetGrouped(
+                        margin: iosSectionMargin,
+                        decoration: iosSectionDecoration(context),
+                        children: [
+                          for (final s in shiyi.skills)
+                            _SkillTile(
+                              skill: s,
+                              onTap: () => _view(context, s),
+                              onMore: () => _showSkillActions(context, s),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
+          );
+        },
+      ),
     );
   }
 
@@ -147,9 +128,9 @@ class SkillsScreen extends StatelessWidget {
         break;
       }
     }
-    final replace = await showDialog<bool>(
+    final replace = await showIosFadeDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => CupertinoAlertDialog(
         title: Text(existing == null ? '导入技能' : '技能已存在'),
         content: SingleChildScrollView(
           child: Column(
@@ -160,7 +141,6 @@ class SkillsScreen extends StatelessWidget {
                 '名称：${pack.name}',
                 style: const TextStyle(fontWeight: FontWeight.w600),
               ),
-              if (pack.description.isNotEmpty)
               if (pack.description.isNotEmpty) ...[
                 const Text('描述', style: TextStyle(fontWeight: FontWeight.w600)),
                 MarkdownInlineText(pack.description),
@@ -180,11 +160,12 @@ class SkillsScreen extends StatelessWidget {
           ),
         ),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx, false),
             child: const Text('取消'),
           ),
-          FilledButton(
+          CupertinoDialogAction(
+            isDefaultAction: true,
             onPressed: () => Navigator.pop(ctx, true),
             child: Text(existing == null ? '导入' : '覆盖'),
           ),
@@ -193,21 +174,21 @@ class SkillsScreen extends StatelessWidget {
     );
     if (replace != true) return;
     try {
-      await shiyi.saveSkill(Skill(
-        id: existing?.id ?? 0,
-        name: pack.name,
-        description: pack.description,
-        content: pack.content,
-        files: pack.files,
-        largeFiles: pack.largeFiles,
-        dirPath: pack.dirPath,
-        createdAt:
-            existing?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
-      ));
+      await shiyi.saveSkill(
+        Skill(
+          id: existing?.id ?? 0,
+          name: pack.name,
+          description: pack.description,
+          content: pack.content,
+          files: pack.files,
+          largeFiles: pack.largeFiles,
+          dirPath: pack.dirPath,
+          createdAt:
+              existing?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
       if (context.mounted) {
-        messenger.showSnackBar(
-          SnackBar(content: Text('技能「${pack.name}」导入成功')),
-        );
+        messenger.showSnackBar(SnackBar(content: Text('技能「${pack.name}」导入成功')));
       }
     } catch (e) {
       if (context.mounted) {
@@ -240,9 +221,7 @@ class SkillsScreen extends StatelessWidget {
       final zipPath = '$dir/拾忆技能_$safeName.zip';
       await SkillPackIO.exportZip(skill: s, zipPath: zipPath);
       if (context.mounted) {
-        messenger.showSnackBar(
-          SnackBar(content: Text('已导出到 $zipPath')),
-        );
+        messenger.showSnackBar(SnackBar(content: Text('已导出到 $zipPath')));
       }
     } catch (e) {
       if (context.mounted) {
@@ -266,105 +245,156 @@ class SkillsScreen extends StatelessWidget {
     return doc.path;
   }
 
+  // ---------------- 操作菜单 ----------------
+
+  Future<void> _showSkillActions(BuildContext context, Skill s) async {
+    FocusScope.of(context).unfocus();
+    final picked = await showIosFadeModalPopup<String>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: Text(s.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx, 'edit'),
+            child: const Text('编辑'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx, 'copy'),
+            child: const Text('复制内容'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx, 'export'),
+            child: const Text('导出为 zip'),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
+        ),
+      ),
+    );
+    if (!context.mounted || picked == null) return;
+    if (picked == 'edit') {
+      _editSkill(context, s);
+    } else if (picked == 'copy') {
+      _copy(context, s);
+    } else if (picked == 'export') {
+      await _exportSkill(context, s);
+    }
+  }
+
   // ---------------- 查看 ----------------
 
   void _view(BuildContext context, Skill s) {
-    // 弹窗内容拍平为块列表，配合 ListView.builder 懒加载渲染，大技能正文不卡顿。
     final items = <Widget>[];
     if (s.description.isNotEmpty) {
-      items.add(const Text('描述', style: TextStyle(fontWeight: FontWeight.w600)));
+      items.add(
+        const Text('描述', style: TextStyle(fontWeight: FontWeight.w600)),
+      );
       items.add(MarkdownText(s.description));
       items.add(const Divider());
     }
-    items.add(Text(
-      s.content.isEmpty ? '（技能内容为空）' : '【SKILL.md】',
-      style: const TextStyle(fontWeight: FontWeight.w600),
-    ));
+    items.add(
+      Text(
+        s.content.isEmpty ? '（技能内容为空）' : '【SKILL.md】',
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+    );
     if (s.content.isNotEmpty) {
       for (final b in splitMarkdownBlocks(s.content)) {
-        items.add(MarkdownBlock(
-          b,
-          style: const TextStyle(fontSize: 14, height: 1.5),
-        ));
+        items.add(
+          MarkdownBlock(b, style: const TextStyle(fontSize: 14, height: 1.5)),
+        );
       }
     }
     if (s.files.isNotEmpty) {
       items.add(const Divider());
-      items.add(Text(
-        '辅助文件（${s.files.length}）',
-        style: const TextStyle(fontWeight: FontWeight.w600),
-      ));
+      items.add(
+        Text(
+          '辅助文件（${s.files.length}）',
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      );
       for (final e in s.files.entries) {
-        items.add(ExpansionTile(
-          title: Text(
-            e.key,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-          ),
-          children: [
-            Align(
-              alignment: Alignment.centerLeft,
-              child: SelectableText(
-                e.value,
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-              ),
+        items.add(
+          ExpansionTile(
+            title: Text(
+              e.key,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
             ),
-          ],
-        ));
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: SelectableText(
+                  e.value,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+        );
       }
     }
     if (s.largeFiles.isNotEmpty) {
       items.add(const Divider());
-      items.add(Text(
-        '大文件（${s.largeFiles.length}，内容在磁盘）',
-        style: const TextStyle(fontWeight: FontWeight.w600),
-      ));
+      items.add(
+        Text(
+          '大文件（${s.largeFiles.length}，内容在磁盘）',
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      );
       for (final e in s.largeFiles.entries) {
-        items.add(ListTile(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          leading: const Icon(Icons.insert_drive_file_outlined, size: 18),
-          title: Text(
-            e.key,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        items.add(
+          CupertinoListTile(
+            leading: const Icon(CupertinoIcons.doc, size: 18),
+            title: Text(
+              e.key,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            ),
+            subtitle: Text(
+              _fmtBytes(e.value),
+              style: const TextStyle(fontSize: 11),
+            ),
           ),
-          subtitle: Text(
-            _fmtBytes(e.value),
-            style: const TextStyle(fontSize: 11),
-          ),
-        ));
+        );
       }
     }
-    showDialog(
+    showIosFadeDialog<void>(
       context: context,
       builder: (ctx) {
         final size = MediaQuery.of(ctx).size;
-        return AlertDialog(
+        return CupertinoAlertDialog(
           title: Text(s.name),
           content: SizedBox(
             width: size.width * 0.9 > 460 ? 460 : size.width * 0.9,
-            height: (size.height * 0.72).clamp(320.0, 620.0).toDouble(),
-            child: ListView.builder(
-              padding: const EdgeInsets.only(right: 4),
-              itemCount: items.length,
-              itemBuilder: (context, i) => items[i],
+            height: (size.height * 0.56).clamp(240.0, 440.0).toDouble(),
+            child: Material(
+              type: MaterialType.transparency,
+              child: ListView.builder(
+                padding: const EdgeInsets.only(right: 4),
+                itemCount: items.length,
+                itemBuilder: (context, i) => items[i],
+              ),
             ),
           ),
           actions: [
-            TextButton(
+            CupertinoDialogAction(
+              isDestructiveAction: true,
               onPressed: () {
                 Navigator.pop(ctx);
                 _deleteConfirm(context, s);
               },
-              child: const Text('删除', style: TextStyle(color: Colors.redAccent)),
+              child: const Text('删除'),
             ),
-            FilledButton(
+            CupertinoDialogAction(
               onPressed: () async {
                 Navigator.pop(ctx);
                 await _exportSkill(context, s);
               },
               child: const Text('导出'),
             ),
-            TextButton(
+            CupertinoDialogAction(
+              isDefaultAction: true,
               onPressed: () => Navigator.pop(ctx),
               child: const Text('关闭'),
             ),
@@ -377,17 +407,20 @@ class SkillsScreen extends StatelessWidget {
   // ---------------- 删除 / 复制 ----------------
 
   Future<void> _deleteConfirm(BuildContext context, Skill s) async {
-    final ok = await showDialog<bool>(
+    final ok = await showIosFadeDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => CupertinoAlertDialog(
         title: const Text('删除技能'),
-        content: Text('确定删除技能「${s.name}」吗？${s.dirPath.isEmpty ? '' : '（含磁盘文件）'}'),
+        content: Text(
+          '确定删除技能「${s.name}」吗？${s.dirPath.isEmpty ? '' : '（含磁盘文件）'}',
+        ),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx, false),
             child: const Text('取消'),
           ),
-          FilledButton(
+          CupertinoDialogAction(
+            isDestructiveAction: true,
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('删除'),
           ),
@@ -412,9 +445,9 @@ class SkillsScreen extends StatelessWidget {
       }
     }
     Clipboard.setData(ClipboardData(text: sb.toString()));
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('内容已复制')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('内容已复制')));
   }
 
   // ---------------- 新建 / 编辑 ----------------
@@ -426,85 +459,88 @@ class SkillsScreen extends StatelessWidget {
     var files = Map<String, String>.from(s?.files ?? const {});
     final largeFiles = Map<String, int>.from(s?.largeFiles ?? const {});
 
-    showDialog(
+    showIosFadeDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setState) => AlertDialog(
+        builder: (ctx, setState) => CupertinoAlertDialog(
           title: Text(s == null ? '新建技能' : '编辑技能'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                TextField(
+                CupertinoTextField(
                   controller: nameCtrl,
-                  decoration: const InputDecoration(
-                    labelText: '技能名称',
-                    hintText: '例如：写周报',
-                  ),
+                  placeholder: '技能名称，例如：写周报',
+                  padding: const EdgeInsets.all(10),
                 ),
                 const SizedBox(height: 8),
-                TextField(
+                CupertinoTextField(
                   controller: descCtrl,
-                  decoration: const InputDecoration(labelText: '描述（可选）'),
+                  placeholder: '描述（可选）',
                   maxLines: 2,
+                  padding: const EdgeInsets.all(10),
                 ),
                 const SizedBox(height: 8),
-                TextField(
+                CupertinoTextField(
                   controller: contentCtrl,
-                  decoration: const InputDecoration(
-                    labelText: '技能内容（SKILL.md / Prompt / 流程）',
-                  ),
+                  placeholder: '技能内容（SKILL.md / Prompt / 流程）',
                   maxLines: 8,
+                  padding: const EdgeInsets.all(10),
                 ),
                 const SizedBox(height: 8),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Row(
-                    children: [
-                      const Icon(Icons.folder_outlined, size: 16),
-                      const SizedBox(width: 4),
-                      Text(
+                Row(
+                  children: [
+                    const Icon(CupertinoIcons.folder, size: 16),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
                         '辅助文件 ${files.length} 个${largeFiles.isEmpty ? '' : ' · 大文件 ${largeFiles.length} 个'}',
                         style: Theme.of(ctx).textTheme.bodySmall,
                       ),
-                      const Spacer(),
-                      TextButton.icon(
-                        icon: const Icon(Icons.edit_note, size: 18),
-                        label: const Text('管理'),
-                        onPressed: () async {
-                          final updated = await _manageFiles(ctx, files);
-                          if (updated != null) {
-                            setState(() => files = updated);
-                          }
-                        },
+                    ),
+                    CupertinoButton(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
                       ),
-                    ],
-                  ),
+                      onPressed: () async {
+                        final updated = await _manageFiles(ctx, files);
+                        if (updated != null) {
+                          setState(() => files = updated);
+                        }
+                      },
+                      child: const Text('管理'),
+                    ),
+                  ],
                 ),
               ],
             ),
           ),
           actions: [
-            TextButton(
+            CupertinoDialogAction(
               onPressed: () => Navigator.pop(ctx),
               child: const Text('取消'),
             ),
-            FilledButton(
+            CupertinoDialogAction(
+              isDefaultAction: true,
               onPressed: () async {
                 final v = nameCtrl.text.trim();
                 if (v.isEmpty) return;
                 try {
-                  await shiyi.saveSkill(Skill(
-                    id: s?.id ?? 0,
-                    name: v,
-                    description: descCtrl.text.trim(),
-                    content: contentCtrl.text.trim(),
-                    files: files,
-                    largeFiles: largeFiles,
-                    dirPath: s?.dirPath ?? '',
-                    createdAt:
-                        s?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
-                  ));
+                  await shiyi.saveSkill(
+                    Skill(
+                      id: s?.id ?? 0,
+                      name: v,
+                      description: descCtrl.text.trim(),
+                      content: contentCtrl.text.trim(),
+                      files: files,
+                      largeFiles: largeFiles,
+                      dirPath: s?.dirPath ?? '',
+                      createdAt:
+                          s?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
+                    ),
+                  );
                   if (ctx.mounted) Navigator.pop(ctx);
                 } catch (e) {
                   if (ctx.mounted) {
@@ -526,17 +562,16 @@ class SkillsScreen extends StatelessWidget {
     );
   }
 
-  /// 文本辅助文件管理：列出已有文件，支持删除与添加（大文件只读展示）。
   Future<Map<String, String>?> _manageFiles(
     BuildContext ctx,
     Map<String, String> files,
   ) async {
-    return showDialog<Map<String, String>>(
+    return showIosFadeDialog<Map<String, String>>(
       context: ctx,
       builder: (dialogCtx) => StatefulBuilder(
         builder: (dialogCtx, setState) {
           final entries = files.entries.toList();
-          return AlertDialog(
+          return CupertinoAlertDialog(
             title: const Text('管理辅助文件'),
             content: SizedBox(
               width: 420,
@@ -549,8 +584,7 @@ class SkillsScreen extends StatelessWidget {
                       shrinkWrap: true,
                       children: entries
                           .map(
-                            (e) => ListTile(
-                              dense: true,
+                            (e) => CupertinoListTile(
                               title: Text(
                                 e.key,
                                 style: const TextStyle(
@@ -562,11 +596,16 @@ class SkillsScreen extends StatelessWidget {
                                 '${e.value.length} 字符',
                                 style: const TextStyle(fontSize: 11),
                               ),
-                              trailing: IconButton(
-                                icon: const Icon(Icons.delete_outline, size: 18),
+                              trailing: CupertinoButton(
+                                padding: EdgeInsets.zero,
                                 onPressed: () {
                                   setState(() => files.remove(e.key));
                                 },
+                                child: const Icon(
+                                  CupertinoIcons.trash,
+                                  color: CupertinoColors.systemRed,
+                                  size: 18,
+                                ),
                               ),
                             ),
                           )
@@ -574,19 +613,18 @@ class SkillsScreen extends StatelessWidget {
                     ),
             ),
             actions: [
-              TextButton(
+              CupertinoDialogAction(
                 onPressed: () => Navigator.pop(dialogCtx, files),
                 child: const Text('完成'),
               ),
-              TextButton.icon(
-                icon: const Icon(Icons.add, size: 18),
-                label: const Text('添加文件'),
+              CupertinoDialogAction(
                 onPressed: () async {
                   final added = await _addFileDialog(dialogCtx);
                   if (added != null) {
                     setState(() => files[added.$1] = added.$2);
                   }
                 },
+                child: const Text('添加文件'),
               ),
             ],
           );
@@ -598,34 +636,34 @@ class SkillsScreen extends StatelessWidget {
   Future<(String, String)?> _addFileDialog(BuildContext ctx) async {
     final pathCtrl = TextEditingController();
     final contentCtrl = TextEditingController();
-    return showDialog<(String, String)>(
+    return showIosFadeDialog<(String, String)>(
       context: ctx,
-      builder: (dialogCtx) => AlertDialog(
+      builder: (dialogCtx) => CupertinoAlertDialog(
         title: const Text('添加辅助文件'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(
+            CupertinoTextField(
               controller: pathCtrl,
-              decoration: const InputDecoration(
-                labelText: '文件路径',
-                hintText: '例如：references/示例.md 或 scripts/run.sh',
-              ),
+              placeholder: '文件路径，例如 references/示例.md',
+              padding: const EdgeInsets.all(10),
             ),
             const SizedBox(height: 8),
-            TextField(
+            CupertinoTextField(
               controller: contentCtrl,
-              decoration: const InputDecoration(labelText: '文件内容'),
+              placeholder: '文件内容',
               maxLines: 6,
+              padding: const EdgeInsets.all(10),
             ),
           ],
         ),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
             onPressed: () => Navigator.pop(dialogCtx),
             child: const Text('取消'),
           ),
-          FilledButton(
+          CupertinoDialogAction(
+            isDefaultAction: true,
             onPressed: () {
               final p = pathCtrl.text.trim();
               if (p.isEmpty) return;
@@ -645,6 +683,106 @@ class SkillsScreen extends StatelessWidget {
     if (n >= 1024 * 1024) return '${(n / (1024 * 1024)).toStringAsFixed(1)} MB';
     if (n >= 1024) return '${(n / 1024).toStringAsFixed(1)} KB';
     return '$n B';
+  }
+}
+
+class _SkillTile extends StatelessWidget {
+  final Skill skill;
+  final VoidCallback onTap;
+  final VoidCallback onMore;
+  const _SkillTile({
+    required this.skill,
+    required this.onTap,
+    required this.onMore,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoListTile(
+      padding: const EdgeInsetsDirectional.fromSTEB(16, 8, 8, 8),
+      leadingSize: 30,
+      leadingToTitle: 10,
+      leading: Container(
+        width: 31,
+        height: 31,
+        decoration: BoxDecoration(
+          color: const Color(0xFFAF52DE),
+          borderRadius: BorderRadius.circular(7),
+        ),
+        child: const Icon(
+          CupertinoIcons.rocket_fill,
+          size: 17,
+          color: CupertinoColors.white,
+        ),
+      ),
+      title: Text(
+        skill.name,
+        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+      ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          skill.description.isEmpty
+              ? const Text('（无描述）')
+              : MarkdownInlineText(
+                  skill.description,
+                  style: const TextStyle(fontSize: 12, height: 1.3),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+          Text(
+            '${skill.content.isEmpty ? '0' : '1'} 个文档${skill.files.isEmpty ? '' : ' · ${skill.files.length} 个辅助文件'}${skill.largeFiles.isEmpty ? '' : ' · ${skill.largeFiles.length} 个大文件'}',
+            style: const TextStyle(fontSize: 11, height: 1.2),
+          ),
+        ],
+      ),
+      trailing: CupertinoButton(
+        padding: EdgeInsets.zero,
+        onPressed: onMore,
+        child: const Icon(CupertinoIcons.ellipsis),
+      ),
+      onTap: onTap,
+    );
+  }
+}
+
+class _EmptySkills extends StatelessWidget {
+  final VoidCallback onCreate;
+  const _EmptySkills({required this.onCreate});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(
+            CupertinoIcons.rocket,
+            size: 56,
+            color: CupertinoColors.systemGrey3,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '还没有技能',
+            style: TextStyle(
+              fontSize: 17,
+              fontWeight: FontWeight.w600,
+              color: CupertinoColors.label,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '点左上角红绿灯新建，或右上角导入 zip',
+            style: const TextStyle(color: CupertinoColors.secondaryLabel),
+          ),
+          const SizedBox(height: 18),
+          CupertinoButton.filled(
+            onPressed: onCreate,
+            child: const Text('新建技能'),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -695,4 +833,3 @@ class _FrostedImportButton extends StatelessWidget {
     );
   }
 }
-

@@ -122,6 +122,10 @@ class ShiyiState extends ChangeNotifier {
   /// 正在生成回复的会话 id（主页显示思考状态）。
   String? busySessionId;
 
+  /// 会话忙碌状态版本号：主页会话卡片的「思考中…」单独监听，
+  /// 避免每次 token/status 变化重建整个会话列表。
+  final ValueNotifier<int> busyRevision = ValueNotifier(0);
+
   /// 已完成但用户尚未查看的会话（主页显示未读）。
   final Set<String> unreadSessions = {};
 
@@ -1349,6 +1353,7 @@ class ShiyiState extends ChangeNotifier {
               ? settings.apiKey
               : settings.visionApiKey.trim(),
           model: settings.visionModel.trim(),
+          protocol: 'openai',
           temperature: 0.2,
           tools: const [],
         );
@@ -1409,6 +1414,7 @@ class ShiyiState extends ChangeNotifier {
       }
       sessionId = currentSessionId!;
       busySessionId = sessionId;
+      busyRevision.value++;
       viewingSessionId = sessionId;
       lastRoundTokens = 0;
       roundCachedTokens = 0;
@@ -1475,6 +1481,7 @@ class ShiyiState extends ChangeNotifier {
       _streaming = null;
       final doneSession = busySessionId;
       busySessionId = null;
+      busyRevision.value++;
       // 回复结束：如果用户没在看该会话，标记未读并推送系统通知（若开启）。
       if (doneSession != null && doneSession != viewingSessionId) {
         unreadSessions.add(doneSession);
@@ -1715,6 +1722,8 @@ class ShiyiState extends ChangeNotifier {
     sessionLastUsageTokens = null;
 
     isBusy = true;
+    busySessionId = sessionId;
+    busyRevision.value++;
     _stopRequested = false;
     _stopForGuide = false;
     status = null;
@@ -1760,6 +1769,8 @@ class ShiyiState extends ChangeNotifier {
     } finally {
       isBusy = false;
       _streaming = null;
+      busySessionId = null;
+      busyRevision.value++;
       notifyListeners();
     }
   }
@@ -2000,6 +2011,7 @@ class ShiyiState extends ChangeNotifier {
       baseUrl: settings.baseUrl,
       apiKey: settings.apiKey,
       model: settings.model,
+      protocol: settings.apiProtocol,
       temperature: settings.temperature,
       maxTokens: settings.maxOutputTokens,
       tools: activeTools,
@@ -2329,6 +2341,12 @@ class ShiyiState extends ChangeNotifier {
     return _memoryTypes.contains(t) ? t : 'user';
   }
 
+  /// search_memory 的类型过滤：缺省/无效时返回 null 表示搜全部类型。
+  static String? memorySearchType(dynamic v) {
+    final t = v?.toString().trim().toLowerCase() ?? '';
+    return _memoryTypes.contains(t) ? t : null;
+  }
+
   Future<String> _execSaveMemory(Map<String, dynamic> args) async {
     final content = (args['content'] ?? '').toString().trim();
     if (content.isEmpty) return '记录失败：content 为空';
@@ -2342,12 +2360,12 @@ class ShiyiState extends ChangeNotifier {
 
   Future<String> _execSearchMemory(Map<String, dynamic> args) async {
     final query = (args['query'] ?? '').toString().trim();
-    final type = _normalizeMemoryType(args['type']);
+    final type = memorySearchType(args['type']);
     final res = query.isEmpty
         ? const <MemoryEntry>[]
         : await _db.searchMemories(query, type: type);
     if (res.isEmpty) {
-      return type == 'user' ? '没有找到相关记忆' : '没有找到类型为 $type 的相关记忆';
+      return type == null ? '没有找到相关记忆' : '没有找到类型为 $type 的相关记忆';
     }
     return res.take(5).map((e) => e.content).join('\n');
   }
@@ -2462,10 +2480,10 @@ class ShiyiState extends ChangeNotifier {
         workingDirectory: cwd,
         environment: embedded ? await TermuxRuntime.environment() : null,
       );
-      final stdoutBytes = <int>[];
-      final stderrBytes = <int>[];
-      proc.stdout.listen(stdoutBytes.addAll);
-      proc.stderr.listen(stderrBytes.addAll);
+      final stdout = _CappedByteBuffer(256 * 1024);
+      final stderr = _CappedByteBuffer(64 * 1024);
+      proc.stdout.listen(stdout.add);
+      proc.stderr.listen(stderr.add);
       int? exitCode;
       try {
         exitCode = await proc.exitCode.timeout(const Duration(seconds: 120));
@@ -2474,12 +2492,15 @@ class ShiyiState extends ChangeNotifier {
         await _logError('Termux', 'run_terminal 超时已终止: $command');
         exitCode = null;
       }
-      final out = utf8.decode(stdoutBytes, allowMalformed: true).trim();
-      final err = utf8.decode(stderrBytes, allowMalformed: true).trim();
+      final out = utf8.decode(stdout.bytes, allowMalformed: true).trim();
+      final err = utf8.decode(stderr.bytes, allowMalformed: true).trim();
       final buf = StringBuffer();
       if (out.isNotEmpty) buf.write(out);
       if (err.isNotEmpty) buf.write(buf.isEmpty ? err : '\n$err');
       var text = buf.toString();
+      if (stdout.overflow || stderr.overflow) {
+        text = text.isEmpty ? '（输出过大，已截断）' : '$text\n（输出过大，已截断）';
+      }
       if (text.length > 4000) {
         text = '${text.substring(0, 4000)}…（输出过长，已截断）';
       }
@@ -2664,6 +2685,7 @@ class ShiyiState extends ChangeNotifier {
           baseUrl: settings.baseUrl,
           apiKey: settings.apiKey,
           model: settings.model,
+          protocol: settings.apiProtocol,
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
           toolsJson: _toolsJsonFor(def.allowedTools),
@@ -2980,6 +3002,7 @@ class ShiyiState extends ChangeNotifier {
       baseUrl: settings.baseUrl,
       apiKey: settings.apiKey,
       model: settings.model,
+      protocol: settings.apiProtocol,
       temperature: 0.2,
       tools: const [],
     );
@@ -3200,6 +3223,7 @@ class ShiyiState extends ChangeNotifier {
         baseUrl: settings.baseUrl,
         apiKey: settings.apiKey,
         model: settings.model,
+        protocol: settings.apiProtocol,
         temperature: 0.2,
         tools: const [],
       );
@@ -3365,6 +3389,29 @@ echo "[rc=\$?]"
     settings = s;
     await _settingsService.save(s);
     notifyListeners();
+  }
+}
+
+/// 终端输出缓冲：只保留前 limit 字节，超出后继续丢弃但不阻塞管道。
+class _CappedByteBuffer {
+  _CappedByteBuffer(this.limit);
+
+  final int limit;
+  final List<int> bytes = <int>[];
+  bool overflow = false;
+
+  void add(List<int> chunk) {
+    if (bytes.length >= limit) {
+      overflow = true;
+      return;
+    }
+    final room = limit - bytes.length;
+    if (chunk.length <= room) {
+      bytes.addAll(chunk);
+    } else {
+      bytes.addAll(chunk.sublist(0, room));
+      overflow = true;
+    }
   }
 }
 

@@ -40,8 +40,8 @@ abstract final class MacTheme {
     );
 
     final scaffoldBg =
-        isLight ? const Color(0xFFF2F2F7) : const Color(0xFF1E1E20);
-    final appBarBg = isLight ? const Color(0xE6F2F2F7) : const Color(0xE61E1E20);
+        isLight ? const Color(0xFFF2F2F7) : const Color(0xFF000000);
+    final appBarBg = isLight ? const Color(0xE6F2F2F7) : const Color(0xE6000000);
 
     final base = ThemeData(
       useMaterial3: true,

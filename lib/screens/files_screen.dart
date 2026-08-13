@@ -1,11 +1,15 @@
 import 'dart:io';
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/app_state.dart';
 import '../services/file_workspace.dart';
 import '../services/permission_service.dart';
+import '../widgets/ios_style.dart';
 import '../widgets/markdown_text.dart';
+import '../widgets/traffic_lights_button.dart';
 
 /// 文件管理页：浏览智能体工作目录（默认 /storage/emulated/0/agent），
 /// 支持新建文件夹、预览文本文件、删除，以及把任意文件夹设为工作目录。
@@ -22,6 +26,7 @@ class _FilesScreenState extends State<FilesScreen> {
   String _workspace = '';
   bool _permission = true;
   String? _error;
+  Future<List<FileSystemEntity>>? _entriesFuture;
 
   @override
   void initState() {
@@ -33,82 +38,153 @@ class _FilesScreenState extends State<FilesScreen> {
     _permission = await PermissionService.isFullAccessGranted();
     _workspace = await FileWorkspace.current();
     if (_path.isEmpty) _path = _workspace;
+    _entriesFuture = _listEntries(_path);
     if (mounted) setState(() {});
+  }
+
+  Future<void> _refresh() async {
+    _entriesFuture = _listEntries(_path);
+    if (mounted) setState(() {});
+  }
+
+  Future<List<FileSystemEntity>> _listEntries(String path) async {
+    try {
+      final dir = Directory(path);
+      if (!dir.existsSync()) {
+        Directory(_workspace).createSync(recursive: true);
+      }
+      final entries = <FileSystemEntity>[];
+      await for (final e in dir.list(followLinks: false)) {
+        entries.add(e);
+      }
+      entries.sort((a, b) {
+        final ad = a is Directory ? 0 : 1;
+        final bd = b is Directory ? 0 : 1;
+        if (ad != bd) return ad - bd;
+        return a.path.toLowerCase().compareTo(b.path.toLowerCase());
+      });
+      _error = null;
+      return entries;
+    } catch (e) {
+      _error = '读取目录失败：$e';
+      return const <FileSystemEntity>[];
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('文件'),
-        actions: [
-          IconButton(
-            tooltip: '刷新',
-            icon: const Icon(Icons.refresh),
-            onPressed: () => setState(() {}),
-          ),
-          Padding(
-            padding: const EdgeInsets.only(right: 6),
-            child: IconButton(
-              tooltip: '把当前文件夹设为工作目录',
-              icon: const Icon(Icons.star_outline),
-              onPressed: () => _setWorkspace(),
+    final theme = Theme.of(context);
+    return CupertinoTheme(
+      data: CupertinoThemeData(brightness: theme.brightness),
+      child: Scaffold(
+        backgroundColor: iosGroupedBackground(context),
+        appBar: AppBar(
+          leadingWidth: 72,
+          leading: Padding(
+            padding: const EdgeInsets.only(left: 12),
+            child: ListenableBuilder(
+              listenable: widget.shiyi,
+              builder: (context, _) =>
+                  TrafficLightsButton(tooltip: '', busy: widget.shiyi.isBusy),
             ),
           ),
-        ],
-      ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _pathBar(),
-          if (!_permission) _permissionBar(),
-          if (_error != null)
+          toolbarHeight: 64,
+          centerTitle: true,
+          backgroundColor: theme.scaffoldBackgroundColor,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          clipBehavior: Clip.none,
+          title: const Text(
+            '文件',
+            style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
+          ),
+          actions: [
+            CupertinoButton(
+              padding: const EdgeInsets.all(8),
+              onPressed: _refresh,
+              child: const Icon(CupertinoIcons.refresh),
+            ),
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              child: Text(
-                _error!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              padding: const EdgeInsets.only(right: 8),
+              child: CupertinoButton(
+                padding: const EdgeInsets.all(8),
+                onPressed: _setWorkspace,
+                child: const Icon(CupertinoIcons.star),
               ),
             ),
-          Expanded(child: _buildList()),
-        ],
+          ],
+        ),
+        body: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _pathBar(),
+            if (!_permission) _permissionBar(),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 6,
+                ),
+                child: Text(
+                  _error!,
+                  style: const TextStyle(color: CupertinoColors.systemRed),
+                ),
+              ),
+            Expanded(child: _buildList()),
+          ],
+        ),
       ),
     );
   }
 
   Widget _pathBar() {
-    final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 10, 8, 4),
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 4),
       child: Row(
         children: [
-          IconButton(
-            tooltip: '上一级',
-            icon: const Icon(Icons.arrow_upward),
+          CupertinoButton(
+            padding: const EdgeInsets.all(8),
             onPressed: _path == _workspace ? null : _goUp,
+            child: const Icon(CupertinoIcons.arrow_up),
           ),
           Expanded(
             child: GestureDetector(
               onTap: () async {
                 final dir = await _pickDirectory(context, _path);
-                if (dir != null) setState(() => _path = dir);
+                if (dir != null) {
+                  setState(() {
+                    _path = dir;
+                    _entriesFuture = _listEntries(dir);
+                  });
+                }
               },
-              child: Text(
-                _path.isEmpty ? '…' : _path,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 13,
-                  color: theme.colorScheme.primary,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  _path.isEmpty ? '…' : _path,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                    color: CupertinoColors.activeBlue,
+                  ),
                 ),
               ),
             ),
           ),
-          IconButton(
-            tooltip: '新建文件夹',
-            icon: const Icon(Icons.create_new_folder_outlined),
+          CupertinoButton(
+            padding: const EdgeInsets.all(8),
             onPressed: _newFolder,
+            child: const Icon(CupertinoIcons.folder_badge_plus),
           ),
         ],
       ),
@@ -116,22 +192,29 @@ class _FilesScreenState extends State<FilesScreen> {
   }
 
   Widget _permissionBar() {
-    final theme = Theme.of(context);
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
       decoration: BoxDecoration(
-        color: theme.colorScheme.errorContainer.withValues(alpha: .4),
+        color: CupertinoColors.systemYellow.withValues(alpha: .16),
         borderRadius: BorderRadius.circular(10),
       ),
       child: Row(
         children: [
-          const Icon(Icons.folder_off_outlined, size: 18),
+          const Icon(
+            CupertinoIcons.folder_badge_minus,
+            size: 18,
+            color: CupertinoColors.systemOrange,
+          ),
           const SizedBox(width: 8),
           const Expanded(
-            child: Text('需要「所有文件访问权限」才能读写 SD 卡'),
+            child: Text(
+              '需要「所有文件访问权限」才能读写 SD 卡',
+              style: TextStyle(fontSize: 13),
+            ),
           ),
-          TextButton(
+          CupertinoButton(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
             onPressed: () async {
               final ok = await PermissionService.requestFullAccess();
               if (mounted) setState(() => _permission = ok);
@@ -144,114 +227,122 @@ class _FilesScreenState extends State<FilesScreen> {
   }
 
   Widget _buildList() {
-    final Directory dir;
-    try {
-      dir = Directory(_path);
-      if (!dir.existsSync()) {
-        Directory(_workspace).createSync(recursive: true);
-      }
-    } catch (_) {
-      return const Center(child: Text('无法访问目录'));
+    final future = _entriesFuture;
+    if (future == null) {
+      return const Center(child: CircularProgressIndicator());
     }
-
-    List<FileSystemEntity> entries;
-    try {
-      entries = dir.listSync();
-      entries.sort((a, b) {
-        final ad = a is Directory ? 0 : 1;
-        final bd = b is Directory ? 0 : 1;
-        if (ad != bd) return ad - bd;
-        return a.path.toLowerCase().compareTo(b.path.toLowerCase());
-      });
-      _error = null;
-    } catch (e) {
-      _error = '读取目录失败：$e';
-      entries = [];
-    }
-
-    if (entries.isEmpty) {
-      return const Center(child: Text('空文件夹', style: TextStyle(color: Colors.grey)));
-    }
-
-    return ListView.builder(
-      padding: const EdgeInsets.only(bottom: 16),
-      itemCount: entries.length,
-      itemBuilder: (context, i) {
-        final e = entries[i];
-        final name = e.path.split(Platform.pathSeparator).last;
-        if (e is Directory) {
-          return ListTile(
-            leading: const Icon(Icons.folder_outlined),
-            title: Text(name, style: const TextStyle(fontWeight: FontWeight.w500)),
-            trailing: IconButton(
-              icon: const Icon(Icons.more_vert, size: 20),
-              onPressed: () => _showActions(e),
+    return FutureBuilder<List<FileSystemEntity>>(
+      future: future,
+      builder: (context, snap) {
+        final entries = snap.data ?? const <FileSystemEntity>[];
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (entries.isEmpty) {
+          return Center(
+            child: Text(
+              _error ?? '空文件夹',
+              style: TextStyle(color: CupertinoColors.secondaryLabel),
             ),
-            onTap: () => setState(() => _path = e.path),
           );
         }
-        final f = e as File;
-        int? size;
-        try {
-          size = f.lengthSync();
-        } catch (_) {}
-        return ListTile(
-          leading: const Icon(Icons.insert_drive_file_outlined),
-          title: Text(name),
-          subtitle: size == null ? null : Text(_fmtBytes(size)),
-          trailing: IconButton(
-            icon: const Icon(Icons.more_vert, size: 20),
-            onPressed: () => _showActions(e),
-          ),
-          onTap: () => _previewFile(f),
+        return ListView(
+          padding: const EdgeInsets.only(top: 4, bottom: 16),
+          children: [
+            CupertinoListSection.insetGrouped(
+              margin: iosSectionMargin,
+              decoration: iosSectionDecoration(context),
+              children: [for (final e in entries) _buildEntryTile(e)],
+            ),
+          ],
         );
       },
     );
   }
 
+  Widget _buildEntryTile(FileSystemEntity e) {
+    final name = e.path.split(Platform.pathSeparator).last;
+    if (e is Directory) {
+      return CupertinoListTile(
+        leading: const Icon(
+          CupertinoIcons.folder_fill,
+          color: CupertinoColors.activeBlue,
+        ),
+        title: Text(name, style: const TextStyle(fontWeight: FontWeight.w500)),
+        trailing: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: () => _showActions(e),
+          child: const Icon(CupertinoIcons.ellipsis),
+        ),
+        onTap: () => setState(() => _path = e.path),
+      );
+    }
+    final f = e as File;
+    int? size;
+    try {
+      size = f.lengthSync();
+    } catch (_) {}
+    return CupertinoListTile(
+      leading: const Icon(
+        CupertinoIcons.doc,
+        color: CupertinoColors.systemGrey,
+      ),
+      title: Text(name),
+      subtitle: size == null ? null : Text(_fmtBytes(size)),
+      trailing: CupertinoButton(
+        padding: EdgeInsets.zero,
+        onPressed: () => _showActions(e),
+        child: const Icon(CupertinoIcons.ellipsis),
+      ),
+      onTap: () => _previewFile(f),
+    );
+  }
+
   void _showActions(FileSystemEntity e) {
     final isDir = e is Directory;
-    showModalBottomSheet<void>(
+    final name = e.path.split(Platform.pathSeparator).last;
+    showIosFadeModalPopup<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.copy_all_outlined),
-              title: const Text('复制路径'),
-              onTap: () {
+      builder: (ctx) => CupertinoActionSheet(
+        title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _copyPath(e.path);
+            },
+            child: const Text('复制路径'),
+          ),
+          if (isDir)
+            CupertinoActionSheetAction(
+              onPressed: () {
                 Navigator.pop(ctx);
-                _copyPath(e.path);
+                _setWorkspaceTo(e.path);
               },
+              child: const Text('设为工作目录'),
             ),
-            if (isDir)
-              ListTile(
-                leading: const Icon(Icons.star_outline),
-                title: const Text('设为工作目录'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _setWorkspaceTo(e.path);
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-              title: const Text('删除', style: TextStyle(color: Colors.redAccent)),
-              onTap: () {
-                Navigator.pop(ctx);
-                _delete(e);
-              },
-            ),
-          ],
+          CupertinoActionSheetAction(
+            isDestructiveAction: true,
+            onPressed: () {
+              Navigator.pop(ctx);
+              _delete(e);
+            },
+            child: const Text('删除'),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
         ),
       ),
     );
   }
 
   void _copyPath(String path) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('路径已复制：$path')),
-    );
+    Clipboard.setData(ClipboardData(text: path));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('路径已复制：$path')));
   }
 
   Future<void> _setWorkspace() async {
@@ -264,35 +355,41 @@ class _FilesScreenState extends State<FilesScreen> {
     setState(() {
       _workspace = path;
       _path = path;
+      _entriesFuture = _listEntries(path);
     });
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('工作目录已设为：$path')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('工作目录已设为：$path')));
   }
 
   Future<void> _goUp() async {
     final parent = Directory(_path).parent.path;
     if (parent == _path) return;
-    setState(() => _path = parent);
+    setState(() {
+      _path = parent;
+      _entriesFuture = _listEntries(parent);
+    });
   }
 
   Future<void> _newFolder() async {
     final ctrl = TextEditingController();
-    final name = await showDialog<String>(
+    final name = await showIosFadeDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => CupertinoAlertDialog(
         title: const Text('新建文件夹'),
-        content: TextField(
+        content: CupertinoTextField(
           controller: ctrl,
           autofocus: true,
-          decoration: const InputDecoration(hintText: '文件夹名称'),
+          placeholder: '文件夹名称',
+          padding: const EdgeInsets.all(10),
         ),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx),
             child: const Text('取消'),
           ),
-          FilledButton(
+          CupertinoDialogAction(
+            isDefaultAction: true,
             onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
             child: const Text('创建'),
           ),
@@ -302,30 +399,31 @@ class _FilesScreenState extends State<FilesScreen> {
     if (name == null || name.isEmpty) return;
     try {
       Directory('$_path/$name').createSync(recursive: true);
-      if (mounted) setState(() {});
+      await _refresh();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('创建失败：$e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('创建失败：$e')));
       }
     }
   }
 
   Future<void> _delete(FileSystemEntity e) async {
     final isDir = e is Directory;
-    final ok = await showDialog<bool>(
+    final name = e.path.split(Platform.pathSeparator).last;
+    final ok = await showIosFadeDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => CupertinoAlertDialog(
         title: Text(isDir ? '删除文件夹' : '删除文件'),
-        content: Text('确定删除「${e.path.split(Platform.pathSeparator).last}」吗？${isDir ? '（含里面所有内容）' : ''}'),
+        content: Text('确定删除「$name」吗？${isDir ? '（含里面所有内容）' : ''}'),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx, false),
             child: const Text('取消'),
           ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+          CupertinoDialogAction(
+            isDestructiveAction: true,
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('删除'),
           ),
@@ -339,12 +437,12 @@ class _FilesScreenState extends State<FilesScreen> {
       } else {
         e.deleteSync();
       }
-      if (mounted) setState(() {});
+      await _refresh();
     } catch (err) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('删除失败：$err')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('删除失败：$err')));
       }
     }
   }
@@ -352,18 +450,18 @@ class _FilesScreenState extends State<FilesScreen> {
   Future<void> _previewFile(File f) async {
     String content;
     try {
-      if (f.lengthSync() > 512 * 1024) {
+      if (await f.length() > 512 * 1024) {
         content = '(文件过大，超过 512KB，无法预览，可用 run_terminal 读取)';
       } else {
-        content = f.readAsStringSync();
+        content = await f.readAsString();
       }
     } catch (e) {
       content = '读取失败：$e';
     }
     if (!mounted) return;
-    showDialog<void>(
+    showIosFadeDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => CupertinoAlertDialog(
         title: Text(
           f.path.split(Platform.pathSeparator).last,
           maxLines: 1,
@@ -382,12 +480,16 @@ class _FilesScreenState extends State<FilesScreen> {
               : SingleChildScrollView(
                   child: SelectableText(
                     content,
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 12,
+                    ),
                   ),
                 ),
         ),
         actions: [
-          TextButton(
+          CupertinoDialogAction(
+            isDefaultAction: true,
             onPressed: () => Navigator.pop(ctx),
             child: const Text('关闭'),
           ),
@@ -397,11 +499,41 @@ class _FilesScreenState extends State<FilesScreen> {
   }
 
   static const Set<String> _textExts = {
-    '.md', '.markdown', '.txt', '.json', '.jsonl', '.yaml', '.yml',
-    '.sh', '.py', '.js', '.ts', '.dart', '.xml', '.html', '.htm',
-    '.css', '.toml', '.ini', '.conf', '.cfg', '.sql', '.csv', '.log',
-    '.rb', '.go', '.rs', '.php', '.svg', '.properties', '.env',
-    '.gitignore', '.prompt', '.text', '.bat', '.ps1',
+    '.md',
+    '.markdown',
+    '.txt',
+    '.json',
+    '.jsonl',
+    '.yaml',
+    '.yml',
+    '.sh',
+    '.py',
+    '.js',
+    '.ts',
+    '.dart',
+    '.xml',
+    '.html',
+    '.htm',
+    '.css',
+    '.toml',
+    '.ini',
+    '.conf',
+    '.cfg',
+    '.sql',
+    '.csv',
+    '.log',
+    '.rb',
+    '.go',
+    '.rs',
+    '.php',
+    '.svg',
+    '.properties',
+    '.env',
+    '.gitignore',
+    '.prompt',
+    '.text',
+    '.bat',
+    '.ps1',
   };
 
   static bool _isTextPath(String path) {
@@ -422,24 +554,12 @@ class _FilesScreenState extends State<FilesScreen> {
   /// 让用户浏览选择一个目录（用于切换浏览位置）。
   Future<String?> _pickDirectory(BuildContext ctx, String start) async {
     var cur = start;
-    return showDialog<String>(
+    var dirsFuture = _listSubdirectories(cur);
+    return showIosFadeDialog<String>(
       context: ctx,
       builder: (dctx) => StatefulBuilder(
         builder: (dctx, setDlg) {
-          Directory d;
-          try {
-            d = Directory(cur);
-          } catch (_) {
-            d = Directory('/');
-          }
-          List<FileSystemEntity> dirs;
-          try {
-            dirs = d.listSync().whereType<Directory>().toList()
-              ..sort((a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()));
-          } catch (_) {
-            dirs = [];
-          }
-          return AlertDialog(
+          return CupertinoAlertDialog(
             title: Text(cur, maxLines: 1, overflow: TextOverflow.ellipsis),
             content: SizedBox(
               width: 360,
@@ -448,42 +568,63 @@ class _FilesScreenState extends State<FilesScreen> {
                 children: [
                   Align(
                     alignment: Alignment.centerLeft,
-                    child: TextButton.icon(
-                      icon: const Icon(Icons.arrow_upward, size: 18),
-                      label: const Text('上一级'),
+                    child: CupertinoButton(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
                       onPressed: () {
                         final p = Directory(cur).parent.path;
                         if (p != cur) {
-                          setDlg(() => cur = p);
+                          cur = p;
+                          dirsFuture = _listSubdirectories(cur);
+                          setDlg(() {});
                         }
                       },
+                      child: const Text('上一级'),
                     ),
                   ),
                   Expanded(
-                    child: dirs.isEmpty
-                        ? const Center(child: Text('没有子文件夹'))
-                        : ListView.builder(
-                            itemCount: dirs.length,
-                            itemBuilder: (_, i) => ListTile(
-                              dense: true,
-                              leading: const Icon(Icons.folder_outlined, size: 18),
-                              title: Text(
-                                dirs[i].path.split(Platform.pathSeparator).last,
-                                style: const TextStyle(fontSize: 14),
-                              ),
-                              onTap: () => setDlg(() => cur = dirs[i].path),
+                    child: FutureBuilder<List<Directory>>(
+                      future: dirsFuture,
+                      builder: (context, snap) {
+                        final dirs = snap.data ?? const <Directory>[];
+                        if (snap.connectionState != ConnectionState.done) {
+                          return const Center(
+                            child: CircularProgressIndicator(),
+                          );
+                        }
+                        if (dirs.isEmpty) {
+                          return const Center(child: Text('没有子文件夹'));
+                        }
+                        return ListView.builder(
+                          itemCount: dirs.length,
+                          itemBuilder: (_, i) => CupertinoListTile(
+                            leading: const Icon(
+                              CupertinoIcons.folder,
+                              size: 18,
                             ),
+                            title: Text(
+                              dirs[i].path.split(Platform.pathSeparator).last,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                            onTap: () {
+                              cur = dirs[i].path;
+                              dirsFuture = _listSubdirectories(cur);
+                              setDlg(() {});
+                            },
                           ),
+                        );
+                      },
+                    ),
                   ),
                 ],
               ),
             ),
             actions: [
-              TextButton(
+              CupertinoDialogAction(
                 onPressed: () => Navigator.pop(dctx),
                 child: const Text('取消'),
               ),
-              FilledButton(
+              CupertinoDialogAction(
+                isDefaultAction: true,
                 onPressed: () => Navigator.pop(dctx, cur),
                 child: const Text('进入此文件夹'),
               ),
@@ -492,5 +633,18 @@ class _FilesScreenState extends State<FilesScreen> {
         },
       ),
     );
+  }
+
+  Future<List<Directory>> _listSubdirectories(String path) async {
+    try {
+      final dirs = <Directory>[];
+      await for (final e in Directory(path).list(followLinks: false)) {
+        if (e is Directory) dirs.add(e);
+      }
+      dirs.sort((a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()));
+      return dirs;
+    } catch (_) {
+      return const <Directory>[];
+    }
   }
 }

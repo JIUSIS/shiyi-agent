@@ -7,13 +7,13 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v1.1.8.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v1.1.8/shiyi-agent-v1.1.8.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.0.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.0.0/shiyi-agent-v2.0.0.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
 ## 关于拾忆
 
-拾忆（ShiYi）是一款运行在 Android 手机上的个人 AI 工作台。它将大语言模型、长期记忆、项目文件管理、内置终端与技能系统整合为一个应用，让 AI 从"聊天助手"升级为"随身工作伙伴"——你可以把资料丢给它、把项目交给它、把重复任务委托给它，它会在你的手机里完成实际工作。
+拾忆（ShiYi）是一款运行在 Android 手机上的个人 AI 工作台。它将大语言模型、长期记忆、项目文件管理、内置终端与技能系统整合为一个应用，让 AI 从"聊天助手"升级为"随身工作伙伴"——你可以把资料丢给它、把项目交给它、把重复任务委托给它，它会在你的手机里完成实际工作。界面按 Apple 设计理念（HIG）统一重构，使用毛玻璃导航、Inset Grouped 分组卡片与深浅色跟随。
 
 ## 功能特性
 

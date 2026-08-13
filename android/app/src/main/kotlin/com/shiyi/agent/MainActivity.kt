@@ -20,8 +20,11 @@ import java.io.FileOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 手动启用 edge-to-edge（内容延伸到状态栏/导航栏后面）并强制系统栏透明：
@@ -74,22 +77,28 @@ class MainActivity : FlutterActivity() {
                                 ?: throw IllegalArgumentException("zipPath missing")
                             val destDir = call.argument<String>("destDir")
                                 ?: throw IllegalArgumentException("destDir missing")
-                            result.success(extractZip(zipPath, destDir))
+                            runInBackground(result) {
+                                extractZip(zipPath, destDir)
+                            }
                         }
                         "createZip" -> {
                             val srcDir = call.argument<String>("srcDir")
                                 ?: throw IllegalArgumentException("srcDir missing")
                             val zipPath = call.argument<String>("zipPath")
                                 ?: throw IllegalArgumentException("zipPath missing")
-                            createZip(srcDir, zipPath)
-                            result.success(true)
+                            runInBackground(result) {
+                                createZip(srcDir, zipPath)
+                                true
+                            }
                         }
                         "extractTermux" -> {
                             val assetPath = call.argument<String>("assetPath")
                                 ?: throw IllegalArgumentException("assetPath missing")
                             val destDir = call.argument<String>("destDir")
                                 ?: throw IllegalArgumentException("destDir missing")
-                            result.success(extractTermux(assetPath, destDir))
+                            runInBackground(result) {
+                                extractTermux(assetPath, destDir)
+                            }
                         }
                         "verifyApk" -> {
                             val path = call.argument<String>("path")
@@ -108,6 +117,28 @@ class MainActivity : FlutterActivity() {
                     result.error("SKILL_PACK_ERROR", e.message ?: e.toString(), null)
                 }
             }
+    }
+
+    override fun onDestroy() {
+        ioExecutor.shutdown()
+        super.onDestroy()
+    }
+
+    /** 耗时的压缩/解压放到后台线程，避免 MethodChannel 主线程卡 UI/ANR。 */
+    private fun runInBackground(
+        result: MethodChannel.Result,
+        block: () -> Any?,
+    ) {
+        ioExecutor.execute {
+            try {
+                val value = block()
+                runOnUiThread { result.success(value) }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    result.error("SKILL_PACK_ERROR", e.message ?: e.toString(), null)
+                }
+            }
+        }
     }
 
     /** 通过系统安装器安装更新包（FileProvider 暴露 APK 给 PackageInstaller）。 */

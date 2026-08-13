@@ -1,5 +1,13 @@
 import 'dart:convert';
 
+/// OpenAI 兼容自定义接口地址规范化：结尾没有版本段时自动补 /v1。
+String normalizeOpenAiBaseUrl(String url) {
+  var u = url.trim().replaceAll(RegExp(r'/+$'), '');
+  if (u.isEmpty) return u;
+  if (RegExp(r'/v\d+([a-z]*)$', caseSensitive: false).hasMatch(u)) return u;
+  return '$u/v1';
+}
+
 /// 一次工具调用的信息流条目（按会话持久化）。
 class ToolEvent {
   int? id;
@@ -410,6 +418,9 @@ class AppSettings {
   String baseUrl;
   String apiKey;
   String model;
+
+  /// API 协议：openai（Chat Completions）或 anthropic（Messages API）。
+  String apiProtocol;
   String systemPrompt;
   double temperature;
   bool enableTools;
@@ -440,10 +451,14 @@ class AppSettings {
   /// 长任务完成时推送系统通知（app 在后台/切走时）。
   bool enableNotifications;
 
+  /// 输入框按回车直接发送；关闭时回车换行。
+  bool enterToSend;
+
   AppSettings({
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
     this.model = '',
+    this.apiProtocol = 'openai',
     this.systemPrompt = '',
     this.temperature = 0.7,
     this.enableTools = true,
@@ -461,12 +476,14 @@ class AppSettings {
     this.visionApiKey = '',
     this.visionModel = '',
     this.enableNotifications = true,
+    this.enterToSend = true,
   });
 
   AppSettings copyWith({
     String? baseUrl,
     String? apiKey,
     String? model,
+    String? apiProtocol,
     String? systemPrompt,
     double? temperature,
     bool? enableTools,
@@ -484,10 +501,12 @@ class AppSettings {
     String? visionApiKey,
     String? visionModel,
     bool? enableNotifications,
+    bool? enterToSend,
   }) => AppSettings(
     baseUrl: baseUrl ?? this.baseUrl,
     apiKey: apiKey ?? this.apiKey,
     model: model ?? this.model,
+    apiProtocol: apiProtocol ?? this.apiProtocol,
     systemPrompt: systemPrompt ?? this.systemPrompt,
     temperature: temperature ?? this.temperature,
     enableTools: enableTools ?? this.enableTools,
@@ -506,12 +525,14 @@ class AppSettings {
     visionApiKey: visionApiKey ?? this.visionApiKey,
     visionModel: visionModel ?? this.visionModel,
     enableNotifications: enableNotifications ?? this.enableNotifications,
+    enterToSend: enterToSend ?? this.enterToSend,
   );
 
   Map<String, dynamic> toJson() => {
     'baseUrl': baseUrl,
     'apiKey': apiKey,
     'model': model,
+    'apiProtocol': apiProtocol,
     'systemPrompt': systemPrompt,
     'temperature': temperature,
     'enableTools': enableTools,
@@ -529,12 +550,14 @@ class AppSettings {
     'visionApiKey': visionApiKey,
     'visionModel': visionModel,
     'enableNotifications': enableNotifications,
+    'enterToSend': enterToSend,
   };
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
     baseUrl: j['baseUrl'] ?? 'https://api.openai.com/v1',
     apiKey: j['apiKey'] ?? '',
     model: j['model'] ?? '',
+    apiProtocol: j['apiProtocol'] ?? 'openai',
     systemPrompt: j['systemPrompt'] ?? '',
     temperature: (j['temperature'] as num?)?.toDouble() ?? 0.7,
     enableTools: j['enableTools'] ?? true,
@@ -553,6 +576,7 @@ class AppSettings {
     visionApiKey: j['visionApiKey'] ?? '',
     visionModel: j['visionModel'] ?? '',
     enableNotifications: j['enableNotifications'] ?? true,
+    enterToSend: j['enterToSend'] ?? true,
   );
 }
 
@@ -563,26 +587,34 @@ class ApiProfile {
   final String baseUrl;
   final String apiKey;
   final String model;
+  final String apiProtocol;
   const ApiProfile({
     required this.name,
     required this.baseUrl,
     this.apiKey = '',
     this.model = '',
+    this.apiProtocol = 'openai',
   });
 
-  ApiProfile copyWith({String? baseUrl, String? apiKey, String? model}) =>
-      ApiProfile(
-        name: name,
-        baseUrl: baseUrl ?? this.baseUrl,
-        apiKey: apiKey ?? this.apiKey,
-        model: model ?? this.model,
-      );
+  ApiProfile copyWith({
+    String? baseUrl,
+    String? apiKey,
+    String? model,
+    String? apiProtocol,
+  }) => ApiProfile(
+    name: name,
+    baseUrl: baseUrl ?? this.baseUrl,
+    apiKey: apiKey ?? this.apiKey,
+    model: model ?? this.model,
+    apiProtocol: apiProtocol ?? this.apiProtocol,
+  );
 
   Map<String, dynamic> toJson() => {
     'name': name,
     'baseUrl': baseUrl,
     'apiKey': apiKey,
     'model': model,
+    'apiProtocol': apiProtocol,
   };
 
   factory ApiProfile.fromJson(Map<String, dynamic> j) => ApiProfile(
@@ -590,5 +622,6 @@ class ApiProfile {
     baseUrl: j['baseUrl'] ?? '',
     apiKey: j['apiKey'] ?? '',
     model: j['model'] ?? '',
+    apiProtocol: j['apiProtocol'] ?? 'openai',
   );
 }

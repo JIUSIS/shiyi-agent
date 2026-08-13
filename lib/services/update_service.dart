@@ -16,7 +16,7 @@ class UpdateService {
   UpdateService._();
 
   /// 读取 PackageInfo 失败时的兜底版本；正常情况以包内真实版本为准。
-  static const String appVersion = '1.1.8';
+  static const String appVersion = '2.0.0';
   static const String repoUrl = 'https://github.com/JIUSIS/shiyi-agent';
   static const String apiReleaseUrl =
       'https://api.github.com/repos/JIUSIS/shiyi-agent/releases/latest';
