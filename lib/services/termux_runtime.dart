@@ -431,6 +431,12 @@ am start -a android.intent.action.VIEW -d "$1" >/dev/null 2>&1
       'SSL_CERT_FILE': cert,
       'PROOT_TMP_DIR': '$prefix/tmp',
       'PROOT_LOADER': '$usr/libexec/proot/loader',
+      // 数据目录环境变量桥（与 bin-shim proot-run 双保险）：
+      // figlet 字体 / man 手册 / groff 字体在宿主直跑时也能找到。
+      'FIGLET_FONTDIR': '$usr/share/figlet',
+      'MANPATH': '$usr/share/man',
+      'GROFF_FONT_PATH':
+          '$usr/share/groff/site-font:$usr/share/groff/font:$usr/share/groff/current/font',
     };
   }
 
@@ -440,10 +446,18 @@ am start -a android.intent.action.VIEW -d "$1" >/dev/null 2>&1
   static const String _termuxAptScript = r'''#!/system/bin/sh
 # termux-apt: run apt/pkg/dpkg through proot (dynamic prefix resolution)
 # 第一个参数是要执行的命令名（由 bin-shim/proot-exec 或直接调用传入）。
+# ROOTFS/CMD 用纯 shell 参数展开解析（SELF 恒为 .../termux/usr/bin/termux-apt），
+# 不用 dirname/basename：app 真实 PATH 里 usr/bin 在 /system/bin 前，
+# 外部命令会解析到 termux 的 dirname，链接 libandroid-support.so 失败。
 SELF=$0
-ROOTFS=$(dirname "$(dirname "$(dirname "$SELF")")")
-mkdir -p "$ROOTFS/tmp" "$ROOTFS/cache" "$ROOTFS/usr/tmp"
+ROOTFS=${SELF%/usr/bin/*}
+CMD=$1
+shift
+# 立即 export LD_LIBRARY_PATH：脚本内所有 termux 命令（mkdir/grep/cat 等）
+# 在 app 真实 PATH（usr/bin 在 /system/bin 前）下会解析到 termux 版本，
+# 依赖 libandroid-support.so，必须先设库路径才能宿主直跑。
 export LD_LIBRARY_PATH=$ROOTFS/usr/lib
+mkdir -p "$ROOTFS/tmp" "$ROOTFS/cache" "$ROOTFS/usr/tmp"
 export PERL5LIB=$ROOTFS/usr/lib/perl5/site_perl/5.42.0/aarch64-android:$ROOTFS/usr/lib/perl5/site_perl/5.42.0:$ROOTFS/usr/lib/perl5/vendor_perl/5.42.0/aarch64-android:$ROOTFS/usr/lib/perl5/vendor_perl/5.42.0:$ROOTFS/usr/lib/perl5/5.42.0/aarch64-android:$ROOTFS/usr/lib/perl5/5.42.0
 export PROOT_TMP_DIR=$ROOTFS/tmp
 export PROOT_LOADER=$ROOTFS/usr/libexec/proot/loader
@@ -455,7 +469,6 @@ export HOME=$ROOTFS/home
 # proot 会为 /data/data 自动创建虚拟 com.termux 目录，配合 run_once 里
 # 的 files -> / 软链，/data/data/com.termux/files/usr 编译前缀可正常解析。
 ARGS="-r $ROOTFS -b /system:/system -b /vendor:/vendor -b /data:/data -b /dev:/dev -b /proc:/proc -b /sys:/sys -b /apex:/apex -b $ROOTFS:/data/data/com.termux -b $ROOTFS/cache:/data/data/com.termux/cache -b $ROOTFS/tmp:/tmp"
-CMD="$1"; shift
 
 # 装包/更新后自动重写 bin 脚本 shebang（旧包名 → 当前包名），
 # 否则新装包（perl/gnupg/cowsay 等带脚本的包）宿主直调全部 127。
@@ -532,11 +545,42 @@ exit $RC
   /// bin-shim 通用包装器：按自身 basename 分发到 termux-apt。
   /// 注意：必须用 `basename "$0"`（不解析符号链接），否则链接名会丢失。
   static const String _prootExecScript = r'''#!/system/bin/sh
+# 参数展开解析（不用 dirname/basename，避免 termux 外部命令链接失败，见 termux-apt 注释）
 SELF=$0
-ROOTFS=$(dirname "$(dirname "$SELF")")
-CMD=$(basename "$SELF")
+ROOTFS=${SELF%/bin-shim/*}
+CMD=${SELF##*/}
 exec "$ROOTFS/usr/bin/termux-apt" "$CMD" "$@"
 ''';
+
+  /// proot-run 通用包装：为「硬编码 $PREFIX 数据路径」的命令（figlet/man/vim 等）
+  /// 提供 proot 前缀桥。不带镜像轮换，仅建 files 软链后执行真实命令。
+  /// bin-shim 目录在 PATH 首位，白名单命令经它进 proot；proot 内 PATH
+  /// 不含 bin-shim，杜绝递归拉起。ARGS 比 termux-apt 多绑外部存储，
+  /// 让 proot 内可访问 /storage/emulated/0（工作目录语义一致）。
+  static const String _prootRunScript = r'''#!/system/bin/sh
+SELF=$0
+ROOTFS=${SELF%/bin-shim/*}
+CMD=${SELF##*/}
+# 立即 export LD_LIBRARY_PATH（脚本内 termux 命令依赖 libandroid-support.so）。
+export LD_LIBRARY_PATH=$ROOTFS/usr/lib
+export PERL5LIB=$ROOTFS/usr/lib/perl5/site_perl/5.42.0/aarch64-android:$ROOTFS/usr/lib/perl5/site_perl/5.42.0:$ROOTFS/usr/lib/perl5/vendor_perl/5.42.0/aarch64-android:$ROOTFS/usr/lib/perl5/vendor_perl/5.42.0:$ROOTFS/usr/lib/perl5/5.42.0/aarch64-android:$ROOTFS/usr/lib/perl5/5.42.0
+export PROOT_TMP_DIR=$ROOTFS/tmp
+export PROOT_LOADER=$ROOTFS/usr/libexec/proot/loader
+export PATH=$ROOTFS/usr/bin:/system/bin
+export HOME=$ROOTFS/home
+ARGS="-r $ROOTFS -b /system:/system -b /vendor:/vendor -b /data:/data -b /dev:/dev -b /proc:/proc -b /sys:/sys -b /apex:/apex -b /storage/emulated/0:/storage/emulated/0 -b $ROOTFS:/data/data/com.termux -b $ROOTFS/cache:/data/data/com.termux/cache -b $ROOTFS/tmp:/tmp"
+# 建前缀软链（幂等）后执行真实命令；CMD 经位置参数传入内层 sh（$1），
+# 避免单引号内变量不展开的问题。
+"$ROOTFS/usr/bin/proot" $ARGS -w / /usr/bin/sh -c 'ln -sfn / /data/data/com.termux/files 2>/dev/null; exec /usr/bin/$1 "$@"' sh "$CMD" "$@"
+''';
+
+  /// 需要 proot 前缀桥的命令白名单（数据目录硬编码前缀；可增删）。
+  static const List<String> _prootRunCmds = [
+    'figlet', 'toilet', 'lolcat', 'cowsay', // 文本艺术类（字体/台词数据）
+    'man', 'groff', 'troff', 'nroff', // 手册/排版（字体与宏包）
+    'vim', 'nano', 'less', 'lynx', 'w3m', // 编辑器/浏览器（数据文件）
+    'htop', 'screen', 'tmux', // 常用交互工具
+  ];
 
   /// 需要走 proot 包装的管理命令（符号链接到 proot-exec）。
   static const List<String> _shimCommands = [
@@ -556,7 +600,7 @@ exec "$ROOTFS/usr/bin/termux-apt" "$CMD" "$@"
     'uname26',
   ];
 
-  /// 生成/刷新 bin-shim：termux-apt 动态版 + 通用 proot-exec + 符号链接。
+  /// 生成/刷新 bin-shim：termux-apt 动态版 + 通用 proot-exec/proot-run + 符号链接。
   static Future<void> _writeShims() async {
     final usr = await usrDir();
     final prefix = await prefixDir();
@@ -564,15 +608,23 @@ exec "$ROOTFS/usr/bin/termux-apt" "$CMD" "$@"
     final shim = Directory('$prefix/bin-shim');
     shim.createSync(recursive: true);
     File('${shim.path}/proot-exec').writeAsStringSync(_prootExecScript);
+    File('${shim.path}/proot-run').writeAsStringSync(_prootRunScript);
     for (final name in _shimCommands) {
       final link = Link('${shim.path}/$name');
       if (!link.existsSync()) link.createSync('proot-exec');
+    }
+    // 前缀桥白名单：仅当 usr/bin 下存在对应命令时才建链接，避免链到不存在的命令。
+    for (final name in _prootRunCmds) {
+      if (!File('$usr/bin/$name').existsSync()) continue;
+      final link = Link('${shim.path}/$name');
+      if (!link.existsSync()) link.createSync('proot-run');
     }
     try {
       await Process.run('/system/bin/chmod', [
         '755',
         '$usr/bin/termux-apt',
         '${shim.path}/proot-exec',
+        '${shim.path}/proot-run',
       ]);
     } catch (_) {}
   }
