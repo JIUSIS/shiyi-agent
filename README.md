@@ -160,11 +160,13 @@ flutter run
 flutter build apk --release
 ```
 
-### Release 签名配置
+### 签名配置
 
-`android/app/build.gradle.kts` 的 release 签名配置读取项目根目录的 `keystore.jks`（keyAlias 为 `shiyi`），签名密码从 `android/local.properties` 的 `KEYSTORE_PASSWORD` 或环境变量 `KEYSTORE_PASSWORD` 读取。
+`android/app/build.gradle.kts` 的 **release 与 debug 变体统一使用**项目根目录的 `keystore.jks`（keyAlias 为 `shiyi`），签名密码从 `android/local.properties` 的 `KEYSTORE_PASSWORD` 或环境变量 `KEYSTORE_PASSWORD` 读取。
 
-首次构建 release 需要：
+> debug 变体也用正式签名的原因：覆盖安装到装有正式版的真机不会因签名不一致失败/清数据；同时 debug 包仍可 `run-as` 备份数据。注意：**构建 debug 也需要配置签名密码**（没有密码时 debug 构建同样会失败）。
+
+首次构建需要：
 
 ```bash
 # 1. 生成签名密钥（只需一次；请务必妥善保管密码）

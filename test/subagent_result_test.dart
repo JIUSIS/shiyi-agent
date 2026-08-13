@@ -164,7 +164,7 @@ void main() {
   });
 
   group('上下文预算裁剪（⑦）', () {
-    test('超预算：早期工具轮被成组删除，保留 system + user', () async {
+    test('超预算：删除早期工具轮，保留最近一组（system+user+最后组）', () async {
       final seen = <List<Map<String, dynamic>>>[];
       var round = 0;
       final runner = makeRunner(
@@ -184,12 +184,19 @@ void main() {
       );
       final r = await runner.run(def, '任务');
       expect(r.isSuccess, isTrue);
-      // 裁剪生效：第一轮之后，每轮看到的消息都只剩 system + user。
+      // 第一轮：system + user（尚无工具轮）。
+      expect(seen.first.length, 2);
+      // 后续轮：system + user + 最近一组（4 条），早期组被裁剪。
       for (final msgs in seen.skip(1)) {
-        expect(msgs.length, 2, reason: '早期工具轮应被上下文预算裁剪');
+        expect(msgs.length, 4, reason: '应保留 system+user+最近一组');
         expect(msgs[0]['role'], 'system');
         expect(msgs[1]['role'], 'user');
+        expect(msgs[2]['role'], 'assistant');
+        expect(msgs[3]['role'], 'tool');
       }
+      // 最近轮保留：最后一轮快照里的工具组是最近一次工具调用（c4）的。
+      final lastTc = (seen.last[2]['tool_calls'] as List).first as Map;
+      expect(lastTc['id'], 'c4', reason: '最近一轮不能被预算裁剪删除');
     });
 
     test('预算 0（默认）：不裁剪，消息逐轮累积', () async {

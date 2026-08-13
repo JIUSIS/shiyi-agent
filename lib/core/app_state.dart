@@ -244,6 +244,14 @@ class ShiyiState extends ChangeNotifier {
     tailChars: 1200,
   );
 
+  /// 子代理最终报告裁剪（与 web_extract 同阈值 8000）：
+  /// worker 最多 40 轮，最终报告可能超长，直接进主上下文会撑爆预算。
+  static const ToolResultPruner _subagentReportPruner = ToolResultPruner(
+    thresholdChars: 8000,
+    headChars: 4800,
+    tailChars: 2000,
+  );
+
   static List<AgentTool> _buildToolRegistry() => [
     AgentTool(
       name: 'save_memory',
@@ -2630,7 +2638,9 @@ class ShiyiState extends ChangeNotifier {
           );
         }
         if (result.totalTokens > 0) subagentTokens += result.totalTokens;
-        return '### 子代理 ${i + 1}/$total（${def.name}）\n${result.toModelText()}';
+        // 最终报告也做掐头去尾裁剪（worker 40 轮的报告可能超长，不能裸奔进主上下文）。
+        final reportText = _subagentReportPruner.prune(result.toModelText());
+        return '### 子代理 ${i + 1}/$total（${def.name}）\n$reportText';
       }),
     );
     // 子代理消耗的 token 统一计入发起会话（与主循环一致，并入「本轮」）。

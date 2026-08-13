@@ -142,6 +142,15 @@ void main() {
       expect(prompt, contains('未知变量 {{nope}}')); // 未注册变量原样保留
     });
 
+    test('persona 自定义提示词支持 {{user_text}}（与技能段落口径一致）', () async {
+      final shiyi = makeState();
+      shiyi.settings = shiyi.settings.copyWith(
+        systemPrompt: '人设：用户刚说「{{user_text}}」',
+      );
+      final prompt = await shiyi.buildSystemPromptForTest('你好世界');
+      expect(prompt, contains('用户刚说「你好世界」'));
+    });
+
     test('已加载技能内容支持 {{变量}} 插值', () async {
       final shiyi = makeState();
       shiyi.loadedSkills.add(

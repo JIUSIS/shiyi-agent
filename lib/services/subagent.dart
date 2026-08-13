@@ -347,8 +347,9 @@ class SubagentRunner {
             : await _round(msgs);
       } on LlmException catch (e) {
         // 请求失败必须如实返回失败状态，不能伪装成成功报告。
+        // 注意：_round 已带「子代理请求失败: 」前缀，这里不再重复拼接。
         return SubagentResult.requestFailed(
-          '子代理请求失败: $e',
+          '$e',
           totalTokens: totalTokens,
         );
       }
@@ -407,24 +408,27 @@ class SubagentRunner {
       // 超预算时裁剪早期工具轮（保留 system + user + 最近轮）。
       _enforceContextBudget(msgs);
     }
-    return SubagentResult.turnLimit(def.maxTurns, totalTokens: totalTokens);
+    // 用实际运行的 budget 上报（max_turns 动态覆盖时不能报定义默认值）。
+    return SubagentResult.turnLimit(budget, totalTokens: totalTokens);
   }
 
   /// 上下文预算裁剪：估算超预算时从最早的工具轮开始成组删除
   /// （assistant 的 tool_calls + 其后的 tool 结果），直到预算内或无可删轮。
-  /// 只删完整组，不会留下孤儿 tool 消息（孤儿 tool 消息会让 API 报 400）。
+  /// 只删完整组，不会留下孤儿 tool 消息（孤儿 tool 消息会让 API 报 400）；
+  /// 始终保留最近一组（最近信息对子代理最有用），只剩一组时接受轻微超预算。
   void _enforceContextBudget(List<Map<String, dynamic>> msgs) {
     if (contextBudgetTokens <= 0) return;
     var guard = 0;
     while (_estimateMessagesTokens(msgs) > contextBudgetTokens && guard++ < 20) {
-      int? groupStart;
+      // 找出所有 assistant 工具轮的起点。
+      final groupStarts = <int>[];
       for (var i = 1; i < msgs.length; i++) {
         if (msgs[i]['role'] == 'assistant' && msgs[i]['tool_calls'] != null) {
-          groupStart = i;
-          break;
+          groupStarts.add(i);
         }
       }
-      if (groupStart == null) break; // 没有可删的工具轮
+      if (groupStarts.length <= 1) break; // 没有可删组，或只剩最近一组 → 接受超预算
+      final groupStart = groupStarts.first;
       var groupEnd = groupStart + 1;
       while (groupEnd < msgs.length && msgs[groupEnd]['role'] == 'tool') {
         groupEnd++;

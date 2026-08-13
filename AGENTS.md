@@ -9,6 +9,10 @@
   - 用 `flutter install` 时：装完必须检查输出里**没有** `Uninstalling old version...`，有则说明走了卸载（数据已清）。
   - 装前可先验签：`adb shell dumpsys package com.shiyi.agent | grep signatures`（同签名覆盖才不清数据）。
   - 备份数据（debug 包可 run-as）：`adb exec-out run-as com.shiyi.agent cat files/... `（app_flutter/shiyi_agent.db + shared_prefs/）。
+- **2026-08-14 起 debug 变体也使用正式签名**（`keystore.jks`，见 `android/app/build.gradle.kts`）：
+  - debug 构建的 APK 与正式版签名一致，`adb install -r` 覆盖安装不会因签名不一致失败/清数据；
+  - debug 包保持 debuggable，可 `run-as` 备份/验证数据；
+  - 注意：因此**构建 debug 同样需要 `KEYSTORE_PASSWORD`**（`android/local.properties` 或环境变量），缺密码时 debug 构建直接报错。
 
 ## 真机环境
 - 常用测试设备：`2509FPN0BC`（Android 16 / API 36）

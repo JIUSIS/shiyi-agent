@@ -1,4 +1,4 @@
-import '../core/models.dart';
+import 'models.dart';
 import '../services/file_workspace.dart';
 import 'prompt_section.dart';
 
@@ -58,9 +58,15 @@ class PromptBuilder {
       order: 0,
       builder: () async {
         final s = settings();
-        final base = s.systemPrompt.isNotEmpty ? s.systemPrompt : _defaultPersonaText;
-        // 用户自定义提示词支持 {{变量}}（宽容模式：未注册变量原样保留）。
-        return renderPromptVariables(base, await _buildPromptVariables(''));
+        final base = s.systemPrompt.isNotEmpty
+            ? s.systemPrompt
+            : _defaultPersonaText;
+        // 用户自定义提示词支持 {{变量}}（宽容模式：未注册变量原样保留）；
+        // 与技能段落一致，注入真实 userText（{{user_text}} 可用）。
+        return renderPromptVariables(
+          base,
+          await _buildPromptVariables(userText),
+        );
       },
     ),
     PromptSection(name: 'tool-rules', order: 100, text: _toolRulesText),
