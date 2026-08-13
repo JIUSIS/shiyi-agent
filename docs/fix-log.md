@@ -801,3 +801,8 @@
 - **内容**：汇总第 66~95 条的 Apple 设计理念统一重构、底部三 Tab、设置 / 关于 / 功能 / 文件 / 记忆 / 技能 / 日志 iOS 化、Anthropic 协议与内置 API 预设、红绿灯全局状态、消息气泡与工具栏、项目 / 会话左滑交互、性能与健壮性修复，作为 `2.0.0` 正式发布。
 - **涉及**：`pubspec.yaml`（2.0.0+13）、`android/app/build.gradle.kts`（versionCode 13 / versionName 2.0.0）、`lib/services/update_service.dart`、`CHANGELOG.md`、`README.md`、`docs/fix-log.md`。
 - **验证**：`flutter analyze` 无告警；`flutter test` 100 项全部通过；release 构建成功；真机 `f29c6ad8` 覆盖安装（`adb install -r`）Success，`firstInstallTime` 未变化，数据保留；推送 GitHub 源码并创建 `v2.0.0` Release。
+
+### 97. README 描述更新 + 2.0 界面预览
+- **内容**：README 功能特性按「智能对话 / 项目与文件 / 记忆与技能 / 内置终端 / 子代理 / 体验与设计」重新排序并补充 2.0 新能力（模型 API 预设、缓存命中率、回车发送、文件异步加载、命令输出限流等）；新增 2.0 界面预览 15 张截图（首页 / 会话 / 功能 / 文件 / 长期记忆 / 技能 / 设置 / 模型 API / 上下文 / 关于），1.0 旧界面保留为对比参考。
+- **涉及**：`README.md`、`docs/screenshots/2.0/*`。
+- **验证**：仅文档与截图变更，不影响代码与构建。
