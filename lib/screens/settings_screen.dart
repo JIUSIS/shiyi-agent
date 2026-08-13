@@ -460,12 +460,12 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
 
   @override
   void dispose() {
+    // 先把未落盘编辑保存（flush 的 _build 会读 controller.text），再释放 controller。
+    if (_save.hasPending) unawaited(_save.flush());
+    _save.dispose();
     _baseCtrl.dispose();
     _keyCtrl.dispose();
     _modelCtrl.dispose();
-    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
-    if (_save.hasPending) unawaited(_save.flush());
-    _save.dispose();
     super.dispose();
   }
 
@@ -1162,12 +1162,12 @@ class _VisionSectionPageState extends State<_VisionSectionPage> {
 
   @override
   void dispose() {
+    // 先把未落盘编辑保存（flush 的 _build 会读 controller.text），再释放 controller。
+    if (_save.hasPending) unawaited(_save.flush());
+    _save.dispose();
     _urlCtrl.dispose();
     _keyCtrl.dispose();
     _modelCtrl.dispose();
-    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
-    if (_save.hasPending) unawaited(_save.flush());
-    _save.dispose();
     super.dispose();
   }
 
@@ -1834,10 +1834,10 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
 
   @override
   void dispose() {
-    _promptCtrl.dispose();
-    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    // 先把未落盘编辑保存（flush 的 _build 会读 controller.text），再释放 controller。
     if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
+    _promptCtrl.dispose();
     super.dispose();
   }
 

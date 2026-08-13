@@ -40,6 +40,16 @@ class _MemoryScreenState extends State<MemoryScreen> {
     _searchDebounce?.cancel();
     final query = q.trim();
     _searchDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (query.isEmpty) {
+        // 清空搜索框：直接清结果，不触发全库检索。
+        if (mounted) {
+          setState(() {
+            _searching = false;
+            _results = [];
+          });
+        }
+        return;
+      }
       _runSearch(query);
     });
   }

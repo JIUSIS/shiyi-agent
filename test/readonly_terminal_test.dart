@@ -56,6 +56,13 @@ void main() {
       expect(reject('> f echo hi'), isNotNull);
       expect(reject('>> f cat a'), isNotNull);
     });
+
+    test('引号内的 > 会被误拒（保守策略，行为固化防意外放宽）', () {
+      // 正则不解析引号：echo "a > b" 会命中 > 被拒。
+      // 这是「漏放写操作不可接受」的取舍——宁可误伤只读命令。
+      expect(reject('echo "a > b"'), isNotNull);
+      expect(reject('echo "a >> b"'), isNotNull);
+    });
   });
 
   group('参数边界', () {

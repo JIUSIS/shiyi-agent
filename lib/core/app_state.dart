@@ -761,8 +761,9 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> deleteSession(String id) async {
     // 与其他写操作一致：生成中不允许删会话（否则主循环会向已删会话
-    // 继续写消息，重建出孤儿会话）。
-    if (isBusy) return;
+    // 继续写消息，重建出孤儿会话）。只挡「正在生成的那个会话」——
+    // 别的会话生成中不影响删除本会话。
+    if (isBusy && busySessionId == id) return;
     await _db.deleteSession(id);
     if (currentSessionId == id) {
       currentSessionId = null;
@@ -1704,14 +1705,23 @@ class ShiyiState extends ChangeNotifier {
       status = null;
       notifyListeners();
       if (isBusy) {
-        await _logError('引导', '引导发送等待超时，强置空闲（isBusy 卡死兜底）');
-        isBusy = false;
-        _streaming = null;
-        busySessionId = null;
-        busyRevision.value++;
-        streamText.value = '';
-        streamReasoning.value = '';
-        notifyListeners();
+        // 先给旧循环最多 3 秒真正退出（stop 已释放 question/流式阻塞点），
+        // 避免强置空闲后旧循环的工具仍在写 DB 造成双写。
+        var grace = 0;
+        while (_streaming != null && grace < 40) {
+          await Future.delayed(const Duration(milliseconds: 80));
+          grace++;
+        }
+        if (_streaming != null) {
+          await _logError('引导', '引导发送等待超时，强置空闲（isBusy 卡死兜底）');
+          isBusy = false;
+          _streaming = null;
+          busySessionId = null;
+          busyRevision.value++;
+          streamText.value = '';
+          streamReasoning.value = '';
+          notifyListeners();
+        }
       }
     }
     await send(text);
@@ -1834,8 +1844,10 @@ class ShiyiState extends ChangeNotifier {
     var asst = firstAsst;
     _streaming = asst;
     for (var round = 0; round < _maxToolRounds; round++) {
-      // 每轮裁剪本轮累积消息（工具结果可能很大，防单轮 payload 超预算）。
-      loopMsgs = await _trimApiMessages(loopMsgs, logBudget: false);
+      // 每轮裁剪本轮累积消息（工具结果可能很大，防单轮 payload 超预算）；
+      // announce: false——静默裁剪，不弹 4 秒「已裁剪」提示打扰。
+      loopMsgs = await _trimApiMessages(loopMsgs,
+          logBudget: false, announce: false);
       final result = await _streamRound(sessionId, loopMsgs, asst);
       if (result == null) {
         await _finalizeAbort(asst);
@@ -2647,12 +2659,17 @@ class ShiyiState extends ChangeNotifier {
               try {
                 realTarget = File(target).resolveSymbolicLinksSync();
               } catch (_) {
-                // 目标不存在（新文件）：词法通过即可。
+                // 目标不存在（新文件）：改查最近存在的父目录前缀的真实路径，
+                // 防父目录本身是软链接（out/sub -> /sdcard）时经父目录逃逸。
               }
               final ok = writePaths.any((w) {
                 if (target != w && !target.startsWith('$w/')) return false;
-                if (realTarget == null) return true;
-                return realTarget == w || realTarget.startsWith('$w/');
+                if (realTarget != null) {
+                  return realTarget == w || realTarget.startsWith('$w/');
+                }
+                final realParent = _resolveExistingPrefix(target);
+                if (realParent == null) return true; // 无已存在的父目录，词法放行
+                return realParent == w || realParent.startsWith('$w/');
               });
               if (!ok) {
                 return '写入被拒绝：$p 不在本子代理允许的 write_paths 内'
@@ -2708,6 +2725,24 @@ class ShiyiState extends ChangeNotifier {
     status = null;
     notifyListeners();
     return results.join('\n\n');
+  }
+
+  /// 找到路径上最近一个已存在的父目录并解析其真实路径（符号链接展开）。
+  /// 目标文件尚不存在时用于防「父目录是软链接」的逃逸；无已存在父目录返回 null。
+  static String? _resolveExistingPrefix(String path) {
+    var dir = File(path).parent;
+    var guard = 0;
+    while (guard++ < 32 && dir.path != dir.parent.path) {
+      if (dir.existsSync()) {
+        try {
+          return dir.resolveSymbolicLinksSync();
+        } catch (_) {
+          return null;
+        }
+      }
+      dir = dir.parent;
+    }
+    return null;
   }
 
   /// 归一路径为绝对路径（相对基于 baseDir），供 write_paths 隔离比较。

@@ -25,21 +25,28 @@ class AppDatabase {
   }
 
   Future<Database> _open() async {
-    final dir = await getApplicationDocumentsDirectory();
-    final db = await openDatabase(
-      join(dir.path, 'shiyi_agent.db'),
-      version: 15,
-      onCreate: _createBaseTables,
-      onUpgrade: _upgrade,
-      onOpen: _repairSchema,
-      onConfigure: (db) async {
-        // WAL 提升并发读写；busy_timeout 让偶发写竞争等待而非立即失败。
-        await db.execute('PRAGMA journal_mode=WAL');
-        await db.execute('PRAGMA busy_timeout=5000');
-      },
-    );
-    _db = db;
-    return db;
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final db = await openDatabase(
+        join(dir.path, 'shiyi_agent.db'),
+        version: 15,
+        onCreate: _createBaseTables,
+        onUpgrade: _upgrade,
+        onOpen: _repairSchema,
+        onConfigure: (db) async {
+          // WAL 提升并发读写；busy_timeout 让偶发写竞争等待而非立即失败。
+          await db.execute('PRAGMA journal_mode=WAL');
+          await db.execute('PRAGMA busy_timeout=5000');
+        },
+      );
+      _db = db;
+      return db;
+    } catch (_) {
+      // 打开失败：重置共享 future，允许下次调用重试
+      //（否则失败的 future 会被永久缓存，本进程内 DB 层彻底失效）。
+      _opening = null;
+      rethrow;
+    }
   }
 
   Future<void> _createBaseTables(Database db, int version) async {

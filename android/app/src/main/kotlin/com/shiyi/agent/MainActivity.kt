@@ -153,36 +153,55 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** 通过系统安装器安装更新包（FileProvider 暴露 APK 给 PackageInstaller）。 */
+    /** 通过系统安装器安装更新包（FileProvider 暴露 APK 给 PackageInstaller）。
+     *  签名校验耗时，调用方应在后台线程执行；startActivity 回主线程。 */
     private fun installApk(path: String) {
         val apk = File(path)
         if (!apk.exists()) throw IllegalStateException("APK 不存在: $path")
         if (!verifyApk(path)) {
             throw SecurityException("APK 签名校验失败，已取消安装")
         }
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runOnUiThread {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
         }
-        startActivity(intent)
+    }
+
+    /** 读取安装包签名：API 28+ 用 GET_SIGNING_CERTIFICATES，旧系统回退 GET_SIGNATURES。 */
+    @Suppress("DEPRECATION")
+    private fun loadSignatures(pm: PackageManager, path: String?): Array<Signature>? {
+        return if (path == null) {
+            if (Build.VERSION.SDK_INT >= 28) {
+                pm.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+                    ?.signingInfo?.apkContentsSigners
+            } else {
+                pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)?.signatures
+            }
+        } else {
+            if (Build.VERSION.SDK_INT >= 28) {
+                pm.getPackageArchiveInfo(path, PackageManager.GET_SIGNING_CERTIFICATES)
+                    ?.signingInfo?.apkContentsSigners
+            } else {
+                pm.getPackageArchiveInfo(path, PackageManager.GET_SIGNATURES)?.signatures
+            }
+        }
     }
 
     /** 校验下载 APK 与当前已安装应用签名一致，防止镜像源篡改包。 */
     private fun verifyApk(path: String): Boolean {
         return try {
             val pm = packageManager
-            val current = pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
-                ?: return false
-            val candidate = pm.getPackageArchiveInfo(path, PackageManager.GET_SIGNATURES)
-                ?: return false
-            val cur = current.signatures ?: return false
-            val cand = candidate.signatures ?: return false
+            val cur = loadSignatures(pm, null) ?: return false
+            val cand = loadSignatures(pm, path) ?: return false
             if (cur.isEmpty() || cur.size != cand.size) return false
-            cur.indices.all { i ->
-                cur[i].toByteArray().contentEquals(cand[i].toByteArray())
-            }
+            // 无序匹配：每个已安装签名都能在候选包里找到相等者
+            //（多签名 APK 的顺序可能不同，按位置比较会误拒）。
+            cur.all { a -> cand.any { b -> a.toByteArray().contentEquals(b.toByteArray()) } }
         } catch (_: Exception) {
             false
         }
@@ -193,11 +212,16 @@ class MainActivity : FlutterActivity() {
         val dest = File(destDir)
         dest.mkdirs()
         val entries = mutableListOf<Map<String, Any>>()
+        var totalBytes = 0L
+        var entryCount = 0
         ZipInputStream(BufferedInputStream(FileInputStream(zipPath))).use { zis ->
             var entry = zis.nextEntry
             while (entry != null) {
                 val name = entry.name.replace('\\', '/')
                 if (!entry.isDirectory) {
+                    if (++entryCount > MAX_ZIP_ENTRIES) {
+                        throw IllegalStateException("压缩包条目过多（超过 $MAX_ZIP_ENTRIES），已中止解压")
+                    }
                     val outFile = File(dest, name)
                     // 防目录穿越：只允许解压到目标目录内
                     val canonical = outFile.canonicalPath
@@ -208,6 +232,10 @@ class MainActivity : FlutterActivity() {
                             val buf = ByteArray(64 * 1024)
                             var n = zis.read(buf)
                             while (n > 0) {
+                                totalBytes += n
+                                if (totalBytes > MAX_ZIP_TOTAL_BYTES) {
+                                    throw IllegalStateException("压缩包解压总量超限（> $MAX_ZIP_TOTAL_BYTES 字节），已中止")
+                                }
                                 out.write(buf, 0, n)
                                 size += n
                                 n = zis.read(buf)

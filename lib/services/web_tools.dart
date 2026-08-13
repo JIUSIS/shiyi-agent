@@ -84,6 +84,7 @@ class WebTools {
   }
 
   static Future<String> _fetchDirect(Uri u, int maxChars) async {
+    await _rejectPrivateHost(u);
     final resp = await http
         .get(
           u,
@@ -96,6 +97,13 @@ class WebTools {
           },
         )
         .timeout(_extractTimeout);
+    // 重定向兜底：http 包自动跟随 3xx，公开站点可能 302 到内网地址
+    //（如 169.254.169.254 云元数据）。内容即使已被拉回也不返回给模型——
+    // SSRF 目标是防数据外泄，最终地址命中内网即整体拒绝。
+    final finalUrl = resp.request?.url;
+    if (finalUrl != null && finalUrl != u) {
+      await _rejectPrivateHost(finalUrl);
+    }
     if (resp.statusCode == 403) {
       throw Exception('HTTP 403：站点启用了防爬（拒绝自动抓取）。');
     }
