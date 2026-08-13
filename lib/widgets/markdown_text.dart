@@ -28,8 +28,14 @@ class MarkdownText extends StatelessWidget {
 String? _lastBlockSource;
 List<String>? _lastBlocks;
 
+/// 只缓存中等长度内容：超长流式文本持有大块列表（全局缓存是单 entry，
+/// 限制影响面，避免长消息驻留内存）。
+const int _blockCacheMaxChars = 100 * 1024;
+
 List<String> splitMarkdownBlocks(String md) {
-  if (_lastBlockSource == md) return _lastBlocks!;
+  if (md.length <= _blockCacheMaxChars && _lastBlockSource == md) {
+    return _lastBlocks!;
+  }
   final out = <String>[];
   final lines = md.split('\n');
   final buf = StringBuffer();
@@ -92,8 +98,10 @@ List<String> splitMarkdownBlocks(String md) {
   } else {
     _flushBuf(out, buf);
   }
-  _lastBlockSource = md;
-  _lastBlocks = out;
+  if (md.length <= _blockCacheMaxChars) {
+    _lastBlockSource = md;
+    _lastBlocks = out;
+  }
   return out;
 }
 
@@ -195,27 +203,33 @@ class AdaptiveMarkdownText extends StatelessWidget {
 
   /// 超过该字符数时启用懒加载渲染。
   final int lazyThreshold;
+
+  /// 流式中：固定使用 Column 渲染，不跨阈值切换渲染树
+  /// （边增长边切换子树会中途重排跳动）；停止后按长度决定懒加载。
+  final bool isStreaming;
+
   const AdaptiveMarkdownText(
     this.data, {
     super.key,
     this.style,
     this.lazyThreshold = 15000,
+    this.isStreaming = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    if (data.length <= lazyThreshold) {
-      return MarkdownText(data, style: style);
+    if (!isStreaming && data.length > lazyThreshold) {
+      final blocks = splitMarkdownBlocks(data);
+      return ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 400),
+        child: ListView.builder(
+          padding: EdgeInsets.zero,
+          itemCount: blocks.length,
+          itemBuilder: (context, i) => MarkdownBlock(blocks[i], style: style),
+        ),
+      );
     }
-    final blocks = splitMarkdownBlocks(data);
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxHeight: 400),
-      child: ListView.builder(
-        padding: EdgeInsets.zero,
-        itemCount: blocks.length,
-        itemBuilder: (context, i) => MarkdownBlock(blocks[i], style: style),
-      ),
-    );
+    return MarkdownText(data, style: style);
   }
 }
 
@@ -312,7 +326,9 @@ List<InlineSpan> _renderInline(String text, TextStyle base, Color accent) {
 
 Future<void> _openUrl(String url) async {
   final uri = Uri.tryParse(url);
-  if (uri == null) return;
+  // 只放行 http/https：javascript:/file:/intent: 等 scheme 不进入系统 Intent
+  //（防 LLM 生成的链接唤起系统文件/内容组件）。
+  if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;
   try {
     await launchUrl(uri, mode: LaunchMode.externalApplication);
   } catch (_) {
@@ -467,10 +483,12 @@ class _CodeBlock extends StatelessWidget {
         .trimRight();
     final lines = body.split('\n');
     var code = body;
+    var lang = '代码';
     if (lines.isNotEmpty) {
       final first = lines.first.trim();
-      // 首行若是语言标识（如 python / dart），不当作代码内容
+      // 首行若是语言标识（如 python / dart），不当作代码内容，并显示为语言标签
       if (first.isNotEmpty && RegExp(r'^[A-Za-z0-9_+#.-]+$').hasMatch(first)) {
+        lang = first;
         code = lines.sublist(1).join('\n').trimRight();
       }
     }
@@ -485,7 +503,7 @@ class _CodeBlock extends StatelessWidget {
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Text('代码',
+          Text(lang,
               style: TextStyle(fontSize: 11, letterSpacing: 1, color: theme.colorScheme.primary)),
           const Spacer(),
           GestureDetector(

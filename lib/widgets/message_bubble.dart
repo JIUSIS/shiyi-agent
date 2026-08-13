@@ -194,6 +194,8 @@ class _MessageBubbleState extends State<MessageBubble> {
                 if ((liveContent ?? message.content).isNotEmpty)
                   AdaptiveMarkdownText(
                     liveContent ?? message.content,
+                    // 流式中固定渲染策略，停止后才切换懒加载（防中途重排跳动）。
+                    isStreaming: liveContent != null,
                     style: theme.textTheme.bodyMedium!.copyWith(
                       fontSize: 16,
                       height: 1.45,

@@ -34,13 +34,16 @@ Write-Host ''
 Write-Host '== 3/3 快照一致性 ==' -ForegroundColor Cyan
 $dirty = git status --porcelain -- test/snapshots/
 if ($dirty) {
-    Write-Host '警告：test/snapshots/ 有未提交改动——' -ForegroundColor Yellow
-    Write-Host $dirty
     if ($FixSnapshots) {
-        Write-Host '（-FixSnapshots 已接受当前输出；请人工 review 上述 diff 确认是预期变更后再提交）' -ForegroundColor Yellow
+        Write-Host '警告：test/snapshots/ 有改动（已用 -FixSnapshots 接受当前输出）——' -ForegroundColor Yellow
+        Write-Host $dirty
+        Write-Host '请人工 review 上述 diff 确认是预期变更后再提交。' -ForegroundColor Yellow
     } else {
-        Write-Host '提示词/工具定义已变化：请先 review diff，确认是预期变更；' -ForegroundColor Yellow
-        Write-Host '确认后提交快照，或重新生成：删除对应快照文件后重跑 flutter test' -ForegroundColor Yellow
+        Write-Host '快照有未提交改动——门禁拦截：' -ForegroundColor Red
+        Write-Host $dirty
+        Write-Host '提示词/工具定义已变化：请先 review diff，确认是预期变更后提交快照；' -ForegroundColor Yellow
+        Write-Host '如需以当前输出为准，显式运行：pwsh tools/check.ps1 -FixSnapshots' -ForegroundColor Yellow
+        exit 1
     }
 } else {
     Write-Host '快照无改动 ✅' -ForegroundColor Green
