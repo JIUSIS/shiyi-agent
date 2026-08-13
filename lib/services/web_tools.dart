@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
@@ -67,6 +68,7 @@ class WebTools {
     if (u.scheme != 'http' && u.scheme != 'https') {
       throw Exception('不支持的链接：$url');
     }
+    await _rejectPrivateHost(u);
     final errors = <String>[];
     try {
       return await _fetchDirect(u, maxChars);
@@ -140,6 +142,48 @@ class WebTools {
       throw Exception('网页内容为空（可能是防爬返回的空页面）。建议换站点。');
     }
     return _truncate(text, maxChars);
+  }
+
+  /// SSRF 防护：拒绝解析到回环 / 内网 / 链路本地的地址。
+  /// 模型若被网页或技能内容诱导抓取内网地址（127.0.0.1、169.254.169.254
+  /// 云元数据等），不能触达本机或内网服务。
+  static Future<void> _rejectPrivateHost(Uri u) async {
+    final host = u.host.toLowerCase();
+    final ip = InternetAddress.tryParse(host);
+    if (ip != null) {
+      if (_isPrivateAddress(ip)) {
+        throw Exception('拒绝访问内网/回环地址：$host');
+      }
+      return;
+    }
+    // 域名：解析一次判断（DNS 解析失败放行，交给抓取层报错）。
+    try {
+      final addrs = await InternetAddress.lookup(host);
+      for (final a in addrs) {
+        if (_isPrivateAddress(a)) {
+          throw Exception('拒绝访问内网/回环地址：$host（解析到 ${a.address}）');
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// 判断是否为私有/保留地址（dart:io 的 InternetAddress 没有 isPrivate，
+  /// 手动判断常见内网网段：10/8、172.16/12、192.168/16、CGNAT 100.64/10、
+  /// IPv6 ULA fc00::/7，外加回环与链路本地）。
+  static bool _isPrivateAddress(InternetAddress a) {
+    if (a.isLoopback || a.isLinkLocal) return true;
+    final bytes = a.rawAddress;
+    if (bytes.length == 16) {
+      return bytes[0] == 0xFC || bytes[0] == 0xFD; // IPv6 ULA
+    }
+    if (bytes.length != 4) return false;
+    final b0 = bytes[0];
+    final b1 = bytes[1];
+    if (b0 == 10) return true;
+    if (b0 == 172 && b1 >= 16 && b1 <= 31) return true;
+    if (b0 == 192 && b1 == 168) return true;
+    if (b0 == 100 && b1 >= 64 && b1 <= 127) return true; // CGNAT
+    return false;
   }
 
   /// 掐头去尾截断（原一刀切只留开头）：保留头部 60% + 尾部 20%，

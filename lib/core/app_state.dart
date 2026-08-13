@@ -760,6 +760,9 @@ class ShiyiState extends ChangeNotifier {
   }
 
   Future<void> deleteSession(String id) async {
+    // 与其他写操作一致：生成中不允许删会话（否则主循环会向已删会话
+    // 继续写消息，重建出孤儿会话）。
+    if (isBusy) return;
     await _db.deleteSession(id);
     if (currentSessionId == id) {
       currentSessionId = null;
@@ -1407,6 +1410,10 @@ class ShiyiState extends ChangeNotifier {
         desc = '';
       }
       _imageDescCache[p] = desc;
+      // 缓存上限 100 条（LRU 简化：超限移除最早插入的），防长期驻留增长。
+      if (_imageDescCache.length > 100) {
+        _imageDescCache.remove(_imageDescCache.keys.first);
+      }
       if (desc.isNotEmpty) parts.add(desc);
     }
     if (parts.isEmpty) return '';
@@ -1827,6 +1834,8 @@ class ShiyiState extends ChangeNotifier {
     var asst = firstAsst;
     _streaming = asst;
     for (var round = 0; round < _maxToolRounds; round++) {
+      // 每轮裁剪本轮累积消息（工具结果可能很大，防单轮 payload 超预算）。
+      loopMsgs = await _trimApiMessages(loopMsgs, logBudget: false);
       final result = await _streamRound(sessionId, loopMsgs, asst);
       if (result == null) {
         await _finalizeAbort(asst);
@@ -2092,8 +2101,12 @@ class ShiyiState extends ChangeNotifier {
         if (lastStreamLen == 0 ||
             now.difference(lastStreamEmit).inMilliseconds >= 80 ||
             totalLen - lastStreamLen >= 200) {
-          streamReasoning.value = t.reasoning;
-          streamText.value = t.text;
+          if (currentSessionId == sessionId) {
+            // 只向当前查看的会话写流式 UI（后台会话的流不污染当前界面；
+            // asst 内容与 DB 持久化不受影响）。
+            streamReasoning.value = t.reasoning;
+            streamText.value = t.text;
+          }
           lastStreamEmit = now;
           lastStreamLen = totalLen;
         }
@@ -2628,9 +2641,19 @@ class ShiyiState extends ChangeNotifier {
               } catch (_) {}
               final p = (a['path'] ?? '').toString();
               final target = _normAbsPath(p, workingDirAbs);
-              final ok = writePaths.any(
-                (w) => target == w || target.startsWith('$w/'),
-              );
+              // 词法校验后解析符号链接：词法在允许范围内但实际指向外部的
+              // 软链接（如 out/link -> /sdcard/x）也要拦下。
+              String? realTarget;
+              try {
+                realTarget = File(target).resolveSymbolicLinksSync();
+              } catch (_) {
+                // 目标不存在（新文件）：词法通过即可。
+              }
+              final ok = writePaths.any((w) {
+                if (target != w && !target.startsWith('$w/')) return false;
+                if (realTarget == null) return true;
+                return realTarget == w || realTarget.startsWith('$w/');
+              });
               if (!ok) {
                 return '写入被拒绝：$p 不在本子代理允许的 write_paths 内'
                     '（允许：${writePaths.join('、')}）。'
@@ -2740,13 +2763,14 @@ class ShiyiState extends ChangeNotifier {
   static String? rejectWriteCommandForTest(String argsJson) =>
       _rejectWriteCommand(argsJson);
 
-  /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用。
+  /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用；
+  /// 统一经 [_normAbsPath] 归一化（消除 `..`、重复分隔符），语义明确、
+  /// 防路径混淆（与子代理 write_paths 同款归一化）。
   Future<String?> _resolveToolPath(String path) async {
     final t = path.trim();
     if (t.isEmpty) return null;
-    if (t.startsWith('/') || RegExp(r'^[A-Za-z]:').hasMatch(t)) return t;
     final base = await currentWorkspace();
-    return '$base/$t';
+    return _normAbsPath(t, base);
   }
 
   // ---------------- 上下文压缩 ----------------
@@ -2934,7 +2958,7 @@ class ShiyiState extends ChangeNotifier {
     if (transcript.trim().isEmpty) return fail;
     final limited = transcript.length <= 12000
         ? transcript
-        : transcript.substring(transcript.length - 12000);
+        : _tailChars(transcript, 12000);
 
     final client = LlmClient(
       baseUrl: settings.baseUrl,
@@ -2963,7 +2987,7 @@ class ShiyiState extends ChangeNotifier {
     final merged = [if (previous.isNotEmpty) previous, clean].join('\n\n');
     final rolling = merged.length <= 1600
         ? merged
-        : merged.substring(merged.length - 1600);
+        : _tailChars(merged, 1600);
     await _db.updateSessionRollingSummary(sessionId, rolling);
     await _db.markMessagesArchived(toCompress.map((m) => m.id).toList());
     // 旧的真实 usage 不再代表归档后的 payload，回退到本地估算。
@@ -3064,6 +3088,14 @@ class ShiyiState extends ChangeNotifier {
       }
     }
     return s;
+  }
+
+  /// 按码点安全截取文本尾部（保留最后 [maxChars] 个 Unicode 码点，
+  /// 不切半 emoji 代理对）。
+  static String _tailChars(String text, int maxChars) {
+    if (text.runes.length <= maxChars) return text;
+    final points = text.runes.toList();
+    return String.fromCharCodes(points.skip(points.length - maxChars));
   }
 
   /// 把待归档消息转成摘要输入：完整工具轮压缩成结构化一行，正文直接保留。
