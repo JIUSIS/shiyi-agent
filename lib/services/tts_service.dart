@@ -130,5 +130,14 @@ class TtsService {
     } catch (_) {}
     _edge = null;
     speakingId.value = null;
+    // 清理当前播放的临时文件（上次的已在 speak 里删过）。
+    final last = _lastFile;
+    _lastFile = null;
+    if (last != null) {
+      try {
+        final f = File(last);
+        if (f.existsSync()) f.deleteSync();
+      } catch (_) {}
+    }
   }
 }

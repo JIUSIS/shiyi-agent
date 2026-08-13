@@ -31,10 +31,14 @@ class ToolResultPruner {
 
   /// 裁剪后的文本；未超过阈值时返回原文本（同一引用）。
   String prune(String text) {
-    assert(
-      headChars + marker.length + tailChars <= thresholdChars,
-      'headChars + marker + tailChars 不能超过 thresholdChars',
-    );
+    // 运行时校验（release 也生效，不只 debug assert）：
+    // 配置非法时显式失败，而不是静默产出超限结果。
+    if (headChars + marker.length + tailChars > thresholdChars) {
+      throw StateError(
+        'ToolResultPruner: headChars + marker + tailChars ($headChars + '
+        '${marker.length} + $tailChars) 不能超过 thresholdChars ($thresholdChars)',
+      );
+    }
     final total = text.runes.length;
     if (total <= thresholdChars) return text;
     final points = text.runes.toList();

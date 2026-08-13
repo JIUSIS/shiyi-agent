@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
@@ -44,7 +45,26 @@ class _LogScreenState extends State<LogScreen> {
       final dir = await FileWorkspace.current();
       final file = File('$dir/logs/error.log');
       final exists = await file.exists();
-      final text = exists ? await file.readAsString() : '';
+      // 只读尾部（最多 256KB），避免每次 3 秒轮询全量读大日志文件。
+      String text = '';
+      if (exists) {
+        final len = await file.length();
+        const maxRead = 256 * 1024;
+        final skip = len > maxRead ? len - maxRead : 0;
+        final raf = await file.open();
+        try {
+          await raf.setPosition(skip);
+          final bytes = await raf.read(len - skip);
+          text = utf8.decode(bytes, allowMalformed: true);
+          if (skip > 0) {
+            // 从行边界开始，避免首行半截。
+            final idx = text.indexOf('\n');
+            if (idx != -1) text = text.substring(idx + 1);
+          }
+        } finally {
+          await raf.close();
+        }
+      }
       if (!mounted) return;
       if (silent && text == _content) return;
       setState(() {

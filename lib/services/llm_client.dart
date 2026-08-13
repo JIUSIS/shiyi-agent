@@ -62,6 +62,9 @@ class LlmClient {
   /// 最近一次请求的缓存输入 token（兼容 OpenAI / 网关 / Anthropic 风格字段）。
   int? lastCachedTokens;
 
+  /// 单行 SSE 缓冲上限（防无界增长）。
+  static const int _maxLineBufferChars = 1024 * 1024;
+
   /// 最近一轮收到的文本（纯文本截断续写时拼接用）。
   String _lastRoundText = '';
 
@@ -440,7 +443,7 @@ class LlmClient {
   }
 
   Future<bool> _parseOpenAiSse(Stream<List<int>> raw) async {
-    final denyBuffer = StringBuffer(); // line buffer
+    final lineBuffer = StringBuffer(); // 行缓冲
     String text = '';
     String reasoning = '';
     final toolBuf = <int, Map<String, String>>{};
@@ -487,15 +490,15 @@ class LlmClient {
       if (!truncated) return false;
       if (toolsComplete) return false; // 工具完整：截断不影响执行
       if (toolBuf.isNotEmpty) {
-        // 工具调用不完整（参数半截）：无法续写，整轮重试。
-        completer.completeError(LlmInterruptedException('工具调用被截断，正在自动重试'));
+        // 工具调用不完整（参数半截）：无法续写，抛给上层整轮重试。
+        completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
         return false;
       }
       // 思考把输出预算吃完、正文还没开始：空正文续写没有断点，
-      // 直接整轮重试，让上层提示模型输出正文而不是继续思考。
+      // 抛给上层整轮重试，让上层提示模型输出正文而不是继续思考。
       if (finishReason == 'length' && t.isEmpty) {
         completer.completeError(
-          LlmInterruptedException('回复中断：模型输出被截断且没有正文，正在自动重试'),
+          LlmInterruptedException('回复中断：模型输出被截断且没有正文，交上层整轮重试'),
         );
         return false;
       }
@@ -644,16 +647,23 @@ class LlmClient {
               return;
             }
             resetIdleTimer();
-            denyBuffer.write(chunk);
-            var s = denyBuffer.toString();
+            lineBuffer.write(chunk);
+            // 单行无界增长防护：异常长行（网关异常/恶意流）不会无限占内存，
+            // 超限整段强制按一行处理（解析失败即丢弃）。
+            if (lineBuffer.length > _maxLineBufferChars) {
+              handleLine(lineBuffer.toString());
+              lineBuffer.clear();
+              return;
+            }
+            var s = lineBuffer.toString();
             int idx;
             while ((idx = s.indexOf('\n')) != -1) {
               final line = s.substring(0, idx).trimRight();
               s = s.substring(idx + 1);
               handleLine(line);
             }
-            denyBuffer.clear();
-            denyBuffer.write(s);
+            lineBuffer.clear();
+            lineBuffer.write(s);
           },
           onError: (Object e) {
             idleTimer?.cancel();
@@ -664,14 +674,14 @@ class LlmClient {
           },
           onDone: () {
             idleTimer?.cancel();
-            if (denyBuffer.isNotEmpty) {
-              final rest = denyBuffer.toString();
+            if (lineBuffer.isNotEmpty) {
+              final rest = lineBuffer.toString();
               if (rest.trim().isNotEmpty) {
                 for (final line in rest.split('\n')) {
                   handleLine(line);
                 }
               }
-              denyBuffer.clear();
+              lineBuffer.clear();
             }
             final tail = text.length <= 40
                 ? text
@@ -867,6 +877,12 @@ class LlmClient {
             }
             resetIdleTimer();
             buffer.write(chunk);
+            // 单行无界增长防护：异常长行不会无限占内存，超限整段强制处理。
+            if (buffer.length > _maxLineBufferChars) {
+              handleLine(buffer.toString());
+              buffer.clear();
+              return;
+            }
             var s = buffer.toString();
             int idx;
             while ((idx = s.indexOf('\n')) != -1) {
