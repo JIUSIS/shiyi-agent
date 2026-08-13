@@ -20,6 +20,62 @@ class TermuxRuntime {
   /// Windows shell 探测结果缓存：'pwsh' 或 'cmd'（null = 尚未探测）。
   static String? _windowsShell;
 
+  /// WSL 探测结果缓存：'wsl2' / 'wsl1' / 'none'（null = 尚未探测）。
+  static Future<String>? _wslProbe;
+
+  /// WSL 探测：运行 `uname -r` 判定内核。
+  /// - WSL2 内核名含 `microsoft-standard-WSL2`
+  /// - WSL1 内核名含 `Microsoft`（大写 M）
+  /// - 未安装 WSL / 无默认发行版：命令失败 → none
+  /// WSL_UTF8=1 强制 wsl.exe 以 UTF-8 输出（默认管道模式是 UTF-16LE）。
+  static Future<String> wslVariant() => _wslProbe ??= _probeWsl();
+
+  static Future<String> _probeWsl() async {
+    try {
+      final probe = await Process.run(
+        'wsl.exe',
+        ['-e', 'bash', '-lc', 'uname -r'],
+        environment: const {'WSL_UTF8': '1'},
+      ).timeout(const Duration(seconds: 20));
+      if (probe.exitCode != 0) return 'none';
+      final kernel = '${probe.stdout} ${probe.stderr}';
+      if (kernel.contains('WSL2') ||
+          kernel.contains('microsoft-standard')) {
+        return 'wsl2';
+      }
+      if (kernel.toLowerCase().contains('microsoft')) return 'wsl1';
+      return 'none';
+    } catch (_) {
+      return 'none';
+    }
+  }
+
+  /// 纯函数：按用户设置与探测结果解析实际后端（便于单测）。
+  /// [setting]：auto / pwsh / cmd / wsl2；[wsl]：wsl2 / wsl1 / none；
+  /// [shell]：已探测的 Windows shell（pwsh / cmd）。
+  /// 返回：wsl2 / pwsh / cmd。
+  static String resolveBackendChoice(
+    String setting,
+    String wsl,
+    String shell,
+  ) {
+    if (setting == 'pwsh' || setting == 'cmd') return setting;
+    // auto 与显式 wsl2：WSL2 可用即用 WSL2，否则回退 Windows shell。
+    return wsl == 'wsl2' ? 'wsl2' : shell;
+  }
+
+  /// Windows 上解析实际生效的终端后端（wsl2 / pwsh / cmd）。
+  static Future<String> resolveWindowsBackend(String setting) async {
+    if (!isWindows) {
+      throw UnsupportedError('resolveWindowsBackend 仅支持 Windows 平台');
+    }
+    return resolveBackendChoice(
+      setting,
+      await wslVariant(),
+      await windowsShell(),
+    );
+  }
+
   /// Windows 桌面 shell：优先 PowerShell 7（pwsh），缺失时回退 cmd。
   static Future<String> windowsShell() async {
     if (!isWindows) {
@@ -443,7 +499,11 @@ run_once() {
   OUT=$("$ROOTFS/usr/bin/proot" $ARGS -w / /usr/bin/$CMD "$@" 2>&1)
   RC=$?
   printf '%s\n' "$OUT"
-  if printf '%s\n' "$OUT" | grep -qE "Failed to fetch|Could not resolve|Connection timed out|Temporary failure|Name or service not known|Err:|404 Not Found|does not have a Release file|Could not connect"; then
+  # 命令成功直接返回，不做错误检测：否则 dpkg -l 表头的 "Err?" 会被
+  # 宽泛的 Err: 模式误判成网络错误，导致每个命令重复执行 8 遍
+  #（初始 1 + 7 个镜像轮换各 1 遍）并白打 7 次网络请求。
+  [ $RC -eq 0 ] && return 0
+  if printf '%s\n' "$OUT" | grep -qE "Failed to fetch|Could not resolve|Connection timed out|Temporary failure|Name or service not known|^E:|404 Not Found|does not have a Release file|Could not connect"; then
     return 1
   fi
   return 0
