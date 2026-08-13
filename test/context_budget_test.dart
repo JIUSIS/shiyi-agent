@@ -430,5 +430,45 @@ void main() {
         reason: '工具回合要么整组保留，要么整组归档，不能停在 tool_calls 和 tool 结果中间',
       );
     });
+
+    test('minKeepStart 落在工具轮中间时对齐到单元起点（历史孤儿 tool 消息场景）', () {
+      final msgs = [
+        msg('user', content: '开始'),
+        msg(
+          'assistant',
+          content: '',
+          toolCalls: [ToolCall(id: 'c1', name: 'file_read', arguments: '{}')],
+        ),
+        msg('tool', content: '结果1', toolCallId: 'c1'),
+        msg(
+          'assistant',
+          content: '',
+          toolCalls: [ToolCall(id: 'c2', name: 'file_read', arguments: '{}')],
+        ),
+        msg('tool', content: '结果2', toolCallId: 'c2'),
+        msg('user', content: '继续'),
+        msg('user', content: '最新'),
+      ];
+      // n=7，minKeepStart=4 恰好落在 tool2（index 4）上：必须对齐回 index 3。
+      final start = ShiyiState.compressionKeepStart(msgs, contextLimit: 0);
+      expect(start, 3);
+      expect(msgs[start].role, 'assistant');
+    });
+
+    test('对齐后保留侧第一条不能是孤儿 tool 消息（token 预算分支同样生效）', () {
+      final msgs = [
+        msg('user', content: '开始'),
+        msg(
+          'assistant',
+          content: '',
+          toolCalls: [ToolCall(id: 'c1', name: 'file_read', arguments: '{}')],
+        ),
+        msg('tool', content: '结果' * 300, toolCallId: 'c1'),
+        msg('user', content: '最新'),
+      ];
+      final start = ShiyiState.compressionKeepStart(msgs, contextLimit: 300);
+      expect(start, 1, reason: '工具单元必须整组保留（asst1+tool1）');
+      expect(msgs[start].role, 'assistant');
+    });
   });
 }

@@ -1685,13 +1685,27 @@ class ShiyiState extends ChangeNotifier {
       status = '正在打断当前回复…';
       notifyListeners();
       stop();
-      while (isBusy) {
+      var waited = 0;
+      // 兜底超时：stop() 已释放所有已知阻塞点（含挂起的 question），
+      // 12 秒仍未退出说明有异常卡死，强置空闲避免应用永久不可交互。
+      while (isBusy && waited < 150) {
         await Future.delayed(const Duration(milliseconds: 80));
+        waited++;
       }
       _guideWaiting = false;
       _stopForGuide = false;
       status = null;
       notifyListeners();
+      if (isBusy) {
+        await _logError('引导', '引导发送等待超时，强置空闲（isBusy 卡死兜底）');
+        isBusy = false;
+        _streaming = null;
+        busySessionId = null;
+        busyRevision.value++;
+        streamText.value = '';
+        streamReasoning.value = '';
+        notifyListeners();
+      }
     }
     await send(text);
   }
@@ -2021,6 +2035,20 @@ class ShiyiState extends ChangeNotifier {
 
   void stop() {
     _stopRequested = true;
+    // 释放挂起的 question：主循环阻塞在它的 future 上，
+    // 不释放会永久卡死 isBusy（问题弹窗期间点停止的场景）。
+    _releasePendingQuestion('（已中断）');
+  }
+
+  /// 完成挂起的 question 等待（停止/退出时调用），避免主循环永久阻塞。
+  void _releasePendingQuestion(String answer) {
+    final c = _questionCompleter;
+    if (c != null && !c.isCompleted) {
+      pendingQuestion = null;
+      _questionCompleter = null;
+      c.complete(answer);
+      notifyListeners();
+    }
   }
 
   Future<TurnResult?> _streamRound(
@@ -2695,8 +2723,9 @@ class ShiyiState extends ChangeNotifier {
       r'(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|chmod|chown|ln|dd|kill|pkill|'
       r'tee|wget|nano|vim|vi|apt|pkg|install|shutdown|reboot)(\s|$)',
     );
-    // 输出重定向（> 或 >>，排除 2>&1 这类 fd 合并——那是只读用法）
-    final redirect = RegExp(r'(^|[;&|]\s*)[12]?[>]{1,2}(?!&)\s*(\S|$)');
+    // 输出重定向（任意位置；仅放行 2>&1 / 1>&2 / >&2 这类 fd 数字合并，
+    // 其余 >、>>、2>、>&文件 一律拒绝；引号内的 > 会误伤，但保守策略可接受）
+    final redirect = RegExp(r'[12]?[>]{1,2}(?!&\d)');
     if (writeCmds.hasMatch(lower)) {
       return '只读模式拒绝：命令含写操作（$t）；请改用 ls/find/grep/cat/head/tail/wc 等只读命令。';
     }
@@ -2705,6 +2734,11 @@ class ShiyiState extends ChangeNotifier {
     }
     return null;
   }
+
+  /// 测试专用：与 [_rejectWriteCommand] 行为一致，仅暴露给只读拦截测试。
+  @visibleForTesting
+  static String? rejectWriteCommandForTest(String argsJson) =>
+      _rejectWriteCommand(argsJson);
 
   /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用。
   Future<String?> _resolveToolPath(String path) async {
@@ -3003,7 +3037,33 @@ class ShiyiState extends ChangeNotifier {
     } else {
       keepStart = minKeepStart;
     }
+    // 对齐工具单元边界：keepStart 不能落在 assistant(tool_calls) 与其
+    // tool 结果之间（拆开会在历史里留下孤儿 tool 消息，发给 API 会 400）。
+    keepStart = _alignCompressionBoundary(keep, keepStart);
     return keepStart > n ? n : keepStart;
+  }
+
+  /// 把压缩边界对齐到工具单元边界：keepStart 要么在单元起点（assistant 前），
+  /// 要么在单元末尾（最后一个 tool 结果之后），绝不拆散 assistant 与 tool。
+  static int _alignCompressionBoundary(List<ChatMessage> keep, int start) {
+    var s = start.clamp(0, keep.length);
+    // 情况 A：keep[s] 是 tool 消息（其 assistant 在左侧被归档）→ 回溯到单元起点。
+    if (s < keep.length && keep[s].role == 'tool') {
+      var p = s;
+      while (p > 0 && keep[p - 1].role == 'tool') {
+        p--;
+      }
+      if (p > 0 && keep[p - 1].role == 'assistant' && keep[p - 1].hasToolCalls) {
+        s = p - 1;
+      }
+    }
+    // 情况 B：keep[s-1] 是 assistant(tool_calls)（其 tool 结果在右侧）→ 前进到单元末尾。
+    if (s > 0 && keep[s - 1].role == 'assistant' && keep[s - 1].hasToolCalls) {
+      while (s < keep.length && keep[s].role == 'tool') {
+        s++;
+      }
+    }
+    return s;
   }
 
   /// 把待归档消息转成摘要输入：完整工具轮压缩成结构化一行，正文直接保留。
