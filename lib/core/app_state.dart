@@ -15,6 +15,7 @@ import '../services/subagent.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
 import '../services/notifier.dart';
+import 'tool_result_pruner.dart';
 
 /// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
 /// readOnly=true 的工具在计划模式（planMode）下仍然可用；
@@ -232,6 +233,14 @@ class ShiyiState extends ChangeNotifier {
         if (!planMode || t.readOnly || planAlways.contains(t.name)) t.toJson(),
     ];
   }
+
+  /// run_terminal 返回给模型的输出裁剪：原 4000 字符一刀切，
+  /// 改为保留头部 + 尾部（结尾的报错/摘要信息不丢），中间用标记替换。
+  static const ToolResultPruner _terminalPruner = ToolResultPruner(
+    thresholdChars: 4000,
+    headChars: 2400,
+    tailChars: 1200,
+  );
 
   static List<AgentTool> _buildToolRegistry() => [
     AgentTool(
@@ -512,6 +521,11 @@ class ShiyiState extends ChangeNotifier {
       execute: (self, args) => self._execSpawnAgent(args),
     ),
   ];
+
+  /// 测试专用：与 [_buildToolRegistry] 行为完全一致，仅暴露给快照测试
+  /// （改动工具描述/参数/只读标记会触发 test/tool_registry_snapshot_test.dart 的 diff）。
+  @visibleForTesting
+  static List<AgentTool> buildToolRegistryForTest() => _buildToolRegistry();
 
   static String _fmtStamp(DateTime d) {
     final h = d.hour.toString().padLeft(2, '0');
@@ -2259,6 +2273,15 @@ class ShiyiState extends ChangeNotifier {
     return parts.join('\n\n');
   }
 
+  /// 测试专用：与 [_buildSystemPrompt] 行为完全一致，仅暴露给快照测试
+  /// （改动人设/工具规则/注入段落会触发 test/system_prompt_snapshot_test.dart 的 diff）。
+  @visibleForTesting
+  Future<String> buildSystemPromptForTest(
+    String userText, {
+    String rollingSummary = '',
+  }) =>
+      _buildSystemPrompt(userText, rollingSummary: rollingSummary);
+
   List<String> _keywords(String text) {
     final list = <String>[];
     for (final w in text.split(RegExp(r'[\s，。！？,.!?、；;：]'))) {
@@ -2501,9 +2524,8 @@ class ShiyiState extends ChangeNotifier {
       if (stdout.overflow || stderr.overflow) {
         text = text.isEmpty ? '（输出过大，已截断）' : '$text\n（输出过大，已截断）';
       }
-      if (text.length > 4000) {
-        text = '${text.substring(0, 4000)}…（输出过长，已截断）';
-      }
+      // 掐头去尾裁剪（原 4000 字符一刀切改为头尾保留，结尾报错/摘要不丢）。
+      text = _terminalPruner.prune(text);
       if (exitCode == null) {
         return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
             '如需长任务请拆分命令或增加耗时。';

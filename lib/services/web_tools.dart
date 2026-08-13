@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../core/tool_result_pruner.dart';
+
 /// 单条搜索结果。
 class WebSearchResult {
   final String title;
@@ -140,9 +142,16 @@ class WebTools {
     return _truncate(text, maxChars);
   }
 
-  static String _truncate(String text, int maxChars) => text.length <= maxChars
-      ? text
-      : '${text.substring(0, maxChars)}\n…（内容过长已截断）';
+  /// 掐头去尾截断（原一刀切只留开头）：保留头部 60% + 尾部 20%，
+  /// 中间用标记替换——网页正文结尾的结论/日期/署名不丢。
+  static String _truncate(String text, int maxChars) {
+    if (text.runes.length <= maxChars) return text;
+    return ToolResultPruner(
+      thresholdChars: maxChars,
+      headChars: maxChars * 3 ~/ 5,
+      tailChars: maxChars ~/ 5,
+    ).prune(text);
+  }
 
   /// 轻量 HTML 正文提取：去掉 script/style，块级标签转成换行后剥离标签。
   static String htmlToText(String html) {

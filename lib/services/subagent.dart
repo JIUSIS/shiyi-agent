@@ -1,4 +1,5 @@
 import 'llm_client.dart';
+import '../core/tool_result_pruner.dart';
 
 /// 子代理定义：一个可派发的专项代理（类型 + 提示词模板 + 工具白名单）。
 /// 设计为数据驱动：新增代理类型 = 加一个定义条目，执行器无需改动，
@@ -200,6 +201,14 @@ class SubagentRunner {
   /// 单个工具结果的最大字符数（防大输出撑爆子代理上下文）。
   static const int maxToolOutputChars = 20000;
 
+  /// 子代理工具结果裁剪：原 maxToolOutputChars 一刀切改为头尾保留
+  /// （结尾的报错/摘要不丢），中间用标记替换。
+  static const ToolResultPruner _subagentPruner = ToolResultPruner(
+    thresholdChars: maxToolOutputChars,
+    headChars: 12000,
+    tailChars: 4000,
+  );
+
   /// 当前工作目录（注入子代理上下文）。
   final String workingDir;
 
@@ -277,10 +286,8 @@ class SubagentRunner {
         } else {
           try {
             final raw = await executeTool(name, args);
-            // 截断超大输出，保护子代理上下文预算。
-            output = raw.length > maxToolOutputChars
-                ? '${raw.substring(0, maxToolOutputChars)}…（输出过长，已截断）'
-                : raw;
+            // 掐头去尾裁剪，保护子代理上下文预算（结尾的报错/摘要不丢）。
+            output = _subagentPruner.prune(raw);
           } catch (e) {
             output = '工具执行异常: $e';
           }
