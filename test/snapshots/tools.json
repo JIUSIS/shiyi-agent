@@ -1,0 +1,333 @@
+{
+  "save_memory": {
+    "readOnly": false,
+    "description": "把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。可用 type 归类（user 用户身份/偏好，feedback 对我工作方式的指导，project 项目相关信息，reference 外部资源链接）；内容里可用 [[记忆名]] 双链引用相关记忆，便于跨记忆关联。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "要保存的记忆内容，可含 [[其他记忆名]] 双链"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "user",
+            "feedback",
+            "project",
+            "reference"
+          ],
+          "description": "记忆类型，默认 user"
+        }
+      },
+      "required": [
+        "content"
+      ]
+    }
+  },
+  "search_memory": {
+    "readOnly": true,
+    "description": "检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "搜索关键词"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "user",
+            "feedback",
+            "project",
+            "reference"
+          ],
+          "description": "只搜该类型的记忆，缺省搜全部"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  "run_skill": {
+    "readOnly": true,
+    "description": "获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "技能名称"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  "web_search": {
+    "readOnly": true,
+    "description": "联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "搜索关键词，尽量具体"
+        },
+        "max_results": {
+          "type": "integer",
+          "description": "返回结果数量，默认 5，最多 10"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  "web_extract": {
+    "readOnly": true,
+    "description": "抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "要阅读的网页 URL"
+        }
+      },
+      "required": [
+        "url"
+      ]
+    }
+  },
+  "run_terminal": {
+    "readOnly": false,
+    "description": "在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "要执行的 shell 命令"
+        },
+        "cwd": {
+          "type": "string",
+          "description": "工作目录，默认是当前会话的工作目录"
+        }
+      },
+      "required": [
+        "command"
+      ]
+    }
+  },
+  "file_write": {
+    "readOnly": false,
+    "description": "把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt"
+        },
+        "content": {
+          "type": "string",
+          "description": "要写入的完整内容"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    }
+  },
+  "file_read": {
+    "readOnly": true,
+    "description": "读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "文件路径"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  "question": {
+    "readOnly": false,
+    "description": "向用户发起一个问题并等待回答。弹窗支持自由文本输入：用户可以直接打字输入任意内容作为回答，无需依赖预设选项。你可以提供 0~4 个快捷选项（如「确认」「保存」「取消」）供用户一键选择，但不要声称用户只能从选项里选。任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。一次只问一个问题。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "要问用户的问题"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "可选快捷选项（0~4 个）；用户也可以不选、直接自由输入回答"
+        }
+      },
+      "required": [
+        "question"
+      ]
+    }
+  },
+  "create_skill": {
+    "readOnly": false,
+    "description": "创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "技能名称，英文小写+连字符，如 chapter-outliner"
+        },
+        "description": {
+          "type": "string",
+          "description": "技能描述，说明何时触发"
+        },
+        "content": {
+          "type": "string",
+          "description": "SKILL.md 完整内容（含 --- frontmatter）"
+        },
+        "files": {
+          "type": "object",
+          "description": "可选辅助文件：相对路径 -> 内容",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "content"
+      ]
+    }
+  },
+  "enter_plan_mode": {
+    "readOnly": false,
+    "description": "进入计划模式：之后你只做分析、调研与方案设计（只能使用只读工具），不得写文件、执行命令或产生任何副作用，直到用户确认方案或调用 exit_plan_mode。适合复杂任务先出方案再动手，如小说大纲、章节规划、批量重构等。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "goal": {
+          "type": "string",
+          "description": "本次要规划的目标，简述即可"
+        }
+      },
+      "required": [
+        "goal"
+      ]
+    }
+  },
+  "exit_plan_mode": {
+    "readOnly": false,
+    "description": "退出计划模式，恢复正常执行能力（写文件、终端、记忆等全部可用）。在用户确认方案后调用，然后开始执行。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "退出原因（如「方案已确认，开始执行」）"
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    }
+  },
+  "spawn_agent": {
+    "readOnly": false,
+    "description": "需要跨多个文件、长链调研或独立执行的任务：派子代理分头处理，不要自己逐文件读或单线程硬扛。【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发（最多 4 个，同时跑互不阻塞，单个失败不影响其他）；禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。tasks 示例：tasks=[{\"agent_type\":\"explore\",\"description\":\"查A\",\"prompt\":\"…\",\"max_turns\":10},{\"agent_type\":\"explore\",\"description\":\"查B\",\"prompt\":\"…\",\"max_turns\":10}]。explore 广网只读侦查（定位文件/搜符号/读多文件，返回精炼答案）；plan 只读方案设计；worker 独立执行（写文件/跑命令）；general-purpose 兜底。子代理完成后报告作为本工具结果返回，你再整合进主任务。简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。可选 max_turns 动态调整轮数预算（默认 explore 15 / plan 15 / worker 40 / general 25）：简单小任务给 5~10 省钱，任务很复杂可给 40~60；1~80 之间。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "agent_type": {
+          "type": "string",
+          "enum": [
+            "explore",
+            "plan",
+            "worker",
+            "general-purpose"
+          ],
+          "description": "子代理类型（见描述）"
+        },
+        "description": {
+          "type": "string",
+          "description": "任务的简短描述（3~5 词）"
+        },
+        "prompt": {
+          "type": "string",
+          "description": "给子代理的具体任务指令，越明确越好"
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "agent_type": {
+                "type": "string",
+                "enum": [
+                  "explore",
+                  "plan",
+                  "worker",
+                  "general-purpose"
+                ]
+              },
+              "description": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "max_turns": {
+                "type": "integer",
+                "description": "动态预算覆盖（1~80）"
+              },
+              "write_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "写路径隔离：只允许 file_write 写这些路径（工作区相对或绝对）；不声明=可写整个工作区。并行多个 worker 时建议各自声明不重叠目录"
+              }
+            },
+            "required": [
+              "agent_type",
+              "description",
+              "prompt"
+            ]
+          },
+          "description": "批量并行派发：数组里的每个任务同时执行（最多 4 个）"
+        },
+        "max_turns": {
+          "type": "integer",
+          "description": "动态预算：覆盖该子代理默认轮数上限（1~80；简单任务给小，复杂给大）"
+        },
+        "write_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "写路径隔离：只允许 file_write 写这些路径；不声明=可写整个工作区"
+        }
+      },
+      "required": [
+        "description",
+        "prompt"
+      ]
+    }
+  }
+}
