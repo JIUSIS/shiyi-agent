@@ -345,6 +345,13 @@ class _SessionsTabState extends State<_SessionsTab> {
   final FocusNode _searchFocus = FocusNode();
   String _query = '';
 
+  /// 搜索防抖：避免每键一次全库查询。
+  Timer? _searchDebounce;
+
+  /// 搜索 future 缓存（按关键词）：避免同关键词重建 FutureBuilder 触发重复查询。
+  String? _searchFutureKey;
+  Future<List<SessionSearchResult>>? _searchFuture;
+
   /// 已展开的项目分组 id；空串表示「未分类」，默认展开。
   final Set<String> _expandedGroups = {''};
 
@@ -368,10 +375,29 @@ class _SessionsTabState extends State<_SessionsTab> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _openSwipeKey.dispose();
     _searchFocus.dispose();
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  /// 输入防抖后触发搜索（250ms），旧 future 由 [_searchFuture] 缓存天然去重。
+  void _onSearchChanged(String v) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted) return;
+      setState(() => _query = v);
+    });
+  }
+
+  /// 按关键词取搜索 future：同关键词复用同一 future，避免竞态覆盖。
+  Future<List<SessionSearchResult>> _searchFutureFor(String q) {
+    if (_searchFutureKey == q && _searchFuture != null) return _searchFuture!;
+    _searchFutureKey = q;
+    final future = shiyi.searchSessions(q);
+    _searchFuture = future;
+    return future;
   }
 
   void _dismissSearch() {
@@ -382,6 +408,7 @@ class _SessionsTabState extends State<_SessionsTab> {
     _dismissSearch();
     if (_query.isEmpty && _searchCtrl.text.isEmpty) return;
     _searchCtrl.clear();
+    _searchDebounce?.cancel();
     setState(() => _query = '');
   }
 
@@ -449,7 +476,7 @@ class _SessionsTabState extends State<_SessionsTab> {
                   child: CupertinoSearchTextField(
                     controller: _searchCtrl,
                     focusNode: _searchFocus,
-                    onChanged: (v) => setState(() => _query = v),
+                    onChanged: _onSearchChanged,
                     onSubmitted: (_) => _dismissSearch(),
                     placeholder: '搜索会话或消息内容',
                     padding: const EdgeInsets.symmetric(
@@ -678,7 +705,7 @@ class _SessionsTabState extends State<_SessionsTab> {
       );
     }
     return FutureBuilder<List<SessionSearchResult>>(
-      future: shiyi.searchSessions(q),
+      future: _searchFutureFor(q),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());

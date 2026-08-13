@@ -381,15 +381,30 @@ class _DebouncedSave {
   final Future<void> Function()? after;
   Timer? _timer;
 
+  /// 是否有尚未落盘的编辑。
+  bool get hasPending => _timer != null;
+
   void schedule() {
     _timer?.cancel();
     _timer = Timer(const Duration(milliseconds: 600), () async {
+      _timer = null;
       await shiyi.updateSettings(_build());
       await after?.call();
     });
   }
 
-  void dispose() => _timer?.cancel();
+  /// 立即保存未落盘的编辑（页面 dispose 时调用，防快速返回丢改动）。
+  Future<void> flush() async {
+    _timer?.cancel();
+    _timer = null;
+    await shiyi.updateSettings(_build());
+    await after?.call();
+  }
+
+  void dispose() {
+    _timer?.cancel();
+    _timer = null;
+  }
 }
 
 class _ApiSectionPage extends StatefulWidget {
@@ -448,6 +463,8 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
     _baseCtrl.dispose();
     _keyCtrl.dispose();
     _modelCtrl.dispose();
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1148,6 +1165,8 @@ class _VisionSectionPageState extends State<_VisionSectionPage> {
     _urlCtrl.dispose();
     _keyCtrl.dispose();
     _modelCtrl.dispose();
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1266,6 +1285,8 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
 
   @override
   void dispose() {
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1410,6 +1431,8 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
     _contextLimitCtrl.dispose();
     _maxOutputTokensCtrl.dispose();
     _thresholdCtrl.dispose();
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1533,6 +1556,8 @@ class _AppearanceSectionPageState extends State<_AppearanceSectionPage> {
 
   @override
   void dispose() {
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1644,6 +1669,8 @@ class _VoiceSectionPageState extends State<_VoiceSectionPage> {
 
   @override
   void dispose() {
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1797,7 +1824,7 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
     _temperature = widget.shiyi.settings.temperature;
     _promptCtrl = TextEditingController(
       text: widget.shiyi.settings.systemPrompt,
-    )..addListener(_onPromptChanged);
+    );
     _save = _DebouncedSave(
       widget.shiyi,
       () => widget.shiyi.settings.copyWith(temperature: _temperature),
@@ -1805,14 +1832,11 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
     _checkFileAccess();
   }
 
-  void _onPromptChanged() {
-    if (mounted) setState(() {});
-  }
-
   @override
   void dispose() {
-    _promptCtrl.removeListener(_onPromptChanged);
     _promptCtrl.dispose();
+    // 快速返回时把未落盘的编辑立即保存，避免丢改动。
+    if (_save.hasPending) unawaited(_save.flush());
     _save.dispose();
     super.dispose();
   }
@@ -1969,18 +1993,26 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
               child: Align(
                 alignment: Alignment.centerRight,
-                child: Text(
-                  _promptCtrl.text.length > _maxPromptChars
-                      ? '${_promptCtrl.text.length} / $_maxPromptChars（超出上限，无法保存）'
-                      : '${_promptCtrl.text.length} / $_maxPromptChars',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: _promptCtrl.text.length > _maxPromptChars
-                        ? CupertinoColors.systemRed
-                        : (dark
-                            ? CupertinoColors.white.withValues(alpha: .5)
-                            : CupertinoColors.black.withValues(alpha: .45)),
-                  ),
+                // 只刷新计数文本，不整页重建。
+                child: ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: _promptCtrl,
+                  builder: (context, value, _) {
+                    final len = value.text.length;
+                    final over = len > _maxPromptChars;
+                    return Text(
+                      over
+                          ? '$len / $_maxPromptChars（超出上限，无法保存）'
+                          : '$len / $_maxPromptChars',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: over
+                            ? CupertinoColors.systemRed
+                            : (dark
+                                ? CupertinoColors.white.withValues(alpha: .5)
+                                : CupertinoColors.black.withValues(alpha: .45)),
+                      ),
+                    );
+                  },
                 ),
               ),
             ),

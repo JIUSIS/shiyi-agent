@@ -152,7 +152,7 @@ class _FilesScreenState extends State<FilesScreen> {
             child: GestureDetector(
               onTap: () async {
                 final dir = await _pickDirectory(context, _path);
-                if (dir != null) {
+                if (dir != null && mounted) {
                   setState(() {
                     _path = dir;
                     _entriesFuture = _listEntries(dir);

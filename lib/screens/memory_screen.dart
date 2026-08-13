@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
@@ -21,17 +23,34 @@ class _MemoryScreenState extends State<MemoryScreen> {
   bool _selectionMode = false;
   final Set<int> _selectedIds = {};
 
+  /// 搜索防抖计时器（每键一次全库检索太浪费）。
+  Timer? _searchDebounce;
+
+  /// 请求序号：防旧请求晚到覆盖新结果（竞态）。
+  int _searchGeneration = 0;
+
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _searchCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _onSearch(String q) async {
-    final res = await widget.shiyi.searchAllMemories(q);
-    if (!mounted) return;
+  void _onSearch(String q) {
+    _searchDebounce?.cancel();
+    final query = q.trim();
+    _searchDebounce = Timer(const Duration(milliseconds: 250), () {
+      _runSearch(query);
+    });
+  }
+
+  /// 立即执行一次搜索（防抖回调与删除后刷新共用）。
+  Future<void> _runSearch(String query) async {
+    final gen = ++_searchGeneration;
+    final res = await widget.shiyi.searchAllMemories(query);
+    if (!mounted || gen != _searchGeneration) return; // 已有更新的搜索
     setState(() {
-      _searching = q.trim().isNotEmpty;
+      _searching = query.isNotEmpty;
       _results = res;
     });
   }
@@ -54,7 +73,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
     final ok = await _confirmDelete('删除这条记忆吗？');
     if (ok != true || !mounted) return;
     await widget.shiyi.deleteMemory(m.id);
-    if (_searching && mounted) await _onSearch(_searchCtrl.text);
+    if (_searching && mounted) await _runSearch(_searchCtrl.text.trim());
   }
 
   Future<void> _deleteSelected() async {
@@ -69,7 +88,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
       _selectionMode = false;
       _selectedIds.clear();
     });
-    if (_searching && mounted) await _onSearch(_searchCtrl.text);
+    if (_searching && mounted) await _runSearch(_searchCtrl.text.trim());
   }
 
   Future<bool?> _confirmDelete(String message) {

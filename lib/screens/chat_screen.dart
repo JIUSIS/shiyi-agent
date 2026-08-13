@@ -2277,11 +2277,27 @@ class _ToolPillState extends State<_ToolPill> {
   @override
   void initState() {
     super.initState();
-    if (!widget.event.done) {
-      _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() {});
-      });
+    _syncTimer();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ToolPill oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 工具结束后取消每秒刷新计时器（避免常驻空转 setState）。
+    _syncTimer();
+  }
+
+  /// 运行中每秒刷新耗时显示；事件完成后立即停表。
+  void _syncTimer() {
+    if (widget.event.done) {
+      _timer?.cancel();
+      _timer = null;
+      return;
     }
+    if (_timer != null) return;
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
   }
 
   @override
