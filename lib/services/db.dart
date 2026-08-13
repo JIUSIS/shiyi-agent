@@ -34,9 +34,13 @@ class AppDatabase {
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
         onConfigure: (db) async {
-          // WAL 提升并发读写；busy_timeout 让偶发写竞争等待而非立即失败。
-          await db.execute('PRAGMA journal_mode=WAL');
-          await db.execute('PRAGMA busy_timeout=5000');
+          // ⚠️ 注意：不能在这里执行返回结果集的 PRAGMA（如 journal_mode=WAL）——
+          // Android 原生 sqflite 的 execute() 会抛 "Queries can be performed
+          // using SQLiteDatabase query or rawQuery methods only"，导致
+          // openDatabase 失败、应用初始化失败（2026-08-14 真机踩坑）。
+          // WAL 无需显式开启：sqflite Android 默认已启用。
+          // busy_timeout 不返回结果集，用 rawQuery 执行安全。
+          await db.rawQuery('PRAGMA busy_timeout=5000');
         },
       );
       _db = db;
