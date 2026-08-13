@@ -68,3 +68,6 @@ android/build/
 
 # 临时调试文件
 /tmp/
+
+# 维护日志仅本地保存，不随仓库发布
+/docs/fix-log.md
