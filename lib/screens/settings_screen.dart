@@ -1783,6 +1783,9 @@ class _AdvancedSectionPage extends StatefulWidget {
 }
 
 class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
+  /// 自定义系统提示词上限（字符）：防止超长提示词每轮烧 token / 撑爆上下文窗口。
+  static const int _maxPromptChars = 32768;
+
   late double _temperature;
   late final TextEditingController _promptCtrl;
   late final _DebouncedSave _save;
@@ -1794,7 +1797,7 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
     _temperature = widget.shiyi.settings.temperature;
     _promptCtrl = TextEditingController(
       text: widget.shiyi.settings.systemPrompt,
-    );
+    )..addListener(_onPromptChanged);
     _save = _DebouncedSave(
       widget.shiyi,
       () => widget.shiyi.settings.copyWith(temperature: _temperature),
@@ -1802,8 +1805,13 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
     _checkFileAccess();
   }
 
+  void _onPromptChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    _promptCtrl.removeListener(_onPromptChanged);
     _promptCtrl.dispose();
     _save.dispose();
     super.dispose();
@@ -1827,8 +1835,20 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
   }
 
   Future<void> _savePrompt() async {
+    final text = _promptCtrl.text;
+    if (text.length > _maxPromptChars) {
+      if (mounted) {
+        await _showIosAlert(
+          context,
+          '提示词过长',
+          '系统提示词最多 $_maxPromptChars 字符，当前 ${text.length} 字符。'
+          '请删减后再保存（超长提示词会占用大量上下文并拖慢每轮请求）。',
+        );
+      }
+      return;
+    }
     await widget.shiyi.updateSettings(
-      widget.shiyi.settings.copyWith(systemPrompt: _promptCtrl.text),
+      widget.shiyi.settings.copyWith(systemPrompt: text),
     );
     if (mounted) await _showIosAlert(context, '完成', '系统提示词已保存');
   }
@@ -1943,6 +1963,25 @@ class _AdvancedSectionPageState extends State<_AdvancedSectionPage> {
                 maxLines: 4,
                 placeholder: '（留空使用默认拾忆人设）',
                 padding: const EdgeInsets.all(10),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Text(
+                  _promptCtrl.text.length > _maxPromptChars
+                      ? '${_promptCtrl.text.length} / $_maxPromptChars（超出上限，无法保存）'
+                      : '${_promptCtrl.text.length} / $_maxPromptChars',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: _promptCtrl.text.length > _maxPromptChars
+                        ? CupertinoColors.systemRed
+                        : (dark
+                            ? CupertinoColors.white.withValues(alpha: .5)
+                            : CupertinoColors.black.withValues(alpha: .45)),
+                  ),
+                ),
               ),
             ),
           ],
