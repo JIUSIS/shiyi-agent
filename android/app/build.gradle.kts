@@ -63,6 +63,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            // debug 变体也用正式签名（keystore.jks）：
+            // 1) 覆盖安装到装有正式版的真机不会因签名不一致失败/清数据
+            //    （与 AGENTS.md 的部署纪律一致：adb install -r 且签名一致）；
+            // 2) debug 包仍可 run-as 备份/验证数据（release 包不可 run-as）。
+            signingConfig = signingConfigs.getByName("release")
+        }
         release {
             signingConfig = signingConfigs.getByName("release")
         }
