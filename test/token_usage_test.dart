@@ -44,6 +44,29 @@ void main() {
       expect(c.lastCachedTokens, 150);
     });
 
+    test('兼容 DeepSeek 官方缓存字段（prompt_cache_hit_tokens）', () {
+      final c = client();
+      c.applyUsage({
+        'prompt_tokens': 100,
+        'completion_tokens': 20,
+        'total_tokens': 120,
+        'prompt_cache_hit_tokens': 80,
+        'prompt_cache_miss_tokens': 20,
+      });
+      expect(c.lastCachedTokens, 80);
+      expect(c.lastPromptTokens, 100);
+    });
+
+    test('只有 cache_miss 字段时按 input - miss 反推命中', () {
+      final c = client();
+      c.applyUsage({
+        'prompt_tokens': 100,
+        'completion_tokens': 20,
+        'prompt_tokens_details': {'cache_miss_tokens': 30},
+      });
+      expect(c.lastCachedTokens, 70);
+    });
+
     test('input+output 可以推导 total_tokens', () {
       final c = client();
       c.applyUsage({'input_tokens': 10, 'output_tokens': 2});

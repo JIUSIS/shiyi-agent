@@ -978,6 +978,21 @@ class LlmClient {
     cached ??= _intOf(usage['cached_tokens']);
     cached ??= _intOf(usage['cached_input_tokens']);
     cached ??= _intOf(usage['cache_read_input_tokens']);
+    // DeepSeek 官方风格：prompt_cache_hit_tokens（主）+ cache_miss_tokens
+    //（配套未命中字段，用于命中率分母校验）。
+    cached ??= _intOf(usage['prompt_cache_hit_tokens']);
+    final cacheMiss = _intOf(usage['prompt_cache_miss_tokens']) ??
+        (promptDetails is Map
+            ? _intOf(promptDetails['cache_miss_tokens'])
+            : null);
+    if (cached == null && cacheMiss != null) {
+      // 只有未命中字段时按 input - miss 反推命中（DeepSeek 兼容网关兜底）。
+      final input = _intOf(usage['input_tokens']) ??
+          _intOf(usage['prompt_tokens']);
+      if (input != null && input >= 0) {
+        cached = (input - cacheMiss).clamp(0, input);
+      }
+    }
     if (cached != null && cached >= 0) {
       lastCachedTokens = cached;
     }
