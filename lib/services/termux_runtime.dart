@@ -3,8 +3,10 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
-/// 内嵌 Termux 运行时：把 assets 里的 bootstrap 解压到应用私有目录，
-/// 提供完整 Linux 环境（bash / apt / pkg），无需安装 Termux。
+/// 运行环境抽象：
+/// - Android：内嵌 Termux 运行时（把 assets 里的 bootstrap 解压到应用私有
+///   目录，提供完整 Linux 环境 bash / apt / pkg，无需安装 Termux）；
+/// - Windows 桌面：PowerShell 7（pwsh，缺失时回退 cmd），无需安装。
 class TermuxRuntime {
   static const MethodChannel _channel = MethodChannel('shiyi/skillpack');
 
@@ -12,6 +14,36 @@ class TermuxRuntime {
 
   /// 环境版本号：bootstrap 内容/结构变更时递增，写进 .env_version 强制重新部署。
   static const String _envVersion = 'v12';
+
+  static bool get isWindows => Platform.isWindows;
+
+  /// Windows shell 探测结果缓存：'pwsh' 或 'cmd'（null = 尚未探测）。
+  static String? _windowsShell;
+
+  /// Windows 桌面 shell：优先 PowerShell 7（pwsh），缺失时回退 cmd。
+  static Future<String> windowsShell() async {
+    if (!isWindows) {
+      throw UnsupportedError('windowsShell 仅支持 Windows 平台');
+    }
+    final cached = _windowsShell;
+    if (cached != null) return cached;
+    try {
+      final probe = await Process.run(
+        'pwsh',
+        ['-NoProfile', '-NoLogo', '-Command', 'exit 0'],
+      ).timeout(const Duration(seconds: 10));
+      _windowsShell = probe.exitCode == 0 ? 'pwsh' : 'cmd';
+    } catch (_) {
+      _windowsShell = 'cmd';
+    }
+    return _windowsShell!;
+  }
+
+  /// Windows 上是否可用 PowerShell 7（pwsh）。
+  static Future<bool> isPwshAvailable() async {
+    if (!isWindows) return false;
+    return await windowsShell() == 'pwsh';
+  }
 
   /// 环境根目录（app 私有 files 目录下的固定 termux 目录，无版本后缀）。
   static Future<String> _baseDir() async {
@@ -22,15 +54,19 @@ class TermuxRuntime {
   /// usr 目录（bootstrap 解压后的 PREFIX）。
   static Future<String> usrDir() async => '${await _baseDir()}/usr';
 
-  static Future<String> shellPath() async => '${await usrDir()}/bin/bash';
+  static Future<String> shellPath() async {
+    if (isWindows) return windowsShell();
+    return '${await usrDir()}/bin/bash';
+  }
 
   static Future<String> prefixDir() async => _baseDir();
 
   static Future<String> _versionFilePath() async =>
       '${await _baseDir()}/.env_version';
 
-  /// 是否已安装且版本匹配（bash 存在 + 版本文件一致）。
+  /// 是否已安装且版本匹配（bash 存在 + 版本文件一致）。Windows 恒为 true。
   static Future<bool> isInstalled() async {
+    if (isWindows) return true;
     try {
       if (!File(await shellPath()).existsSync()) return false;
       final vf = File(await _versionFilePath());
@@ -118,10 +154,16 @@ export PATH="$prefix/bin-shim:$usr/bin:$usr/bin/applets:/system/bin:/system/xbin
     File('$prefix/home/.bashrc').writeAsStringSync(homeRc);
   }
 
-  /// 确保已安装：未安装则解压；无论是否已安装都执行运行时补丁（幂等）：
+  /// 确保已安装：Windows 仅探测 pwsh/cmd 可用性；Android 未安装则解压，
+  /// 且无论是否已安装都执行运行时补丁（幂等）：
   /// 清理 bootstrap 残留脚本 + 生成 bin-shim 包装器 + 重写 termux-apt 动态版
   /// + 修复损坏链接 + 替换 etc 旧包名路径。
   static Future<void> ensureInstalled() async {
+    if (isWindows) {
+      // Windows 无需安装 Termux：探测并缓存可用 shell。
+      await windowsShell();
+      return;
+    }
     if (!await isInstalled()) {
       await install();
     }
@@ -306,9 +348,14 @@ am start -a android.intent.action.VIEW -d "$1" >/dev/null 2>&1
     }
   }
 
-  /// 内嵌 Termux 的执行环境变量（run_terminal / 终端页每次执行都注入，
-  /// 不依赖 profile —— 非登录 bash -c 不会加载 profile）。
+  /// 执行环境变量（run_terminal / 终端页每次执行都注入）。
+  /// Android：内嵌 Termux 的完整环境（不依赖 profile ——
+  /// 非登录 bash -c 不会加载 profile）；Windows：使用进程默认环境。
   static Future<Map<String, String>> environment() async {
+    if (isWindows) {
+      // Dart 的 environment 参数与父进程环境合并，空 map = 继承全部默认值。
+      return const {};
+    }
     final usr = await usrDir();
     final prefix = await prefixDir();
     final cert = '$usr/etc/tls/cert.pem';
@@ -347,7 +394,11 @@ export PROOT_LOADER=$ROOTFS/usr/libexec/proot/loader
 # proot 内 PATH 不含 bin-shim：避免 apt-key/apt-config 等内部命令嵌套拉起 proot。
 export PATH=$ROOTFS/usr/bin:/system/bin
 export HOME=$ROOTFS/home
-ARGS="-r $ROOTFS -b /system:/system -b /vendor:/vendor -b /data:/data -b /dev:/dev -b /proc:/proc -b /sys:/sys -b /apex:/apex -b $ROOTFS:/data/data/com.termux/files -b $ROOTFS/cache:/data/data/com.termux/cache -b $ROOTFS/tmp:/tmp"
+# bind 目标降一级到 com.termux（无 root 环境下 /data/data/com.termux 不存在
+# 也无法创建，原 files 级别 bind 会静默失败导致 apt 判定"非 Debian 系统"）；
+# proot 会为 /data/data 自动创建虚拟 com.termux 目录，配合 run_once 里
+# 的 files -> / 软链，/data/data/com.termux/files/usr 编译前缀可正常解析。
+ARGS="-r $ROOTFS -b /system:/system -b /vendor:/vendor -b /data:/data -b /dev:/dev -b /proc:/proc -b /sys:/sys -b /apex:/apex -b $ROOTFS:/data/data/com.termux -b $ROOTFS/cache:/data/data/com.termux/cache -b $ROOTFS/tmp:/tmp"
 CMD="$1"; shift
 
 # 装包/更新后自动重写 bin 脚本 shebang（旧包名 → 当前包名），
@@ -373,8 +424,10 @@ esac
 MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/apt/termux-main https://mirrors.nju.edu.cn/apt/termux-main https://mirrors.pku.edu.cn/apt/termux-main https://mirrors.ustc.edu.cn/apt/termux-main https://mirrors.hust.edu.cn/apt/termux-main https://mirrors.aliyun.com/termux/apt/termux-main https://packages.termux.dev/apt/termux-main"
 SRC_FILE=$ROOTFS/usr/etc/apt/sources.list
 
+# 放宽匹配：兼容自选的非标准镜像路径（如 .../applications/termux/termux-main），
+# 避免 CUR 取空导致轮换跳过当前源、恢复时把自选源覆盖成列表首个。
 cur_mirror() {
-  grep -oE "https?://[^ /]*(/termux)?/apt/termux-main" $SRC_FILE 2>/dev/null | head -1
+  grep -oE "https?://[^ /]+/.+termux-main" $SRC_FILE 2>/dev/null | head -1
 }
 
 set_mirror() {
@@ -384,6 +437,9 @@ set_mirror() {
 # 执行一次 proot 命令。返回 0 = 正常结束（命令成功或失败都不轮换）；
 # 返回 1 = 网络错误（触发镜像轮换）。RC 始终为命令真实退出码。
 run_once() {
+  # 先建前缀软链 files -> /（幂等）：让 apt 编译前缀
+  # /data/data/com.termux/files/usr 指向 proot 根 = termux rootfs。
+  "$ROOTFS/usr/bin/proot" $ARGS -w / /usr/bin/sh -c 'ln -sfn / /data/data/com.termux/files' 2>/dev/null
   OUT=$("$ROOTFS/usr/bin/proot" $ARGS -w / /usr/bin/$CMD "$@" 2>&1)
   RC=$?
   printf '%s\n' "$OUT"
@@ -393,6 +449,7 @@ run_once() {
   return 0
 }
 
+SRC_ORIG=$(cat $SRC_FILE 2>/dev/null)
 CUR=$(cur_mirror)
 if run_once "$@"; then
   exit $RC
@@ -407,8 +464,8 @@ for M in $MIRRORS; do
     exit $RC
   fi
 done
-# 全部失败：恢复原源
-set_mirror "$CUR"
+# 全部失败：恢复原源（含非标准镜像，原样写回，不再覆盖成列表首个）
+printf '%s\n' "$SRC_ORIG" > $SRC_FILE 2>/dev/null || set_mirror "$CUR"
 exit $RC
 ''';
 
