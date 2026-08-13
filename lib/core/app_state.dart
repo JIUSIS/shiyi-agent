@@ -2159,7 +2159,7 @@ class ShiyiState extends ChangeNotifier {
     final parts = <String>[];
     parts.add(base);
     parts.add(
-      '【工具使用规则】'
+      '【工具使用规则】\n'
       '- 需要最新信息、实时数据或超出你知识截止日期的问题，直接用 web_search，不要先调用 search_memory。'
       '- 相关长期记忆已在上方【长期记忆】中提供，回答时直接使用，无需再调用 search_memory 检索。'
       '- 涉及事实、新闻、价格、数据等关键信息时，必须先验证资料真伪：换多个关键词和来源交叉搜索，不要只凭单一来源下结论。'
