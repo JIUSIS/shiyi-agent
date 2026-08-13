@@ -1030,10 +1030,10 @@ class _ChatScreenState extends State<ChatScreen>
                   children: [
                     Expanded(
                       child: ListenableBuilder(
-                        listenable: Listenable.merge([
-                          widget.shiyi.messagesRevision,
-                          widget.shiyi,
-                        ]),
+                        // 只监听消息版本：status/token/工具轮等状态变化
+                        // 不再重建整个消息列表（流式文本由气泡内部
+                        // ValueListenableBuilder 单独驱动）。
+                        listenable: widget.shiyi.messagesRevision,
                         builder: (context, _) {
                           final messages = widget.shiyi.messages;
                           // 工具调用已集中到右上角信息流胶囊，对话流里不再显示工具消息与纯工具回合。

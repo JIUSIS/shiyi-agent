@@ -262,18 +262,27 @@ class ChatMessage {
         toolCalls.isEmpty &&
         (rawContent.trim().isEmpty || sameText);
     return ChatMessage(
-      id: m['id'],
-      sessionId: m['session_id'],
-      role: m['role'],
+      // 脏数据兜底（迁移/损坏库读出 null 或错误类型时取默认，不抛异常）：
+      // 与 Session/MemoryEntry 的 tryParse 风格保持一致。
+      id: (m['id'] ?? '').toString(),
+      sessionId: (m['session_id'] ?? '').toString(),
+      role: (m['role'] ?? 'user').toString(),
       content: misplacedReply && rawContent.trim().isEmpty
           ? rawReasoning
           : rawContent,
       reasoning: misplacedReply ? '' : rawReasoning,
       toolCalls: toolCalls,
-      toolCallId: m['tool_call_id'] ?? '',
-      createdAt: m['created_at'],
-      archived: (m['archived'] as num?)?.toInt() == 1,
+      toolCallId: (m['tool_call_id'] ?? '').toString(),
+      createdAt: _toInt(m['created_at']),
+      archived: _toInt(m['archived']) == 1,
     );
+  }
+
+  /// 数字字段脏数据兜底：num 直接取，数字字符串解析，其余取 0。
+  static int _toInt(Object? v) {
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v) ?? 0;
+    return 0;
   }
 
   Map<String, dynamic> toApiMap() {
