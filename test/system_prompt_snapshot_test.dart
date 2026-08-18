@@ -66,6 +66,7 @@ void main() {
 /// 动态内容打码，保证快照跨平台 / 跨时刻稳定：
 /// - 时间行（运行时刻不同）
 /// - 工作目录段落（Windows Temp 路径 / Android 存储路径随平台不同）
+/// - 平台环境段落（Android 与 Windows 文本不同，两端都移除）
 String _normalize(String prompt) {
   var s = prompt.replaceAll(
     RegExp(r'【当前时间】现在是 \d+年\d+月\d+日 \d{2}:\d{2}。'),
@@ -75,5 +76,6 @@ String _normalize(String prompt) {
     RegExp(r'- 当前会话工作目录是 [^\n]+'),
     '- 当前会话工作目录是 {WORKSPACE}',
   );
+  s = s.replaceAll(RegExp(r'\n\n【平台环境】[^\n]*'), '');
   return s;
 }

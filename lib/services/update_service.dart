@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../widgets/markdown_text.dart';
 
@@ -203,12 +204,24 @@ class UpdateService {
     );
   }
 
-  /// 下载并安装新版本 APK。
-  /// 优先 GitHub 官方直链，首字节无响应或下载过慢时自动切换国内镜像源。
+  /// 下载并安装新版本。
+  /// Android：优先 GitHub 官方直链，首字节无响应或下载过慢时自动切换国内镜像源，
+  /// 校验签名后交给系统安装器。
+  /// Windows 桌面：不下载 APK，直接跳转 GitHub 发布页手动下载 exe。
   static Future<void> downloadAndInstall(
     BuildContext context,
     String ver,
   ) async {
+    if (!Platform.isAndroid) {
+      // 桌面版没有 APK 安装流程：引导用户到发布页下载对应平台的安装包。
+      try {
+        await launchUrl(
+          Uri.parse('$repoUrl/releases/latest'),
+          mode: LaunchMode.externalApplication,
+        );
+      } catch (_) {}
+      return;
+    }
     final direct =
         'https://github.com/JIUSIS/shiyi-agent/releases/download/'
         'v$ver/shiyi-agent-v$ver.apk';

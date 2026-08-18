@@ -105,7 +105,7 @@
   },
   "run_terminal": {
     "readOnly": false,
-    "description": "在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。",
+    "description": "在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（内嵌 Alpine，可用 apk 安装软件包），首次使用前会自动部署。",
     "parameters": {
       "type": "object",
       "properties": {

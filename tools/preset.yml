@@ -1,0 +1,2 @@
+name: Android 精简
+description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具

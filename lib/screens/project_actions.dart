@@ -86,54 +86,65 @@ class _NewProjectDialogState extends State<_NewProjectDialog> {
   Widget build(BuildContext context) {
     return CupertinoAlertDialog(
       title: const Text('新建项目'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          CupertinoTextField(
-            controller: _controller,
-            autofocus: true,
-            placeholder: '项目名称',
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            clearButtonMode: OverlayVisibilityMode.editing,
-            onSubmitted: (_) => _create(),
-          ),
-          const SizedBox(height: 12),
-          CupertinoButton(
-            padding: EdgeInsets.zero,
-            onPressed: _pickFolder,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-              decoration: BoxDecoration(
-                color: iosSectionBackground(context),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Row(
-                children: [
-                  const Icon(CupertinoIcons.folder, size: 18, color: _iosBlue),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _folder ?? '选择文件夹位置',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: _folder == null
-                            ? Theme.of(context).colorScheme.onSurfaceVariant
-                            : Theme.of(context).colorScheme.onSurface,
+      content: SingleChildScrollView(
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            CupertinoTextField(
+              controller: _controller,
+              autofocus: true,
+              placeholder: '项目名称',
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              clearButtonMode: OverlayVisibilityMode.editing,
+              scrollPadding: const EdgeInsets.only(bottom: 120),
+              onSubmitted: (_) => _create(),
+            ),
+            const SizedBox(height: 12),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _pickFolder,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 9,
+                ),
+                decoration: BoxDecoration(
+                  color: iosSectionBackground(context),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      CupertinoIcons.folder,
+                      size: 18,
+                      color: _iosBlue,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _folder ?? '选择文件夹位置',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: _folder == null
+                              ? Theme.of(context).colorScheme.onSurfaceVariant
+                              : Theme.of(context).colorScheme.onSurface,
+                        ),
                       ),
                     ),
-                  ),
-                  Icon(
-                    CupertinoIcons.chevron_right,
-                    size: 14,
-                    color: Theme.of(context).hintColor,
-                  ),
-                ],
+                    Icon(
+                      CupertinoIcons.chevron_right,
+                      size: 14,
+                      color: Theme.of(context).hintColor,
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
       actions: [
         CupertinoDialogAction(

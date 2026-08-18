@@ -44,9 +44,13 @@ class FileWorkspace {
 
   /// 把外部文件复制到工作目录的 attachments/ 下并返回新路径，
   /// 让模型可以用 run_terminal 读取；复制失败返回 null。
-  static Future<String?> copyToAttachments(String srcPath) async {
+  static Future<String?> copyToAttachments(
+    String srcPath, {
+    String? workspacePath,
+  }) async {
     try {
-      final base = await current();
+      final selected = workspacePath?.trim() ?? '';
+      final base = selected.isEmpty ? await current() : selected;
       final dir = Directory('$base/attachments');
       dir.createSync(recursive: true);
       final src = File(srcPath);

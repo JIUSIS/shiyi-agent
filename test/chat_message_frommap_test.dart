@@ -56,4 +56,19 @@ void main() {
     final api = m.toApiMap();
     expect(api['role'], 'user');
   });
+
+  test('子代理结果可落库往返，但不进入模型上下文', () {
+    final original = ChatMessage(
+      id: 'm3',
+      sessionId: 's1',
+      role: 'assistant',
+      content: '正文',
+      subagentResult: '子代理报告',
+      createdAt: 0,
+    );
+    final restored = ChatMessage.fromMap(original.toMap());
+
+    expect(restored.subagentResult, '子代理报告');
+    expect(restored.toApiMap().containsKey('subagent_result'), isFalse);
+  });
 }

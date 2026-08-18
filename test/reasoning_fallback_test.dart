@@ -1,9 +1,10 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shiyi_agent_app/core/app_state.dart';
 import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/services/llm_client.dart';
 
 void main() {
-  test('content 为空时把 reasoning 当正文读取', () {
+  test('正文为空且只有 reasoning 时按备份提升为正文', () {
     final msg = ChatMessage.fromMap({
       'id': 'm1',
       'session_id': 's1',
@@ -16,6 +17,39 @@ void main() {
     });
     expect(msg.content, '选了「骂一句」——完全理解！');
     expect(msg.reasoning, isEmpty);
+  });
+
+  test('拾忆 fromMap 不拆正文里的 think 标签', () {
+    final msg = ChatMessage.fromMap({
+      'id': 'm1b',
+      'session_id': 's1',
+      'role': 'assistant',
+      'content': '<think>先分析问题</think>这是最终回答',
+      'reasoning': '',
+      'tool_calls': '',
+      'tool_call_id': '',
+      'created_at': 1,
+    });
+    expect(msg.content, '<think>先分析问题</think>这是最终回答');
+    expect(msg.reasoning, isEmpty);
+  });
+
+  test('splitThinkTags 处理未闭合与半截标签', () {
+    expect(splitThinkTags('hello').text, 'hello');
+    expect(splitThinkTags('hello').reasoning, isEmpty);
+    expect(splitThinkTags('<think>foo').text, isEmpty);
+    expect(splitThinkTags('<think>foo').reasoning, 'foo');
+    expect(splitThinkTags('pre<think>foo</think>post').text, 'prepost');
+    expect(splitThinkTags('pre<think>foo</think>post').reasoning, 'foo');
+    expect(splitThinkTags('hello <th').text, 'hello ');
+    expect(splitThinkTags('<thinking>a</thinking>b').reasoning, 'a');
+    expect(splitThinkTags('<thinking>a</thinking>b').text, 'b');
+  });
+
+  test('mergeReasoning 不重复追加已包含片段', () {
+    expect(mergeReasoning('foo', 'foobar'), 'foobar');
+    expect(mergeReasoning('foobar', 'bar'), 'foobar');
+    expect(mergeReasoning('foo', 'bar'), 'foobar');
   });
 
   test('有工具调用时 reasoning 仍保留为思考内容', () {
@@ -93,6 +127,53 @@ void main() {
       'created_at': 6,
     });
     expect(msg.toApiMap().containsKey('reasoning_content'), isFalse);
+  });
+
+  test('reasoning 空且正文带 think 标签时拆进思考面板', () {
+    final n1 = ShiyiState.normalizeMisplacedReasoningForTest(
+      TurnResult(text: '<thinking>先分析问题</thinking>这是最终回答', reasoning: ''),
+    );
+    expect(n1.text, '这是最终回答');
+    expect(n1.reasoning, '先分析问题');
+  });
+
+  test('think 标签未闭合时整段按思考处理', () {
+    final n = ShiyiState.normalizeMisplacedReasoningForTest(
+      TurnResult(text: '<thinking>只有思考没有正文', reasoning: ''),
+    );
+    expect(n.text, isEmpty);
+    expect(n.reasoning, '只有思考没有正文');
+  });
+
+  test('正文无 think 标签时不误拆', () {
+    const raw = '你好呀！有什么我能帮你的吗？😊';
+    final n = ShiyiState.normalizeMisplacedReasoningForTest(
+      TurnResult(text: raw, reasoning: ''),
+    );
+    expect(n.text, raw);
+    expect(n.reasoning, isEmpty);
+  });
+
+  test('reasoning 非空时优先字段流，不拆正文标签', () {
+    final n = ShiyiState.normalizeMisplacedReasoningForTest(
+      TurnResult(text: '<thinking>正文里的标签</thinking>', reasoning: '字段流思考'),
+    );
+    expect(n.text, '<thinking>正文里的标签</thinking>');
+    expect(n.reasoning, '字段流思考');
+  });
+
+  test('有工具调用时不拆 think 标签', () {
+    final n = ShiyiState.normalizeMisplacedReasoningForTest(
+      TurnResult(
+        text: '<thinking>先想</thinking>调用工具',
+        reasoning: '',
+        toolCalls: [
+          {'id': 'c1', 'name': 'run_terminal', 'arguments': '{}'},
+        ],
+      ),
+    );
+    expect(n.text, '<thinking>先想</thinking>调用工具');
+    expect(n.reasoning, isEmpty);
   });
 
   test('提取 reasoning_summary 对象与嵌套 summary 数组', () {

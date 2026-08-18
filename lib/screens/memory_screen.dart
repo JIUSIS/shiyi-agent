@@ -1,11 +1,14 @@
 import 'dart:async';
 
+import 'dart:io';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/models.dart';
 import '../widgets/ios_style.dart';
+import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
 
 class MemoryScreen extends StatefulWidget {
@@ -159,7 +162,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
     final shiyi = widget.shiyi;
     final theme = Theme.of(context);
     return CupertinoTheme(
-      data: CupertinoThemeData(brightness: theme.brightness),
+      data: iosCupertinoTheme(context),
       child: ListenableBuilder(
         listenable: shiyi,
         builder: (context, _) {
@@ -171,11 +174,17 @@ class _MemoryScreenState extends State<MemoryScreen> {
               leadingWidth: 72,
               leading: Padding(
                 padding: const EdgeInsets.only(left: 12),
-                child: TrafficLightsButton(
-                  busy: shiyi.isBusy,
-                  tooltip: '新建记忆',
-                  onTap: _newMemory,
-                ),
+                child: Platform.isWindows
+                    ? MacActionButton(
+                        icon: CupertinoIcons.plus,
+                        tooltip: '新建记忆',
+                        onTap: _newMemory,
+                      )
+                    : TrafficLightsButton(
+                        busy: shiyi.isBusy,
+                        tooltip: '新建记忆',
+                        onTap: _newMemory,
+                      ),
               ),
               toolbarHeight: 64,
               centerTitle: true,

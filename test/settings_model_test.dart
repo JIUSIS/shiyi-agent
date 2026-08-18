@@ -29,6 +29,30 @@ void main() {
     expect(ApiProfile.fromJson({}).apiProtocol, 'openai');
   });
 
+  test('dshStopOnExit 默认开启，并随设置 JSON 往返持久化', () {
+    expect(AppSettings().dshStopOnExit, isTrue);
+    expect(AppSettings.fromJson({}).dshStopOnExit, isTrue);
+    expect(
+      AppSettings.fromJson({'dshStopOnExit': false}).dshStopOnExit,
+      isFalse,
+    );
+
+    final saved = AppSettings(dshStopOnExit: false).toJson();
+    expect(AppSettings.fromJson(saved).dshStopOnExit, isFalse);
+  });
+
+  test('DSH 搜索默认自动免费引擎，并随设置 JSON 往返', () {
+    expect(AppSettings().dshSearchProvider, 'auto');
+    expect(AppSettings.fromJson({}).dshSearchProvider, 'auto');
+    final saved = AppSettings(
+      dshSearchProvider: 'ddg',
+      dshSearchKey: 'sk-search',
+    ).toJson();
+    final restored = AppSettings.fromJson(saved);
+    expect(restored.dshSearchProvider, 'ddg');
+    expect(restored.dshSearchKey, 'sk-search');
+  });
+
   test('内置预设包含 Anthropic 协议接口', () {
     final anthropic = modelPresets
         .where((p) => p.name == 'Anthropic Claude')

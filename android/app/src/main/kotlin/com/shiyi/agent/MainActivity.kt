@@ -76,6 +76,21 @@ class MainActivity : FlutterActivity() {
     }
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // Android 系统代理读取（DSH 安装/更新走代理）。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyi/system_proxy")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getProxy" -> {
+                        val proxy = systemProxy()
+                        if (proxy == null) {
+                            result.success(null)
+                        } else {
+                            result.success(mapOf("host" to proxy.host, "port" to proxy.port))
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyi/skillpack")
             .setMethodCallHandler { call, result ->
                 try {
@@ -108,11 +123,23 @@ class MainActivity : FlutterActivity() {
                                 extractTermux(assetPath, destDir)
                             }
                         }
+                        "extractTarGz" -> {
+                            val assetPath = call.argument<String>("assetPath")
+                                ?: throw IllegalArgumentException("assetPath missing")
+                            val destDir = call.argument<String>("destDir")
+                                ?: throw IllegalArgumentException("destDir missing")
+                            runInBackground(result) {
+                                extractTarGz(assetPath, destDir)
+                            }
+                        }
                         "verifyApk" -> {
                             val path = call.argument<String>("path")
                                 ?: throw IllegalArgumentException("path missing")
                             // 校验要解析整个 APK，放后台线程避免主线程卡 UI/ANR。
                             runInBackground(result) { verifyApk(path) }
+                        }
+                        "nativeLibraryDir" -> {
+                            result.success(applicationInfo.nativeLibraryDir)
                         }
                         "installApk" -> {
                             val path = call.argument<String>("path")
@@ -129,6 +156,16 @@ class MainActivity : FlutterActivity() {
                     result.error("SKILL_PACK_ERROR", e.message ?: e.toString(), null)
                 }
             }
+    }
+
+    /** 读取 Android 系统代理（WiFi/APN 设置里的 HTTP 代理），无则返回 null。 */
+    private fun systemProxy(): android.net.ProxyInfo? {
+        return try {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            cm.defaultProxy
+        } catch (_: Exception) {
+            null
+        }
     }
 
     override fun onDestroy() {
@@ -365,6 +402,219 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
+     * 解压内嵌的 Alpine minirootfs（assets 的 .tar.gz）到目标目录。
+     * 自实现 tar 解析：支持普通文件 / 目录 / 符号链接 / 硬链接（复制兜底，
+     * Android 应用数据分区禁 hard link）/ GNU longname / longlink；
+     * 防目录穿越 + 条目/总量上限（与 extractZip 同规格）。
+     */
+    private fun extractTarGz(assetPath: String, destDirPath: String): Map<String, Any> {
+        val dest = File(destDirPath)
+        dest.mkdirs()
+        // 注意：不能 deleteRecursively 重建——rootfs 里可能已有用户安装的包
+        //（node/npm/dsh 等），误判版本重建时删除会清掉它们。改为覆盖式解压：
+        // 同名文件覆盖、目录合并、符号链接重建，已有内容全部保留。
+        val destCanonical = dest.canonicalPath
+        val symlinks = mutableListOf<Pair<String, String>>()
+        var fileCount = 0
+        var totalBytes = 0L
+        var entryCount = 0
+        val buf = ByteArray(512)
+        assets.open("flutter_assets/$assetPath").use { input ->
+            java.util.zip.GZIPInputStream(BufferedInputStream(input)).use { gz ->
+                var pendingName: String? = null
+                var pendingLink: String? = null
+                while (true) {
+                    val read = readFully(gz, buf)
+                    if (read == -1) break
+                    if (read < 512) throw IllegalStateException("tar 头不完整（$read 字节）")
+                    val name = tarString(buf, 0, 100)
+                    if (name.isEmpty()) break
+                    val size = tarOctal(buf, 124, 12)
+                    val type = buf[156].toInt().toChar()
+                    var linkName = tarString(buf, 157, 100)
+                    // GNU 扩展头：真正的名字/链接名在下一块。
+                    var realName = name
+                    if (type == 'L') {
+                        pendingName = tarPayloadString(gz, size)
+                        continue
+                    }
+                    if (type == 'K') {
+                        pendingLink = tarPayloadString(gz, size)
+                        continue
+                    }
+                    if (pendingName != null) {
+                        realName = pendingName
+                        pendingName = null
+                    }
+                    if (pendingLink != null) {
+                        linkName = pendingLink
+                        pendingLink = null
+                    }
+                    realName = realName.replace('\\', '/')
+                    // 规范化 tar 根条目（GNU tar 常见 "./" 前缀）：去掉前缀，
+                    // 空名或 "." 等价于目标目录本身，直接建目录后跳过。
+                    while (realName.startsWith("./")) {
+                        realName = realName.substring(2)
+                    }
+                    if (realName.isEmpty()) {
+                        dest.mkdirs()
+                        skipTarPayload(gz, size)
+                        val pad0 = ((size + 511) / 512) * 512 - size
+                        skipBytes(gz, pad0)
+                        continue
+                    }
+                    val target = File(dest, realName)
+                    val targetCanonical = target.canonicalPath
+                    val insideDest = targetCanonical == destCanonical ||
+                        targetCanonical.startsWith(destCanonical + File.separator)
+                    if (!insideDest) {
+                        throw IllegalStateException("非法解压路径: $realName")
+                    }
+                    when (type) {
+                        '5' -> target.mkdirs()
+                        '2' -> {
+                            // 符号链接：目标允许在 rootfs 内任意位置（相对/绝对）。
+                            if (++entryCount > MAX_ZIP_ENTRIES) {
+                                throw IllegalStateException("压缩包条目过多（超过 $MAX_ZIP_ENTRIES），已中止解压")
+                            }
+                            symlinks.add(linkName to target.absolutePath)
+                            fileCount++
+                        }
+                        '1' -> {
+                            // 硬链接：目标指向 rootfs 内已有文件，复制兜底。
+                            if (++entryCount > MAX_ZIP_ENTRIES) {
+                                throw IllegalStateException("压缩包条目过多（超过 $MAX_ZIP_ENTRIES），已中止解压")
+                            }
+                            val srcFile = File(dest, linkName)
+                            target.parentFile?.mkdirs()
+                            srcFile.copyTo(target, overwrite = true)
+                            fileCount++
+                        }
+                        '0', '\u0000' -> {
+                            // 普通文件。
+                            if (++entryCount > MAX_ZIP_ENTRIES) {
+                                throw IllegalStateException("压缩包条目过多（超过 $MAX_ZIP_ENTRIES），已中止解压")
+                            }
+                            target.parentFile?.mkdirs()
+                            val mode = tarOctal(buf, 100, 8)
+                            BufferedOutputStream(FileOutputStream(target)).use { out ->
+                                var remaining = size
+                                while (remaining > 0) {
+                                    val n = gz.read(buf, 0, minOf(remaining, buf.size.toLong()).toInt())
+                                    if (n <= 0) throw IllegalStateException("tar 数据不完整")
+                                    totalBytes += n
+                                    if (totalBytes > MAX_ZIP_TOTAL_BYTES) {
+                                        throw IllegalStateException("压缩包解压总量超限（> $MAX_ZIP_TOTAL_BYTES 字节），已中止")
+                                    }
+                                    out.write(buf, 0, n)
+                                    remaining -= n
+                                }
+                            }
+                            if (mode and 0x49L != 0L) {
+                                target.setExecutable(true, false)
+                            }
+                            if (mode and 0x24L != 0L) {
+                                target.setWritable(true, false)
+                            }
+                            if (mode and 0x92L != 0L) {
+                                target.setReadable(true, false)
+                            }
+                            fileCount++
+                        }
+                        else -> {
+                            // 设备/管道等特殊条目：跳过数据。
+                            skipTarPayload(gz, size)
+                        }
+                    }
+                    // tar 块按 512 对齐，跳过填充。
+                    val pad = ((size + 511) / 512) * 512 - size
+                    skipBytes(gz, pad)
+                }
+            }
+        }
+        for ((old, new) in symlinks) {
+            try {
+                val newFile = File(new)
+                newFile.parentFile?.mkdirs()
+                if (newFile.exists()) newFile.delete()
+                Os.symlink(old, new)
+            } catch (_: Exception) {
+                // 个别符号链接失败不阻塞整体
+            }
+        }
+        return mapOf("files" to fileCount, "symlinks" to symlinks.size)
+    }
+
+    private fun readFully(input: java.io.InputStream, buf: ByteArray): Int {
+        var total = 0
+        while (total < buf.size) {
+            val n = input.read(buf, total, buf.size - total)
+            if (n < 0) return if (total == 0) -1 else total
+            if (n == 0) throw IllegalStateException("tar 流读取停滞")
+            total += n
+        }
+        return total
+    }
+
+    private fun skipBytes(input: java.io.InputStream, count: Long) {
+        var remaining = count
+        val buf = ByteArray(512)
+        while (remaining > 0) {
+            val n = input.read(buf, 0, minOf(remaining, buf.size.toLong()).toInt())
+            if (n <= 0) throw IllegalStateException("tar 填充数据不完整")
+            remaining -= n
+        }
+    }
+
+    private fun skipTarPayload(input: java.io.InputStream, size: Long) {
+        var remaining = size
+        val buf = ByteArray(4096)
+        while (remaining > 0) {
+            val n = input.read(buf, 0, minOf(remaining, buf.size.toLong()).toInt())
+            if (n <= 0) throw IllegalStateException("tar 数据不完整")
+            remaining -= n
+        }
+    }
+
+    private fun tarPayloadString(input: java.io.InputStream, size: Long): String {
+        val bytes = ByteArray(size.toInt())
+        var off = 0
+        while (off < bytes.size) {
+            val n = input.read(bytes, off, bytes.size - off)
+            if (n <= 0) throw IllegalStateException("tar 扩展头数据不完整")
+            off += n
+        }
+        val pad = ((size + 511) / 512) * 512 - size
+        skipBytes(input, pad)
+        return String(bytes, Charsets.UTF_8).trimEnd('\u0000')
+    }
+
+    private fun tarString(buf: ByteArray, offset: Int, length: Int): String {
+        var end = offset
+        val limit = offset + length
+        while (end < limit && buf[end] != 0.toByte()) end++
+        return String(buf, offset, end - offset, Charsets.UTF_8)
+    }
+
+    private fun tarOctal(buf: ByteArray, offset: Int, length: Int): Long {
+        var end = offset
+        val limit = offset + length
+        while (end < limit && buf[end] != 0.toByte()) end++
+        val s = String(buf, offset, end - offset, Charsets.US_ASCII).trim()
+        if (s.isEmpty()) return 0L
+        // 支持 GNU base-256 编码：首字节 0x80 标志，数值在字段最后 8 字节
+        //（前面是 0xff 填充，从 offset+4 起读 8 字节）。
+        if (buf[offset].toInt() and 0x80 != 0) {
+            var v = 0L
+            for (i in offset + 4 until offset + 12) {
+                v = (v shl 8) or (buf[i].toLong() and 0xFF)
+            }
+            return v and 0x7FFFFFFFFFFFFFFFL
+        }
+        return s.toLongOrNull(8) ?: 0L
+    }
+
+    /**
      * 修复脚本里硬编码的 Termux 路径。
      * 文本脚本（无 NUL）：全局替换 /data/data/com.termux 系路径为内嵌路径；
      * 二进制（含 NUL）或 skipGlobalRewrite：只修文件开头 256 字节内的 shebang。
@@ -433,5 +683,3 @@ class MainActivity : FlutterActivity() {
         return -1
     }
 }
-
-

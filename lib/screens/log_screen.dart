@@ -117,9 +117,7 @@ class _LogScreenState extends State<LogScreen> {
         .reversed
         .toList();
     return CupertinoTheme(
-      data: CupertinoThemeData(
-        brightness: dark ? Brightness.dark : Brightness.light,
-      ),
+      data: iosCupertinoTheme(context),
       child: Material(
         type: MaterialType.transparency,
         child: CupertinoPageScaffold(

@@ -76,6 +76,15 @@ class Session {
   /// 会话级项目工作目录（空 = 用全局默认工作目录）。
   String workspaceDir;
 
+  /// 本会话累计的缓存命中 token（Σ 服务端返回的缓存输入）。
+  /// 与 [cacheInputTokens] 配对持久化：退出会话再进入/重启后仍显示
+  /// 整个会话的缓存命中率（口径同 DSH 的 durable log）。
+  int cacheHitTokens;
+
+  /// 本会话累计的输入 token（Σ 每次请求的 prompt 输入，仅统计
+  /// 服务端明确返回缓存字段的请求；与 [cacheHitTokens] 同分母）。
+  int cacheInputTokens;
+
   Session({
     required this.id,
     required this.title,
@@ -88,6 +97,8 @@ class Session {
     this.lastUsageTotalTokens,
     this.rollingSummary = '',
     this.workspaceDir = '',
+    this.cacheHitTokens = 0,
+    this.cacheInputTokens = 0,
   });
 
   Map<String, dynamic> toMap() => {
@@ -101,6 +112,8 @@ class Session {
     'last_usage_total_tokens': lastUsageTotalTokens,
     'rolling_summary': rollingSummary,
     'workspace_dir': workspaceDir,
+    'cache_hit_tokens': cacheHitTokens,
+    'cache_input_tokens': cacheInputTokens,
   };
 
   factory Session.fromMap(Map<String, dynamic> m) => Session(
@@ -123,6 +136,12 @@ class Session {
         ? ''
         : '${m['rolling_summary']}',
     workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
+    cacheHitTokens: m['cache_hit_tokens'] == null
+        ? 0
+        : int.tryParse('${m['cache_hit_tokens']}') ?? 0,
+    cacheInputTokens: m['cache_input_tokens'] == null
+        ? 0
+        : int.tryParse('${m['cache_input_tokens']}') ?? 0,
   );
 }
 
@@ -202,6 +221,78 @@ List<String> extractImagePaths(String content) => imageMarkerRegExp
 String stripImageMarkers(String content) =>
     content.replaceAll(imageMarkerRegExp, '').trim();
 
+/// 正文里拆出的思考块。部分网关不走 reasoning_content，只在 content 里写 think 标签。
+class ThinkSplit {
+  final String text;
+  final String reasoning;
+  const ThinkSplit(this.text, this.reasoning);
+}
+
+final _thinkOpen = RegExp(r'<think(?:ing)?>', caseSensitive: false);
+final _thinkClose = RegExp(r'</think(?:ing)?>', caseSensitive: false);
+
+/// 把正文里的 think 标签拆成可见文本和思考。未闭合标签按思考处理；
+/// 末尾半截 <th 先留着，等下一片 delta。
+ThinkSplit splitThinkTags(String raw) {
+  if (raw.isEmpty) return const ThinkSplit('', '');
+  if (!_thinkOpen.hasMatch(raw) && !raw.contains('<')) {
+    return ThinkSplit(raw, '');
+  }
+  final text = StringBuffer();
+  final reasoning = StringBuffer();
+  var i = 0;
+  var inThink = false;
+  while (i < raw.length) {
+    final rest = raw.substring(i);
+    if (!inThink) {
+      final open = _thinkOpen.firstMatch(rest);
+      if (open == null) {
+        final hold = _incompleteThinkOpenAt(rest);
+        text.write(hold == null ? rest : rest.substring(0, hold));
+        break;
+      }
+      text.write(rest.substring(0, open.start));
+      i += open.end;
+      inThink = true;
+      continue;
+    }
+    final close = _thinkClose.firstMatch(rest);
+    if (close == null) {
+      reasoning.write(rest);
+      break;
+    }
+    reasoning.write(rest.substring(0, close.start));
+    i += close.end;
+    inThink = false;
+  }
+  return ThinkSplit(text.toString(), reasoning.toString());
+}
+
+int? _incompleteThinkOpenAt(String rest) {
+  final lt = rest.lastIndexOf('<');
+  if (lt < 0) return null;
+  final frag = rest.substring(lt + 1).toLowerCase();
+  if (frag.isEmpty ||
+      'think>'.startsWith(frag) ||
+      'thinking>'.startsWith(frag) ||
+      '/think>'.startsWith(frag) ||
+      '/thinking>'.startsWith(frag)) {
+    return lt;
+  }
+  return null;
+}
+
+/// 合并两路思考：字段流和 think 标签。已包含的片段不重复追加。
+String mergeReasoning(String current, String incoming) {
+  if (incoming.isEmpty) return current;
+  if (current.isEmpty || incoming == current) return incoming;
+  if (incoming.startsWith(current)) return incoming;
+  if (current.startsWith(incoming) || current.endsWith(incoming)) {
+    return current;
+  }
+  return current + incoming;
+}
+
 class ChatMessage {
   String id;
   String sessionId;
@@ -214,6 +305,16 @@ class ChatMessage {
   bool streaming;
   bool archived;
 
+  /// DSH 官方 runtime-context 快照。只给 UI 折叠展示，不入库、不回传模型。
+  String runtimeContext;
+
+  /// DSH 子代理结果的主模型总结。仅缓存展示，不回传模型。
+  String subagentSummary;
+
+  /// 拾忆子代理返回给主模型的原始报告。只在助手气泡折叠展示，
+  /// 落库但不进入 [toApiMap]，避免在模型上下文里重复工具结果。
+  String subagentResult;
+
   ChatMessage({
     required this.id,
     required this.sessionId,
@@ -225,6 +326,9 @@ class ChatMessage {
     required this.createdAt,
     this.streaming = false,
     this.archived = false,
+    this.runtimeContext = '',
+    this.subagentSummary = '',
+    this.subagentResult = '',
   }) : toolCalls = toolCalls ?? [];
 
   bool get hasToolCalls => toolCalls.isNotEmpty;
@@ -236,6 +340,7 @@ class ChatMessage {
     'role': role,
     'content': content,
     'reasoning': reasoning,
+    'subagent_result': subagentResult,
     'tool_calls': jsonEncode(toolCalls.map((t) => t.toJson()).toList()),
     'tool_call_id': toolCallId,
     'created_at': createdAt,
@@ -271,6 +376,7 @@ class ChatMessage {
           ? rawReasoning
           : rawContent,
       reasoning: misplacedReply ? '' : rawReasoning,
+      subagentResult: (m['subagent_result'] ?? '').toString(),
       toolCalls: toolCalls,
       toolCallId: (m['tool_call_id'] ?? '').toString(),
       createdAt: _toInt(m['created_at']),
@@ -463,6 +569,34 @@ class AppSettings {
   /// 输入框按回车直接发送；关闭时回车换行。
   bool enterToSend;
 
+  /// Windows 桌面终端后端：auto / pwsh / cmd / wsl2
+  /// （Android 恒用内嵌 Alpine Linux，此设置不生效）。auto = WSL2 优先，
+  /// 其次 PowerShell 7（pwsh），再回退 cmd。
+  String terminalBackend;
+
+  /// Agent 引擎：shiyi（拾忆本地引擎）/ dsh（DeepSeek Harness，经 HTTP API）。
+  /// 切换后会话 tab 与聊天页走对应数据源；两套数据完全独立。
+  String agentEngine;
+
+  /// DSH 自动检查更新（默认开）：进入 DSH 模式时检测 npm 最新版，
+  /// 发现新版弹提示由用户选择更新或暂不。
+  bool dshAutoCheckUpdate;
+
+  /// DSH 安装/更新自动使用代理（默认开）：检测系统代理或本地代理端口，
+  /// npm 与 registry 请求走代理；无代理时直连 + 镜像兜底。
+  bool dshUseProxy;
+
+  /// 退出 App 时是否停止 DSH 服务（默认开）。关闭后退出 App / 进程销毁
+  /// 不杀 dsh，重开 App 即用；切后台不受影响，始终常驻。
+  bool dshStopOnExit;
+
+  /// DSH 联网搜索引擎：auto / bing / ddg / ddg-lite / deepseek。
+  /// 前四项免密；deepseek 使用 [dshSearchKey]。
+  String dshSearchProvider;
+
+  /// DSH DeepSeek 官方搜索 API Key（仅 provider=deepseek 时使用）。
+  String dshSearchKey;
+
   AppSettings({
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
@@ -486,6 +620,13 @@ class AppSettings {
     this.visionModel = '',
     this.enableNotifications = true,
     this.enterToSend = true,
+    this.terminalBackend = 'auto',
+    this.agentEngine = 'shiyi',
+    this.dshAutoCheckUpdate = true,
+    this.dshUseProxy = true,
+    this.dshStopOnExit = true,
+    this.dshSearchProvider = 'auto',
+    this.dshSearchKey = '',
   });
 
   AppSettings copyWith({
@@ -511,6 +652,13 @@ class AppSettings {
     String? visionModel,
     bool? enableNotifications,
     bool? enterToSend,
+    String? terminalBackend,
+    String? agentEngine,
+    bool? dshAutoCheckUpdate,
+    bool? dshUseProxy,
+    bool? dshStopOnExit,
+    String? dshSearchProvider,
+    String? dshSearchKey,
   }) => AppSettings(
     baseUrl: baseUrl ?? this.baseUrl,
     apiKey: apiKey ?? this.apiKey,
@@ -535,6 +683,13 @@ class AppSettings {
     visionModel: visionModel ?? this.visionModel,
     enableNotifications: enableNotifications ?? this.enableNotifications,
     enterToSend: enterToSend ?? this.enterToSend,
+    terminalBackend: terminalBackend ?? this.terminalBackend,
+    agentEngine: agentEngine ?? this.agentEngine,
+    dshAutoCheckUpdate: dshAutoCheckUpdate ?? this.dshAutoCheckUpdate,
+    dshUseProxy: dshUseProxy ?? this.dshUseProxy,
+    dshStopOnExit: dshStopOnExit ?? this.dshStopOnExit,
+    dshSearchProvider: dshSearchProvider ?? this.dshSearchProvider,
+    dshSearchKey: dshSearchKey ?? this.dshSearchKey,
   );
 
   Map<String, dynamic> toJson() => {
@@ -560,6 +715,13 @@ class AppSettings {
     'visionModel': visionModel,
     'enableNotifications': enableNotifications,
     'enterToSend': enterToSend,
+    'terminalBackend': terminalBackend,
+    'agentEngine': agentEngine,
+    'dshAutoCheckUpdate': dshAutoCheckUpdate,
+    'dshUseProxy': dshUseProxy,
+    'dshStopOnExit': dshStopOnExit,
+    'dshSearchProvider': dshSearchProvider,
+    'dshSearchKey': dshSearchKey,
   };
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
@@ -586,6 +748,13 @@ class AppSettings {
     visionModel: j['visionModel'] ?? '',
     enableNotifications: j['enableNotifications'] ?? true,
     enterToSend: j['enterToSend'] ?? true,
+    terminalBackend: j['terminalBackend'] ?? 'auto',
+    agentEngine: j['agentEngine'] ?? 'shiyi',
+    dshAutoCheckUpdate: j['dshAutoCheckUpdate'] ?? true,
+    dshUseProxy: j['dshUseProxy'] ?? true,
+    dshStopOnExit: j['dshStopOnExit'] ?? true,
+    dshSearchProvider: j['dshSearchProvider'] ?? 'auto',
+    dshSearchKey: j['dshSearchKey'] ?? '',
   );
 }
 

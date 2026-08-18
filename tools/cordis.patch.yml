@@ -1,0 +1,16 @@
+# Android: 禁用依赖不可用原生模块（node-pty/koffi）的插件。
+# sharp 走 @img/sharp-wasm32（已由 app 补装），attachment-local 与 api-gateway 保持启用。
+- id: hmr
+  disabled: true
+- id: subprocess
+  disabled: true
+- id: sandbox
+  disabled: true
+- id: bash-sandbox
+  disabled: true
+- id: permission
+  disabled: true
+# 默认使用 Android 精简预设（standard 含 tool-bash/tool-fs-search，依赖 subprocess）
+- id: agent-presets
+  config:
+    default: android

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../core/app_state.dart';
 import '../services/file_workspace.dart';
 import '../services/permission_service.dart';
+import '../services/storage_scope.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/markdown_text.dart';
 import '../widgets/traffic_lights_button.dart';
@@ -37,7 +38,14 @@ class _FilesScreenState extends State<FilesScreen> {
   Future<void> _init() async {
     _permission = await PermissionService.isFullAccessGranted();
     _workspace = await FileWorkspace.current();
-    if (_path.isEmpty) _path = _workspace;
+    var start = _path.isEmpty ? _workspace : _path;
+    // 无 Root 时不能停在 SD 以上；回落到 SD 根目录。
+    if (Platform.isAndroid &&
+        !StorageScope.isWithinSdRoot(start) &&
+        RootAccess.granted != true) {
+      start = StorageScope.androidSdRoots.first;
+    }
+    _path = StorageScope.normalize(start);
     _entriesFuture = _listEntries(_path);
     if (mounted) setState(() {});
   }
@@ -47,8 +55,20 @@ class _FilesScreenState extends State<FilesScreen> {
     if (mounted) setState(() {});
   }
 
+  bool get _needsRoot =>
+      Platform.isAndroid && !StorageScope.isWithinSdRoot(_path);
+
   Future<List<FileSystemEntity>> _listEntries(String path) async {
     try {
+      if (Platform.isAndroid && !StorageScope.isWithinSdRoot(path)) {
+        if (RootAccess.granted != true) {
+          _error = '进入 SD 卡以上目录需要 Root 权限';
+          return const <FileSystemEntity>[];
+        }
+        final entries = await RootAccess.list(path);
+        _error = null;
+        return entries;
+      }
       final dir = Directory(path);
       if (!dir.existsSync()) {
         Directory(_workspace).createSync(recursive: true);
@@ -66,7 +86,7 @@ class _FilesScreenState extends State<FilesScreen> {
       _error = null;
       return entries;
     } catch (e) {
-      _error = '读取目录失败：$e';
+      _error = '读取目录失败：${_shortErr(e)}';
       return const <FileSystemEntity>[];
     }
   }
@@ -75,19 +95,24 @@ class _FilesScreenState extends State<FilesScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return CupertinoTheme(
-      data: CupertinoThemeData(brightness: theme.brightness),
+      data: iosCupertinoTheme(context),
       child: Scaffold(
         backgroundColor: iosGroupedBackground(context),
         appBar: AppBar(
           leadingWidth: 72,
-          leading: Padding(
-            padding: const EdgeInsets.only(left: 12),
-            child: ListenableBuilder(
-              listenable: widget.shiyi,
-              builder: (context, _) =>
-                  TrafficLightsButton(tooltip: '', busy: widget.shiyi.isBusy),
-            ),
-          ),
+          // Windows：窗口三键已在全局标题栏，页面内红绿灯不再需要。
+          leading: Platform.isWindows
+              ? null
+              : Padding(
+                  padding: const EdgeInsets.only(left: 12),
+                  child: ListenableBuilder(
+                    listenable: widget.shiyi,
+                    builder: (context, _) => TrafficLightsButton(
+                      tooltip: '',
+                      busy: widget.shiyi.isBusy,
+                    ),
+                  ),
+                ),
           toolbarHeight: 64,
           centerTitle: true,
           backgroundColor: theme.scaffoldBackgroundColor,
@@ -145,7 +170,7 @@ class _FilesScreenState extends State<FilesScreen> {
         children: [
           CupertinoButton(
             padding: const EdgeInsets.all(8),
-            onPressed: _path == _workspace ? null : _goUp,
+            onPressed: StorageScope.isFilesystemRoot(_path) ? null : _goUp,
             child: const Icon(CupertinoIcons.arrow_up),
           ),
           Expanded(
@@ -263,18 +288,25 @@ class _FilesScreenState extends State<FilesScreen> {
   Widget _buildEntryTile(FileSystemEntity e) {
     final name = e.path.split(Platform.pathSeparator).last;
     if (e is Directory) {
-      return CupertinoListTile(
-        leading: const Icon(
-          CupertinoIcons.folder_fill,
-          color: CupertinoColors.activeBlue,
+      return GestureDetector(
+        // Windows 桌面：右键弹出与「…」按钮相同的操作菜单。
+        onSecondaryTapDown: (d) => _showActions(e),
+        child: CupertinoListTile(
+          leading: const Icon(
+            CupertinoIcons.folder_fill,
+            color: CupertinoColors.activeBlue,
+          ),
+          title: Text(
+            name,
+            style: const TextStyle(fontWeight: FontWeight.w500),
+          ),
+          trailing: CupertinoButton(
+            padding: EdgeInsets.zero,
+            onPressed: () => _showActions(e),
+            child: const Icon(CupertinoIcons.ellipsis),
+          ),
+          onTap: () => _navigateTo(e.path),
         ),
-        title: Text(name, style: const TextStyle(fontWeight: FontWeight.w500)),
-        trailing: CupertinoButton(
-          padding: EdgeInsets.zero,
-          onPressed: () => _showActions(e),
-          child: const Icon(CupertinoIcons.ellipsis),
-        ),
-        onTap: () => setState(() => _path = e.path),
       );
     }
     final f = e as File;
@@ -282,19 +314,23 @@ class _FilesScreenState extends State<FilesScreen> {
     try {
       size = f.lengthSync();
     } catch (_) {}
-    return CupertinoListTile(
-      leading: const Icon(
-        CupertinoIcons.doc,
-        color: CupertinoColors.systemGrey,
+    // Windows 桌面：右键弹出与「…」按钮相同的操作菜单。
+    return GestureDetector(
+      onSecondaryTapDown: (d) => _showActions(e),
+      child: CupertinoListTile(
+        leading: const Icon(
+          CupertinoIcons.doc,
+          color: CupertinoColors.systemGrey,
+        ),
+        title: Text(name),
+        subtitle: size == null ? null : Text(_fmtBytes(size)),
+        trailing: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: () => _showActions(e),
+          child: const Icon(CupertinoIcons.ellipsis),
+        ),
+        onTap: () => _previewFile(f),
       ),
-      title: Text(name),
-      subtitle: size == null ? null : Text(_fmtBytes(size)),
-      trailing: CupertinoButton(
-        padding: EdgeInsets.zero,
-        onPressed: () => _showActions(e),
-        child: const Icon(CupertinoIcons.ellipsis),
-      ),
-      onTap: () => _previewFile(f),
     );
   }
 
@@ -362,13 +398,60 @@ class _FilesScreenState extends State<FilesScreen> {
     ).showSnackBar(SnackBar(content: Text('工作目录已设为：$path')));
   }
 
-  Future<void> _goUp() async {
-    final parent = Directory(_path).parent.path;
-    if (parent == _path) return;
+  Future<void> _navigateTo(String raw) async {
+    final next = StorageScope.resolveListable(raw);
+    if (next.isEmpty) return;
+    if (Platform.isAndroid && !StorageScope.isWithinSdRoot(next)) {
+      final ok = await _ensureRootForPath(next);
+      if (!ok) return;
+    }
+    if (!mounted) return;
     setState(() {
-      _path = parent;
-      _entriesFuture = _listEntries(parent);
+      _path = next;
+      _entriesFuture = _listEntries(next);
     });
+  }
+
+  Future<bool> _ensureRootForPath(String next) async {
+    if (RootAccess.granted == true) return true;
+    final go = await showIosFadeDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('需要 Root 权限'),
+        content: const Text(
+          '无 Root 时只能在 SD 卡根目录及以下浏览。\n'
+          '进入更高层目录（如 /storage、/data）需要授予 Root。',
+        ),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('申请 Root'),
+          ),
+        ],
+      ),
+    );
+    if (go != true) return false;
+    final ok = await RootAccess.request();
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('未获得 Root 权限，已阻止进入 SD 卡以上目录')),
+      );
+    }
+    return ok;
+  }
+
+  Future<void> _goUp() async {
+    final parent = StorageScope.visibleParent(
+      _path,
+      android: Platform.isAndroid,
+    );
+    if (parent == StorageScope.normalize(_path)) return;
+    await _navigateTo(parent);
   }
 
   Future<void> _newFolder() async {
@@ -398,7 +481,12 @@ class _FilesScreenState extends State<FilesScreen> {
     );
     if (name == null || name.isEmpty) return;
     try {
-      Directory('$_path/$name').createSync(recursive: true);
+      final dest = '$_path/$name';
+      if (_needsRoot) {
+        await RootAccess.createDir(dest);
+      } else {
+        Directory(dest).createSync(recursive: true);
+      }
       await _refresh();
     } catch (e) {
       if (mounted) {
@@ -432,7 +520,9 @@ class _FilesScreenState extends State<FilesScreen> {
     );
     if (ok != true) return;
     try {
-      if (isDir) {
+      if (_needsRoot) {
+        await RootAccess.delete(e.path, recursive: isDir);
+      } else if (isDir) {
         e.deleteSync(recursive: true);
       } else {
         e.deleteSync();
@@ -450,7 +540,9 @@ class _FilesScreenState extends State<FilesScreen> {
   Future<void> _previewFile(File f) async {
     String content;
     try {
-      if (await f.length() > 512 * 1024) {
+      if (_needsRoot) {
+        content = await RootAccess.readString(f.path);
+      } else if (await f.length() > 512 * 1024) {
         content = '(文件过大，超过 512KB，无法预览，可用 run_terminal 读取)';
       } else {
         content = await f.readAsString();
@@ -542,6 +634,13 @@ class _FilesScreenState extends State<FilesScreen> {
     return _textExts.contains(path.substring(dot).toLowerCase());
   }
 
+  static String _shortErr(Object e) {
+    final s = '$e';
+    final i = s.indexOf('Root 读取');
+    if (i >= 0) return s.substring(i);
+    return s;
+  }
+
   static String _fmtBytes(int n) {
     if (n >= 1024 * 1024 * 1024) {
       return '${(n / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
@@ -570,13 +669,20 @@ class _FilesScreenState extends State<FilesScreen> {
                     alignment: Alignment.centerLeft,
                     child: CupertinoButton(
                       padding: const EdgeInsets.symmetric(horizontal: 8),
-                      onPressed: () {
-                        final p = Directory(cur).parent.path;
-                        if (p != cur) {
-                          cur = p;
-                          dirsFuture = _listSubdirectories(cur);
-                          setDlg(() {});
+                      onPressed: () async {
+                        final p = StorageScope.visibleParent(
+                          cur,
+                          android: Platform.isAndroid,
+                        );
+                        if (p == StorageScope.normalize(cur)) return;
+                        if (Platform.isAndroid &&
+                            !StorageScope.isWithinSdRoot(p)) {
+                          final ok = await _ensureRootForPath(p);
+                          if (!ok) return;
                         }
+                        cur = p;
+                        dirsFuture = _listSubdirectories(cur);
+                        setDlg(() {});
                       },
                       child: const Text('上一级'),
                     ),
@@ -637,6 +743,11 @@ class _FilesScreenState extends State<FilesScreen> {
 
   Future<List<Directory>> _listSubdirectories(String path) async {
     try {
+      if (Platform.isAndroid && !StorageScope.isWithinSdRoot(path)) {
+        if (RootAccess.granted != true) return const <Directory>[];
+        final all = await RootAccess.list(path);
+        return all.whereType<Directory>().toList();
+      }
       final dirs = <Directory>[];
       await for (final e in Directory(path).list(followLinks: false)) {
         if (e is Directory) dirs.add(e);

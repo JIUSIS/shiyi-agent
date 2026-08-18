@@ -4,9 +4,12 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/models.dart';
 import '../services/db.dart';
+import '../services/dsh_service.dart';
+import '../services/dsh_model_sync.dart';
 import '../services/llm_client.dart';
 import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
@@ -102,9 +105,39 @@ class RequestTokenEstimate {
   });
 }
 
+class _SessionRun {
+  _SessionRun(this.sessionId);
+
+  final String sessionId;
+  bool active = false;
+  bool stopRequested = false;
+  bool stopForGuide = false;
+  bool guideWaiting = false;
+  ChatMessage? streaming;
+  String? status;
+  Map<String, dynamic>? pendingQuestion;
+  Completer<String>? questionCompleter;
+  final ValueNotifier<String> streamText = ValueNotifier('');
+  final ValueNotifier<String> streamReasoning = ValueNotifier('');
+  final List<ToolEvent> toolEvents = [];
+  List<Skill> loadedSkillsSnapshot = const [];
+  bool planMode = false;
+  int sessionTotalTokens = 0;
+  int? sessionLastUsageTokens;
+  int lastRoundTokens = 0;
+  int sessionCachedTokens = 0;
+  int sessionInputTokens = 0;
+  bool sessionCacheKnown = false;
+  int sessionContextTokens = 0;
+  int sessionContextTokensFull = 0;
+}
+
 class ShiyiState extends ChangeNotifier {
   final AppDatabase _db = AppDatabase.instance;
   final SettingsService _settingsService = SettingsService();
+
+  /// 记录最后一次使用的 Agent 引擎：冷启动时只在 DSH 退出过才自动拉起。
+  static const String _lastEngineKey = 'dsh_last_engine_v1';
 
   AppSettings settings = AppSettings();
   List<Session> sessions = [];
@@ -147,10 +180,12 @@ class ShiyiState extends ChangeNotifier {
   /// 当前这一轮对话（一次 send）消耗的 token。
   int lastRoundTokens = 0;
 
-  /// 本轮按 Token 加权累计的真实缓存输入与总输入（来自 API usage）。
-  int roundCachedTokens = 0;
-  int roundInputTokens = 0;
-  bool roundCacheKnown = false;
+  /// 本会话按 Token 加权累计的真实缓存输入与总输入（来自 API usage）。
+  /// 口径与 DSH 一致：跨整段会话累计（Σ缓存token ÷ Σ输入token），
+  /// 只在切换/新建会话时清零，不随单轮重置。
+  int sessionCachedTokens = 0;
+  int sessionInputTokens = 0;
+  bool sessionCacheKnown = false;
 
   /// 当前会话上下文估算 token 数（与 contextLimit 同口径，用于显示剩余百分比）。
   int sessionContextTokens = 0;
@@ -179,17 +214,103 @@ class ShiyiState extends ChangeNotifier {
   /// 项目列表版本号：项目管理页只监听它。
   final ValueNotifier<int> projectsRevision = ValueNotifier(0);
 
-  ChatMessage? _streaming;
-  bool _stopRequested = false;
-  bool _stopForGuide = false;
-  bool _guideWaiting = false;
+  final Map<String, _SessionRun> _sessionRuns = {};
   DateTime? _lastRefine;
   int _refineCount = 0;
   bool _knownImageUnsupported = false;
 
-  /// 模型发起的待用户确认问题：{question, options}；UI 弹窗后用户选择。
+  /// 当前页面会话的待用户确认问题镜像；真实状态存放在 [_sessionRuns]。
   Map<String, dynamic>? pendingQuestion;
-  Completer<String>? _questionCompleter;
+
+  _SessionRun _runFor(String sessionId) =>
+      _sessionRuns.putIfAbsent(sessionId, () => _SessionRun(sessionId));
+
+  _SessionRun? _existingRun(String? sessionId) =>
+      sessionId == null ? null : _sessionRuns[sessionId];
+
+  bool isBusyForSession(String? sessionId) =>
+      _existingRun(sessionId)?.active ?? false;
+
+  bool canSendToSession(String? sessionId) => sessionId != null;
+
+  Map<String, dynamic>? pendingQuestionForSession(String? sessionId) {
+    return _existingRun(sessionId)?.pendingQuestion;
+  }
+
+  String? statusForSession(String? sessionId) =>
+      _existingRun(sessionId)?.status;
+
+  List<ToolEvent> toolEventsForSession(String? sessionId) =>
+      _existingRun(sessionId)?.toolEvents ?? toolEvents;
+
+  ValueNotifier<String> streamTextForSession(String? sessionId) =>
+      _existingRun(sessionId)?.streamText ?? streamText;
+
+  ValueNotifier<String> streamReasoningForSession(String? sessionId) =>
+      _existingRun(sessionId)?.streamReasoning ?? streamReasoning;
+
+  bool planModeForSession(String? sessionId) =>
+      _existingRun(sessionId)?.planMode ?? planMode;
+
+  @visibleForTesting
+  bool stopRequestedForSessionForTest(String sessionId) =>
+      _existingRun(sessionId)?.stopRequested ?? false;
+
+  @visibleForTesting
+  void setSessionActiveForTest(String sessionId, bool active) {
+    final run = _runFor(sessionId)..active = active;
+    _refreshBusySummary(preferred: run, bumpRevision: true);
+  }
+
+  @visibleForTesting
+  void setSessionStatusForTest(String sessionId, String? value) {
+    final run = _runFor(sessionId)..status = value;
+    _publishRun(run);
+  }
+
+  void _refreshBusySummary({
+    _SessionRun? preferred,
+    bool bumpRevision = false,
+  }) {
+    final oldBusy = isBusy;
+    isBusy = _sessionRuns.values.any((run) => run.active);
+    final currentRun = _existingRun(currentSessionId);
+    busySessionId = currentRun?.active == true ? currentRun!.sessionId : null;
+    if (busySessionId == null) {
+      for (final run in _sessionRuns.values) {
+        if (run.active) {
+          busySessionId = run.sessionId;
+          break;
+        }
+      }
+    }
+    if (bumpRevision || oldBusy != isBusy) busyRevision.value++;
+    if (preferred != null && preferred.sessionId == currentSessionId) {
+      _syncCurrentRunView(preferred);
+    }
+  }
+
+  void _syncCurrentRunView(_SessionRun run) {
+    status = run.status;
+    pendingQuestion = run.pendingQuestion;
+    toolEvents = run.toolEvents;
+    planMode = run.planMode;
+    sessionTotalTokens = run.sessionTotalTokens;
+    sessionLastUsageTokens = run.sessionLastUsageTokens;
+    lastRoundTokens = run.lastRoundTokens;
+    sessionCachedTokens = run.sessionCachedTokens;
+    sessionInputTokens = run.sessionInputTokens;
+    sessionCacheKnown = run.sessionCacheKnown;
+    sessionContextTokens = run.sessionContextTokens;
+    sessionContextTokensFull = run.sessionContextTokensFull;
+    streamText.value = run.streamText.value;
+    streamReasoning.value = run.streamReasoning.value;
+  }
+
+  void _publishRun(_SessionRun run, {bool notify = true}) {
+    if (run.sessionId == currentSessionId) _syncCurrentRunView(run);
+    if (notify) notifyListeners();
+  }
 
   /// 计划模式：模型只输出方案、不执行有副作用的操作（写文件/终端/记忆等被裁剪），
   /// 直到调用 exit_plan_mode 或用户确认方案后退出。
@@ -197,8 +318,17 @@ class ShiyiState extends ChangeNotifier {
 
   /// 用户回答 question 工具；optionIndex 为空表示取消；custom 非空时优先作为自定义回答。
   void answerQuestion(int? optionIndex, {String? custom}) {
-    final c = _questionCompleter;
-    final q = pendingQuestion;
+    answerQuestionForSession(currentSessionId, optionIndex, custom: custom);
+  }
+
+  void answerQuestionForSession(
+    String? sessionId,
+    int? optionIndex, {
+    String? custom,
+  }) {
+    final run = _existingRun(sessionId);
+    final c = run?.questionCompleter;
+    final q = run?.pendingQuestion;
     if (c == null || q == null) return;
     final options = (q['options'] as List?) ?? const [];
     final customText = custom?.trim() ?? '';
@@ -209,10 +339,10 @@ class ShiyiState extends ChangeNotifier {
               optionIndex < options.length)
         ? options[optionIndex].toString()
         : '用户取消了选择';
-    pendingQuestion = null;
-    _questionCompleter = null;
+    run!.pendingQuestion = null;
+    run.questionCompleter = null;
     if (!c.isCompleted) c.complete(answer);
-    notifyListeners();
+    _publishRun(run);
   }
 
   /// 图片路径 -> 视觉模型描述缓存（避免同一图片每轮重复调用）。
@@ -227,7 +357,10 @@ class ShiyiState extends ChangeNotifier {
   /// - 全局关闭工具（enableTools=false）时为空；
   /// - 计划模式（planMode）下只保留只读工具 + question + 计划模式切换工具，
   ///   避免模型在执行方案前产生副作用。
-  List<Map<String, dynamic>> get activeTools {
+  List<Map<String, dynamic>> get activeTools =>
+      _activeToolsFor(planMode: planModeForSession(currentSessionId));
+
+  List<Map<String, dynamic>> _activeToolsFor({required bool planMode}) {
     if (!settings.enableTools) return const [];
     const planAlways = {'question', 'enter_plan_mode', 'exit_plan_mode'};
     return [
@@ -343,7 +476,7 @@ class ShiyiState extends ChangeNotifier {
     AgentTool(
       name: 'run_terminal',
       description:
-          '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（bash/apt/pkg，可安装软件包），首次使用前会自动部署。',
+          '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（内嵌 Alpine，可用 apk 安装软件包），首次使用前会自动部署。',
       parameters: {
         'type': 'object',
         'properties': {
@@ -549,6 +682,8 @@ class ShiyiState extends ChangeNotifier {
     if (loaded) return;
     try {
       settings = await _settingsService.load();
+      // 同步 DSH 代理开关到服务单例。
+      DshService.instance.useProxyEnabled = settings.dshUseProxy;
       await FileWorkspace.ensure();
       await _reloadAll();
       loadedNotifier.value = true;
@@ -580,19 +715,16 @@ class ShiyiState extends ChangeNotifier {
                   environment: const {'WSL_UTF8': '1'},
                 ).timeout(const Duration(seconds: 20))
               : backend == 'cmd'
-                  ? await Process.run(
-                      'cmd',
-                      ['/c', 'echo probe-ok'],
-                    ).timeout(const Duration(seconds: 20))
-                  : await Process.run(
-                      shell,
-                      [
-                        '-NoProfile',
-                        '-NoLogo',
-                        '-Command',
-                        'echo probe-ok; \$PSVersionTable.PSVersion.ToString()',
-                      ],
-                    ).timeout(const Duration(seconds: 20));
+              ? await Process.run('cmd', [
+                  '/c',
+                  'echo probe-ok',
+                ]).timeout(const Duration(seconds: 20))
+              : await Process.run(shell, [
+                  '-NoProfile',
+                  '-NoLogo',
+                  '-Command',
+                  'echo probe-ok; \$PSVersionTable.PSVersion.ToString()',
+                ]).timeout(const Duration(seconds: 20));
           await _logError(
             'TermuxProbe',
             'backend=$backend exit=${probe.exitCode} '
@@ -600,17 +732,18 @@ class ShiyiState extends ChangeNotifier {
                 'err=${probe.stderr.toString().trim()}',
           );
         } else {
+          final argv = await TermuxRuntime.shellCommand([
+            '-c',
+            'echo probe-ok; '
+                'curl -s -o /dev/null -m 8 -w " net=%{http_code}" '
+                'https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.24/main/aarch64/APKINDEX.tar.gz '
+                '|| echo net=fail',
+          ]);
           final probe = await Process.run(
-            shell,
-            [
-              '-c',
-              'echo probe-ok; '
-                  'curl -s -o /dev/null -m 8 -w " net=%{http_code}" '
-                  'https://mirrors.tuna.tsinghua.edu.cn/apt/termux-main/dists/stable/InRelease '
-                  '|| echo net=fail',
-            ],
+            argv.first,
+            argv.sublist(1),
             environment: await TermuxRuntime.environment(),
-          ).timeout(const Duration(seconds: 20));
+          ).timeout(const Duration(seconds: 180));
           await _logError(
             'TermuxProbe',
             'exit=${probe.exitCode} out=${probe.stdout.toString().trim()} '
@@ -619,6 +752,16 @@ class ShiyiState extends ChangeNotifier {
         }
       } catch (e) {
         await _logError('TermuxProbe', 'EXEC_FAILED: $e');
+      }
+      // 上次退出时处于 DSH 引擎：冷启动后自动拉起已安装的 DSH；
+      // 拾忆退出 / 未安装不自动启动。切换引擎本身不触发，只影响下次启动。
+      if (settings.agentEngine == 'dsh' && await _lastEngineWasDsh()) {
+        // 先落盘合法配置再启动：上次写入若残留非法 YAML（如 API key
+        // 粘贴带入换行 → .credentials.yaml 解析失败），DSH 启动即崩，
+        // 文件路径同步会清洗重写（DSH 未运行时不走 live）。
+        await DshModelSync.syncFromShiyi(settings);
+        final ok = await DshService.instance.ensureRunning();
+        if (ok) await DshModelSync.syncFromShiyi(settings);
       }
     } catch (e) {
       await _logError('Termux', '$e');
@@ -663,9 +806,8 @@ class ShiyiState extends ChangeNotifier {
   /// 当前会话手动加载的技能（输入 / 选择），注入到系统提示，切换会话时清空。
   final List<Skill> loadedSkills = [];
 
-  /// 当前会话的工作目录：会话单独设置 > 所属项目目录 > 全局默认。
-  Future<String> currentWorkspace() async {
-    final id = currentSessionId;
+  /// 指定会话的工作目录：会话单独设置 > 所属项目目录 > 全局默认。
+  Future<String> workspaceForSession(String? id) async {
     if (id != null) {
       for (final s in sessions) {
         if (s.id == id && s.workspaceDir.trim().isNotEmpty) {
@@ -681,6 +823,9 @@ class ShiyiState extends ChangeNotifier {
     }
     return FileWorkspace.current();
   }
+
+  /// 当前页面会话的工作目录。
+  Future<String> currentWorkspace() => workspaceForSession(currentSessionId);
 
   /// 会话所属项目；未分类返回 null。
   Project? projectForSession(String sessionId) {
@@ -727,11 +872,16 @@ class ShiyiState extends ChangeNotifier {
     sessionTotalTokens = 0;
     sessionLastUsageTokens = null;
     lastRoundTokens = 0;
-    roundCachedTokens = 0;
-    roundInputTokens = 0;
-    roundCacheKnown = false;
+    sessionCachedTokens = 0;
+    sessionInputTokens = 0;
+    sessionCacheKnown = false;
     sessionContextTokens = 0;
     sessionContextTokensFull = 0;
+    status = null;
+    pendingQuestion = null;
+    planMode = false;
+    streamText.value = '';
+    streamReasoning.value = '';
     await refreshSessions();
   }
 
@@ -744,11 +894,14 @@ class ShiyiState extends ChangeNotifier {
     messages = await _db.listMessages(id);
     _bumpMessages();
     _messagesLoadedForSessionId = id;
-    toolEvents = await _db.listToolEvents(id);
+    final run = _existingRun(id);
+    toolEvents = run?.active == true
+        ? run!.toolEvents
+        : await _db.listToolEvents(id);
     // 兜底收尾：会话不在实时生成中时，把 DB 里残留的未完成工具事件标记为
     // 「已中断」（进程早已结束，事件永远等不到完成回调），避免退出重进后
     // 终端一直显示运行中转圈。
-    final generating = busySessionId == id && _streaming != null;
+    final generating = run?.active == true && run?.streaming != null;
     if (!generating) {
       final stale = toolEvents.where((e) => !e.done).toList();
       if (stale.isNotEmpty) {
@@ -765,24 +918,40 @@ class ShiyiState extends ChangeNotifier {
       }
     }
     final sess = await _db.getSession(id);
-    sessionTotalTokens = sess?.totalTokens ?? 0;
-    sessionLastUsageTokens = sess?.lastUsageTotalTokens;
-    lastRoundTokens = 0;
-    roundCachedTokens = 0;
-    roundInputTokens = 0;
-    roundCacheKnown = false;
+    if (run?.active == true) {
+      _syncCurrentRunView(run!);
+    } else {
+      sessionTotalTokens = sess?.totalTokens ?? 0;
+      sessionLastUsageTokens = sess?.lastUsageTotalTokens;
+      lastRoundTokens = 0;
+      // 缓存命中率按会话持久化：从 DB 读回整段会话的累计分子/分母，
+      // 退出会话再进入（含重启）仍显示累计值，不重新从零开始。
+      sessionCachedTokens = sess?.cacheHitTokens ?? 0;
+      sessionInputTokens = sess?.cacheInputTokens ?? 0;
+      sessionCacheKnown = (sess?.cacheInputTokens ?? 0) > 0;
+      status = run?.status;
+      pendingQuestion = run?.pendingQuestion;
+      planMode = run?.planMode ?? false;
+      streamText.value = run?.streamText.value ?? '';
+      streamReasoning.value = run?.streamReasoning.value ?? '';
+    }
     await _updateContextStats(id);
     // 该会话若正在生成中，把内存里实时更新的流式消息接回来，
     // 避免重进会话后「正在思考…」消失、或刷新内容与 DB 不一致。
-    if (busySessionId == id && _streaming != null) {
-      final live = _streaming!;
+    if (run?.active == true && run?.streaming != null) {
+      final live = run!.streaming!;
       final idx = messages.indexWhere((m) => m.id == live.id);
       if (idx >= 0) {
         messages[idx] = live;
       } else {
         messages.add(live);
       }
+      run.streamText.value = live.content;
+      run.streamReasoning.value = live.reasoning;
+      streamText.value = run.streamText.value;
+      streamReasoning.value = run.streamReasoning.value;
     }
+    _refreshBusySummary(preferred: run);
     _bumpMessages();
     notifyListeners();
   }
@@ -796,7 +965,7 @@ class ShiyiState extends ChangeNotifier {
     // 与其他写操作一致：生成中不允许删会话（否则主循环会向已删会话
     // 继续写消息，重建出孤儿会话）。只挡「正在生成的那个会话」——
     // 别的会话生成中不影响删除本会话。
-    if (isBusy && busySessionId == id) return;
+    if (isBusyForSession(id)) return;
     await _db.deleteSession(id);
     if (currentSessionId == id) {
       currentSessionId = null;
@@ -806,6 +975,8 @@ class ShiyiState extends ChangeNotifier {
       toolEvents = [];
       loadedSkills.clear();
     }
+    _sessionRuns.remove(id);
+    _refreshBusySummary(bumpRevision: true);
     await refreshSessions();
   }
 
@@ -1129,9 +1300,11 @@ class ShiyiState extends ChangeNotifier {
     List<Map<String, dynamic>> apiMsgs, {
     bool announce = true,
     bool logBudget = false,
+    List<Map<String, dynamic>>? tools,
   }) async {
     if (apiMsgs.length <= 1) return apiMsgs;
-    final estimate = estimateRequestTokens(apiMsgs, tools: activeTools);
+    final requestTools = tools ?? activeTools;
+    final estimate = estimateRequestTokens(apiMsgs, tools: requestTools);
     final plan = planContextBudget(
       contextLimit: settings.contextLimit,
       maxOutputTokens: settings.maxOutputTokens,
@@ -1158,16 +1331,16 @@ class ShiyiState extends ChangeNotifier {
     final trimmed = trimApiMessagesForBudget(
       apiMsgs,
       plan.usableInputTokens,
-      tools: activeTools,
+      tools: requestTools,
     );
     if (trimmed.length < apiMsgs.length && announce) {
       final before = estimateRequestTokens(
         apiMsgs,
-        tools: activeTools,
+        tools: requestTools,
       ).totalEstimatedTokens;
       final after = estimateRequestTokens(
         trimmed,
-        tools: activeTools,
+        tools: requestTools,
       ).totalEstimatedTokens;
       _showTrimNotice(
         '历史较长，已从约 ${_fmtTokens(before)} 裁剪至 ${_fmtTokens(after)} token 后发送',
@@ -1273,8 +1446,15 @@ class ShiyiState extends ChangeNotifier {
   /// 基线（无 usage 时全量估算兜底）。
   Future<void> _updateContextStats(String sessionId) async {
     final active = await activeContextTokenEstimate(sessionId);
-    sessionContextTokens = active;
-    sessionContextTokensFull = active;
+    final run = _existingRun(sessionId);
+    if (run != null) {
+      run.sessionContextTokens = active;
+      run.sessionContextTokensFull = active;
+    }
+    if (currentSessionId == sessionId) {
+      sessionContextTokens = active;
+      sessionContextTokensFull = active;
+    }
   }
 
   /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部并给
@@ -1458,101 +1638,123 @@ class ShiyiState extends ChangeNotifier {
     return parts.map((e) => '【图片：$e】').join('\n');
   }
 
-  Future<void> send(String text) async {
-    if (isBusy) return;
+  Future<void> send(String text, {String? sessionId}) async {
     final trimText = text.trim();
     if (trimText.isEmpty) return;
+    var targetSessionId = sessionId ?? currentSessionId;
+    if (targetSessionId == null) {
+      await newSession();
+      targetSessionId = currentSessionId;
+    }
+    if (targetSessionId == null) return;
+    final run = _runFor(targetSessionId);
+    if (run.active) return;
     if (settings.apiKey.isEmpty || settings.model.isEmpty) {
-      status = '请先在设置中配置 API 密钥与模型';
-      notifyListeners();
+      run.status = '请先在设置中配置 API 密钥与模型';
+      _publishRun(run);
       return;
     }
 
-    _clearTrimNotice();
-    isBusy = true;
-    _stopRequested = false;
-    _stopForGuide = false;
-    status = null;
-    streamText.value = '';
-    notifyListeners();
+    if (currentSessionId == targetSessionId) _clearTrimNotice();
+    run
+      ..active = true
+      ..stopRequested = false
+      ..stopForGuide = false
+      ..guideWaiting = false
+      ..status = null
+      ..streaming = null
+      ..lastRoundTokens = 0
+      ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
+      ..planMode = currentSessionId == targetSessionId
+          ? planMode
+          : run.planMode;
+    run.streamText.value = '';
+    run.streamReasoning.value = '';
+    if (run.toolEvents.isEmpty) {
+      run.toolEvents.addAll(await _db.listToolEvents(targetSessionId));
+    }
+    _refreshBusySummary(preferred: run, bumpRevision: true);
+    _publishRun(run);
 
-    String? sessionId;
     try {
-      if (currentSessionId == null) {
-        await newSession();
+      if (currentSessionId == targetSessionId) {
+        viewingSessionId = targetSessionId;
       }
-      sessionId = currentSessionId!;
-      busySessionId = sessionId;
-      busyRevision.value++;
-      viewingSessionId = sessionId;
-      lastRoundTokens = 0;
-      roundCachedTokens = 0;
-      roundInputTokens = 0;
-      roundCacheKnown = false;
-      final sessNow = await _db.getSession(sessionId);
-      sessionTotalTokens = sessNow?.totalTokens ?? 0;
-      sessionLastUsageTokens = sessNow?.lastUsageTotalTokens;
+      // 缓存命中率是会话累计口径（与 DSH 一致），不在每轮开头清零。
+      final sessNow = await _db.getSession(targetSessionId);
+      run
+        ..sessionTotalTokens = sessNow?.totalTokens ?? 0
+        ..sessionLastUsageTokens = sessNow?.lastUsageTotalTokens
+        ..sessionCachedTokens = sessNow?.cacheHitTokens ?? 0
+        ..sessionInputTokens = sessNow?.cacheInputTokens ?? 0
+        ..sessionCacheKnown = (sessNow?.cacheInputTokens ?? 0) > 0;
+      _publishRun(run);
       final now = DateTime.now().millisecondsSinceEpoch;
 
       final userMsg = ChatMessage(
         id: 'm${now}_${_rand()}',
-        sessionId: sessionId,
+        sessionId: targetSessionId,
         role: 'user',
         content: trimText,
         createdAt: now,
       );
       await _db.insertMessage(userMsg);
-      messages.add(userMsg);
-      _bumpMessages();
+      if (currentSessionId == targetSessionId) {
+        messages.add(userMsg);
+        _bumpMessages();
+      }
 
       // 发送前检查是否需要自动压缩历史上下文（此时新用户消息已计入统计）。
-      await _maybeAutoCompress(sessionId);
+      await _maybeAutoCompress(targetSessionId);
 
       final firstAsst = ChatMessage(
         id: 'm${now}_${_rand()}',
-        sessionId: sessionId,
+        sessionId: targetSessionId,
         role: 'assistant',
         content: '',
         createdAt: now + 1,
         streaming: true,
       );
       await _db.insertMessage(firstAsst);
-      messages.add(firstAsst);
-      _bumpMessages();
-      _streaming = firstAsst;
-      notifyListeners();
+      if (currentSessionId == targetSessionId) {
+        messages.add(firstAsst);
+        _bumpMessages();
+      }
+      run.streaming = firstAsst;
+      _publishRun(run);
 
       final cleanText = stripImageMarkers(trimText);
-      final s = await _db.getSession(sessionId);
+      final s = await _db.getSession(targetSessionId);
       if (s != null && s.title.startsWith('新会话')) {
         final title = cleanText.isEmpty
             ? '[图片]'
             : (cleanText.length <= 20
                   ? cleanText
                   : '${cleanText.substring(0, 20)}…');
-        await _db.renameSession(sessionId, title);
+        await _db.renameSession(targetSessionId, title);
       }
 
-      await _generateWithHistory(sessionId, firstAsst, systemHint: cleanText);
+      await _generateWithHistory(run, firstAsst, systemHint: cleanText);
     } catch (e) {
-      status = '错误: $e';
+      run.status = '错误: $e';
       await _logError('生成', '$e');
-      final st = _streaming;
+      final st = run.streaming;
       if (st != null) {
         st.streaming = false;
         if (st.content.isEmpty) st.content = '(生成出错)';
         await _db.updateMessageContent(st.id, st.content);
       }
-      _bumpMessages();
-      notifyListeners();
+      if (currentSessionId == targetSessionId) _bumpMessages();
+      _publishRun(run);
     } finally {
-      isBusy = false;
-      _streaming = null;
-      final doneSession = busySessionId;
-      busySessionId = null;
-      busyRevision.value++;
+      run
+        ..active = false
+        ..streaming = null
+        ..guideWaiting = false;
+      final doneSession = targetSessionId;
+      _refreshBusySummary(preferred: run, bumpRevision: true);
       // 回复结束：如果用户没在看该会话，标记未读并推送系统通知（若开启）。
-      if (doneSession != null && doneSession != viewingSessionId) {
+      if (doneSession != viewingSessionId) {
         unreadSessions.add(doneSession);
         if (settings.enableNotifications) {
           var title = '拾忆 · 任务完成';
@@ -1571,29 +1773,37 @@ class ShiyiState extends ChangeNotifier {
           );
         }
       }
-      notifyListeners();
+      _publishRun(run);
     }
     // 输出完成后后台提炼记忆，不阻塞界面（busy 已释放）。
-    if (sessionId != null) {
-      unawaited(_maybeAutoRefine(sessionId));
-    }
+    unawaited(_maybeAutoRefine(targetSessionId));
   }
 
   /// 基于当前 messages 历史生成一轮回复（含图片降级重试、工具多轮循环）。
   Future<void> _generateWithHistory(
-    String sessionId,
+    _SessionRun run,
     ChatMessage firstAsst, {
     required String systemHint,
     bool runRefine = true,
   }) async {
+    // 切到其他会话会清空 loadedSkills；发送瞬间先拍快照，保证后台会话
+    // 继续使用自己的技能、计划模式和工作目录构建提示词。
+    final loadedSkillsSnapshot = run.loadedSkillsSnapshot;
+    final sessionId = run.sessionId;
+    final planModeSnapshot = run.planMode;
+    final runTools = _activeToolsFor(planMode: planModeSnapshot);
     final sess = await _db.getSession(sessionId);
     final systemPrompt = await _buildSystemPrompt(
       systemHint,
       rollingSummary: sess?.rollingSummary ?? '',
+      sessionId: sessionId,
+      loadedSkillsSnapshot: loadedSkillsSnapshot,
+      planModeSnapshot: planModeSnapshot,
     );
     final fullEstimate = await activeContextTokenEstimate(sessionId);
+    final sessionMessages = await _db.listMessages(sessionId);
     final contextSummaries = await _buildContextSummaries(
-      messages,
+      sessionMessages,
       fullEstimate,
     );
     final compactOldTools =
@@ -1623,7 +1833,7 @@ class ShiyiState extends ChangeNotifier {
                   '也不要输出长篇思考过程；需要操作时第一步就调用 '
                   'run_terminal（或相关工具）执行实际操作。】';
         final historyPayload = await _historyToApi(
-          messages,
+          sessionMessages,
           imagesAllowed: imagesAllowed,
           compactOldTools: compactOldTools,
         );
@@ -1631,27 +1841,30 @@ class ShiyiState extends ChangeNotifier {
           {'role': 'system', 'content': sysContent},
           ...historyPayload,
         ];
-        final trimmed = await _trimApiMessages(loopMsgs, logBudget: true);
+        final trimmed = await _trimApiMessages(
+          loopMsgs,
+          logBudget: true,
+          tools: runTools,
+        );
         // 状态栏、发送前阈值、压缩判断统一走 activeContextTokenEstimate：
         // 有真实 usage 时用「上次真实 total + 新增消息」，没有时才全量估算。
         final active = await activeContextTokenEstimate(sessionId);
-        sessionContextTokensFull = active;
-        // 硬裁剪后状态栏显示实际发送 payload，不再用裁剪前的全量估算。
-        sessionContextTokens = estimateRequestTokens(
+        run.sessionContextTokensFull = active;
+        run.sessionContextTokens = estimateRequestTokens(
           trimmed,
-          tools: activeTools,
+          tools: runTools,
         ).totalEstimatedTokens;
-        notifyListeners();
-        await _runAgentLoop(sessionId, firstAsst, trimmed);
+        _publishRun(run);
+        await _runAgentLoop(run, firstAsst, trimmed);
         completed = true;
-        status = null;
-        notifyListeners();
+        run.status = null;
+        _publishRun(run);
       } on LlmInterruptedException catch (_) {
         if (attempt == 0) {
           // 连接被切断（未收到 [DONE]）：清掉半截占位消息，自动重试一次。
-          status = '回复中断，正在自动重试…';
-          await _retryReset(firstAsst);
-          notifyListeners();
+          run.status = '回复中断，正在自动重试…';
+          await _retryReset(run, firstAsst);
+          _publishRun(run);
           continue;
         }
         rethrow;
@@ -1662,15 +1875,15 @@ class ShiyiState extends ChangeNotifier {
           firstAsst.content = '';
           firstAsst.toolCalls = [];
           await _db.updateMessageContent(firstAsst.id, '');
-          status = '当前模型不支持图片，已自动切换为纯文本重试';
-          notifyListeners();
+          run.status = '当前模型不支持图片，已自动切换为纯文本重试';
+          _publishRun(run);
           continue;
         }
         // 偶发的网关/服务器错误（限流、5xx、session 类、超时/连接）：自动重试一次。
         if (attempt == 0 && _isRetryableLlmError(e.message)) {
-          status = '请求出错，正在自动重试…';
-          await _retryReset(firstAsst);
-          notifyListeners();
+          run.status = '请求出错，正在自动重试…';
+          await _retryReset(run, firstAsst);
+          _publishRun(run);
           continue;
         }
         rethrow;
@@ -1680,8 +1893,8 @@ class ShiyiState extends ChangeNotifier {
     // 兜底：只要有一次尝试成功（completed），就清除重试/等待提示，
     // 避免中断重试成功后状态条残留。
     if (completed) {
-      status = null;
-      notifyListeners();
+      run.status = null;
+      _publishRun(run);
     }
 
     await _db.touchSession(sessionId, model: settings.model);
@@ -1689,8 +1902,8 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 清掉半截占位消息，为自动重试做准备。
-  Future<void> _retryReset(ChatMessage firstAsst) async {
-    final st = _streaming;
+  Future<void> _retryReset(_SessionRun run, ChatMessage firstAsst) async {
+    final st = run.streaming;
     if (st != null) {
       st.content = '';
       st.toolCalls = [];
@@ -1698,10 +1911,10 @@ class ShiyiState extends ChangeNotifier {
       if (identical(st, firstAsst)) {
         await _db.updateMessageContent(st.id, '');
       } else {
-        messages.remove(st);
+        if (currentSessionId == st.sessionId) messages.remove(st);
         await _db.deleteMessage(st.id);
       }
-      _bumpMessages();
+      if (currentSessionId == st.sessionId) _bumpMessages();
     }
   }
 
@@ -1718,57 +1931,66 @@ class ShiyiState extends ChangeNotifier {
 
   /// 引导发送：AI 正在生成时也能发消息。直接打断当前生成，
   /// 但保留它已输出的思考内容和工具调用轨迹，随后插入你的新消息继续对话。
-  Future<void> guideSend(String text) async {
-    if (isBusy) {
-      if (_guideWaiting) {
-        status = '正在处理上一条引导消息，稍等片刻';
-        notifyListeners();
-        return;
+  Future<bool> guideSend(String text, {String? sessionId}) async {
+    final targetSessionId = sessionId ?? currentSessionId;
+    if (targetSessionId == null) {
+      await send(text);
+      return currentSessionId != null;
+    }
+    final run = _runFor(targetSessionId);
+    if (run.active) {
+      if (run.guideWaiting) {
+        run.status = '正在处理上一条引导消息，稍等片刻';
+        _publishRun(run);
+        return false;
       }
-      _guideWaiting = true;
-      _stopForGuide = true;
-      status = '正在打断当前回复…';
-      notifyListeners();
-      stop();
+      run
+        ..guideWaiting = true
+        ..stopForGuide = true
+        ..status = '正在打断当前回复…';
+      _publishRun(run);
+      stopSession(targetSessionId);
       var waited = 0;
-      // 兜底超时：stop() 已释放所有已知阻塞点（含挂起的 question），
+      // 兜底超时：stopSession() 已释放该会话的阻塞点（含挂起的 question），
       // 12 秒仍未退出说明有异常卡死，强置空闲避免应用永久不可交互。
-      while (isBusy && waited < 150) {
+      while (run.active && waited < 150) {
         await Future.delayed(const Duration(milliseconds: 80));
         waited++;
       }
-      _guideWaiting = false;
-      _stopForGuide = false;
-      status = null;
-      notifyListeners();
-      if (isBusy) {
+      run
+        ..guideWaiting = false
+        ..stopForGuide = false
+        ..status = null;
+      _publishRun(run);
+      if (run.active) {
         // 先给旧循环最多 3 秒真正退出（stop 已释放 question/流式阻塞点），
         // 避免强置空闲后旧循环的工具仍在写 DB 造成双写。
         var grace = 0;
-        while (_streaming != null && grace < 40) {
+        while (run.streaming != null && grace < 40) {
           await Future.delayed(const Duration(milliseconds: 80));
           grace++;
         }
-        if (_streaming != null) {
+        if (run.streaming != null) {
           await _logError('引导', '引导发送等待超时，强置空闲（isBusy 卡死兜底）');
-          isBusy = false;
-          _streaming = null;
-          busySessionId = null;
-          busyRevision.value++;
-          streamText.value = '';
-          streamReasoning.value = '';
-          notifyListeners();
+          run
+            ..active = false
+            ..streaming = null;
+          run.streamText.value = '';
+          run.streamReasoning.value = '';
+          _refreshBusySummary(preferred: run, bumpRevision: true);
+          _publishRun(run);
         }
       }
     }
-    await send(text);
+    await send(text, sessionId: targetSessionId);
+    return true;
   }
 
   /// 删除单条消息，连同紧随其后的工具结果消息一起删除。
   Future<void> deleteMessage(String id) async {
-    if (isBusy) return;
     final sessionId = currentSessionId;
     if (sessionId == null) return;
+    if (isBusyForSession(sessionId)) return;
     final idx = messages.indexWhere((m) => m.id == id);
     if (idx < 0) return;
     final toDelete = <ChatMessage>[messages[idx]];
@@ -1793,9 +2015,9 @@ class ShiyiState extends ChangeNotifier {
 
   /// 重新生成某条助手回复：删除该条及其后的所有消息，再基于此前历史重新生成。
   Future<void> regenerate(String id) async {
-    if (isBusy) return;
     final sessionId = currentSessionId;
     if (sessionId == null) return;
+    if (isBusyForSession(sessionId)) return;
     _clearTrimNotice();
     final idx = messages.indexWhere((m) => m.id == id);
     if (idx < 0 || messages[idx].role != 'assistant') return;
@@ -1813,18 +2035,22 @@ class ShiyiState extends ChangeNotifier {
     await _db.updateSessionLastUsage(sessionId, null);
     sessionLastUsageTokens = null;
 
-    isBusy = true;
-    busySessionId = sessionId;
-    busyRevision.value++;
-    _stopRequested = false;
-    _stopForGuide = false;
-    status = null;
-    lastRoundTokens = 0;
-    roundCachedTokens = 0;
-    roundInputTokens = 0;
-    roundCacheKnown = false;
-    streamText.value = '';
-    notifyListeners();
+    final run = _runFor(sessionId)
+      ..active = true
+      ..stopRequested = false
+      ..stopForGuide = false
+      ..guideWaiting = false
+      ..status = null
+      ..lastRoundTokens = 0
+      ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
+      ..planMode = planMode;
+    run.streamText.value = '';
+    run.streamReasoning.value = '';
+    if (run.toolEvents.isEmpty) {
+      run.toolEvents.addAll(await _db.listToolEvents(sessionId));
+    }
+    _refreshBusySummary(preferred: run, bumpRevision: true);
+    _publishRun(run);
 
     final now = DateTime.now().millisecondsSinceEpoch;
     final firstAsst = ChatMessage(
@@ -1838,32 +2064,32 @@ class ShiyiState extends ChangeNotifier {
     await _db.insertMessage(firstAsst);
     messages.add(firstAsst);
     _bumpMessages();
-    _streaming = firstAsst;
-    notifyListeners();
+    run.streaming = firstAsst;
+    _publishRun(run);
 
     try {
       await _generateWithHistory(
-        sessionId,
+        run,
         firstAsst,
         systemHint: hint,
         runRefine: false,
       );
     } catch (e) {
-      status = '错误: $e';
-      final st = _streaming;
+      run.status = '错误: $e';
+      final st = run.streaming;
       if (st != null) {
         st.streaming = false;
         if (st.content.isEmpty) st.content = '(生成出错)';
         await _db.updateMessageContent(st.id, st.content);
       }
       _bumpMessages();
-      notifyListeners();
+      _publishRun(run);
     } finally {
-      isBusy = false;
-      _streaming = null;
-      busySessionId = null;
-      busyRevision.value++;
-      notifyListeners();
+      run
+        ..active = false
+        ..streaming = null;
+      _refreshBusySummary(preferred: run, bumpRevision: true);
+      _publishRun(run);
     }
   }
 
@@ -1872,42 +2098,47 @@ class ShiyiState extends ChangeNotifier {
   static const int _maxToolRounds = 99;
 
   Future<void> _runAgentLoop(
-    String sessionId,
+    _SessionRun run,
     ChatMessage firstAsst,
     List<Map<String, dynamic>> loopMsgs,
   ) async {
+    final sessionId = run.sessionId;
     // 工具历史按会话持续展示，不在每轮对话清空。
     // 每轮工具调用时模型输出的文字都作为独立消息保留（像多发了几条消息），不合并。
     var asst = firstAsst;
-    _streaming = asst;
+    run.streaming = asst;
     for (var round = 0; round < _maxToolRounds; round++) {
       // 每轮裁剪本轮累积消息（工具结果可能很大，防单轮 payload 超预算）；
       // announce: false——静默裁剪，不弹 4 秒「已裁剪」提示打扰。
-      loopMsgs = await _trimApiMessages(loopMsgs,
-          logBudget: false, announce: false);
-      final result = await _streamRound(sessionId, loopMsgs, asst);
+      loopMsgs = await _trimApiMessages(
+        loopMsgs,
+        logBudget: false,
+        announce: false,
+        tools: _activeToolsFor(planMode: run.planMode),
+      );
+      final result = await _streamRound(run, loopMsgs, asst);
       if (result == null) {
-        await _finalizeAbort(asst);
+        await _finalizeAbort(run, asst);
         break;
       }
-      if (_stopRequested) {
-        await _applyTurn(asst, result);
+      if (run.stopRequested) {
+        await _applyTurn(run, asst, result);
         break;
       }
 
       final hasTools = settings.enableTools && result.toolCalls.isNotEmpty;
       if (!hasTools) {
-        await _applyTurn(asst, result);
+        await _applyTurn(run, asst, result);
         break;
       }
 
-      // 工具轮统一落库：有文本时文本与 tool_calls 一起保存；纯工具轮也保存
+      // 工具轮统一落库：正文或 reasoning 与 tool_calls 一起保存；纯工具轮也保存
       // 一条空正文的 tool_calls 消息，后续请求才能按完整工具回合成组恢复。
       ChatMessage toolCallOwner;
-      if (result.text.isNotEmpty) {
-        await _applyTurn(asst, result);
+      if (result.text.isNotEmpty || result.reasoning.isNotEmpty) {
+        await _applyTurn(run, asst, result);
         toolCallOwner = asst;
-        asst = await _newAssistantMessage(sessionId);
+        asst = await _newAssistantMessage(run);
       } else {
         toolCallOwner = ChatMessage(
           id: 'm${DateTime.now().millisecondsSinceEpoch}_${_rand()}',
@@ -1926,13 +2157,16 @@ class ShiyiState extends ChangeNotifier {
               .toList(),
         );
         await _db.insertMessage(toolCallOwner);
-        messages.add(toolCallOwner);
-        _bumpMessages();
+        if (currentSessionId == sessionId) {
+          messages.add(toolCallOwner);
+          _bumpMessages();
+        }
       }
 
       loopMsgs.add({
         'role': 'assistant',
         'content': result.text,
+        if (result.reasoning.isNotEmpty) 'reasoning_content': result.reasoning,
         'tool_calls': result.toolCalls
             .map(
               (t) => {
@@ -1953,9 +2187,25 @@ class ShiyiState extends ChangeNotifier {
           startedAt: DateTime.now().millisecondsSinceEpoch,
         );
         ev.id = await _db.addToolEvent(sessionId, ev);
-        toolEvents.add(ev);
-        notifyListeners();
-        final output = await _executeTool(tname, targs);
+        run.toolEvents.add(ev);
+        _publishRun(run);
+        final output = await _executeTool(tname, targs, sessionId: sessionId);
+        if (tname == 'spawn_agent' && output.trim().isNotEmpty) {
+          // 结果挂到承接后续主模型回复的当前助手气泡：
+          // 纯工具回合会复用原占位，有文本/思考的工具回合则已切到
+          // 新占位。两种情况都能让子代理折叠项与最终正文同泡展示。
+          final previous = asst.subagentResult.trim();
+          asst.subagentResult = previous.isEmpty
+              ? output.trim()
+              : '$previous\n\n${output.trim()}';
+          await _db.updateMessageContent(
+            asst.id,
+            asst.content,
+            subagentResult: asst.subagentResult,
+          );
+          if (currentSessionId == sessionId) _bumpMessages();
+          _publishRun(run);
+        }
         if (_isToolError(output)) {
           await _logError('工具:$tname', output);
         }
@@ -1967,7 +2217,7 @@ class ShiyiState extends ChangeNotifier {
         if (ev.id != null) {
           await _db.updateToolEvent(ev.id!, ev);
         }
-        notifyListeners();
+        _publishRun(run);
         final toolMsg = ChatMessage(
           id: 'm${DateTime.now().millisecondsSinceEpoch}_${_rand()}',
           sessionId: sessionId,
@@ -1979,8 +2229,10 @@ class ShiyiState extends ChangeNotifier {
           createdAt: DateTime.now().millisecondsSinceEpoch,
         );
         await _db.insertMessage(toolMsg);
-        messages.add(toolMsg);
-        _bumpMessages();
+        if (currentSessionId == sessionId) {
+          messages.add(toolMsg);
+          _bumpMessages();
+        }
         loopMsgs.add({
           'role': 'tool',
           'content': output,
@@ -1993,22 +2245,23 @@ class ShiyiState extends ChangeNotifier {
 
       if (round == _maxToolRounds - 1) {
         // 已达轮次上限：强制请求最终文本，复用当前思考占位气泡。
-        final last = await _streamRound(sessionId, loopMsgs, asst);
+        final last = await _streamRound(run, loopMsgs, asst);
         if (last == null) {
-          await _finalizeAbort(asst);
+          await _finalizeAbort(run, asst);
         } else {
-          await _applyTurn(asst, last);
+          await _applyTurn(run, asst, last);
         }
         break;
       }
 
       // 下一轮继续用当前气泡：纯工具轮复用思考占位，文本轮已是新占位，思考不中断。
-      notifyListeners();
+      _publishRun(run);
     }
   }
 
   /// 新开一个流式占位消息（工具循环的每一轮文本独立成一条消息）。
-  Future<ChatMessage> _newAssistantMessage(String sessionId) async {
+  Future<ChatMessage> _newAssistantMessage(_SessionRun run) async {
+    final sessionId = run.sessionId;
     final now = DateTime.now().millisecondsSinceEpoch;
     final m = ChatMessage(
       id: 'm${now}_${_rand()}',
@@ -2019,19 +2272,36 @@ class ShiyiState extends ChangeNotifier {
       streaming: true,
     );
     await _db.insertMessage(m);
-    messages.add(m);
-    _bumpMessages();
-    _streaming = m;
-    streamText.value = '';
-    streamReasoning.value = '';
+    if (currentSessionId == sessionId) {
+      messages.add(m);
+      _bumpMessages();
+    }
+    run.streaming = m;
+    run.streamText.value = '';
+    run.streamReasoning.value = '';
+    _publishRun(run, notify: false);
     return m;
   }
 
   /// 把一轮结果写入占位消息并落库。
-  Future<void> _applyTurn(ChatMessage asst, TurnResult result) async {
+  Future<void> _applyTurn(
+    _SessionRun run,
+    ChatMessage asst,
+    TurnResult result,
+  ) async {
     final normalized = _normalizeMisplacedReasoning(result);
-    asst.content = normalized.text;
-    asst.reasoning = normalized.reasoning;
+    // 最终落库时：如果只有 reasoning 没有正文，把 reasoning 作为正文保存。
+    // 这是给「网关只返回 reasoning_content 的情况」的兜底，但只在最终确认时做，
+    // 不在流式期间做（否则思考内容会在流式时显示在输出区）。
+    final finalText = normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
+        ? normalized.reasoning
+        : normalized.text;
+    final finalReasoning = normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
+        ? ''
+        : normalized.reasoning;
+
+    asst.content = finalText;
+    asst.reasoning = finalReasoning;
     asst.toolCalls = normalized.toolCalls
         .map(
           (tc) => ToolCall(
@@ -2044,24 +2314,36 @@ class ShiyiState extends ChangeNotifier {
     asst.streaming = false;
     await _db.updateMessageContent(
       asst.id,
-      normalized.text,
-      reasoning: normalized.reasoning.isEmpty ? null : normalized.reasoning,
+      finalText,
+      reasoning: finalReasoning.isEmpty ? null : finalReasoning,
       toolCalls: normalized.toolCalls.isEmpty ? null : asst.toolCalls,
     );
-    streamText.value = '';
-    streamReasoning.value = '';
-    _bumpMessages();
-    notifyListeners();
+    run.streamText.value = '';
+    run.streamReasoning.value = '';
+    if (currentSessionId == asst.sessionId) _bumpMessages();
+    _publishRun(run);
   }
 
   /// 网关只回 reasoning_content 且没有工具调用时，把它当作最终正文；
   /// 若思考文本与正文重复，也只保留正文，避免「不思考直接回复」被误显示。
+  /// 另兜底：reasoning 为空但正文带 think 标签时（部分网关把思考写进 content），
+  /// 拆进思考面板，只认明确标签、不做「用户说…」启发式。
   static TurnResult _normalizeMisplacedReasoning(TurnResult result) {
     if (result.toolCalls.isNotEmpty) return result;
     final reasoning = result.reasoning.trim();
     final text = result.text.trim();
-    if (reasoning.isEmpty) return result;
-    if (text.isEmpty) return TurnResult(text: result.reasoning, reasoning: '');
+    if (reasoning.isEmpty) {
+      if (!text.contains('<think')) return result;
+      final split = splitThinkTags(text);
+      if (split.reasoning.trim().isEmpty) return result;
+      return TurnResult(
+        text: split.text.trim(),
+        reasoning: split.reasoning.trim(),
+      );
+    }
+    // 注释掉：流式期间不要把 reasoning 移到 text，否则思考内容会显示在输出区。
+    // 只在最终落库时（_applyTurn）判断：如果真的没有正文只有思考，那时再转换。
+    // if (text.isEmpty) return TurnResult(text: result.reasoning, reasoning: '');
     if (_sameReplyText(reasoning, text)) {
       return TurnResult(text: result.text, reasoning: '');
     }
@@ -2071,49 +2353,68 @@ class ShiyiState extends ChangeNotifier {
   static bool _sameReplyText(String a, String b) =>
       a.replaceAll(RegExp(r'\s+'), '') == b.replaceAll(RegExp(r'\s+'), '');
 
+  @visibleForTesting
+  static TurnResult normalizeMisplacedReasoningForTest(TurnResult result) =>
+      _normalizeMisplacedReasoning(result);
+
   /// 收尾一个被中断/无输出的占位消息，防止一直显示「正在思考…」。
-  Future<void> _finalizeAbort(ChatMessage? m) async {
+  Future<void> _finalizeAbort(_SessionRun run, ChatMessage? m) async {
     if (m == null) return;
     m.streaming = false;
     if (m.content.isEmpty) {
-      if (_stopForGuide) {
+      if (run.stopForGuide) {
         await _db.deleteMessage(m.id);
-        messages.remove(m);
-        _bumpMessages();
-        notifyListeners();
+        if (currentSessionId == m.sessionId) {
+          messages.remove(m);
+          _bumpMessages();
+        }
+        _publishRun(run);
         return;
       }
-      m.content = _stopRequested ? '(已停止)' : '(生成出错)';
+      m.content = run.stopRequested ? '(已停止)' : '(生成出错)';
     }
-    streamText.value = '';
-    await _db.updateMessageContent(m.id, m.content, toolCalls: m.toolCalls);
-    _bumpMessages();
-    notifyListeners();
+    run.streamText.value = '';
+    run.streamReasoning.value = '';
+    await _db.updateMessageContent(
+      m.id,
+      m.content,
+      reasoning: m.reasoning.isEmpty ? null : m.reasoning,
+      toolCalls: m.toolCalls,
+    );
+    if (currentSessionId == m.sessionId) _bumpMessages();
+    _publishRun(run);
   }
 
   void stop() {
-    _stopRequested = true;
-    // 释放挂起的 question：主循环阻塞在它的 future 上，
-    // 不释放会永久卡死 isBusy（问题弹窗期间点停止的场景）。
-    _releasePendingQuestion('（已中断）');
+    stopSession(currentSessionId);
+  }
+
+  void stopSession(String? sessionId) {
+    final run = _existingRun(sessionId);
+    if (run?.active != true) return;
+    run!.stopRequested = true;
+    // 释放该会话挂起的 question，避免主循环永久阻塞。
+    _releasePendingQuestion(run, '（已中断）');
+    _publishRun(run);
   }
 
   /// 完成挂起的 question 等待（停止/退出时调用），避免主循环永久阻塞。
-  void _releasePendingQuestion(String answer) {
-    final c = _questionCompleter;
+  void _releasePendingQuestion(_SessionRun run, String answer) {
+    final c = run.questionCompleter;
     if (c != null && !c.isCompleted) {
-      pendingQuestion = null;
-      _questionCompleter = null;
+      run.pendingQuestion = null;
+      run.questionCompleter = null;
       c.complete(answer);
-      notifyListeners();
+      _publishRun(run);
     }
   }
 
   Future<TurnResult?> _streamRound(
-    String sessionId,
+    _SessionRun run,
     List<Map<String, dynamic>> msgs,
     ChatMessage asst,
   ) async {
+    final sessionId = run.sessionId;
     TurnResult? accumulated;
     var lastStreamEmit = DateTime.now();
     var lastStreamLen = 0;
@@ -2124,14 +2425,16 @@ class ShiyiState extends ChangeNotifier {
       protocol: settings.apiProtocol,
       temperature: settings.temperature,
       maxTokens: settings.maxOutputTokens,
-      tools: activeTools,
-      shouldStop: () => _stopRequested,
+      tools: _activeToolsFor(planMode: run.planMode),
+      shouldStop: () => run.stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
       onTurn: (t) {
         accumulated = t;
-        asst.content = t.text;
-        asst.reasoning = t.reasoning;
-        streamReasoning.value = t.reasoning;
+        // 流式期间同步处理：归一化思考字段 + think 标签兜底拆分。
+        // 即使 reasoning 不为空也要调用，因为正文里可能混入 <thinking> 标签。
+        final live = _normalizeMisplacedReasoning(t);
+        asst.content = live.text;
+        asst.reasoning = live.reasoning;
         if (t.toolCalls.isNotEmpty) {
           asst.toolCalls = t.toolCalls
               .map(
@@ -2145,23 +2448,24 @@ class ShiyiState extends ChangeNotifier {
         }
         // 流式刷新节流：80ms 内且增量不大时不重复重建气泡，
         // 保持视觉连续的同时减少长文逐 token 解析/布局开销。
-        final totalLen = t.text.length + t.reasoning.length;
+        final totalLen = live.text.length + live.reasoning.length;
         final now = DateTime.now();
         if (lastStreamLen == 0 ||
             now.difference(lastStreamEmit).inMilliseconds >= 80 ||
             totalLen - lastStreamLen >= 200) {
+          run.streamReasoning.value = live.reasoning;
+          run.streamText.value = live.text;
           if (currentSessionId == sessionId) {
-            // 只向当前查看的会话写流式 UI（后台会话的流不污染当前界面；
-            // asst 内容与 DB 持久化不受影响）。
-            streamReasoning.value = t.reasoning;
-            streamText.value = t.text;
+            streamReasoning.value = live.reasoning;
+            streamText.value = live.text;
           }
           lastStreamEmit = now;
           lastStreamLen = totalLen;
         }
       },
       onError: (e) {
-        status = '错误: $e';
+        run.status = '错误: $e';
+        _publishRun(run);
       },
     );
     await client.send(msgs);
@@ -2170,9 +2474,7 @@ class ShiyiState extends ChangeNotifier {
     final usageTotal = client.lastTotalTokens;
     if (usageTotal != null && usageTotal > 0) {
       await _db.updateSessionLastUsage(sessionId, usageTotal);
-      if (currentSessionId == sessionId) {
-        sessionLastUsageTokens = usageTotal;
-      }
+      run.sessionLastUsageTokens = usageTotal;
     }
     var used = client.lastTotalTokens;
     if (used == null || used <= 0) {
@@ -2188,45 +2490,66 @@ class ShiyiState extends ChangeNotifier {
     final sessNow = await _db.getSession(sessionId);
     final newTotal = (sessNow?.totalTokens ?? 0) + used;
     await _db.updateSessionTokens(sessionId, newTotal);
-    if (currentSessionId == sessionId) {
-      // 缓存命中率按本轮回合加权累计，只统计服务端明确返回缓存字段的请求。
-      final cachedInput = client.lastCachedTokens;
-      final promptInput = client.lastPromptTokens ?? client.lastInputTokens;
-      if (cachedInput != null && promptInput != null && promptInput > 0) {
-        roundCacheKnown = true;
-        roundCachedTokens += cachedInput.clamp(0, promptInput);
-        roundInputTokens += promptInput;
-      }
-      lastRoundTokens += used;
-      sessionTotalTokens = newTotal;
-      await _updateContextStats(sessionId);
+    // 缓存命中率按整段会话 Token 加权累计（口径同 DSH：Σ缓存 ÷ Σ输入）。
+    final cachedInput = client.lastCachedTokens;
+    final promptInput = client.lastPromptTokens ?? client.lastInputTokens;
+    if (cachedInput != null && promptInput != null && promptInput > 0) {
+      run.sessionCacheKnown = true;
+      run.sessionCachedTokens += cachedInput.clamp(0, promptInput);
+      run.sessionInputTokens += promptInput;
+      await _db.updateSessionCacheTokens(
+        sessionId,
+        run.sessionCachedTokens,
+        run.sessionInputTokens,
+      );
     }
-    notifyListeners();
+    run.lastRoundTokens += used;
+    run.sessionTotalTokens = newTotal;
+    run.sessionContextTokens = await activeContextTokenEstimate(sessionId);
+    run.sessionContextTokensFull = run.sessionContextTokens;
+    _publishRun(run);
     return accumulated;
   }
 
   Future<String> _buildSystemPrompt(
     String userText, {
     String rollingSummary = '',
+    String? sessionId,
+    List<Skill>? loadedSkillsSnapshot,
+    bool? planModeSnapshot,
   }) async {
-    return _prompts.buildSystemPrompt(
-      userText,
-      rollingSummary: rollingSummary,
-    );
+    final builder = sessionId == null && loadedSkillsSnapshot == null
+        ? _prompts
+        : _createPromptBuilder(
+            sessionId: sessionId,
+            loadedSkillsSnapshot: loadedSkillsSnapshot,
+            planModeSnapshot: planModeSnapshot,
+          );
+    return builder.buildSystemPrompt(userText, rollingSummary: rollingSummary);
   }
 
   /// 系统提示词构建器（懒加载）：提示词组装已独立到 [PromptBuilder]，
   /// 这里只注入本实例的上下文提供者。
-  PromptBuilder get _prompts => _promptBuilder ??= PromptBuilder(
-    settings: () => settings,
-    skills: () => skills,
-    loadedSkills: () => loadedSkills,
-    planMode: () => planMode,
-    currentWorkspace: currentWorkspace,
-    memories: (t) => _db.recentMemoriesWithTerms(_keywords(t), 8),
-    terminalBackend: _actualTerminalBackend,
-  );
+  PromptBuilder get _prompts => _promptBuilder ??= _createPromptBuilder();
   PromptBuilder? _promptBuilder;
+
+  PromptBuilder _createPromptBuilder({
+    String? sessionId,
+    List<Skill>? loadedSkillsSnapshot,
+    bool? planModeSnapshot,
+  }) {
+    return PromptBuilder(
+      settings: () => settings,
+      skills: () => skills,
+      loadedSkills: () => loadedSkillsSnapshot ?? loadedSkills,
+      planMode: () => planModeSnapshot ?? planMode,
+      currentWorkspace: () => sessionId == null
+          ? currentWorkspace()
+          : workspaceForSession(sessionId),
+      memories: (t) => _db.recentMemoriesWithTerms(_keywords(t), 8),
+      terminalBackend: _actualTerminalBackend,
+    );
+  }
 
   /// 实际生效的终端后端（供提示词【平台环境】段落使用）：
   /// Android 恒为 android；Windows 由设置 + WSL2/pwsh 探测决定。
@@ -2247,16 +2570,14 @@ class ShiyiState extends ChangeNotifier {
   Future<String> buildSystemPromptForTest(
     String userText, {
     String rollingSummary = '',
-  }) =>
-      _buildSystemPrompt(userText, rollingSummary: rollingSummary);
+  }) => _buildSystemPrompt(userText, rollingSummary: rollingSummary);
 
   /// 测试专用：暴露段落注册表（名字唯一性、order 顺序、段落独立性）。
   @visibleForTesting
   List<PromptSection> buildPromptSectionsForTest(
     String userText, {
     String rollingSummary = '',
-  }) =>
-      _prompts.buildSections(userText, rollingSummary: rollingSummary);
+  }) => _prompts.buildSections(userText, rollingSummary: rollingSummary);
 
   List<String> _keywords(String text) {
     final list = <String>[];
@@ -2301,7 +2622,11 @@ class ShiyiState extends ChangeNotifier {
   /// 用于在工具反复失败时强制提示模型停止重试同一目标。
   final Map<String, int> _toolFailStreak = {};
 
-  Future<String> _executeTool(String name, String argsJson) async {
+  Future<String> _executeTool(
+    String name,
+    String argsJson, {
+    String? sessionId,
+  }) async {
     for (final t in toolRegistry) {
       if (t.name != name) continue;
       try {
@@ -2309,6 +2634,7 @@ class ShiyiState extends ChangeNotifier {
         try {
           args = jsonDecode(argsJson) as Map<String, dynamic>;
         } catch (_) {}
+        if (sessionId != null) args['_sessionId'] = sessionId;
         final out = await t.execute(this, args);
         _toolFailStreak.remove(name);
         return out;
@@ -2423,7 +2749,7 @@ class ShiyiState extends ChangeNotifier {
         // 默认在「会话自定义工作目录 → Agent 默认目录」执行；
         // 目录不存在时自动创建，创建失败回退 Agent 默认目录，
         // 避免 Process.start 因目录无效直接抛异常。
-        cwd = await currentWorkspace();
+        cwd = await workspaceForSession(args['_sessionId']?.toString());
         try {
           Directory(cwd).createSync(recursive: true);
         } catch (_) {
@@ -2438,7 +2764,7 @@ class ShiyiState extends ChangeNotifier {
         } catch (_) {}
       }
       // 平台执行后端：
-      // - Android：优先内嵌 Termux（完整 Linux 环境，apt/pkg 可用），
+      // - Android：优先内嵌 Alpine（proot + minirootfs，apk 可用），
       //   其次系统 Termux；都没有则用系统精简 shell；
       // - Windows：按设置选择 WSL2（Linux 环境）/ pwsh / cmd，
       //   auto = WSL2 优先 → pwsh → cmd。
@@ -2482,18 +2808,18 @@ class ShiyiState extends ChangeNotifier {
         }
       } else {
         shell = embedded
-            ? embeddedShell
+            ? '/system/bin/sh'
             : (systemTermux ? systemTermuxShell : 'sh');
-        shellArgs = ['-c', command];
+        shellArgs = embedded ? [embeddedShell, '-c', command] : ['-c', command];
       }
-      // 内嵌 Termux：先自检 bash 能否启动，失败时给出可诊断的错误。
+      // 内嵌 Alpine：先自检 init-host 能否启动，失败时给出可诊断的错误。
       if (embedded) {
         try {
           final probe = await Process.run(
-            embeddedShell,
-            ['-c', 'true'],
+            '/system/bin/sh',
+            [embeddedShell, '-c', 'true'],
             environment: await TermuxRuntime.environment(),
-          ).timeout(const Duration(seconds: 15));
+          ).timeout(const Duration(seconds: 45));
           if (probe.exitCode != 0) {
             final msg =
                 '内嵌终端自检失败(exit ${probe.exitCode}): '
@@ -2517,9 +2843,7 @@ class ShiyiState extends ChangeNotifier {
         shell,
         shellArgs,
         workingDirectory: cwd,
-        environment: embedded
-            ? await TermuxRuntime.environment()
-            : winEnv,
+        environment: embedded ? await TermuxRuntime.environment() : winEnv,
       );
       final stdout = _CappedByteBuffer(256 * 1024);
       final stderr = _CappedByteBuffer(64 * 1024);
@@ -2564,7 +2888,10 @@ class ShiyiState extends ChangeNotifier {
     final content = (args['content'] ?? '').toString();
     if (wPath.isEmpty) return '写入失败：path 为空';
     try {
-      final resolved = await _resolveToolPath(wPath);
+      final resolved = await _resolveToolPath(
+        wPath,
+        sessionId: args['_sessionId']?.toString(),
+      );
       if (resolved == null) return '写入失败：路径无效';
       final f = File(resolved);
       await f.create(recursive: true);
@@ -2579,7 +2906,10 @@ class ShiyiState extends ChangeNotifier {
     final rPath = (args['path'] ?? '').toString().trim();
     if (rPath.isEmpty) return '读取失败：path 为空';
     try {
-      final resolved = await _resolveToolPath(rPath);
+      final resolved = await _resolveToolPath(
+        rPath,
+        sessionId: args['_sessionId']?.toString(),
+      );
       final f = resolved == null ? null : File(resolved);
       if (f == null || !f.existsSync()) return '文件不存在：$rPath';
       if (await f.length() > 200 * 1024) {
@@ -2598,10 +2928,17 @@ class ShiyiState extends ChangeNotifier {
     final options = (opts is List && opts.isNotEmpty)
         ? opts.map((e) => e.toString()).take(4).toList()
         : const <String>['确认', '取消'];
+    final sessionId = args['_sessionId']?.toString();
+    if (sessionId == null || sessionId.isEmpty) return '提问失败：缺少会话标识';
+    final run = _runFor(sessionId);
     final completer = Completer<String>();
-    pendingQuestion = {'question': qText, 'options': options};
-    _questionCompleter = completer;
-    notifyListeners();
+    run.pendingQuestion = {
+      'sessionId': sessionId,
+      'question': qText,
+      'options': options,
+    };
+    run.questionCompleter = completer;
+    _publishRun(run);
     final answer = await completer.future;
     return '用户的选择：$answer';
   }
@@ -2644,17 +2981,31 @@ class ShiyiState extends ChangeNotifier {
   }
 
   Future<String> _execEnterPlanMode(Map<String, dynamic> args) async {
-    if (planMode) return '已经在计划模式中';
-    planMode = true;
-    notifyListeners();
+    final sessionId = args['_sessionId']?.toString();
+    final run = sessionId == null ? null : _runFor(sessionId);
+    if (run?.planMode ?? planMode) return '已经在计划模式中';
+    if (run != null) {
+      run.planMode = true;
+      _publishRun(run);
+    } else {
+      planMode = true;
+      notifyListeners();
+    }
     return '已进入计划模式：接下来只能使用只读工具（搜索/读文件/读技能），'
         '请先输出完整方案，等待用户确认后再调用 exit_plan_mode 开始执行。';
   }
 
   Future<String> _execExitPlanMode(Map<String, dynamic> args) async {
-    if (!planMode) return '当前不在计划模式';
-    planMode = false;
-    notifyListeners();
+    final sessionId = args['_sessionId']?.toString();
+    final run = sessionId == null ? null : _runFor(sessionId);
+    if (!(run?.planMode ?? planMode)) return '当前不在计划模式';
+    if (run != null) {
+      run.planMode = false;
+      _publishRun(run);
+    } else {
+      planMode = false;
+      notifyListeners();
+    }
     return '已退出计划模式，恢复正常执行能力，开始执行方案。';
   }
 
@@ -2666,7 +3017,8 @@ class ShiyiState extends ChangeNotifier {
 
   /// 派发子代理：独立 LLM 对话 + 受限工具集，返回其最终文本报告。
   Future<String> _execSpawnAgent(Map<String, dynamic> args) async {
-    final spawnSessionId = currentSessionId;
+    final spawnSessionId = args['_sessionId']?.toString();
+    final run = spawnSessionId == null ? null : _runFor(spawnSessionId);
     final rawTasks = args['tasks'];
     final List<Map<String, dynamic>> tasks = <Map<String, dynamic>>[];
     if (rawTasks is List && rawTasks.isNotEmpty) {
@@ -2706,7 +3058,8 @@ class ShiyiState extends ChangeNotifier {
         final prompt = (t['prompt'] ?? '').toString().trim();
         final def = SubagentDefinition.byName(type);
         if (def == null) {
-          return '### 子代理 ${i + 1}/$total（$type）\n未知子代理类型：$type'
+          return '### 子代理 ${i + 1}/$total（$type）\n'
+              '未知子代理类型：$type'
               '（可选 ${SubagentDefinition.all.map((d) => d.name).join(' / ')}）';
         }
         final int? override;
@@ -2717,7 +3070,8 @@ class ShiyiState extends ChangeNotifier {
         }
         // 写路径隔离：声明 write_paths 后，file_write 只能写这些路径
         //（不声明 = 允许写整个工作区）。多个并行子代理声明不重叠路径即可放心并行。
-        final workingDirAbs = await currentWorkspace();
+        final toolSessionId = args['_sessionId']?.toString();
+        final workingDirAbs = await workspaceForSession(toolSessionId);
         final rawWp = t['write_paths'];
         final List<String>? writePaths = rawWp is List
             ? rawWp
@@ -2778,17 +3132,18 @@ class ShiyiState extends ChangeNotifier {
               final denied = _rejectWriteCommand(argsJson);
               if (denied != null) return denied;
             }
-            return _executeTool(name, argsJson);
+            return _executeTool(name, argsJson, sessionId: toolSessionId);
           },
           workingDir: workingDirAbs,
-          shouldStop: () => _stopRequested,
+          shouldStop: () => run?.stopRequested ?? false,
           // 进度回流：显示「第 i/N 个子代理 · 类型 · 第 n/m 轮 · 工具」。
           onProgress: (round, max, tool) {
             final t2 = tool.isEmpty ? '思考中' : '正在调用 $tool';
-            status =
+            if (run == null) return;
+            run.status =
                 '子代理 ${i + 1}/$total · ${def.name} · '
                 '第 ${round + 1}/$max 轮 · $t2';
-            notifyListeners();
+            _publishRun(run);
           },
         );
         SubagentResult result;
@@ -2812,14 +3167,17 @@ class ShiyiState extends ChangeNotifier {
       final sessNow = await _db.getSession(spawnSessionId);
       final newTotal = (sessNow?.totalTokens ?? 0) + subagentTokens;
       await _db.updateSessionTokens(spawnSessionId, newTotal);
-      if (currentSessionId == spawnSessionId) {
-        sessionTotalTokens = newTotal;
-        lastRoundTokens += subagentTokens;
+      if (run != null) {
+        run.sessionTotalTokens = newTotal;
+        run.lastRoundTokens += subagentTokens;
+        _publishRun(run, notify: false);
       }
     }
     // 全部结束后清掉轮次状态条，避免残留「第 n/m 轮」。
-    status = null;
-    notifyListeners();
+    if (run != null) {
+      run.status = null;
+      _publishRun(run);
+    }
     return results.join('\n\n');
   }
 
@@ -2875,7 +3233,7 @@ class ShiyiState extends ChangeNotifier {
     // 写操作命令（单词边界匹配，避免误伤 find 等组合）
     final writeCmds = RegExp(
       r'(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|chmod|chown|ln|dd|kill|pkill|'
-      r'tee|wget|nano|vim|vi|apt|pkg|install|shutdown|reboot)(\s|$)',
+      r'tee|wget|nano|vim|vi|apt|apk|pkg|install|shutdown|reboot)(\s|$)',
     );
     // 输出重定向（任意位置；仅放行 2>&1 / 1>&2 / >&2 这类 fd 数字合并，
     // 其余 >、>>、2>、>&文件 一律拒绝；引号内的 > 会误伤，但保守策略可接受）
@@ -2897,10 +3255,10 @@ class ShiyiState extends ChangeNotifier {
   /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用；
   /// 统一经 [_normAbsPath] 归一化（消除 `..`、重复分隔符），语义明确、
   /// 防路径混淆（与子代理 write_paths 同款归一化）。
-  Future<String?> _resolveToolPath(String path) async {
+  Future<String?> _resolveToolPath(String path, {String? sessionId}) async {
     final t = path.trim();
     if (t.isEmpty) return null;
-    final base = await currentWorkspace();
+    final base = await workspaceForSession(sessionId);
     return _normAbsPath(t, base);
   }
 
@@ -2909,11 +3267,23 @@ class ShiyiState extends ChangeNotifier {
   /// 从 DB 重新加载当前会话的 token 统计与上下文估算（聊天页打开时调用）。
   Future<void> refreshTokenStats(String sessionId) async {
     final s = await _db.getSession(sessionId);
+    final run = _existingRun(sessionId);
     if (s != null) {
-      sessionTotalTokens = s.totalTokens;
-      sessionLastUsageTokens = s.lastUsageTotalTokens;
+      if (run != null) {
+        run
+          ..sessionTotalTokens = s.totalTokens
+          ..sessionLastUsageTokens = s.lastUsageTotalTokens
+          ..sessionCachedTokens = s.cacheHitTokens
+          ..sessionInputTokens = s.cacheInputTokens
+          ..sessionCacheKnown = s.cacheInputTokens > 0;
+      }
+      if (currentSessionId == sessionId) {
+        sessionTotalTokens = s.totalTokens;
+        sessionLastUsageTokens = s.lastUsageTotalTokens;
+      }
     }
     await _updateContextStats(sessionId);
+    if (run != null) _publishRun(run, notify: false);
     notifyListeners();
   }
 
@@ -3051,6 +3421,7 @@ class ShiyiState extends ChangeNotifier {
   /// 工具结果压缩后由 _trimApiMessages 按实际 payload 再核算，这里用于触发
   /// 60%/75%/85% 的压缩与裁剪阈值。
   Future<int> sessionContextTokenEstimate(String sessionId) async {
+    final run = _existingRun(sessionId);
     final msgs = _messagesLoadedForSessionId == sessionId
         ? messages
         : await _db.listMessages(sessionId);
@@ -3072,9 +3443,14 @@ class ShiyiState extends ChangeNotifier {
     final sys = await _buildSystemPrompt(
       '',
       rollingSummary: sess?.rollingSummary ?? '',
+      sessionId: sessionId,
+      loadedSkillsSnapshot: run?.loadedSkillsSnapshot,
+      planModeSnapshot: run?.planMode,
     );
     total += _estimateTokens(sys);
-    total += _estimateTokens(jsonEncode(activeTools)); // 工具定义开销
+    total += _estimateTokens(
+      jsonEncode(_activeToolsFor(planMode: run?.planMode ?? false)),
+    );
     return total;
   }
 
@@ -3122,16 +3498,17 @@ class ShiyiState extends ChangeNotifier {
     final sess = await _db.getSession(sessionId);
     final previous = sess?.rollingSummary.trim() ?? '';
     final merged = [if (previous.isNotEmpty) previous, clean].join('\n\n');
-    final rolling = merged.length <= 1600
-        ? merged
-        : _tailChars(merged, 1600);
+    final rolling = merged.length <= 1600 ? merged : _tailChars(merged, 1600);
     await _db.updateSessionRollingSummary(sessionId, rolling);
     await _db.markMessagesArchived(toCompress.map((m) => m.id).toList());
     // 旧的真实 usage 不再代表归档后的 payload，回退到本地估算。
     await _db.updateSessionLastUsage(sessionId, null);
-    sessionLastUsageTokens = null;
-    messages = await _db.listMessages(sessionId);
-    _bumpMessages();
+    if (currentSessionId == sessionId) sessionLastUsageTokens = null;
+    if (currentSessionId == sessionId) {
+      messages = await _db.listMessages(sessionId);
+      _messagesLoadedForSessionId = sessionId;
+      _bumpMessages();
+    }
     final afterTokens = await activeContextTokenEstimate(sessionId);
     await _updateContextStats(sessionId);
     notifyListeners();
@@ -3214,7 +3591,9 @@ class ShiyiState extends ChangeNotifier {
       while (p > 0 && keep[p - 1].role == 'tool') {
         p--;
       }
-      if (p > 0 && keep[p - 1].role == 'assistant' && keep[p - 1].hasToolCalls) {
+      if (p > 0 &&
+          keep[p - 1].role == 'assistant' &&
+          keep[p - 1].hasToolCalls) {
         s = p - 1;
       }
     }
@@ -3457,7 +3836,7 @@ class ShiyiState extends ChangeNotifier {
 
   /// 记录错误日志到智能体工作目录 logs/error.log，方便排查生成与工具错误。
   /// 终端 exec 失败时收集诊断信息（系统 sh 保证可执行），
-  /// 用于定位「Permission denied」是 ROM/SELinux 策略还是权限/依赖问题。
+  /// 用于定位「Permission denied」是 ROM/SELinux 策略还是 proot/rootfs 问题。
   Future<String> _diagnoseTermuxExec(String shell) async {
     final buf = StringBuffer('--- 终端诊断 ---');
     try {
@@ -3465,18 +3844,21 @@ class ShiyiState extends ChangeNotifier {
         '-c',
         '''
 B="\$1"
-echo "[bash 路径] \$B"
-echo "[bash 权限/context]"
+echo "[启动器路径] \$B"
+echo "[启动器权限/context]"
 ls -lZ "\$B" 2>&1
-echo "[usr 目录 context]"
-ls -ldZ "\$(dirname "\$B")/.." 2>&1
-echo "[依赖库 libandroid-support]"
-ls -lZ "\$(dirname "\$B")/../lib/libandroid-support.so" 2>&1 | head -1
+P="\$(dirname "\$B")/.."
+echo "[local 目录 context]"
+ls -ldZ "\$P" 2>&1
+echo "[proot 二进制]"
+ls -lZ "\$P/bin/proot" 2>&1
+echo "[rootfs bin/sh]"
+ls -lZ "\$P/alpine/bin/sh" 2>&1
 echo "[SELinux]"
 getenforce 2>&1
 echo "[设备] android=\$(getprop ro.build.version.release) api=\$(getprop ro.build.version.sdk) brand=\$(getprop ro.product.brand) model=\$(getprop ro.product.model)"
-echo "[直跑 bash]"
-"\$B" -c 'echo bash-ok' 2>&1
+echo "[直跑启动器]"
+"\$B" -c 'echo alpine-ok' 2>&1
 echo "[rc=\$?]"
 ''',
         'diag',
@@ -3513,6 +3895,8 @@ echo "[rc=\$?]"
   }
 
   Future<void> updateSettings(AppSettings s) async {
+    final modelChanged = DshModelSync.isModelSettingsChange(settings, s);
+    final engineChanged = s.agentEngine != settings.agentEngine;
     if (s.model != settings.model) _knownImageUnsupported = false;
     if (s.model != settings.model ||
         s.visionEnabled != settings.visionEnabled ||
@@ -3520,8 +3904,30 @@ echo "[rc=\$?]"
       _imageDescCache.clear();
     }
     settings = s;
-    await _settingsService.save(s);
     notifyListeners();
+    await _settingsService.save(s);
+    if (engineChanged) {
+      await _rememberLastEngine(s.agentEngine);
+    }
+    if (modelChanged) {
+      unawaited(DshModelSync.syncFromShiyi(s, allowClear: true));
+    }
+  }
+
+  Future<void> _rememberLastEngine(String engine) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_lastEngineKey, engine);
+    } catch (_) {}
+  }
+
+  Future<bool> _lastEngineWasDsh() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_lastEngineKey) == 'dsh';
+    } catch (_) {
+      return false;
+    }
   }
 }
 

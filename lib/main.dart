@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,12 +9,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'core/app_state.dart';
 import 'services/permission_service.dart';
 import 'core/app_theme.dart';
+import 'services/dsh_service.dart';
 import 'screens/welcome_screen.dart';
+import 'widgets/macos_window_buttons.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // 强制 edge-to-edge：状态栏/导航栏透明沉浸。
-  // targetSdk 降到 34 后系统不再强制，这里显式开启保持沉浸效果。
+  // 强制 edge-to-edge：状态栏/导航栏透明沉浸（targetSdk 35+ 系统强制，
+  // 显式开启保持旧版本一致体验）。
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   final initialThemeMode = await _readInitialThemeMode();
   runApp(ShiyiAgentApp(initialThemeMode: initialThemeMode));
@@ -47,6 +50,8 @@ class ShiyiAgentApp extends StatefulWidget {
 class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
   late final ShiyiState shiyi;
   late String _themeModeSetting;
+  final GlobalKey<ScaffoldMessengerState> _messengerKey =
+      GlobalKey<ScaffoldMessengerState>();
 
   @override
   void initState() {
@@ -55,6 +60,21 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
     _themeModeSetting = widget.initialThemeMode;
     shiyi.addListener(_handleShiyiChanged);
     shiyi.init();
+    // 冷启动立即体检，与欢迎动画并行，不等主页出现再拉服务。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_checkDshOnLaunch());
+    });
+  }
+
+  Future<void> _checkDshOnLaunch() async {
+    if (!Platform.isAndroid) return;
+    final ok = await DshService.instance.ensureAvailableOnLaunch();
+    if (ok) return;
+    _messengerKey.currentState?.showSnackBar(
+      const SnackBar(
+        content: Text('DeepSeek Harness 未安装，请到 Agent 引擎页安装'),
+      ),
+    );
   }
 
   void _handleShiyiChanged() {
@@ -111,9 +131,23 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
     return MaterialApp(
       title: '拾忆',
       debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: _messengerKey,
       theme: MacTheme.light(),
       darkTheme: MacTheme.dark(),
       themeMode: themeMode,
+      // Windows 无边框窗口：全局顶部挂 macOS 风格标题栏（红黄绿三键），
+      // 所有路由页面都在标题栏下方；Android 保持原样。
+      builder: (context, child) {
+        if (!Platform.isWindows) {
+          return child ?? const SizedBox.shrink();
+        }
+        return Column(
+          children: [
+            const MacTitleBar(),
+            Expanded(child: child ?? const SizedBox.shrink()),
+          ],
+        );
+      },
       home: WelcomeScreen(shiyi: shiyi),
     );
   }

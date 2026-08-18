@@ -68,6 +68,10 @@ class LlmClient {
   /// 最近一轮收到的文本（纯文本截断续写时拼接用）。
   String _lastRoundText = '';
 
+  /// 最近一轮收到的思考内容（thinking 模式网关要求续写时必须
+  /// 把 reasoning_content 一起回传，否则 HTTP 400）。
+  String _lastRoundReasoning = '';
+
   LlmClient({
     required this.baseUrl,
     required this.apiKey,
@@ -130,11 +134,23 @@ class LlmClient {
     lastOutputTokens = null;
     lastInputTokens = null;
     lastCachedTokens = null;
+    _lastRoundReasoning = '';
     final client = http.Client();
     try {
       var includeUsage = true;
       // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级到 8192 重试。
       var outputLimit = maxTokens;
+      // 明显思考型模型默认请求思考输出；网关拒绝 thinking / reasoning_effort
+      // 时分别去掉不兼容字段重试，普通模型/旧网关不受影响。
+      // `thinking: {type: enabled}` 只对 DeepSeek 官方 API（api.deepseek.com）
+      // 下发：opencode.ai/zen 等网关不识别该参数时会把思考链灌进 content
+      // （真机复现：textLen=20 reasoningLen=0 tail=用户用英文问好…），
+      // 它们只用 reasoning_effort，思考走 delta.reasoning 字段。
+      var thinkingEnabled =
+          usesDeepSeekThinkingParam(model) && baseUrl.contains('deepseek.com');
+      String? reasoningEffort = defaultReasoningEffort(model);
+      // 网关拒绝 max_completion_tokens 时回退 max_tokens（旧网关兼容）。
+      var useMaxCompletion = _useMaxCompletionTokens;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
@@ -144,16 +160,49 @@ class LlmClient {
           stream: true,
           includeUsage: includeUsage,
           maxTokens: outputLimit,
+          thinkingEnabled: thinkingEnabled,
+          reasoningEffort: reasoningEffort,
+          useMaxCompletionTokens: useMaxCompletion,
         );
         final request = http.Request('POST', Uri.parse(_endpoint))
           ..headers.addAll(_headers(streaming: true))
           ..body = jsonEncode(body);
+        onDiag?.call(
+          '[stream] request model=$model '
+          'thinking=${thinkingEnabled ? 'on' : 'off'} '
+          'reasoningEffort=${reasoningEffort ?? 'off'} '
+          'tokenField=${useMaxCompletion ? 'max_completion_tokens' : 'max_tokens'}',
+        );
+        // 完整请求体诊断（无密钥；截断防爆日志）。
+        {
+          final bodyPreview = jsonEncode(body);
+          onDiag?.call(
+            '[reqbody] ${bodyPreview.length <= 2000 ? bodyPreview : '${bodyPreview.substring(0, 2000)}…'}',
+          );
+        }
         try {
           final response = await client
               .send(request)
               .timeout(const Duration(seconds: 60));
           if (response.statusCode != 200) {
             final err = await response.stream.bytesToString();
+            // 思考参数被网关拒绝：先分别去掉不兼容字段重试。
+            final e = err.toLowerCase();
+            if (useMaxCompletion && e.contains('max_completion_tokens')) {
+              useMaxCompletion = false;
+              onDiag?.call('[stream] max_completion_tokens 被拒绝，回退 max_tokens');
+              continue;
+            }
+            if (thinkingEnabled && e.contains('thinking')) {
+              thinkingEnabled = false;
+              onDiag?.call('[stream] thinking 参数被网关拒绝，去掉后重试');
+              continue;
+            }
+            if (reasoningEffort != null && e.contains('reasoning_effort')) {
+              reasoningEffort = null;
+              onDiag?.call('[stream] reasoning_effort 被网关拒绝，去掉后重试');
+              continue;
+            }
             // 部分网关/中转不支持 stream_options：去掉后重试一次（只少 token 统计，不影响内容）。
             if (includeUsage && _isUsageParamError(err)) {
               includeUsage = false;
@@ -180,7 +229,14 @@ class LlmClient {
             '[stream] 续写第 ${round + 1} 轮${toolKick ? ' (工具唤醒)' : ''}',
           );
           continuation.addAll([
-            {'role': 'assistant', 'content': _lastRoundText},
+            {
+              'role': 'assistant',
+              'content': _lastRoundText,
+              // thinking 模式网关（OpenCode Go 等）要求 reasoning_content
+              // 必须原样回传，否则上游 HTTP 400 拒绝续写请求。
+              if (_lastRoundReasoning.isNotEmpty)
+                'reasoning_content': _lastRoundReasoning,
+            },
             {
               'role': 'user',
               'content': buildContinuationPrompt(
@@ -191,7 +247,27 @@ class LlmClient {
           ]);
           includeUsage = false;
         } on TimeoutException {
+          // 瞬态超时（网络抖动/网关繁忙）：首轮自动重试一次。
+          if (round == 0) {
+            onDiag?.call('[stream] 请求超时，自动重试一次');
+            continue;
+          }
           throw LlmException('请求超时：网络连接或响应过慢，请重试');
+        } on http.ClientException catch (e) {
+          final m = e.message;
+          // 连接类瞬态错误（连接超时/拒绝/断连/DNS 失败）：首轮自动重试
+          // 一次；仍失败则转成可读的中文提示，不再把原始
+          // "ClientException with SocketException ..." 直接抛给界面。
+          if (round == 0 &&
+              (m.contains('timed out') ||
+                  m.contains('SocketException') ||
+                  m.contains('Connection refused') ||
+                  m.contains('Connection reset') ||
+                  m.contains('Failed host lookup'))) {
+            onDiag?.call('[stream] 连接异常，自动重试一次: $m');
+            continue;
+          }
+          throw LlmException('网络连接失败：${_short(m)}，请检查网络/代理或稍后重试');
         }
       }
     } finally {
@@ -205,6 +281,9 @@ class LlmClient {
     required bool stream,
     required bool includeUsage,
     required int maxTokens,
+    bool thinkingEnabled = false,
+    String? reasoningEffort,
+    bool? useMaxCompletionTokens,
   }) {
     if (protocol == 'anthropic') {
       final systemParts = <String>[];
@@ -234,11 +313,46 @@ class LlmClient {
       'messages': messages,
       'stream': stream,
       if (includeUsage) 'stream_options': {'include_usage': true},
-      'temperature': temperature,
-      'max_tokens': maxTokens,
+      // 思考模式（reasoning_effort）下不发送 temperature 与 tool_choice：
+      // 与 DSH 引擎走通该网关的请求（llm-pi-ai/pi-ai）逐字段对齐——
+      // pi-ai 仅在调用方显式传值时才带这两个字段，而 DSH agent 请求
+      // 从不带；真机对照：带 temperature=0.2 + tool_choice=auto 时网关把
+      // 思考链折叠进 content（reasoning_content 恒 null），DSH 引擎不带
+      // 时 reasoning_content 正常下发。
+      if (reasoningEffort == null || reasoningEffort.isEmpty)
+        'temperature': temperature,
+      // opencode.ai 等 OpenAI 风格网关用 max_completion_tokens 区分新旧
+      // 请求路径（与 DSH 内置 pi-ai 的 detectCompat 一致）；发 max_tokens
+      // 时网关会把思考链折叠进 content（真机原始 SSE 帧实证：
+      // delta.content=思考链, delta.reasoning_content=null）。
+      if (useMaxCompletionTokens ?? _useMaxCompletionTokens)
+        'max_completion_tokens': maxTokens
+      else
+        'max_tokens': maxTokens,
+      if (thinkingEnabled) 'thinking': {'type': 'enabled'},
+      if (reasoningEffort != null && reasoningEffort.isNotEmpty)
+        'reasoning_effort': reasoningEffort,
       if (tools.isNotEmpty) 'tools': tools,
-      if (tools.isNotEmpty) 'tool_choice': 'auto',
+      // tool_choice 与 pi-ai 对齐：不显式发送（OpenAI 默认 auto）。
     };
+  }
+
+  /// 与 DSH 内置 pi-ai（detectCompat）保持一致的网关判定：
+  /// 只有少数网关/中转用 max_tokens 字段，其余（含 opencode.ai/zen）
+  /// 走 max_completion_tokens，否则思考链会被折叠进正文。
+  bool get _useMaxCompletionTokens {
+    final b = baseUrl.toLowerCase();
+    if (protocol != 'openai') return false;
+    final useMaxTokens =
+        b.contains('chutes.ai') ||
+        b.contains('api.moonshot.') ||
+        b.contains('cloudflare') ||
+        b.contains('api.together.ai') ||
+        b.contains('api.together.xyz') ||
+        b.contains('nvidia') ||
+        b.contains('ant-ling') ||
+        b.contains('deepseek.com');
+    return !useMaxTokens;
   }
 
   List<Map<String, dynamic>> _toAnthropicMessages(
@@ -325,6 +439,33 @@ class LlmClient {
         e.contains('extra fields');
   }
 
+  /// 与 DSH 模型同步一致的默认思考档位判定。
+  static String? defaultReasoningEffort(String model) {
+    final id = model.trim().toLowerCase();
+    if (id.isEmpty) return null;
+    if (id.contains('deepseek') ||
+        id.contains('reasoner') ||
+        id.contains('thinking') ||
+        id.contains('mimo') ||
+        id.contains('qwq') ||
+        id.contains('r1') ||
+        RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
+      return 'high';
+    }
+    return null;
+  }
+
+  /// DeepSeek 风格的兼容接口需要 `thinking: {type: enabled}` 才会真正
+  /// 推送 reasoning_content；OpenAI 风格模型仍只使用 reasoning_effort。
+  static bool usesDeepSeekThinkingParam(String model) {
+    final id = model.trim().toLowerCase();
+    if (id.isEmpty) return false;
+    return id.contains('deepseek') ||
+        id.contains('reasoner') ||
+        id.contains('kimi-k2-thinking') ||
+        RegExp(r'(^|[-_/])r1(?:$|[-_/])').hasMatch(id);
+  }
+
   /// 判断 HTTP 400 是否由 max_tokens 参数过大/不被支持引起。
   static bool _isMaxTokensParamError(String err) {
     final e = err.toLowerCase();
@@ -380,6 +521,10 @@ class LlmClient {
       if (choices.isEmpty) return '';
       final msg = choices.first['message'] as Map<String, dynamic>?;
       return (msg?['content'] as String?)?.trim() ?? '';
+    } on TimeoutException {
+      throw LlmException('请求超时：网络连接或响应过慢，请重试');
+    } on http.ClientException catch (e) {
+      throw LlmException('网络连接失败：${_short(e.message)}，请检查网络/代理或稍后重试');
     } finally {
       client.close();
     }
@@ -450,6 +595,7 @@ class LlmClient {
     var doneReceived = false;
     var stoppedByUser = false;
     var reasoningSeeded = false;
+    var rawFramesLeft = 25;
     String? finishReason; // 最后一条 chunk 的 finish_reason：'length' = 输出被截断
     final completer = Completer<bool>();
 
@@ -509,6 +655,15 @@ class LlmClient {
       if (line.isEmpty) return;
       if (line.startsWith('data:')) {
         final data = line.substring(5).trim();
+        // 受控原始帧诊断：每轮前 25 个 data 帧截断落盘，用于定位网关
+        // 实际下发的思考字段（reasoning / reasoning_content / content）。
+        if (rawFramesLeft > 0) {
+          rawFramesLeft--;
+          final preview = data.length <= 500
+              ? data
+              : '${data.substring(0, 500)}…';
+          onDiag?.call('[sse] $preview');
+        }
         if (data == '[DONE]') {
           doneReceived = true;
           return;
@@ -704,6 +859,7 @@ class LlmClient {
             // 截断决策：纯文本截断 → 续写；工具完整 → 正常完成。
             final needContinue = decideContinue();
             _lastRoundText = text.trim();
+            _lastRoundReasoning = reasoning;
             onDiag?.call(
               '[stream] needContinue=$needContinue model=$model '
               'max=$maxTokens fr=$finishReason '
@@ -922,6 +1078,7 @@ class LlmClient {
             }
             final needContinue = decideContinue();
             _lastRoundText = text.trim();
+            _lastRoundReasoning = reasoning;
             if (!completer.isCompleted) {
               if (!doneReceived &&
                   !stoppedByUser &&
@@ -981,14 +1138,15 @@ class LlmClient {
     // DeepSeek 官方风格：prompt_cache_hit_tokens（主）+ cache_miss_tokens
     //（配套未命中字段，用于命中率分母校验）。
     cached ??= _intOf(usage['prompt_cache_hit_tokens']);
-    final cacheMiss = _intOf(usage['prompt_cache_miss_tokens']) ??
+    final cacheMiss =
+        _intOf(usage['prompt_cache_miss_tokens']) ??
         (promptDetails is Map
             ? _intOf(promptDetails['cache_miss_tokens'])
             : null);
     if (cached == null && cacheMiss != null) {
       // 只有未命中字段时按 input - miss 反推命中（DeepSeek 兼容网关兜底）。
-      final input = _intOf(usage['input_tokens']) ??
-          _intOf(usage['prompt_tokens']);
+      final input =
+          _intOf(usage['input_tokens']) ?? _intOf(usage['prompt_tokens']);
       if (input != null && input >= 0) {
         cached = (input - cacheMiss).clamp(0, input);
       }

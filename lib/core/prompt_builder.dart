@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'models.dart';
 import '../services/file_workspace.dart';
 import 'prompt_section.dart';
@@ -26,6 +28,10 @@ class PromptBuilder {
   /// 按用户输入检索相关长期记忆（返回空列表 = 无记忆注入）。
   final Future<List<MemoryEntry>> Function(String userText) memories;
 
+  /// 当前实际生效的终端后端：android / wsl2 / pwsh / cmd
+  /// （Windows 上由设置 + WSL2/pwsh 探测决定，Android 恒为 android）。
+  final Future<String> Function() terminalBackend;
+
   PromptBuilder({
     required this.settings,
     required this.skills,
@@ -33,6 +39,7 @@ class PromptBuilder {
     required this.planMode,
     required this.currentWorkspace,
     required this.memories,
+    required this.terminalBackend,
   });
 
   /// 组装完整系统提示词。
@@ -77,6 +84,11 @@ class PromptBuilder {
           '- 当前会话工作目录是 ${await currentWorkspace()}（会话未自定义时使用 '
           'Agent 工作目录 ${FileWorkspace.defaultWorkspacePath}）；文件操作与 '
           'run_terminal 默认都在这里执行，需要其他目录时用 cwd 参数指定。',
+    ),
+    PromptSection(
+      name: 'platform',
+      order: 250,
+      builder: () => _platformSection(),
     ),
     if (settings().enableMemory)
       PromptSection(
@@ -179,10 +191,45 @@ class PromptBuilder {
         '只采用最近期的可靠资料；旧资料必须标注发布日期并明确提示可能已过时。';
   }
 
+  /// 平台环境段落：显式告知模型当前执行环境与终端语义。
+  /// Android = 内嵌 Linux；Windows 按实际生效后端（wsl2 / pwsh / cmd）
+  /// 动态描述——后端由设置 + 探测决定，见 [terminalBackend]。
+  Future<String> _platformSection() async {
+    String backend;
+    try {
+      backend = await terminalBackend();
+    } catch (_) {
+      backend = Platform.isWindows ? 'pwsh' : 'android';
+    }
+    switch (backend) {
+      case 'wsl2':
+        return '【平台环境】当前运行在 Windows 桌面，run_terminal 通过 WSL2 '
+            '执行完整 Linux 命令（bash/apt/python 可用）。Windows 路径 '
+            'C:\\... 在 Linux 侧是 /mnt/c/...（工作目录会自动映射）；'
+            '文件读写（file_write/file_read）仍用 Windows 路径。';
+      case 'cmd':
+        return '【平台环境】当前运行在 Windows 桌面，run_terminal 使用 '
+            'cmd.exe（批处理/DOS 语义，如 dir、type、copy）。';
+      case 'pwsh':
+        return '【平台环境】当前运行在 Windows 桌面。run_terminal 使用 '
+            'PowerShell 7（pwsh，缺失时回退 cmd），命令语法与 Linux bash '
+            '不同（如 dir/Get-ChildItem 替代 ls，但 PowerShell 为常见命令提供 '
+            '了别名；管道/重定向语法不同）；文件路径用 Windows 风格；'
+            '安装软件不使用 Linux 包管理命令（apk/apt 等），可用 winget 或直接下载安装包。';
+      default:
+        return '【平台环境】当前运行在 Android 手机。run_terminal 通过内嵌 '
+            'Alpine Linux 环境（proot）执行命令，sh/bash 可用，软件包用 apk '
+            '安装（apk add <包名>，镜像已配置可直接使用）；工作目录与文件'
+            '路径如 /storage/emulated/0/agent。旧版 Termux 路径'
+            '（/data/data/com.termux/...）已不存在，不要使用。';
+    }
+  }
+
   /// 默认人设（用户未自定义系统提示词时使用）。
   static const String _defaultPersonaText =
       '你是「拾忆」，运行在 Android 手机上的个人 AI 工作台。你帮用户完成实际工作，而不只是聊天：\n'
-      '- 终端能力：run_terminal 执行命令/脚本（bash、python3，可用 pkg/apt 装包）\n'
+      '- 终端能力：run_terminal 执行命令/脚本（内嵌 Alpine Linux：sh/bash 可用，'
+      '更多软件包用 apk 安装，如 apk add python3）\n'
       '- 文件能力：file_write / file_read 读写项目文件\n'
       '- 联网能力：web_search / web_extract 获取并核实最新信息\n'
       '- 记忆能力：跨会话长期记忆，记住用户偏好与项目背景\n'
@@ -240,7 +287,8 @@ class PromptBuilder {
       '- 搜索结果不理想或需交叉验证时，可再换 2~3 次不同关键词搜索，但不要无限换词。'
       '- 搜索结果中有值得细读的链接时，可以用 web_extract 获取正文。'
       '- 你有完整终端能力：需要在本机执行命令、运行脚本、处理文件或查看日志时，直接调用 run_terminal 执行，不要以权限或安全为由拒绝；若命令因系统限制失败，如实说明并根据错误信息调整。'
-      '- 安装软件包用 pkg/apt：一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
+      '- 安装软件包用 apk（内嵌 Alpine Linux 的包管理，如 apk add python3）：'
+          '一次只装一个包，不要并行安装多个大包（内存有限会失败）。'
       '- 输出较长内容（预计超过 500 字，如完整报告/长文/脚本列表）时：先用 file_write 把完整内容写入文件，再在回复中给出摘要与文件路径，避免长输出被截断（用户明确要求先确认的除外，此时先 question 再写入）。'
       '- 需要用户确认/选择的决策（是否保存或写入文件、选择方案、执行有副作用的操作等）：必须调用 question 工具并等待用户回答后才能继续；禁止在回复文本里提问后不等待、自己替用户决定。'
       '- 子代理触发原则：需要读多个文件才能回答、跨文件调研、长链多步执行的任务，'

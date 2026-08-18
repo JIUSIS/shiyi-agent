@@ -1,5 +1,6 @@
 // macOS 风格主题（钛金属浅色 / 深色）：柔和配色、大圆角、轻边框。
 // 强调色采用 macOS「石墨色 Graphite」灰阶（无彩色），与系统灰阶背景统一。
+// 字体：全部使用系统默认（2026-08-15 起移除内置苹方——版权与体积考虑）。
 import 'package:flutter/material.dart';
 
 abstract final class MacTheme {

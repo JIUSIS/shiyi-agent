@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:sqflite/sqflite.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -26,10 +28,19 @@ class AppDatabase {
 
   Future<Database> _open() async {
     try {
-      final dir = await getApplicationDocumentsDirectory();
+      // Windows 桌面端 sqflite 没有原生实现：切换到 FFI（sqlite3.dll）。
+      // Android/iOS 继续走默认原生实现。全局 databaseFactory 赋值是幂等的。
+      if (Platform.isWindows) {
+        sqfliteFfiInit();
+        databaseFactory = databaseFactoryFfi;
+      }
+      // Windows 用应用支持目录（%APPDATA%），Android 用 Documents。
+      final dir = await (Platform.isWindows
+          ? getApplicationSupportDirectory()
+          : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 15,
+        version: 17,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -65,7 +76,9 @@ class AppDatabase {
       last_usage_total_tokens INTEGER,
       rolling_summary TEXT,
       project_id TEXT,
-      workspace_dir TEXT
+      workspace_dir TEXT,
+      cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_input_tokens INTEGER NOT NULL DEFAULT 0
     )
   ''');
     await db.execute('''
@@ -75,6 +88,7 @@ class AppDatabase {
       role TEXT NOT NULL,
       content TEXT,
       reasoning TEXT,
+      subagent_result TEXT,
       tool_calls TEXT,
       tool_call_id TEXT,
       created_at INTEGER NOT NULL,
@@ -257,6 +271,32 @@ class AppDatabase {
         await db.execute('ALTER TABLE projects ADD COLUMN workspace_dir TEXT');
       }
     }
+    // v15 -> v16：sessions 表加缓存命中率累计列
+    // （cache_hit_tokens / cache_input_tokens，会话级持久化，
+    //  退出会话再进入/重启后仍显示整段会话的缓存命中率）。
+    if (oldV < 16) {
+      final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+      if (!cols.any((c) => c['name'] == 'cache_hit_tokens')) {
+        await db.execute(
+          'ALTER TABLE sessions ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0',
+        );
+      }
+      if (!cols.any((c) => c['name'] == 'cache_input_tokens')) {
+        await db.execute(
+          'ALTER TABLE sessions ADD COLUMN cache_input_tokens INTEGER NOT NULL DEFAULT 0',
+        );
+      }
+    }
+    // v16 -> v17：拾忆子代理原始报告跟随助手消息落库，
+    // 用于左侧气泡折叠展示，不进入模型上下文。
+    if (oldV < 17) {
+      final cols = await db.rawQuery('PRAGMA table_info(messages)');
+      if (!cols.any((c) => c['name'] == 'subagent_result')) {
+        await db.execute(
+          'ALTER TABLE messages ADD COLUMN subagent_result TEXT',
+        );
+      }
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -279,11 +319,25 @@ class AppDatabase {
         'ALTER TABLE messages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0',
       );
     }
+    if (!messageCols.any((c) => c['name'] == 'subagent_result')) {
+      await db.execute('ALTER TABLE messages ADD COLUMN subagent_result TEXT');
+    }
     if (!sessionCols.any((c) => c['name'] == 'rolling_summary')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN rolling_summary TEXT');
     }
     if (!sessionCols.any((c) => c['name'] == 'project_id')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN project_id TEXT');
+    }
+    final cacheCols = await db.rawQuery('PRAGMA table_info(sessions)');
+    if (!cacheCols.any((c) => c['name'] == 'cache_hit_tokens')) {
+      await db.execute(
+        'ALTER TABLE sessions ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    if (!cacheCols.any((c) => c['name'] == 'cache_input_tokens')) {
+      await db.execute(
+        'ALTER TABLE sessions ADD COLUMN cache_input_tokens INTEGER NOT NULL DEFAULT 0',
+      );
     }
     await db.execute('''
       CREATE TABLE IF NOT EXISTS projects (
@@ -363,6 +417,22 @@ class AppDatabase {
     await db.update(
       'sessions',
       {'last_usage_total_tokens': tokens},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  /// 持久化本会话累计的缓存命中率分子/分母
+  /// （Σ缓存token / Σ输入token，退出会话再进入/重启后仍可见）。
+  Future<void> updateSessionCacheTokens(
+    String id,
+    int hitTokens,
+    int inputTokens,
+  ) async {
+    final db = await this.db;
+    await db.update(
+      'sessions',
+      {'cache_hit_tokens': hitTokens, 'cache_input_tokens': inputTokens},
       where: 'id = ?',
       whereArgs: [id],
     );
@@ -563,12 +633,16 @@ class AppDatabase {
     String id,
     String content, {
     String? reasoning,
+    String? subagentResult,
     List<ToolCall>? toolCalls,
   }) async {
     final db = await this.db;
     final upd = <String, dynamic>{'content': content};
     if (reasoning != null) {
       upd['reasoning'] = reasoning;
+    }
+    if (subagentResult != null) {
+      upd['subagent_result'] = subagentResult;
     }
     if (toolCalls != null) {
       upd['tool_calls'] = jsonEncode(toolCalls.map((t) => t.toJson()).toList());

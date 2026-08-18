@@ -11,6 +11,7 @@ import '../core/app_state.dart';
 import '../core/models.dart';
 import '../services/skill_pack.dart';
 import '../widgets/ios_style.dart';
+import '../widgets/mac_action_button.dart';
 import '../widgets/markdown_text.dart';
 import '../widgets/traffic_lights_button.dart';
 
@@ -22,7 +23,7 @@ class SkillsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return CupertinoTheme(
-      data: CupertinoThemeData(brightness: theme.brightness),
+      data: iosCupertinoTheme(context),
       child: ListenableBuilder(
         listenable: shiyi,
         builder: (context, _) {
@@ -32,11 +33,17 @@ class SkillsScreen extends StatelessWidget {
               leadingWidth: 72,
               leading: Padding(
                 padding: const EdgeInsets.only(left: 12),
-                child: TrafficLightsButton(
-                  busy: shiyi.isBusy,
-                  tooltip: '新建技能',
-                  onTap: () => _editSkill(context, null),
-                ),
+                child: Platform.isWindows
+                    ? MacActionButton(
+                        icon: CupertinoIcons.plus,
+                        tooltip: '新建技能',
+                        onTap: () => _editSkill(context, null),
+                      )
+                    : TrafficLightsButton(
+                        busy: shiyi.isBusy,
+                        tooltip: '新建技能',
+                        onTap: () => _editSkill(context, null),
+                      ),
               ),
               toolbarHeight: 64,
               centerTitle: true,
@@ -698,50 +705,54 @@ class _SkillTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return CupertinoListTile(
-      padding: const EdgeInsetsDirectional.fromSTEB(16, 8, 8, 8),
-      leadingSize: 30,
-      leadingToTitle: 10,
-      leading: Container(
-        width: 31,
-        height: 31,
-        decoration: BoxDecoration(
-          color: const Color(0xFFAF52DE),
-          borderRadius: BorderRadius.circular(7),
-        ),
-        child: const Icon(
-          CupertinoIcons.rocket_fill,
-          size: 17,
-          color: CupertinoColors.white,
-        ),
-      ),
-      title: Text(
-        skill.name,
-        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-      ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          skill.description.isEmpty
-              ? const Text('（无描述）')
-              : MarkdownInlineText(
-                  skill.description,
-                  style: const TextStyle(fontSize: 12, height: 1.3),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-          Text(
-            '${skill.content.isEmpty ? '0' : '1'} 个文档${skill.files.isEmpty ? '' : ' · ${skill.files.length} 个辅助文件'}${skill.largeFiles.isEmpty ? '' : ' · ${skill.largeFiles.length} 个大文件'}',
-            style: const TextStyle(fontSize: 11, height: 1.2),
+    return GestureDetector(
+      // Windows 桌面：右键弹出与「…」按钮相同的操作菜单。
+      onSecondaryTapDown: (_) => onMore(),
+      child: CupertinoListTile(
+        padding: const EdgeInsetsDirectional.fromSTEB(16, 8, 8, 8),
+        leadingSize: 30,
+        leadingToTitle: 10,
+        leading: Container(
+          width: 31,
+          height: 31,
+          decoration: BoxDecoration(
+            color: const Color(0xFFAF52DE),
+            borderRadius: BorderRadius.circular(7),
           ),
-        ],
+          child: const Icon(
+            CupertinoIcons.rocket_fill,
+            size: 17,
+            color: CupertinoColors.white,
+          ),
+        ),
+        title: Text(
+          skill.name,
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+        ),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            skill.description.isEmpty
+                ? const Text('（无描述）')
+                : MarkdownInlineText(
+                    skill.description,
+                    style: const TextStyle(fontSize: 12, height: 1.3),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+            Text(
+              '${skill.content.isEmpty ? '0' : '1'} 个文档${skill.files.isEmpty ? '' : ' · ${skill.files.length} 个辅助文件'}${skill.largeFiles.isEmpty ? '' : ' · ${skill.largeFiles.length} 个大文件'}',
+              style: const TextStyle(fontSize: 11, height: 1.2),
+            ),
+          ],
+        ),
+        trailing: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: onMore,
+          child: const Icon(CupertinoIcons.ellipsis),
+        ),
+        onTap: onTap,
       ),
-      trailing: CupertinoButton(
-        padding: EdgeInsets.zero,
-        onPressed: onMore,
-        child: const Icon(CupertinoIcons.ellipsis),
-      ),
-      onTap: onTap,
     );
   }
 }

@@ -15,6 +15,11 @@
         android:enableOnBackInvokedCallback="true"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- MTK/MIUI 真机在 Impeller(Vulkan) 下大面积黑屏（布局/触摸正常、
+             像素不绘制），退回 Skia 渲染保证功能页/文件页/设置页可见。 -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

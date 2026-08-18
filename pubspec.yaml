@@ -50,6 +50,11 @@ dependencies:
   url_launcher: ^6.3.1
   package_info_plus: ^9.0.1
   flutter_secure_storage: ^10.3.1
+  # Windows 桌面端 sqflite 的 FFI 实现（Android 继续用原生 sqflite）。
+  sqflite_common_ffi: ^2.3.0
+  # 解析 DSH Cordis 插件清单 cordis.patch.yml（plugin 管理页与 LLM 操作共用）。
+  yaml: ^3.1.2
+  liquid_glass_easy: ^4.0.0
 dependency_overrides:
   file_picker:
     path: third_party/file_picker_patch
@@ -78,7 +83,12 @@ flutter:
   assets:
     - assets/welcome.png
     - assets/avatar.png
-    - assets/termux/bootstrap-aarch64.zip
+    - assets/dsh_plugins/shiyi_free_search/package.json
+    - assets/dsh_plugins/shiyi_free_search/lib/index.js
+    # 内嵌 Alpine 运行时：minirootfs + proot 家族（目录声明，含全部资产）。
+    - assets/termux/
+  # 不使用内置字体（2026-08-15 移除苹方：版权风险 + 33MB 体积），
+  # 全部走系统默认字体（Android 系统 CJK / Windows Segoe UI+雅黑 fallback）。
 
   # To add assets to your application, add an assets section, like this:
   # assets:

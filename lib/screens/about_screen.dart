@@ -51,7 +51,7 @@ const _features = <(IconData, Color, String, String)>[
   (CupertinoIcons.doc_text_fill, _iosTeal, '文件管理', '会话文件附件与文件页浏览'),
   (CupertinoIcons.bookmark_fill, _iosPink, '长期记忆', '自动沉淀偏好、决定与项目背景'),
   (CupertinoIcons.bolt_fill, _iosIndigo, '技能系统', '内置技能与自定义技能包'),
-  (CupertinoIcons.desktopcomputer, _iosGray, '内置终端', 'bash / python3 / apt 装包'),
+  (CupertinoIcons.desktopcomputer, _iosGray, '内置终端', '内嵌 Alpine Linux / python3 / apk 装包'),
   (CupertinoIcons.globe, _iosBlue, '网页搜索与内容提取', '联网搜索、抓取网页正文'),
   (CupertinoIcons.photo_fill, _iosPurple, '图片与视觉模型', '图片附件、视觉模型辅助看图'),
   (CupertinoIcons.square_on_square, _iosTeal, '上下文压缩', '大上下文自动压缩与裁剪保护'),
@@ -144,9 +144,7 @@ class _AboutScreenState extends State<AboutScreen> {
       builder: (context, _) {
         final dark = _aboutIsDark(context, widget.shiyi.settings.themeMode);
         return CupertinoTheme(
-          data: CupertinoThemeData(
-            brightness: dark ? Brightness.dark : Brightness.light,
-          ),
+          data: iosCupertinoTheme(context),
           child: Material(
             type: MaterialType.transparency,
             child: CupertinoPageScaffold(

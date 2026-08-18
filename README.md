@@ -45,8 +45,11 @@
 
 ### 内置终端
 
-- 集成移动端终端环境（bash / python3 / apt），**无需安装 Termux、无需 root**
-- 软件包管理器内置国内镜像与自动切换（清华 / 南大 / 北大 / 中科大等）
+- 集成移动端终端环境（bash / python3 / apk），**无需安装 Termux、无需 root**
+- **2026-08-15 起基于 Alpine Linux**（proot + minirootfs，APK 内置约 3.9MB，取代旧 Termux bootstrap 40MB+）：
+  - 包管理 `apk`（清华镜像优先 + 官方兜底，网络抖动自动重试），命令全部在 Alpine 沙箱内执行；
+  - Node.js 环境（`apk add nodejs npm`）随 DeepSeek Harness 引擎自动安装，无需手动配置；
+  - 旧版本数据无缝迁移（会话 / 凭据 / 记忆全部保留，覆盖安装即可升级）。
 - 命令输出限流，长日志不撑爆内存；支持运行 Python 脚本、文本处理、项目管理工具
 
 ### 子代理（委派分工）
@@ -132,7 +135,7 @@
 
 ### 内置终端（免 root）
 
-应用内集成了移动端终端环境（bash + python3），不需要额外安装 Termux，也不需要 root。它基于 Android 应用沙箱 + 内嵌用户空间（proot）实现，首次启动自动部署，开箱即用。
+应用内集成了移动端终端环境（bash + python3），不需要额外安装 Termux，也不需要 root。它基于 Android 应用沙箱 + 内嵌用户空间（proot + Alpine Linux minirootfs）实现，首次启动自动部署，开箱即用。
 
 ### 技能系统
 
@@ -144,7 +147,7 @@
 | --- | --- |
 | 客户端 | Flutter / Dart（Android，targetSdk 27，兼容 SELinux 直接执行内嵌终端 ELF） |
 | 数据存储 | SQLite（会话与消息）、SharedPreferences（设置） |
-| 终端环境 | 内置 Termux 用户空间（bootstrap 固化进 assets，proot 沙箱） |
+| 终端环境 | 内置 Alpine Linux 用户空间（minirootfs 固化进 assets + proot 沙箱，apk 包管理） |
 | 模型接入 | LLM API + 多模态图片处理 |
 
 ## 从源码构建

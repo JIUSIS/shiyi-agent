@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
@@ -20,15 +22,22 @@ class FeaturesScreen extends StatelessWidget {
     return ListenableBuilder(
       listenable: shiyi,
       builder: (context, _) => CupertinoTheme(
-        data: CupertinoThemeData(brightness: Theme.of(context).brightness),
+        data: iosCupertinoTheme(context),
         child: Scaffold(
           backgroundColor: iosGroupedBackground(context),
           appBar: AppBar(
             leadingWidth: 72,
-            leading: Padding(
-              padding: const EdgeInsets.only(left: 12),
-              child: TrafficLightsButton(tooltip: '', busy: shiyi.isBusy),
-            ),
+            // Windows：窗口三键已在全局标题栏，页面内红绿灯（仅 busy 指示）
+            // 不再需要；手机端保留。
+            leading: Platform.isWindows
+                ? null
+                : Padding(
+                    padding: const EdgeInsets.only(left: 12),
+                    child: TrafficLightsButton(
+                      tooltip: '',
+                      busy: shiyi.isBusy,
+                    ),
+                  ),
             toolbarHeight: 64,
             centerTitle: true,
             backgroundColor: Theme.of(context).scaffoldBackgroundColor,

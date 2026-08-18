@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'dart:ui' show ImageFilter;
 
@@ -9,11 +10,18 @@ import 'package:flutter/services.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../services/dsh_service.dart';
 import '../services/update_service.dart';
+import '../widgets/context_menu.dart';
 import '../widgets/ios_style.dart';
+import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
 import 'chat_screen.dart';
+import 'dsh_center_screen.dart';
+import 'dsh_features_tab.dart';
+import 'dsh_files_tab.dart';
+import 'dsh_workspaces_tab.dart';
 import 'features_screen.dart';
 import 'files_screen.dart';
 import 'project_actions.dart';
@@ -32,8 +40,11 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   int _tab = 0;
+
+  /// 桌面侧边栏宽度（拖拽把手调整，150~300）。
+  double _sidebarWidth = 190;
   final int _sessionsResetRevision = 0;
   // tab 懒缓存：切换过的页面保留不重建（页面切换卡顿根因=每次全量重建+DB重查）。
   final Map<int, Widget> _tabCache = {};
@@ -50,18 +61,58 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _lastAgentEngine = widget.shiyi.settings.agentEngine;
     _fadeController.value = 1;
     _prebuildTabs();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _scheduleLaunchUpdateCheck();
     });
+    // Agent 引擎切换（拾忆/DSH）时：tab 内容随引擎变化，清缓存重建。
+    widget.shiyi.addListener(_onShiyiEngineChanged);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    widget.shiyi.removeListener(_onShiyiEngineChanged);
     widget.shiyi.loadedNotifier.removeListener(_onLoadedForUpdateCheck);
     _fadeController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!Platform.isAndroid) return;
+    if (state == AppLifecycleState.detached) {
+      // 进程销毁（杀后台/卸载等）时按用户开关决定是否停 DSH；
+      // 仅退后台不杀，避免每次重开都等 dsh 冷启动。
+      if (widget.shiyi.settings.dshStopOnExit) {
+        unawaited(DshService.instance.stop());
+      }
+    } else if (state == AppLifecycleState.resumed) {
+      unawaited(_checkDshOnLaunch());
+    }
+  }
+
+  /// 打开 app 时自动体检：未安装提示；未开启自动拉起；已开启刷新状态。
+  Future<void> _checkDshOnLaunch() async {
+    final ok = await DshService.instance.ensureAvailableOnLaunch();
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('DeepSeek Harness 未安装，请到 Agent 引擎页安装')),
+      );
+    }
+  }
+
+  String _lastAgentEngine = 'shiyi';
+
+  void _onShiyiEngineChanged() {
+    final engine = widget.shiyi.settings.agentEngine;
+    if (engine == _lastAgentEngine) return;
+    _lastAgentEngine = engine;
+    _tabCache.clear();
+    if (mounted) setState(() {});
   }
 
   /// 启动自动检查更新：等 app 初始化完成后触发，避免弹窗压住加载页。
@@ -135,6 +186,10 @@ class _HomeScreenState extends State<HomeScreen>
       ),
     );
     if (ok == true && mounted) {
+      // 显式退出按用户开关决定是否停服务；退后台保持常驻，重开即用。
+      if (widget.shiyi.settings.dshStopOnExit) {
+        await DshService.instance.stop();
+      }
       SystemNavigator.pop();
     }
   }
@@ -142,60 +197,103 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   Widget build(BuildContext context) {
     final shiyi = widget.shiyi;
+    // Windows 宽窗口：桌面侧边导航；窄窗口/手机：底部 Tab。
+    final desktopNav =
+        Platform.isWindows && MediaQuery.sizeOf(context).width >= 720;
+    // 引擎决定主页 tab 套件：拾忆（会话/功能/文件）或 DS Harness
+    //（工作数据/功能/文件）。
+    final tabs = shiyi.settings.agentEngine == 'dsh' ? _dshTabs : _iosTabs;
+    final content = ListenableBuilder(
+      listenable: Listenable.merge([
+        shiyi.loadedNotifier,
+        shiyi.initErrorNotifier,
+      ]),
+      builder: (context, _) {
+        if (!shiyi.loaded) {
+          if (shiyi.initError != null) {
+            return SafeArea(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    '初始化失败：${shiyi.initError}',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ),
+              ),
+            );
+          }
+          return const SafeArea(
+            child: Center(child: CircularProgressIndicator()),
+          );
+        }
+        // IndexedStack 常驻全部 tab：切换零构建、立即响应；切换时淡入。
+        // 桌面宽窗口下内容区居中限宽，避免手机布局被横向拉伸。
+        // 只缓存真实 tab，SizedBox 占位不入缓存：引擎切换清缓存后，
+        // 首次切到某个 tab 会当场重建，不会一直显示空页。
+        final stack = FadeTransition(
+          opacity: _fade,
+          child: IndexedStack(
+            index: _tab,
+            children: [
+              for (var i = 0; i <= 2; i++)
+                if (i == _tab)
+                  _tabCache[i] ??= _buildTabFor(i)
+                else
+                  _tabCache[i] ?? const SizedBox.shrink(),
+            ],
+          ),
+        );
+        if (!desktopNav) return SafeArea(child: stack);
+        return SafeArea(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 980),
+              child: stack,
+            ),
+          ),
+        );
+      },
+    );
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) return;
         _handleBack();
       },
-      child: Scaffold(
-        backgroundColor: iosGroupedBackground(context),
-        // 键盘只应压缩当前 tab 的内容，不能把悬浮侧边栏一起压矮。
-        resizeToAvoidBottomInset: false,
-        body: ListenableBuilder(
-          listenable: Listenable.merge([
-            shiyi.loadedNotifier,
-            shiyi.initErrorNotifier,
-          ]),
-          builder: (context, _) {
-            if (!shiyi.loaded) {
-              if (shiyi.initError != null) {
-                return SafeArea(
-                  child: Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(
-                        '初始化失败：${shiyi.initError}',
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
-                    ),
-                  ),
-                );
-              }
-              return const SafeArea(
-                child: Center(child: CircularProgressIndicator()),
-              );
-            }
-            // IndexedStack 常驻全部 tab：切换零构建、立即响应；切换时淡入。
-            return SafeArea(
-              child: FadeTransition(
-                opacity: _fade,
-                child: IndexedStack(
-                  index: _tab,
+      // Windows 桌面快捷键：Ctrl+N 新建会话、Ctrl+, 打开设置。
+      child: Focus(
+        autofocus: Platform.isWindows,
+        onKeyEvent: _handleGlobalKeys,
+        child: Scaffold(
+          backgroundColor: iosGroupedBackground(context),
+          // 键盘只应压缩当前 tab 的内容，不能把悬浮侧边栏一起压矮。
+          resizeToAvoidBottomInset: false,
+          body: desktopNav
+              ? Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    for (var i = 0; i <= 2; i++)
-                      _tabCache[i] ??
-                          (i == _tab
-                              ? _buildTabFor(i)
-                              : const SizedBox.shrink()),
+                    _DesktopNavBar(
+                      currentIndex: _tab,
+                      onTap: _selectTab,
+                      onOpenSettings: _openSettingsForCurrentEngine,
+                      tabs: tabs,
+                      width: _sidebarWidth,
+                    ),
+                    _SidebarResizer(
+                      width: _sidebarWidth,
+                      onChanged: (w) =>
+                          setState(() => _sidebarWidth = w.clamp(150.0, 300.0)),
+                    ),
+                    Expanded(child: content),
                   ],
-                ),
-              ),
-            );
-          },
+                )
+              : content,
+          bottomNavigationBar: desktopNav
+              ? null
+              : _IosTabBar(currentIndex: _tab, onTap: _selectTab, tabs: tabs),
         ),
-        bottomNavigationBar: _IosTabBar(currentIndex: _tab, onTap: _selectTab),
       ),
     );
   }
@@ -208,8 +306,37 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  /// 设置入口跟随 Agent 引擎：DS Harness 引擎下打开 DS Harness 中心
+  ///（含引擎切换、模型/预设/工作区/技能/设置）；拾忆引擎下打开拾忆设置。
+  void _openSettingsForCurrentEngine() {
+    _dismissKeyboard();
+    if (widget.shiyi.settings.agentEngine == 'dsh') {
+      Navigator.push(
+        context,
+        MacPageRoute(builder: (_) => DshCenterScreen(shiyi: widget.shiyi)),
+      );
+    } else {
+      _openSettings();
+    }
+  }
+
   Widget _buildTabFor(int i) {
     final shiyi = widget.shiyi;
+    // Agent 引擎：DS Harness 时主页三个 tab 整体切换（外观复用拾忆，
+    // 数据源为 DeepSeek Harness）：会话（工作区分组）/ 功能（DSH 功能
+    // 入口集合）/ 文件。
+    if (shiyi.settings.agentEngine == 'dsh') {
+      switch (i) {
+        case 0:
+          return DshWorkspacesTab(shiyi: shiyi);
+        case 1:
+          return DshFeaturesTab(shiyi: shiyi);
+        case 2:
+          // DSH 文件页使用主机目录 API；拾忆引擎仍使用本地文件页。
+          return buildFilesTabForEngine(shiyi);
+      }
+      return const SizedBox.shrink();
+    }
     switch (i) {
       case 0:
         return _SessionsTab(
@@ -224,6 +351,40 @@ class _HomeScreenState extends State<HomeScreen>
     }
     return const SizedBox.shrink();
   }
+
+  /// Windows 桌面快捷键（macOS 惯例：⌘ = Ctrl）：
+  /// Ctrl+N 新建会话、Ctrl+, 打开设置。
+  KeyEventResult _handleGlobalKeys(FocusNode node, KeyEvent event) {
+    if (!Platform.isWindows || event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (!HardwareKeyboard.instance.isControlPressed) {
+      return KeyEventResult.ignored;
+    }
+    switch (event.logicalKey) {
+      case LogicalKeyboardKey.keyN:
+        unawaited(_newSessionShortcut());
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.comma:
+        _openSettingsForCurrentEngine();
+        return KeyEventResult.handled;
+      default:
+        return KeyEventResult.ignored;
+    }
+  }
+
+  Future<void> _newSessionShortcut() async {
+    if (_tab != 0) _selectTab(0);
+    try {
+      await widget.shiyi.newSession();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('新建会话失败：$e')));
+      }
+    }
+  }
 }
 
 const _iosTabs = <(IconData, IconData, String)>[
@@ -232,11 +393,33 @@ const _iosTabs = <(IconData, IconData, String)>[
   (CupertinoIcons.folder, CupertinoIcons.folder_fill, '文件'),
 ];
 
+/// DS Harness 引擎下的主页 tab：工作数据 / 功能 / 文件（拾忆同款布局，
+/// 功能页的「技能」卡片走 DeepSeek Harness 接口）。
+const _dshTabs = <(IconData, IconData, String)>[
+  (CupertinoIcons.archivebox, CupertinoIcons.archivebox_fill, '工作数据'),
+  (CupertinoIcons.square_grid_2x2, CupertinoIcons.square_grid_2x2_fill, '功能'),
+  (CupertinoIcons.folder, CupertinoIcons.folder_fill, '文件'),
+];
+
+/// 返回当前 Agent 引擎对应的文件页。
+/// DSH 使用主机目录 API；拾忆使用本地文件工作区。
+/// 单独保留为纯路由选择点，避免两个引擎的文件数据源再次串线。
+Widget buildFilesTabForEngine(ShiyiState shiyi) {
+  return shiyi.settings.agentEngine == 'dsh'
+      ? DshFilesTab(shiyi: shiyi)
+      : FilesScreen(shiyi: shiyi);
+}
+
 /// iOS 风格底部 Tab：毛玻璃背景、蓝点选中态、图标+文字。
 class _IosTabBar extends StatelessWidget {
   final int currentIndex;
   final ValueChanged<int> onTap;
-  const _IosTabBar({required this.currentIndex, required this.onTap});
+  final List<(IconData, IconData, String)> tabs;
+  const _IosTabBar({
+    required this.currentIndex,
+    required this.onTap,
+    required this.tabs,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -259,12 +442,12 @@ class _IosTabBar extends StatelessWidget {
               height: 58,
               child: Row(
                 children: [
-                  for (var i = 0; i < _iosTabs.length; i++)
+                  for (var i = 0; i < tabs.length; i++)
                     Expanded(
                       child: _IosTabItem(
-                        icon: _iosTabs[i].$1,
-                        selectedIcon: _iosTabs[i].$2,
-                        label: _iosTabs[i].$3,
+                        icon: tabs[i].$1,
+                        selectedIcon: tabs[i].$2,
+                        label: tabs[i].$3,
                         selected: i == currentIndex,
                         onTap: () => onTap(i),
                       ),
@@ -320,6 +503,163 @@ class _IosTabItem extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Windows 桌面侧边导航栏：宽窗口时替代底部 Tab。
+/// macOS 风格：毛玻璃材质、选中项圆角高亮条、宽度可拖拽调整。
+class _DesktopNavBar extends StatelessWidget {
+  final int currentIndex;
+  final ValueChanged<int> onTap;
+  final VoidCallback onOpenSettings;
+  final double width;
+  final List<(IconData, IconData, String)> tabs;
+  const _DesktopNavBar({
+    required this.currentIndex,
+    required this.onTap,
+    required this.onOpenSettings,
+    required this.tabs,
+    this.width = 190,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final hairline = dark
+        ? Colors.white.withValues(alpha: 0.08)
+        : Colors.black.withValues(alpha: 0.08);
+    final barBg = dark ? const Color(0xFF1C1C1E) : const Color(0xFFF2F2F7);
+    return Container(
+      width: width,
+      decoration: BoxDecoration(
+        color: barBg,
+        border: Border(right: BorderSide(color: hairline)),
+      ),
+      child: ClipRect(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          child: Container(
+            color: barBg.withValues(alpha: dark ? 0.82 : 0.72),
+            child: SafeArea(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                    child: Text(
+                      '拾忆',
+                      style: TextStyle(
+                        fontSize: 19,
+                        fontWeight: FontWeight.w700,
+                        color: dark
+                            ? CupertinoColors.white
+                            : CupertinoColors.black,
+                      ),
+                    ),
+                  ),
+                  for (var i = 0; i < tabs.length; i++)
+                    _DesktopNavItem(
+                      icon: tabs[i].$1,
+                      selectedIcon: tabs[i].$2,
+                      label: tabs[i].$3,
+                      selected: i == currentIndex,
+                      onTap: () => onTap(i),
+                    ),
+                  const Spacer(),
+                  _DesktopNavItem(
+                    icon: CupertinoIcons.slider_horizontal_3,
+                    selectedIcon: CupertinoIcons.slider_horizontal_3,
+                    label: '设置',
+                    selected: false,
+                    onTap: onOpenSettings,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 侧边栏右侧拖拽把手：拖动调整侧边栏宽度。
+class _SidebarResizer extends StatelessWidget {
+  final double width;
+  final ValueChanged<double> onChanged;
+  const _SidebarResizer({required this.width, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: (d) => onChanged(width + d.delta.dx),
+        child: const SizedBox(width: 6),
+      ),
+    );
+  }
+}
+
+/// 桌面侧边导航项：图标 + 文字；选中项 macOS 风格圆角高亮条。
+class _DesktopNavItem extends StatelessWidget {
+  final IconData icon;
+  final IconData selectedIcon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _DesktopNavItem({
+    required this.icon,
+    required this.selectedIcon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final color = selected
+        ? (dark ? const Color(0xFF0A84FF) : const Color(0xFF007AFF))
+        : (dark ? CupertinoColors.systemGrey : CupertinoColors.secondaryLabel);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      child: Material(
+        color: selected
+            ? (dark ? const Color(0x330A84FF) : const Color(0x1F0A84FF))
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          onTap: onTap,
+          hoverColor: dark
+              ? Colors.white.withValues(alpha: 0.06)
+              : Colors.black.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            child: Row(
+              children: [
+                Icon(selected ? selectedIcon : icon, size: 19, color: color),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      color: color,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -443,11 +783,19 @@ class _SessionsTabState extends State<_SessionsTab> {
               leadingWidth: 72,
               leading: Padding(
                 padding: const EdgeInsets.only(left: 12),
-                child: TrafficLightsButton(
-                  busy: shiyi.isBusy,
-                  tooltip: '新建项目',
-                  onTap: _newProject,
-                ),
+                // Windows：页面内红绿灯改为 mac 风格「+」按钮
+                // （窗口三键已在全局标题栏）。
+                child: Platform.isWindows
+                    ? MacActionButton(
+                        icon: CupertinoIcons.plus,
+                        tooltip: '新建项目',
+                        onTap: _newProject,
+                      )
+                    : TrafficLightsButton(
+                        busy: shiyi.isBusy,
+                        tooltip: '新建项目',
+                        onTap: _newProject,
+                      ),
               ),
               toolbarHeight: 64,
               centerTitle: true,
@@ -913,7 +1261,7 @@ class _SessionTile extends StatelessWidget {
     final s = session;
     final theme = Theme.of(context);
     final projectName = shiyi.projectNameFor(s.id);
-    final busy = shiyi.isBusy && shiyi.busySessionId == s.id;
+    final busy = shiyi.isBusyForSession(s.id);
     final unread = shiyi.unreadSessions.contains(s.id);
     final subtitle = busy
         ? Row(
@@ -1207,6 +1555,51 @@ class _SwipeActionsState extends State<_SwipeActions>
     widget.onTap?.call();
   }
 
+  /// Windows 桌面：鼠标悬停展开操作区（代替左滑），离开收回。
+  void _setHovered(bool hovered) {
+    if (!Platform.isWindows) return;
+    if (_animating) {
+      _controller.stop();
+      _animating = false;
+    }
+    if (hovered) {
+      if (_offset >= 0) {
+        _controller.forward();
+        _syncOpenState(-actionWidth);
+      }
+    } else if (_offset < 0) {
+      widget.onOpenRectChanged?.call(null);
+      _settle(0);
+      _syncOpenState(0);
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Windows 桌面：右键弹出与左滑操作相同的菜单（悬停展开之外的第二入口）。
+  void _openContextMenu(BuildContext context, Offset globalPosition) {
+    final entries = <DesktopMenuItem>[];
+    for (final a in widget.actions) {
+      if (a is _CircularSwipeAction) {
+        entries.add(
+          DesktopMenuItem(
+            label: a.label,
+            icon: a.icon,
+            iconColor: a.backgroundColor,
+            onTap: a.onTap,
+          ),
+        );
+      }
+    }
+    if (entries.isEmpty) return;
+    // 若已展开先收回，避免菜单出现时列表项还露着操作区。
+    if (_offset < 0) {
+      widget.onOpenRectChanged?.call(null);
+      _settle(0);
+      _syncOpenState(0);
+    }
+    showDesktopMenu(context, globalPosition: globalPosition, items: entries);
+  }
+
   void _syncOpenState(double target) {
     final n = widget.openNotifier;
     final k = widget.swipeKey;
@@ -1248,60 +1641,74 @@ class _SwipeActionsState extends State<_SwipeActions>
     final displayOffset = _animating
         ? -actionWidth * _controller.value
         : _offset;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(14),
-      child: Stack(
-        children: [
-          // 底层：右侧固定宽度操作区（仅滑动展开时显示，静止时完全不可见）。
-          Positioned.fill(
-            child: AnimatedOpacity(
-              opacity: displayOffset < 0 ? 1 : 0,
-              duration: const Duration(milliseconds: 100),
-              child: GestureDetector(
-                // 露出的操作区背景也视为空白：点圆形按钮触发操作，
-                // 点按钮之间的空隙则收回左滑。
-                behavior: HitTestBehavior.opaque,
-                onTap: _handleTap,
-                child: Align(
-                  alignment: Alignment.centerRight,
-                  child: SizedBox(
-                    width: actionWidth,
-                    height: double.infinity,
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [for (final a in widget.actions) a],
+    final desktop = Platform.isWindows;
+    // Windows 桌面：鼠标悬停展开操作区（代替左滑手势），右键弹菜单；
+    // 手机端保持左滑 + 点击逻辑不变。
+    return MouseRegion(
+      onEnter: desktop ? (_) => _setHovered(true) : null,
+      onExit: desktop ? (_) => _setHovered(false) : null,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(14),
+        child: Stack(
+          children: [
+            // 底层：右侧固定宽度操作区（仅滑动展开时显示，静止时完全不可见）。
+            Positioned.fill(
+              child: AnimatedOpacity(
+                opacity: displayOffset < 0 ? 1 : 0,
+                duration: const Duration(milliseconds: 100),
+                child: GestureDetector(
+                  // 露出的操作区背景也视为空白：点圆形按钮触发操作，
+                  // 点按钮之间的空隙则收回左滑。
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _handleTap,
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: SizedBox(
+                      width: actionWidth,
+                      height: double.infinity,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [for (final a in widget.actions) a],
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
-          ),
-          // 上层：内容。手势放在 transform 内部，命中区域随左移，
-          // 右侧露出的操作区才能被点中；内容带不透明背景遮挡底层。
-          AnimatedBuilder(
-            animation: _controller,
-            builder: (context, _) {
-              final off = _animating
-                  ? -actionWidth * _controller.value
-                  : _offset;
-              return Container(
-                transform: Matrix4.translationValues(off, 0, 0),
-                decoration: BoxDecoration(
-                  color: iosSectionBackground(context),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onHorizontalDragUpdate: (d) => _drag(d.delta.dx),
-                  onHorizontalDragEnd: (d) => _end(d.primaryVelocity ?? 0),
-                  onHorizontalDragCancel: () => _end(0),
-                  onTap: _handleTap,
-                  child: widget.child,
-                ),
-              );
-            },
-          ),
-        ],
+            // 上层：内容。手势放在 transform 内部，命中区域随左移，
+            // 右侧露出的操作区才能被点中；内容带不透明背景遮挡底层。
+            AnimatedBuilder(
+              animation: _controller,
+              builder: (context, _) {
+                final off = _animating
+                    ? -actionWidth * _controller.value
+                    : _offset;
+                return Container(
+                  transform: Matrix4.translationValues(off, 0, 0),
+                  decoration: BoxDecoration(
+                    color: iosSectionBackground(context),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onHorizontalDragUpdate: desktop
+                        ? null
+                        : (d) => _drag(d.delta.dx),
+                    onHorizontalDragEnd: desktop
+                        ? null
+                        : (d) => _end(d.primaryVelocity ?? 0),
+                    onHorizontalDragCancel: desktop ? null : () => _end(0),
+                    onSecondaryTapDown: desktop
+                        ? (d) => _openContextMenu(context, d.globalPosition)
+                        : null,
+                    onTap: _handleTap,
+                    child: widget.child,
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
       ),
     );
   }

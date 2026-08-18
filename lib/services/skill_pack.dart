@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:flutter/services.dart';
 
 import '../core/models.dart';
@@ -31,8 +32,9 @@ class SkillPack {
 }
 
 /// skill 包（zip）导入 / 导出。
-/// 全程流式：zip 由 Android 原生 ZipInputStream 流式解压到磁盘，
-/// 小文本文件入内存，大文件留在磁盘，避免超大包 OOM。
+/// Android：全程流式（zip 由 Android 原生 ZipInputStream 流式解压到磁盘，
+/// 小文本文件入内存，大文件留在磁盘，避免超大包 OOM）。
+/// Windows 桌面：无原生实现，用 Dart 的 archive 包解压/打包（桌面内存充足）。
 class SkillPackIO {
   static const MethodChannel _channel = MethodChannel('shiyi/skillpack');
 
@@ -77,11 +79,28 @@ class SkillPackIO {
     if (dest.existsSync()) dest.deleteSync(recursive: true);
     dest.createSync(recursive: true);
 
-    final rawEntries = await _channel.invokeListMethod<Map<dynamic, dynamic>>(
-      'extractZip',
-      {'zipPath': zipPath, 'destDir': destDir},
-    );
-    if (rawEntries == null) throw const FormatException('解压失败：无返回数据');
+    // Android：原生流式解压。Windows 桌面端无原生实现：先尝试 channel
+    //（测试环境有 mock），MissingPluginException 时回退 Dart archive 实现。
+    List<Map<dynamic, dynamic>> rawEntries;
+    if (Platform.isWindows) {
+      try {
+        final r = await _channel.invokeListMethod<Map<dynamic, dynamic>>(
+          'extractZip',
+          {'zipPath': zipPath, 'destDir': destDir},
+        );
+        if (r == null) throw const FormatException('解压失败：无返回数据');
+        rawEntries = r;
+      } on MissingPluginException {
+        rawEntries = _extractZipDart(zipPath, destDir);
+      }
+    } else {
+      final r = await _channel.invokeListMethod<Map<dynamic, dynamic>>(
+        'extractZip',
+        {'zipPath': zipPath, 'destDir': destDir},
+      );
+      if (r == null) throw const FormatException('解压失败：无返回数据');
+      rawEntries = r;
+    }
     final fileMap = <String, int>{};
     for (final e in rawEntries) {
       final path = e['path']?.toString() ?? '';
@@ -244,13 +263,65 @@ class SkillPackIO {
         final outS = f.openWrite();
         await inS.pipe(outS);
       }
-      await _channel.invokeMethod<void>(
-        'createZip',
-        {'srcDir': tmp.path, 'zipPath': zipPath},
-      );
+      if (Platform.isWindows) {
+        try {
+          await _channel.invokeMethod<void>(
+            'createZip',
+            {'srcDir': tmp.path, 'zipPath': zipPath},
+          );
+        } on MissingPluginException {
+          _createZipDart(tmp.path, zipPath);
+        }
+      } else {
+        await _channel.invokeMethod<void>(
+          'createZip',
+          {'srcDir': tmp.path, 'zipPath': zipPath},
+        );
+      }
     } finally {
       if (tmp.existsSync()) tmp.deleteSync(recursive: true);
     }
+  }
+
+  /// Windows 实现：把 zip 解压到 [destDir]（仅安全相对路径条目），
+  /// 返回 [{path, size}] 列表，结构与 Android 原生通道一致。
+  static List<Map<dynamic, dynamic>> _extractZipDart(
+    String zipPath,
+    String destDir,
+  ) {
+    try {
+      final bytes = File(zipPath).readAsBytesSync();
+      final archive = ZipDecoder().decodeBytes(bytes);
+      final entries = <Map<dynamic, dynamic>>[];
+      final seen = <String>{};
+      for (final f in archive.files) {
+        if (!f.isFile) continue;
+        final path = f.name;
+        if (!isSafeRelativeEntry(path)) continue;
+        if (!seen.add(path)) continue;
+        final content = f.content as List<int>;
+        final target = File('$destDir/$path');
+        target.parent.createSync(recursive: true);
+        target.writeAsBytesSync(content, flush: true);
+        entries.add({'path': path, 'size': content.length});
+      }
+      return entries;
+    } on FormatException {
+      throw const FormatException('压缩包损坏或格式不支持');
+    }
+  }
+
+  /// Windows 实现：把 [srcDir] 下所有文件打包为 zip 写入 [zipPath]。
+  static void _createZipDart(String srcDir, String zipPath) {
+    final base = Directory(srcDir);
+    final archive = Archive();
+    for (final f in base.listSync(recursive: true).whereType<File>()) {
+      final rel = f.path.substring(base.path.length + 1).replaceAll('\\', '/');
+      if (rel.isEmpty) continue;
+      archive.addFile(ArchiveFile(rel, f.lengthSync(), f.readAsBytesSync()));
+    }
+    final data = ZipEncoder().encode(archive);
+    File(zipPath).writeAsBytesSync(data, flush: true);
   }
 
   static bool _isTextPath(String path) {

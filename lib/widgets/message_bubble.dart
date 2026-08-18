@@ -2,17 +2,20 @@ import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../core/models.dart';
+import 'context_menu.dart';
 import 'ios_style.dart';
 import 'markdown_text.dart';
 
 const _iosBlueLight = Color(0xFF007AFF);
 const _iosBlueDark = Color(0xFF0A84FF);
-const _iosGrayLight = Color(0xFFE9E9EB);
-const _iosGrayDark = Color(0xFF2C2C2E);
 const _toolbarIconWidth = 34.0;
 const _messageListSidePadding = 12.0;
+const _subagentResultMarker = '<子代理返回信息>';
+const _subagentPromptMarker = '<子代理提示词注入>';
+const _subagentSummaryMarker = '<子代理总结>';
 
 class MessageBubble extends StatefulWidget {
   final ChatMessage message;
@@ -56,6 +59,18 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// 思考内容是否展开（默认收起）。
   bool _showReasoning = false;
 
+  /// DSH 运行时上下文是否展开（默认收起）。
+  bool _showRuntimeContext = false;
+
+  /// DSH 子代理返回内容是否展开（默认收起）。
+  bool _showSubagentResult = false;
+
+  /// DSH 子代理提示词是否展开（默认收起）。
+  bool _showSubagentPrompt = false;
+
+  /// 主模型对子代理结果的总结是否展开（默认收起）。
+  bool _showSubagentSummary = false;
+
   /// 思考区滚动控制器（流式增长时自动跟随到最新）。
   final ScrollController _reasoningCtrl = ScrollController();
 
@@ -96,12 +111,81 @@ class _MessageBubbleState extends State<MessageBubble> {
   void Function(ChatMessage)? get onSpeak => widget.onSpeak;
   VoidCallback? get onStopSpeak => widget.onStopSpeak;
 
+  String? _extractMarkedContent(String content, String marker) {
+    final trimmed = content.trimLeft();
+    if (!trimmed.startsWith(marker)) return null;
+    return trimmed.substring(marker.length).trimLeft();
+  }
+
+  LiquidGlassStyle _glassStyle({
+    required bool dark,
+    required bool isUser,
+    double cornerRadius = 20,
+  }) {
+    final tint = isUser
+        ? (dark ? const Color(0x991A4DAD) : const Color(0x5C9EC5FF))
+        : (dark ? const Color(0x733A3A3E) : const Color(0x70FFFFFF));
+    return LiquidGlassStyle(
+      shape: LiquidGlassShape.continuousRoundedRectangle(
+        cornerRadius: cornerRadius,
+        borderWidth: 1,
+        borderColor: dark
+            ? Colors.white.withValues(alpha: .18)
+            : Colors.white.withValues(alpha: .55),
+        lightIntensity: .85,
+        lightDirection: isUser ? 55 : 125,
+      ),
+      appearance: LiquidGlassAppearance(
+        color: tint,
+        blur: const LiquidGlassBlur(sigmaX: 14, sigmaY: 14),
+        saturation: 1.12,
+      ),
+      refraction: const LiquidGlassRefraction(
+        distortion: .08,
+        distortionWidth: 22,
+        magnification: 1.01,
+        chromaticAberration: .0015,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
     final isUser = message.role == 'user';
-    final bubbleBlue = dark ? _iosBlueDark : _iosBlueLight;
+    // 流式缓冲可能暂时为空；这时回退到消息自身，避免历史 reasoning/content
+    // 被一个空的 ValueNotifier 覆盖掉。
+    final assistantContent = liveContent?.isNotEmpty == true
+        ? liveContent!
+        : message.content;
+    final visibleReasoning = liveReasoning?.isNotEmpty == true
+        ? liveReasoning!
+        : message.reasoning;
+    final legacySubagentResult = isUser
+        ? null
+        : _extractMarkedContent(assistantContent, _subagentResultMarker);
+    final foldedSubagentResult = message.subagentResult.trim().isNotEmpty
+        ? message.subagentResult.trim()
+        : legacySubagentResult ?? '';
+    final subagentPrompt = isUser
+        ? null
+        : _extractMarkedContent(assistantContent, _subagentPromptMarker);
+    final legacySubagentSummary = isUser
+        ? null
+        : _extractMarkedContent(assistantContent, _subagentSummaryMarker);
+    final foldedSubagentSummary = message.subagentSummary.trim().isNotEmpty
+        ? message.subagentSummary.trim()
+        : legacySubagentSummary ?? '';
+    final hasMarkedSubagentContent =
+        legacySubagentResult != null ||
+        subagentPrompt != null ||
+        legacySubagentSummary != null;
+    final visibleAssistantContent = hasMarkedSubagentContent
+        ? ''
+        : assistantContent;
+    // 用户气泡前景色：深色模式用白、浅色模式用深灰蓝，保证在液态玻璃上的对比度。
+    final userFg = dark ? Colors.white : const Color(0xFF14264A);
     final maxBubbleWidth =
         MediaQuery.sizeOf(context).width -
         _messageListSidePadding * 2 -
@@ -116,33 +200,59 @@ class _MessageBubbleState extends State<MessageBubble> {
           child: Container(
             key: const ValueKey('userBubble'),
             margin: const EdgeInsets.only(left: _toolbarIconWidth),
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
-              color: bubbleBlue,
               borderRadius: const BorderRadius.only(
                 topLeft: Radius.circular(20),
                 topRight: Radius.circular(20),
                 bottomLeft: Radius.circular(20),
                 bottomRight: Radius.circular(7),
               ),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: .18),
-                width: 1,
-              ),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: dark ? .18 : .06),
-                  blurRadius: 10,
+                  color: Colors.black.withValues(alpha: dark ? .22 : .10),
+                  blurRadius: 12,
                   offset: const Offset(0, 2),
                 ),
               ],
             ),
-            child: _UserContent(
-              content: message.content,
-              style: theme.textTheme.bodyMedium!.copyWith(
-                fontSize: 16,
-                height: 1.45,
-                color: Colors.white,
+            child: LiquidGlassLens(
+              key: const ValueKey('userLiquidGlassLens'),
+              style: _glassStyle(dark: dark, isUser: true),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (message.runtimeContext.trim().isNotEmpty) ...[
+                      _runtimeContextHeader(
+                        theme,
+                        onBlue: true,
+                        foreground: userFg,
+                      ),
+                      if (_showRuntimeContext)
+                        _runtimeContextBody(
+                          theme,
+                          message.runtimeContext,
+                          onBlue: true,
+                          foreground: userFg,
+                        ),
+                    ],
+                    if (message.content.isNotEmpty)
+                      _UserContent(
+                        content: message.content,
+                        style: theme.textTheme.bodyMedium!.copyWith(
+                          fontSize: 16,
+                          height: 1.45,
+                          color: userFg,
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -156,55 +266,74 @@ class _MessageBubbleState extends State<MessageBubble> {
           child: Container(
             key: const ValueKey('assistantBubble'),
             margin: const EdgeInsets.only(top: 8, right: _toolbarIconWidth),
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
-              color: dark ? _iosGrayDark : _iosGrayLight,
               borderRadius: const BorderRadius.only(
                 topLeft: Radius.circular(20),
                 topRight: Radius.circular(20),
                 bottomLeft: Radius.circular(7),
                 bottomRight: Radius.circular(20),
               ),
-              border: Border.all(
-                color: dark
-                    ? Colors.white.withValues(alpha: .10)
-                    : Colors.black.withValues(alpha: .06),
-                width: 1,
-              ),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: dark ? .18 : .06),
-                  blurRadius: 10,
+                  color: Colors.black.withValues(alpha: dark ? .22 : .08),
+                  blurRadius: 12,
                   offset: const Offset(0, 2),
                 ),
               ],
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 思考内容（如有）：默认收起，点击展开/收回。
-                // 进行中（streaming）也实时显示，让用户能看到模型的思考过程。
-                if ((liveReasoning ?? message.reasoning).isNotEmpty) ...[
-                  _reasoningHeader(theme),
-                  if (_showReasoning)
-                    _reasoningBody(theme, liveReasoning ?? message.reasoning),
-                ] else if (message.streaming) ...[
-                  _thinkingIndicator(theme),
-                ],
-                if ((liveContent ?? message.content).isNotEmpty)
-                  AdaptiveMarkdownText(
-                    liveContent ?? message.content,
-                    // 流式中固定渲染策略，停止后才切换懒加载（防中途重排跳动）。
-                    isStreaming: liveContent != null,
-                    style: theme.textTheme.bodyMedium!.copyWith(
-                      fontSize: 16,
-                      height: 1.45,
-                      color: dark
-                          ? const Color(0xFFF2F2F7)
-                          : const Color(0xFF1C1C1E),
-                    ),
-                  ),
-              ],
+            child: LiquidGlassLens(
+              key: const ValueKey('assistantLiquidGlassLens'),
+              style: _glassStyle(dark: dark, isUser: false),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (message.runtimeContext.trim().isNotEmpty) ...[
+                      _runtimeContextHeader(theme, onBlue: false),
+                      if (_showRuntimeContext)
+                        _runtimeContextBody(
+                          theme,
+                          message.runtimeContext,
+                          onBlue: false,
+                        ),
+                    ],
+                    // 流式期间与已完成的思考统一为一个可展开面板，不再让
+                    // 子代理总结、工具调用或空 live 缓冲把 reasoning 隐藏掉。
+                    if (message.streaming || visibleReasoning.isNotEmpty) ...[
+                      _reasoningHeader(theme, streaming: message.streaming),
+                      if (_showReasoning && visibleReasoning.isNotEmpty)
+                        _reasoningBody(theme, visibleReasoning),
+                    ],
+                    if (foldedSubagentResult.isNotEmpty) ...[
+                      _subagentResultHeader(theme),
+                      if (_showSubagentResult)
+                        _subagentMessageBody(theme, foldedSubagentResult),
+                    ],
+                    if (subagentPrompt != null) ...[
+                      _subagentPromptHeader(theme),
+                      if (_showSubagentPrompt && subagentPrompt.isNotEmpty)
+                        _subagentMessageBody(theme, subagentPrompt),
+                    ],
+                    if (foldedSubagentSummary.isNotEmpty) ...[
+                      _subagentSummaryHeader(theme),
+                      if (_showSubagentSummary)
+                        _subagentMessageBody(theme, foldedSubagentSummary),
+                    ],
+                    if (visibleAssistantContent.isNotEmpty)
+                      _assistantContent(
+                        theme,
+                        dark,
+                        visibleAssistantContent,
+                        isStreaming: liveContent != null,
+                      ),
+                  ],
+                ),
+              ),
             ),
           ),
         ),
@@ -213,6 +342,8 @@ class _MessageBubbleState extends State<MessageBubble> {
 
     final padded = GestureDetector(
       onLongPress: () => _showActions(context),
+      // Windows 桌面：右键弹出同一操作菜单（手机端长按不变）。
+      onSecondaryTapDown: (d) => _showActionsDesktop(context, d.globalPosition),
       child: body,
     );
 
@@ -242,32 +373,31 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
-  /// 「正在思考…」指示：spinner + 文字，进行中常驻显示。
-  Widget _thinkingIndicator(ThemeData theme) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const SizedBox(
-            width: 13,
-            height: 13,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            '正在思考…',
-            style: theme.textTheme.bodySmall!.copyWith(
-              color: theme.disabledColor,
-            ),
-          ),
-        ],
-      ),
+  /// 流式助手正文：只动画稳定子组件的透明度，不用正文内容作 Key，
+  /// 避免每个 chunk 重建气泡并清空“思考过程 / 注入上下文”的展开状态。
+  Widget _assistantContent(
+    ThemeData theme,
+    bool dark,
+    String content, {
+    required bool isStreaming,
+  }) {
+    final textStyle = theme.textTheme.bodyMedium!.copyWith(
+      fontSize: 16,
+      height: 1.45,
+      color: dark ? const Color(0xFFF2F2F7) : const Color(0xFF1C1C1E),
+    );
+    if (!isStreaming || content.isEmpty) {
+      return AdaptiveMarkdownText(content, style: textStyle);
+    }
+    return _StreamingFadeMarkdown(
+      key: const ValueKey('streamingFadeMarkdown'),
+      content: content,
+      style: textStyle,
     );
   }
 
-  /// 思考内容折叠头：点击展开/收回，进行中显示小 spinner。
-  Widget _reasoningHeader(ThemeData theme) {
+  /// 思考内容折叠头：流式期间显示 spinner + “思考中”，结束后显示“思考过程”。
+  Widget _reasoningHeader(ThemeData theme, {required bool streaming}) {
     final blue = theme.brightness == Brightness.dark
         ? _iosBlueDark
         : _iosBlueLight;
@@ -284,27 +414,26 @@ class _MessageBubbleState extends State<MessageBubble> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              _showReasoning ? Icons.unfold_less : Icons.unfold_more,
-              size: 15,
-              color: blue,
-            ),
+            if (streaming)
+              const SizedBox(
+                width: 15,
+                height: 15,
+                child: CupertinoActivityIndicator(radius: 7),
+              )
+            else
+              Icon(
+                _showReasoning ? Icons.unfold_less : Icons.unfold_more,
+                size: 15,
+                color: blue,
+              ),
             const SizedBox(width: 4),
             Text(
-              _showReasoning ? '收起思考' : '思考过程',
+              _showReasoning ? '收起思考' : (streaming ? '思考中' : '思考过程'),
               style: theme.textTheme.bodySmall!.copyWith(
                 color: blue,
                 fontWeight: FontWeight.w600,
               ),
             ),
-            if (message.streaming) ...[
-              const SizedBox(width: 6),
-              const SizedBox(
-                width: 10,
-                height: 10,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            ],
           ],
         ),
       ),
@@ -314,24 +443,219 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// 思考内容正文：浅色块 + 小字，超高可滚动。
   Widget _reasoningBody(ThemeData theme, String reasoning) {
     final dark = theme.brightness == Brightness.dark;
-    return Container(
-      margin: const EdgeInsets.only(top: 2, bottom: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: dark
-            ? const Color(0xFF3A3A3C)
-            : Colors.white.withValues(alpha: .55),
-        borderRadius: BorderRadius.circular(12),
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 6),
+      child: LiquidGlassLens(
+        style: _glassStyle(dark: dark, isUser: false, cornerRadius: 12),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 220),
+            child: SingleChildScrollView(
+              controller: _reasoningCtrl,
+              child: SelectableText(
+                reasoning,
+                style: theme.textTheme.bodySmall!.copyWith(
+                  color: dark
+                      ? const Color(0xFFD1D1D6)
+                      : const Color(0xFF3A3A3C),
+                  height: 1.5,
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 220),
-        child: SingleChildScrollView(
-          controller: _reasoningCtrl,
-          child: SelectableText(
-            reasoning,
-            style: theme.textTheme.bodySmall!.copyWith(
-              color: dark ? const Color(0xFFD1D1D6) : const Color(0xFF3A3A3C),
-              height: 1.5,
+    );
+  }
+
+  Widget _subagentResultHeader(ThemeData theme) {
+    final blue = theme.brightness == Brightness.dark
+        ? _iosBlueDark
+        : _iosBlueLight;
+    return InkWell(
+      onTap: () => setState(() => _showSubagentResult = !_showSubagentResult),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _showSubagentResult ? Icons.unfold_less : Icons.unfold_more,
+              size: 15,
+              color: blue,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              _showSubagentResult ? '收起子代理' : '子代理返回信息',
+              style: theme.textTheme.bodySmall!.copyWith(
+                color: blue,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _subagentPromptHeader(ThemeData theme) {
+    final blue = theme.brightness == Brightness.dark
+        ? _iosBlueDark
+        : _iosBlueLight;
+    return InkWell(
+      onTap: () => setState(() => _showSubagentPrompt = !_showSubagentPrompt),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _showSubagentPrompt ? Icons.unfold_less : Icons.unfold_more,
+              size: 15,
+              color: blue,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              _showSubagentPrompt ? '收起提示词' : '子代理提示词注入',
+              style: theme.textTheme.bodySmall!.copyWith(
+                color: blue,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _subagentSummaryHeader(ThemeData theme) {
+    final blue = theme.brightness == Brightness.dark
+        ? _iosBlueDark
+        : _iosBlueLight;
+    return InkWell(
+      onTap: () => setState(() => _showSubagentSummary = !_showSubagentSummary),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _showSubagentSummary ? Icons.unfold_less : Icons.unfold_more,
+              size: 15,
+              color: blue,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              _showSubagentSummary ? '收起总结' : '子代理总结',
+              style: theme.textTheme.bodySmall!.copyWith(
+                color: blue,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _subagentMessageBody(ThemeData theme, String text) {
+    final dark = theme.brightness == Brightness.dark;
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 6),
+      child: LiquidGlassLens(
+        style: _glassStyle(dark: dark, isUser: false, cornerRadius: 12),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 220),
+            child: SingleChildScrollView(
+              child: AdaptiveMarkdownText(
+                text,
+                style: theme.textTheme.bodySmall!.copyWith(
+                  color: dark
+                      ? const Color(0xFFD1D1D6)
+                      : const Color(0xFF3A3A3C),
+                  height: 1.5,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 运行时上下文折叠头：有注入才画，默认收起。
+  Widget _runtimeContextHeader(
+    ThemeData theme, {
+    required bool onBlue,
+    Color? foreground,
+  }) {
+    final color = onBlue
+        // 用户气泡上的前景：浅色模式深字、深色模式白字（foreground 已算好）。
+        ? (foreground ??
+              (theme.brightness == Brightness.dark
+                  ? Colors.white
+                  : const Color(0xFF14264A)))
+        : (theme.brightness == Brightness.dark ? _iosBlueDark : _iosBlueLight);
+    return InkWell(
+      onTap: () => setState(() => _showRuntimeContext = !_showRuntimeContext),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _showRuntimeContext ? Icons.unfold_less : Icons.unfold_more,
+              size: 15,
+              color: color,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              _showRuntimeContext ? '收起上下文' : '注入上下文',
+              style: theme.textTheme.bodySmall!.copyWith(
+                color: color,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 运行时上下文正文：浅色块 + 小字，超高可滚动。
+  Widget _runtimeContextBody(
+    ThemeData theme,
+    String text, {
+    required bool onBlue,
+    Color? foreground,
+  }) {
+    final dark = theme.brightness == Brightness.dark;
+    final fg = onBlue
+        ? (foreground ?? (dark ? Colors.white : const Color(0xFF14264A)))
+        : (dark ? const Color(0xFFD1D1D6) : const Color(0xFF3A3A3C));
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 6),
+      child: LiquidGlassLens(
+        style: _glassStyle(dark: dark, isUser: onBlue, cornerRadius: 12),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 220),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                text,
+                style: theme.textTheme.bodySmall!.copyWith(
+                  color: fg,
+                  height: 1.5,
+                ),
+              ),
             ),
           ),
         ),
@@ -344,7 +668,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     final canSpeak = !isUser && message.content.trim().isNotEmpty && !busy;
     final dark = theme.brightness == Brightness.dark;
     final actions = <Widget>[
-      if (canSpeak)
+      if (canSpeak && onSpeak != null)
         _barButton(
           theme: theme,
           icon: speaking ? Icons.stop_circle : Icons.volume_up_outlined,
@@ -359,34 +683,35 @@ class _MessageBubbleState extends State<MessageBubble> {
             }
           },
         ),
-      _barButton(
-        theme: theme,
-        icon: Icons.copy_all_outlined,
-        tooltip: '复制',
-        onTap: () => onCopy?.call(message),
-      ),
-      if (!isUser && !busy)
+      if (onCopy != null)
+        _barButton(
+          theme: theme,
+          icon: Icons.copy_all_outlined,
+          tooltip: '复制',
+          onTap: () => onCopy?.call(message),
+        ),
+      if (!isUser && !busy && onRegenerate != null)
         _barButton(
           theme: theme,
           icon: Icons.refresh,
           tooltip: '重新生成',
           onTap: () => onRegenerate?.call(message),
         ),
-      if (!busy) ...[
+      if (!busy && onSaveMemory != null)
         _barButton(
           theme: theme,
           icon: Icons.bookmark_add_outlined,
           tooltip: '保存记忆',
           onTap: () => onSaveMemory?.call(message),
         ),
+      if (!busy && onSaveSkill != null)
         _barButton(
           theme: theme,
           icon: Icons.rocket_launch_outlined,
           tooltip: '保存技能',
           onTap: () => onSaveSkill?.call(message),
         ),
-      ],
-      if (!busy)
+      if (!busy && onDelete != null)
         _barButton(
           theme: theme,
           icon: Icons.delete_outline,
@@ -394,6 +719,7 @@ class _MessageBubbleState extends State<MessageBubble> {
           onTap: () => onDelete?.call(message),
         ),
     ];
+    if (actions.isEmpty) return const SizedBox.shrink();
 
     return Padding(
       padding: const EdgeInsets.only(top: 6),
@@ -467,7 +793,9 @@ class _MessageBubbleState extends State<MessageBubble> {
     final canSpeak =
         message.role == 'assistant' &&
         message.content.trim().isNotEmpty &&
-        !busy;
+        !busy &&
+        onSpeak != null;
+    final canCopy = onCopy != null;
     final sheetBg = Theme.of(context).scaffoldBackgroundColor;
     showIosFadeSheet<void>(
       context: context,
@@ -518,16 +846,17 @@ class _MessageBubbleState extends State<MessageBubble> {
                       _showSelectText();
                     },
                   ),
-                  _messageActionTile(
-                    ctx: ctx,
-                    icon: CupertinoIcons.doc_on_doc,
-                    color: const Color(0xFF8E8E93),
-                    label: '复制',
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      onCopy?.call(message);
-                    },
-                  ),
+                  if (canCopy)
+                    _messageActionTile(
+                      ctx: ctx,
+                      icon: CupertinoIcons.doc_on_doc,
+                      color: const Color(0xFF8E8E93),
+                      label: '复制',
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        onCopy?.call(message);
+                      },
+                    ),
                   if (canSpeak)
                     _messageActionTile(
                       ctx: ctx,
@@ -545,7 +874,9 @@ class _MessageBubbleState extends State<MessageBubble> {
                         }
                       },
                     ),
-                  if (message.role == 'assistant' && !busy)
+                  if (message.role == 'assistant' &&
+                      !busy &&
+                      onRegenerate != null)
                     _messageActionTile(
                       ctx: ctx,
                       icon: CupertinoIcons.refresh,
@@ -556,7 +887,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                         onRegenerate?.call(message);
                       },
                     ),
-                  if (!busy) ...[
+                  if (!busy && onSaveMemory != null)
                     _messageActionTile(
                       ctx: ctx,
                       icon: CupertinoIcons.bookmark,
@@ -567,6 +898,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                         onSaveMemory?.call(message);
                       },
                     ),
+                  if (!busy && onSaveSkill != null)
                     _messageActionTile(
                       ctx: ctx,
                       icon: CupertinoIcons.rocket,
@@ -577,10 +909,9 @@ class _MessageBubbleState extends State<MessageBubble> {
                         onSaveSkill?.call(message);
                       },
                     ),
-                  ],
                 ],
               ),
-              if (!busy) ...[
+              if (!busy && onDelete != null) ...[
                 const SizedBox(height: 8),
                 CupertinoListSection.insetGrouped(
                   decoration: iosSectionDecoration(ctx),
@@ -627,6 +958,76 @@ class _MessageBubbleState extends State<MessageBubble> {
         );
       },
     );
+  }
+
+  /// Windows 桌面：在右键位置弹出消息操作菜单（与长按菜单同操作集）。
+  void _showActionsDesktop(BuildContext context, Offset globalPosition) {
+    final canSpeak =
+        message.role == 'assistant' &&
+        message.content.trim().isNotEmpty &&
+        !busy &&
+        onSpeak != null;
+    final canCopy = onCopy != null;
+    final blue = Theme.of(context).brightness == Brightness.dark
+        ? _iosBlueDark
+        : _iosBlueLight;
+    final items = <DesktopMenuItem>[
+      DesktopMenuItem(
+        label: '选择文字',
+        icon: CupertinoIcons.textformat,
+        iconColor: blue,
+        onTap: () => _showSelectText(),
+      ),
+      if (canCopy)
+        DesktopMenuItem(
+          label: '复制',
+          icon: CupertinoIcons.doc_on_doc,
+          iconColor: const Color(0xFF8E8E93),
+          onTap: () => onCopy?.call(message),
+        ),
+      if (canSpeak)
+        DesktopMenuItem(
+          label: speaking ? '停止朗读' : '朗读',
+          icon: CupertinoIcons.speaker_2_fill,
+          iconColor: const Color(0xFF34C759),
+          onTap: () {
+            if (speaking) {
+              onStopSpeak?.call();
+            } else {
+              onSpeak?.call(message);
+            }
+          },
+        ),
+      if (message.role == 'assistant' && !busy && onRegenerate != null)
+        DesktopMenuItem(
+          label: '重新生成',
+          icon: CupertinoIcons.refresh,
+          iconColor: const Color(0xFFFF9500),
+          onTap: () => onRegenerate?.call(message),
+        ),
+      if (!busy && onSaveMemory != null)
+        DesktopMenuItem(
+          label: '保存记忆',
+          icon: CupertinoIcons.bookmark,
+          iconColor: const Color(0xFF5856D6),
+          onTap: () => onSaveMemory?.call(message),
+        ),
+      if (!busy && onSaveSkill != null)
+        DesktopMenuItem(
+          label: '保存技能',
+          icon: CupertinoIcons.rocket,
+          iconColor: const Color(0xFFAF52DE),
+          onTap: () => onSaveSkill?.call(message),
+        ),
+      if (!busy && onDelete != null)
+        DesktopMenuItem(
+          label: '删除',
+          icon: CupertinoIcons.delete,
+          iconColor: CupertinoColors.systemRed,
+          onTap: () => onDelete?.call(message),
+        ),
+    ];
+    showDesktopMenu(context, globalPosition: globalPosition, items: items);
   }
 
   Widget _messageActionTile({
@@ -715,6 +1116,67 @@ class _MessageBubbleState extends State<MessageBubble> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 稳定的流式正文渐显组件。State 不随正文 chunk 替换，仅在内容增长时重播淡入。
+class _StreamingFadeMarkdown extends StatefulWidget {
+  final String content;
+  final TextStyle style;
+
+  const _StreamingFadeMarkdown({
+    super.key,
+    required this.content,
+    required this.style,
+  });
+
+  @override
+  State<_StreamingFadeMarkdown> createState() => _StreamingFadeMarkdownState();
+}
+
+class _StreamingFadeMarkdownState extends State<_StreamingFadeMarkdown>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+    );
+    _opacity = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOut,
+    ).drive(Tween<double>(begin: .65, end: 1));
+    _controller.forward();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StreamingFadeMarkdown oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.content != oldWidget.content) {
+      _controller.forward(from: 0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _opacity,
+      child: AdaptiveMarkdownText(
+        widget.content,
+        isStreaming: true,
+        style: widget.style,
       ),
     );
   }
