@@ -123,6 +123,60 @@ void main() {
     }
   });
 
+  test('显式思考强度覆盖默认值，off 与省略语义分离', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final bodies = <Map<String, dynamic>>[];
+    final handled = () async {
+      await for (final request in server) {
+        bodies.add(
+          jsonDecode(await utf8.decoder.bind(request).join())
+              as Map<String, dynamic>,
+        );
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType(
+            'text',
+            'event-stream',
+            charset: 'utf-8',
+          )
+          ..write(
+            'data: {"choices":[{"delta":{"content":"答案"},'
+            '"finish_reason":"stop"}]}\n\n',
+          )
+          ..write('data: [DONE]\n\n');
+        await request.response.close();
+        if (bodies.length == 2) break;
+      }
+    }();
+
+    try {
+      final baseUrl =
+          'http://${server.address.host}:${server.port}/api.deepseek.com/v1';
+      for (final effort in ['low', 'off']) {
+        final client = LlmClient(
+          baseUrl: baseUrl,
+          apiKey: 'test-key',
+          model: 'deepseek-v4-flash',
+          temperature: 0.2,
+          maxTokens: 1024,
+          tools: const [],
+          reasoningEffortOverride: effort,
+        );
+        await client.send([
+          {'role': 'user', 'content': '测试'},
+        ]);
+      }
+      await handled;
+
+      expect(bodies[0]['reasoning_effort'], 'low');
+      expect(bodies[0]['thinking'], {'type': 'enabled'});
+      expect(bodies[1]['reasoning_effort'], 'off');
+      expect(bodies[1].containsKey('thinking'), isFalse);
+    } finally {
+      await server.close(force: true);
+    }
+  });
+
   test('普通模型不发送 thinking / reasoning_effort', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     late Map<String, dynamic> requestBody;

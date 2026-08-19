@@ -67,8 +67,396 @@ class SubagentStatusBar extends StatelessWidget {
   }
 }
 
-/// 拾忆与 DSH 共用的聊天输入区。视觉、附件预览和键盘交互只维护一份；
-/// 引擎能力差异通过 [allowSendWhileBusy] 与 [questionActive] 参数表达。
+/// 思考强度选项。空字符串表示跟随提供商默认，`off` 表示显式关闭。
+class ThinkingIntensityOption {
+  final String value;
+  final String label;
+
+  const ThinkingIntensityOption(this.value, this.label);
+}
+
+/// 根据能力映射构建选项列表；兼容 DSH 的 `session.models` 格式和拾忆的
+/// `LlmClient.reasoningEffortsForModel` 格式。
+List<ThinkingIntensityOption> buildReasoningOptions(
+  Map<String, String?> capabilities,
+) {
+  final options = <ThinkingIntensityOption>[];
+  if (capabilities.containsKey('off')) {
+    options.add(const ThinkingIntensityOption('', 'Default'));
+  }
+  if (capabilities.containsKey('low')) {
+    options.add(const ThinkingIntensityOption('low', 'Low'));
+  }
+  if (capabilities.containsKey('medium')) {
+    options.add(const ThinkingIntensityOption('medium', 'Medium'));
+  }
+  if (capabilities.containsKey('high')) {
+    options.add(const ThinkingIntensityOption('high', 'High'));
+  }
+  if (capabilities.containsKey('xhigh')) {
+    options.add(const ThinkingIntensityOption('xhigh', 'XHigh'));
+  }
+  if (capabilities.containsKey('max')) {
+    options.add(const ThinkingIntensityOption('max', 'Max'));
+  }
+  return options;
+}
+
+/// 拾忆与 DSH 共用的思考强度选择器；只负责展示和回调，不持有引擎状态。
+/// 以 iOS 工具栏控件呈现，从按钮上沿拉开未选项的液态玻璃抽屉。
+class ThinkingIntensitySelector extends StatefulWidget {
+  final List<ThinkingIntensityOption> options;
+  final String value;
+  final ValueChanged<String> onChanged;
+  final bool enabled;
+
+  const ThinkingIntensitySelector({
+    super.key,
+    required this.options,
+    required this.value,
+    required this.onChanged,
+    this.enabled = true,
+  });
+
+  @override
+  State<ThinkingIntensitySelector> createState() =>
+      _ThinkingIntensitySelectorState();
+}
+
+class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
+    with SingleTickerProviderStateMixin {
+  final _buttonKey = GlobalKey();
+  OverlayEntry? _popup;
+  Rect _anchor = Rect.zero;
+  late final AnimationController _anim;
+  late final Animation<double> _reveal;
+
+  static const _gap = 6.0;
+  static const _rowPadding = 28.0;
+  static const _minMenuWidth = 56.0;
+  static const _maxMenuWidth = 160.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+      reverseDuration: const Duration(milliseconds: 160),
+    );
+    _reveal = CurvedAnimation(
+      parent: _anim,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
+
+  bool get _isOpen => _popup != null;
+
+  void _togglePopup() {
+    if (_isOpen) {
+      _dismissPopup();
+    } else {
+      _showPopup();
+    }
+  }
+
+  Future<void> _dismissPopup() async {
+    final entry = _popup;
+    if (entry == null) return;
+    _popup = null;
+    if (mounted) setState(() {});
+    if (_anim.value > 0) {
+      try {
+        await _anim.reverse();
+      } catch (_) {}
+    }
+    entry.remove();
+  }
+
+  void _showPopup() {
+    if (_drawerOptions.isEmpty) return;
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    _anchor = box.localToGlobal(Offset.zero) & box.size;
+    HapticFeedback.selectionClick();
+    _popup = OverlayEntry(builder: _buildOverlay);
+    Overlay.of(context, rootOverlay: true).insert(_popup!);
+    _anim.forward(from: 0);
+    setState(() {});
+  }
+
+  String get _selectedValue {
+    if (widget.options.any((item) => item.value == widget.value)) {
+      return widget.value;
+    }
+    return widget.options.first.value;
+  }
+
+  List<ThinkingIntensityOption> get _drawerOptions =>
+      widget.options.where((item) => item.value != _selectedValue).toList();
+
+  double _menuWidthFor(
+    BuildContext context,
+    List<ThinkingIntensityOption> items,
+  ) {
+    final style =
+        Theme.of(
+          context,
+        ).textTheme.bodyLarge?.copyWith(fontSize: 15, letterSpacing: -0.24) ??
+        const TextStyle(fontSize: 15, letterSpacing: -0.24);
+    final painter = TextPainter(textDirection: TextDirection.ltr);
+    var maxWidth = 0.0;
+    for (final item in items) {
+      painter.text = TextSpan(text: item.label, style: style);
+      painter.layout();
+      if (painter.width > maxWidth) maxWidth = painter.width;
+    }
+    painter.dispose();
+    return (maxWidth + _rowPadding).clamp(_minMenuWidth, _maxMenuWidth);
+  }
+
+  Widget _buildOverlay(BuildContext overlayContext) {
+    final dark = Theme.of(overlayContext).brightness == Brightness.dark;
+    final mq = MediaQuery.of(overlayContext);
+    final items = _drawerOptions;
+    if (items.isEmpty) return const SizedBox.shrink();
+    final menuWidth = _menuWidthFor(overlayContext, items);
+
+    // 抽屉贴在按钮上沿，右对齐；空间不够时再夹回安全区内。
+    final right = (mq.size.width - _anchor.right).clamp(
+      8.0,
+      (mq.size.width - menuWidth - 8.0).clamp(8.0, mq.size.width),
+    );
+    final bottom = (mq.size.height - _anchor.top + _gap).clamp(
+      mq.padding.bottom + 8.0,
+      mq.size.height - mq.padding.top - 48.0,
+    );
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: _dismissPopup,
+          ),
+        ),
+        Positioned(
+          right: right,
+          bottom: bottom,
+          width: menuWidth,
+          child: Material(
+            color: Colors.transparent,
+            child: SizeTransition(
+              sizeFactor: _reveal,
+              alignment: Alignment.bottomRight,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(14),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: dark ? .36 : .14),
+                      blurRadius: 24,
+                      offset: const Offset(0, 8),
+                    ),
+                  ],
+                ),
+                child: LiquidGlassLens(
+                  style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final item in items)
+                          _ThinkingMenuRow(
+                            label: item.label,
+                            onTap: () {
+                              HapticFeedback.selectionClick();
+                              _dismissPopup();
+                              widget.onChanged(item.value);
+                            },
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  void dispose() {
+    _popup?.remove();
+    _popup = null;
+    _anim.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.options.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final selected = widget.options.any((item) => item.value == widget.value)
+        ? widget.value
+        : widget.options.first.value;
+    final label = widget.options
+        .firstWhere((item) => item.value == selected)
+        .label;
+    final accent = widget.enabled
+        ? (_isOpen ? _iosBlue : theme.colorScheme.onSurfaceVariant)
+        : theme.disabledColor;
+
+    return Tooltip(
+      message: '思考强度',
+      child: GestureDetector(
+        key: _buttonKey,
+        onTap: widget.enabled ? _togglePopup : null,
+        behavior: HitTestBehavior.opaque,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 160),
+          opacity: widget.enabled ? 1 : 0.38,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(4, 4, 2, 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  label,
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: accent,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: -0.24,
+                  ),
+                ),
+                const SizedBox(width: 1),
+                Icon(
+                  _isOpen
+                      ? CupertinoIcons.chevron_down
+                      : CupertinoIcons.chevron_up,
+                  size: 11,
+                  color: accent,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ThinkingMenuRow extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+
+  const _ThinkingMenuRow({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: SizedBox(
+        height: 36,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodyLarge?.copyWith(
+                fontSize: 15,
+                fontWeight: FontWeight.w400,
+                color: theme.colorScheme.onSurface,
+                letterSpacing: -0.24,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 会话页共用的思考开关；点亮为开，点灭为关。不持有引擎状态。
+class ThinkingToggleButton extends StatelessWidget {
+  final bool on;
+  final VoidCallback? onPressed;
+
+  const ThinkingToggleButton({
+    super.key,
+    required this.on,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final enabled = onPressed != null;
+    final color = !enabled
+        ? theme.disabledColor
+        : on
+        ? _iosBlue
+        : theme.colorScheme.onSurfaceVariant;
+    return Tooltip(
+      message: on ? '思考已开启' : '思考已关闭',
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+        visualDensity: VisualDensity.compact,
+        iconSize: 18,
+        onPressed: onPressed,
+        color: color,
+        disabledColor: theme.disabledColor,
+        icon: Icon(
+          on ? CupertinoIcons.lightbulb_fill : CupertinoIcons.lightbulb,
+        ),
+      ),
+    );
+  }
+}
+
+/// 会话页共用的紧凑压缩入口；压缩实现仍由各引擎自己的回调负责。
+class ChatCompressionButton extends StatelessWidget {
+  final VoidCallback? onPressed;
+  final bool busy;
+
+  const ChatCompressionButton({
+    super.key,
+    required this.onPressed,
+    this.busy = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Tooltip(
+      message: busy ? '正在压缩上下文' : '压缩上下文',
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+        visualDensity: VisualDensity.compact,
+        iconSize: 18,
+        onPressed: onPressed,
+        color: theme.colorScheme.onSurfaceVariant,
+        disabledColor: theme.disabledColor,
+        icon: busy
+            ? const CupertinoActivityIndicator(radius: 7)
+            : const Icon(CupertinoIcons.rectangle_compress_vertical),
+      ),
+    );
+  }
+}
+
 class LiquidGlassChatComposer extends StatelessWidget {
   final TextEditingController input;
   final bool busy;
@@ -84,6 +472,14 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final VoidCallback onStop;
   final String idleHint;
   final String busyHint;
+  final List<ThinkingIntensityOption> thinkingOptions;
+  final String thinkingValue;
+  final ValueChanged<String>? onThinkingChanged;
+  final bool thinkingEnabled;
+  final bool thinkingOn;
+  final ValueChanged<bool>? onThinkingToggled;
+  final VoidCallback? onCompress;
+  final bool compressBusy;
 
   const LiquidGlassChatComposer({
     super.key,
@@ -101,6 +497,14 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.allowSendWhileBusy = false,
     this.idleHint = '输入消息…',
     this.busyHint = 'agent 运行中…',
+    this.thinkingOptions = const [],
+    this.thinkingValue = '',
+    this.onThinkingChanged,
+    this.thinkingEnabled = true,
+    this.thinkingOn = true,
+    this.onThinkingToggled,
+    this.onCompress,
+    this.compressBusy = false,
   });
 
   bool _handleKey(KeyEvent event) {
@@ -162,6 +566,40 @@ class LiquidGlassChatComposer extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                if (thinkingOptions.isNotEmpty && onThinkingChanged != null ||
+                    onThinkingToggled != null ||
+                    onCompress != null) ...[
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (onCompress != null)
+                          ChatCompressionButton(
+                            onPressed: onCompress,
+                            busy: compressBusy,
+                          ),
+                        if (onThinkingToggled != null &&
+                            thinkingOptions.isNotEmpty)
+                          ThinkingToggleButton(
+                            on: thinkingOn,
+                            onPressed: thinkingEnabled
+                                ? () => onThinkingToggled!(!thinkingOn)
+                                : null,
+                          ),
+                        if (thinkingOptions.isNotEmpty &&
+                            onThinkingChanged != null)
+                          ThinkingIntensitySelector(
+                            options: thinkingOptions,
+                            value: thinkingValue,
+                            onChanged: onThinkingChanged!,
+                            enabled: thinkingEnabled,
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                ],
                 if (pendingImages.isNotEmpty || pendingFiles.isNotEmpty) ...[
                   _previewRow(theme),
                   const SizedBox(height: 6),

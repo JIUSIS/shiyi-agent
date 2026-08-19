@@ -23,7 +23,44 @@ class DshApiException implements Exception {
   String toString() => code == null ? message : '$message (code: $code)';
 }
 
-/// DSH 会话摘要（session.list 返回项）。
+class DshCommandExecution {
+  final String? commandId;
+  final bool ok;
+  final String? result;
+  final String? error;
+  final int? sourceEventSeq;
+
+  const DshCommandExecution({
+    required this.commandId,
+    required this.ok,
+    this.result,
+    this.error,
+    this.sourceEventSeq,
+  });
+
+  factory DshCommandExecution.fromJson(Map<String, dynamic> json) {
+    final outcome = (json['result'] as Map?)?.cast<String, dynamic>();
+    final kind = outcome?['kind']?.toString();
+    final text = outcome?['text']?.toString();
+    final legacyError = json['error'];
+    final error = kind == 'error'
+        ? text ?? 'DSH 命令执行失败'
+        : legacyError is Map
+        ? legacyError['message']?.toString() ?? legacyError.toString()
+        : legacyError?.toString();
+    return DshCommandExecution(
+      commandId: json['commandId']?.toString(),
+      ok: kind == 'success' || (kind == null && json['ok'] == true),
+      result: kind == 'success'
+          ? text
+          : json['output']?.toString() ??
+                (json['result'] is String ? json['result']?.toString() : null),
+      error: error,
+      sourceEventSeq: (outcome?['sourceEventSeq'] as num?)?.toInt(),
+    );
+  }
+}
+
 class DshSessionSummary {
   final String sessionId;
   final String? title;
@@ -652,6 +689,20 @@ class DshApiClient {
     });
   }
 
+  /// Execute an official DSH command without routing it through session.prompt.
+  Future<DshCommandExecution> executeCommand({
+    required String sessionId,
+    required String line,
+  }) async {
+    final value = await _rpc('commands/execute', {
+      'args': {'agentId': sessionId, 'line': line},
+    });
+    return DshCommandExecution.fromJson(value);
+  }
+
+  Future<DshCommandExecution> compactSession(String sessionId) =>
+      executeCommand(sessionId: sessionId, line: '/compact');
+
   /// 停止当前正在运行的 agent 回合（session.cancel）。
   Future<void> cancel(String sessionId) async {
     await _rpc('session.cancel', {'sessionId': sessionId});
@@ -1245,7 +1296,11 @@ class DshApiClient {
     for (final entry in entries) {
       final ev = ((entry as Map)['event'] as Map?)?.cast<String, dynamic>();
       final type = ev?['type']?.toString() ?? '';
-      if (type == 'user/message' || type == 'agent/inbox/spliced') {
+      final surfaceOp = ev?['surfaceOp'];
+      final isReplacementCheckpoint =
+          surfaceOp is Map && surfaceOp['op']?.toString() == 'replace';
+      if ((type == 'user/message' && !isReplacementCheckpoint) ||
+          type == 'agent/inbox/spliced') {
         sawUser = true;
         ended = false;
       } else if (type == 'turn/end' && sawUser) {
@@ -1296,6 +1351,8 @@ class DshApiClient {
     final messages = <ChatMessage>[];
     final rolledBack = <ChatMessage>[];
     final seenMessageIds = <String>{};
+    final surfaceSeqs = <int>[];
+    final messageEventSeqs = <ChatMessage, int>{};
     var pendingContext = '';
     var pendingSubagentSummary = false;
     var suppressDuplicateSubagentReply = false;
@@ -1366,6 +1423,54 @@ class DshApiClient {
       return true;
     }
 
+    void applySurfaceOp(Map<String, dynamic> event, String type, int seq) {
+      if (type != 'user/message' &&
+          type != 'assistant/message' &&
+          type != 'tool/result') {
+        return;
+      }
+      final rawOp = event['surfaceOp'];
+      if (rawOp is! Map || rawOp['op']?.toString() != 'replace') {
+        // 旧版 history 与测试夹具没有 surfaceOp；按 append 兼容。
+        surfaceSeqs.add(seq);
+        return;
+      }
+      final start = (rawOp['start'] as num?)?.toInt();
+      final end = (rawOp['end'] as num?)?.toInt();
+      if (start == null || end == null) {
+        surfaceSeqs.add(seq);
+        return;
+      }
+      final startIndex = surfaceSeqs.indexOf(start);
+      final endIndex = surfaceSeqs.indexOf(end);
+      if (startIndex < 0 || endIndex < startIndex) {
+        // 畸形或截断历史不能破坏整页加载；至少展示新的 checkpoint。
+        surfaceSeqs.add(seq);
+        return;
+      }
+
+      final removed = messages.where((message) {
+        final eventSeq = messageEventSeqs[message];
+        return eventSeq != null && eventSeq >= start && eventSeq <= end;
+      }).toList();
+      for (final message in removed) {
+        seenMessageIds.remove(message.id);
+        messageEventSeqs.remove(message);
+      }
+      messages.removeWhere(removed.contains);
+      rolledBack.removeWhere((message) {
+        final eventSeq = messageEventSeqs[message];
+        final shadowed =
+            eventSeq != null && eventSeq >= start && eventSeq <= end;
+        if (shadowed) messageEventSeqs.remove(message);
+        return shadowed;
+      });
+      surfaceSeqs.replaceRange(startIndex, endIndex + 1, [seq]);
+      pendingContext = '';
+      pendingSubagentSummary = false;
+      suppressDuplicateSubagentReply = false;
+    }
+
     for (final entry in entries) {
       final ev = ((entry as Map)['event'] as Map?)?.cast<String, dynamic>();
       if (ev == null) continue;
@@ -1373,6 +1478,7 @@ class DshApiClient {
       final data = (ev['data'] as Map?)?.cast<String, dynamic>() ?? const {};
       final seq = (ev['seq'] as num?)?.toInt() ?? 0;
       final time = (ev['time'] as num?)?.toInt() ?? 0;
+      applySurfaceOp(ev, type, seq);
       if (type == 'agent/inbox/spliced') {
         final removed = (data['removedCount'] as num?)?.toInt() ?? 0;
         var left = removed;
@@ -1421,6 +1527,7 @@ class DshApiClient {
           );
           attachContext(msg);
           messages.add(msg);
+          messageEventSeqs[msg] = seq;
           seenMessageIds.add(id);
           trackSubagentSummary(presentation);
         }
@@ -1434,15 +1541,15 @@ class DshApiClient {
           final err =
               (reason['error'] as Map?)?.cast<String, dynamic>() ?? const {};
           final msg = err['message']?.toString() ?? '未知错误';
-          messages.add(
-            ChatMessage(
-              id: 'dsh-err-$seq',
-              sessionId: '',
-              role: 'assistant',
-              content: '本轮失败：$msg',
-              createdAt: time,
-            ),
+          final errorMessage = ChatMessage(
+            id: 'dsh-err-$seq',
+            sessionId: '',
+            role: 'assistant',
+            content: '本轮失败：$msg',
+            createdAt: time,
           );
+          messages.add(errorMessage);
+          messageEventSeqs[errorMessage] = seq;
         } else {
           rolledBack.clear();
         }
@@ -1478,6 +1585,7 @@ class DshApiClient {
         );
         attachContext(msg);
         messages.add(msg);
+        messageEventSeqs[msg] = seq;
         seenMessageIds.add(id);
         trackSubagentSummary(presentation);
       } else if (type == 'assistant/message') {
@@ -1510,6 +1618,7 @@ class DshApiClient {
         );
         attachContext(item);
         messages.add(item);
+        messageEventSeqs[item] = seq;
         if (pendingSubagentSummary) pendingSubagentSummary = false;
       } else if (type == 'tool/call') {
         // 工具调用：阶段 1 只做轻量记录（追加到前一条助手消息的 toolCalls）。

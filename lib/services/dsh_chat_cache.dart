@@ -105,7 +105,12 @@ class DshChatCache {
     );
   }
 
-  /// 把 ValueNotifier 中的流式正文固化为可重启恢复的临时助手消息。
+  static Future<void> clear(String sessionId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_snapshotPrefix$sessionId');
+    await prefs.remove('$_legacyPrefix$sessionId');
+  }
+
   static List<ChatMessage> materializeMessages({
     required String sessionId,
     required List<ChatMessage> messages,

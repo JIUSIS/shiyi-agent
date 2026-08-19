@@ -122,6 +122,12 @@ class _SessionRun {
   final List<ToolEvent> toolEvents = [];
   List<Skill> loadedSkillsSnapshot = const [];
   bool planMode = false;
+
+  /// 显式思考强度；null 表示使用模型默认值。不含开关状态。
+  String? reasoningEffort;
+
+  /// 会话级思考开关；关闭时请求发 `off`，档位仍保留。
+  bool thinkingOn = true;
   int sessionTotalTokens = 0;
   int? sessionLastUsageTokens;
   int lastRoundTokens = 0;
@@ -150,6 +156,12 @@ class ShiyiState extends ChangeNotifier {
   String? currentSessionId;
   bool isBusy = false;
   String? status;
+
+  /// 当前会话显式思考强度；null 表示使用模型默认值。不含开关状态。
+  String? reasoningEffort;
+
+  /// 当前会话思考开关。
+  bool thinkingOn = true;
 
   /// 一次性的历史裁剪提示（4 秒后自动消失，不表示当前仍接近上限）。
   String? trimNotice;
@@ -252,6 +264,37 @@ class ShiyiState extends ChangeNotifier {
   bool planModeForSession(String? sessionId) =>
       _existingRun(sessionId)?.planMode ?? planMode;
 
+  String? reasoningEffortForSession(String? sessionId) =>
+      _existingRun(sessionId)?.reasoningEffort;
+
+  bool thinkingOnForSession(String? sessionId) =>
+      _existingRun(sessionId)?.thinkingOn ?? true;
+
+  /// 设置当前会话的拾忆思考强度；空值恢复模型默认值。
+  /// 选 `off` 只关开关，不改档位；选其它档位会打开开关。
+  void setReasoningEffortForSession(String? sessionId, String? value) {
+    if (sessionId == null) return;
+    final normalized = value?.trim();
+    final run = _runFor(sessionId);
+    if (normalized == 'off') {
+      run.thinkingOn = false;
+    } else {
+      run.reasoningEffort = normalized == null || normalized.isEmpty
+          ? null
+          : normalized;
+      run.thinkingOn = true;
+    }
+    _publishRun(run);
+  }
+
+  /// 设置当前会话的拾忆思考开关；关闭时请求发 `off`，档位仍保留。
+  void setThinkingOnForSession(String? sessionId, bool value) {
+    if (sessionId == null) return;
+    final run = _runFor(sessionId);
+    run.thinkingOn = value;
+    _publishRun(run);
+  }
+
   @visibleForTesting
   bool stopRequestedForSessionForTest(String sessionId) =>
       _existingRun(sessionId)?.stopRequested ?? false;
@@ -295,6 +338,8 @@ class ShiyiState extends ChangeNotifier {
     pendingQuestion = run.pendingQuestion;
     toolEvents = run.toolEvents;
     planMode = run.planMode;
+    reasoningEffort = run.reasoningEffort;
+    thinkingOn = run.thinkingOn;
     sessionTotalTokens = run.sessionTotalTokens;
     sessionLastUsageTokens = run.sessionLastUsageTokens;
     lastRoundTokens = run.lastRoundTokens;
@@ -2293,10 +2338,12 @@ class ShiyiState extends ChangeNotifier {
     // 最终落库时：如果只有 reasoning 没有正文，把 reasoning 作为正文保存。
     // 这是给「网关只返回 reasoning_content 的情况」的兜底，但只在最终确认时做，
     // 不在流式期间做（否则思考内容会在流式时显示在输出区）。
-    final finalText = normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
+    final finalText =
+        normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
         ? normalized.reasoning
         : normalized.text;
-    final finalReasoning = normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
+    final finalReasoning =
+        normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
         ? ''
         : normalized.reasoning;
 
@@ -2426,6 +2473,7 @@ class ShiyiState extends ChangeNotifier {
       temperature: settings.temperature,
       maxTokens: settings.maxOutputTokens,
       tools: _activeToolsFor(planMode: run.planMode),
+      reasoningEffortOverride: run.thinkingOn ? run.reasoningEffort : 'off',
       shouldStop: () => run.stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
       onTurn: (t) {

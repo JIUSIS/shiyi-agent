@@ -21,6 +21,20 @@ void main() {
       expect(DshModelSync.dshApiFor('anthropic'), 'anthropic-messages');
     });
 
+    test('mimo 与 deepseek 一样声明思考档位，普通模型不声明', () {
+      expect(DshModelSync.defaultReasoningEffort('mimo-v2.5'), 'high');
+      expect(DshModelSync.defaultReasoningEffort('mimo-v2.5-pro'), 'high');
+      expect(DshModelSync.reasoningEffortsForModel('mimo-v2.5'), {
+        'off': null,
+        'low': 'low',
+        'medium': 'medium',
+        'high': 'high',
+        'max': 'max',
+      });
+      expect(DshModelSync.defaultReasoningEffort('gpt-4.1-mini'), isNull);
+      expect(DshModelSync.reasoningEffortsForModel('gpt-4.1-mini'), isNull);
+    });
+
     test('手写路由 patch 含 api + baseURL + 非空 models，密钥不进 settings', () {
       final s = AppSettings(
         baseUrl: 'https://api.deepseek.com/v1',
@@ -47,6 +61,7 @@ void main() {
           'reasoningEfforts': {
             'off': null,
             'low': 'low',
+            'medium': 'medium',
             'high': 'high',
             'max': 'max',
           },
@@ -58,6 +73,7 @@ void main() {
           'reasoningEfforts': {
             'off': null,
             'low': 'low',
+            'medium': 'medium',
             'high': 'high',
             'max': 'max',
           },
@@ -81,6 +97,13 @@ void main() {
           'id': 'mimo-v2.5',
           'name': 'mimo-v2.5',
           'input': ['text', 'image'],
+          'reasoningEfforts': {
+            'off': null,
+            'low': 'low',
+            'medium': 'medium',
+            'high': 'high',
+            'max': 'max',
+          },
         },
         {
           'id': 'vision-model-x',
@@ -103,6 +126,13 @@ void main() {
           'id': 'mimo-v2.5',
           'name': 'mimo-v2.5',
           'input': ['text'],
+          'reasoningEfforts': {
+            'off': null,
+            'low': 'low',
+            'medium': 'medium',
+            'high': 'high',
+            'max': 'max',
+          },
         },
       ]);
     });

@@ -256,4 +256,19 @@ void main() {
       isFalse,
     );
   });
+
+  test('clear 使压缩前的新旧缓存同时失效', () async {
+    await DshChatCache.write(
+      's1',
+      DshChatSnapshot(messages: [_message('m1', 'assistant', '旧历史')]),
+    );
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('dsh_chat_history_cache_v1_s1', '[]');
+    expect(await DshChatCache.read('s1'), isNotNull);
+
+    await DshChatCache.clear('s1');
+
+    expect(await DshChatCache.read('s1'), isNull);
+    expect(prefs.getString('dsh_chat_history_cache_v1_s1'), isNull);
+  });
 }

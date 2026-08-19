@@ -103,6 +103,11 @@ class _DshChatScreenState extends State<DshChatScreen>
   final Set<String> _syncedResponseModels = {};
   late String _title = widget.initialTitle;
   late String _model = widget.shiyi?.settings.model.trim() ?? '';
+  String _provider = '';
+  String _reasoningEffort = '';
+  String _lastNonOffEffort = '';
+  Map<String, String?> _reasoningCapabilities = const {};
+  bool _compacting = false;
   late String _cwd = widget.initialSummary?.cwd ?? '';
   bool _stopping = false;
   bool _showToolLog = false;
@@ -155,6 +160,9 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (widget.initialInput.isNotEmpty) {
       _input.text = widget.initialInput;
       _input.selection = TextSelection.collapsed(offset: _input.text.length);
+    }
+    if (_model.isNotEmpty) {
+      _applyReasoningCapabilities(_model);
     }
     final snapshot = widget.initialSnapshot;
     if (snapshot?.hasUiData == true) {
@@ -400,7 +408,10 @@ class _DshChatScreenState extends State<DshChatScreen>
     void restore() {
       _messages = List<ChatMessage>.of(cached.messages);
       if (cached.title.isNotEmpty) _title = cached.title;
-      if (cached.model.isNotEmpty) _model = cached.model;
+      if (cached.model.isNotEmpty) {
+        _model = cached.model;
+        _applyReasoningCapabilities(cached.model);
+      }
       if (cached.cwd.isNotEmpty) _cwd = cached.cwd;
       _running = cached.running;
       _summary = cached.summary ?? _summary;
@@ -571,17 +582,99 @@ class _DshChatScreenState extends State<DshChatScreen>
     });
   }
 
+  List<ThinkingIntensityOption> get _thinkingOptions =>
+      buildReasoningOptions(_reasoningCapabilities);
+
+  void _applyReasoningCapabilities(String model, {String? selected}) {
+    final capabilities =
+        DshModelSync.reasoningEffortsForModel(model) ?? const {};
+    _reasoningCapabilities = capabilities;
+    if (selected != null) {
+      _reasoningEffort = capabilities.containsKey(selected)
+          ? selected
+          : capabilities.containsKey('')
+          ? ''
+          : '';
+    } else if (_reasoningEffort.isNotEmpty &&
+        !capabilities.containsKey(_reasoningEffort) &&
+        _reasoningEffort != 'off') {
+      _reasoningEffort = capabilities.containsKey('') ? '' : '';
+    }
+    if (_reasoningEffort != 'off') {
+      _lastNonOffEffort = _reasoningEffort;
+    }
+  }
+
+  bool get _thinkingOn => _reasoningEffort != 'off';
+
+  Future<void> _setReasoningEffort(String value) async {
+    if (_compacting ||
+        _sending ||
+        _running ||
+        _provider.isEmpty ||
+        _model.isEmpty) {
+      return;
+    }
+    final previous = _reasoningEffort;
+    final previousLast = _lastNonOffEffort;
+    setState(() {
+      _reasoningEffort = value;
+      if (value != 'off') _lastNonOffEffort = value;
+    });
+    try {
+      final selected = await _api.selectModel(
+        widget.sessionId,
+        _provider,
+        _model,
+        reasoningEffort: value,
+      );
+      if (!mounted) return;
+      final next = selected.reasoningEffort ?? '';
+      setState(() {
+        _reasoningEffort = next;
+        if (next != 'off') _lastNonOffEffort = next;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _reasoningEffort = previous;
+          _lastNonOffEffort = previousLast;
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('思考强度更新失败：$e')));
+      }
+    }
+  }
+
+  Future<void> _setThinkingOn(bool on) async {
+    if (on == _thinkingOn) return;
+    await _setReasoningEffort(on ? _lastNonOffEffort : 'off');
+  }
+
   Future<void> _loadMeta() async {
     try {
       final models = await _api.sessionModels(widget.sessionId);
-      if (mounted && models.current.model.isNotEmpty) {
-        setState(() => _model = models.current.model);
+      if (mounted) {
+        final currentModel = models.current.model;
+        final selected = models.current.reasoningEffort ?? '';
+        setState(() {
+          if (currentModel.isNotEmpty) _model = currentModel;
+          _provider = models.current.provider;
+          _applyReasoningCapabilities(
+            currentModel.isNotEmpty ? currentModel : _model,
+            selected: selected,
+          );
+        });
         _scheduleCacheWrite();
       }
     } catch (_) {
       final fallback = widget.shiyi?.settings.model.trim() ?? '';
       if (mounted && fallback.isNotEmpty) {
-        setState(() => _model = fallback);
+        setState(() {
+          _model = fallback;
+          _applyReasoningCapabilities(fallback);
+        });
         _scheduleCacheWrite();
       }
     }
@@ -826,6 +919,58 @@ class _DshChatScreenState extends State<DshChatScreen>
       ).showSnackBar(SnackBar(content: Text('停止失败：$e')));
     } finally {
       if (mounted) setState(() => _stopping = false);
+    }
+  }
+
+  Future<void> _compactContext() async {
+    if (_compacting || _sending || _running) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('压缩上下文'),
+        content: const Text('将用 DSH 的 /compact 命令压缩当前会话历史，是否继续？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('压缩'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _compacting = true);
+    try {
+      final execution = await _api.compactSession(widget.sessionId);
+      if (!execution.ok) {
+        throw DshApiException(execution.error ?? 'DSH 压缩命令失败');
+      }
+      _cacheTimer?.cancel();
+      _cacheTimer = null;
+      await _cacheWriteTail;
+      await DshChatCache.clear(widget.sessionId);
+      await _refreshHistory(
+        clearLive: true,
+        authoritative: true,
+        throwOnError: true,
+      );
+      await _refreshMeta();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('上下文已压缩')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('压缩失败：$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _compacting = false);
     }
   }
 
@@ -1313,7 +1458,11 @@ class _DshChatScreenState extends State<DshChatScreen>
     return _messages.any((message) => message.id == 'dsh-$id');
   }
 
-  Future<void> _refreshHistory({required bool clearLive}) async {
+  Future<void> _refreshHistory({
+    required bool clearLive,
+    bool authoritative = false,
+    bool throwOnError = false,
+  }) async {
     try {
       final bundle = await _api.historyBundle(widget.sessionId);
       if (!mounted) return;
@@ -1332,6 +1481,7 @@ class _DshChatScreenState extends State<DshChatScreen>
       );
       final finalizesTurn = _historyFinalizesPendingTurn(bundle);
       final preserveLocalProgress =
+          !authoritative &&
           !finalizesTurn &&
           (_shouldPreserveLocalProgress(bundle) || !historyConfirmsLive);
       _replaceMessages(
@@ -1365,7 +1515,9 @@ class _DshChatScreenState extends State<DshChatScreen>
       _scheduleCacheWrite();
       _scrollToBottom();
     } catch (e) {
-      // 不自动拉起服务：刷新失败等用户手动启动。
+      // 不自动拉起服务：刷新失败等用户手动启动。手动压缩需要把失败
+      // 交给调用方，避免在权威历史尚未重载时误报成功。
+      if (throwOnError) rethrow;
     }
   }
 
@@ -1954,17 +2106,22 @@ class _DshChatScreenState extends State<DshChatScreen>
                       padding: const EdgeInsets.only(left: 12),
                       child: Align(
                         alignment: Alignment.centerLeft,
-                        child: Platform.isWindows
-                            ? MacActionButton(
-                                icon: CupertinoIcons.chevron_left,
-                                tooltip: '返回',
-                                onTap: _pop,
-                              )
-                            : TrafficLightsButton(
-                                busy: _lightsBusy,
-                                tooltip: '返回',
-                                onTap: _pop,
-                              ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Platform.isWindows
+                                ? MacActionButton(
+                                    icon: CupertinoIcons.chevron_left,
+                                    tooltip: '返回',
+                                    onTap: _pop,
+                                  )
+                                : TrafficLightsButton(
+                                    busy: _lightsBusy,
+                                    tooltip: '返回',
+                                    onTap: _pop,
+                                  ),
+                          ],
+                        ),
                       ),
                     ),
                     actions: [
@@ -2096,6 +2253,21 @@ class _DshChatScreenState extends State<DshChatScreen>
                               setState(() => _pendingFiles.removeAt(index)),
                           onSend: _send,
                           onStop: _stopping ? () {} : _stop,
+                          thinkingOptions: _thinkingOptions,
+                          thinkingValue: _thinkingOn
+                              ? _reasoningEffort
+                              : _lastNonOffEffort,
+                          onThinkingChanged: _setReasoningEffort,
+                          thinkingEnabled:
+                              !_compacting && !_sending && !_running,
+                          thinkingOn: _thinkingOn,
+                          onThinkingToggled: _thinkingOptions.isNotEmpty
+                              ? _setThinkingOn
+                              : null,
+                          onCompress: _compacting || _sending || _running
+                              ? null
+                              : _compactContext,
+                          compressBusy: _compacting,
                         ),
                     ],
                   ),

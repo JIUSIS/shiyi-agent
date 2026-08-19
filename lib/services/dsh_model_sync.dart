@@ -42,6 +42,7 @@ class DshModelSync {
     if (id.contains('deepseek') ||
         id.contains('reasoner') ||
         id.contains('thinking') ||
+        id.contains('mimo') ||
         id.contains('qwq') ||
         id.contains('r1') ||
         RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
@@ -52,7 +53,19 @@ class DshModelSync {
 
   static Map<String, String?>? reasoningEffortsForModel(String model) {
     if (defaultReasoningEffort(model) == null) return null;
-    return const {'off': null, 'low': 'low', 'high': 'high', 'max': 'max'};
+    final id = model.trim().toLowerCase();
+    // OpenAI o 系列支持 low/medium/high，部分支持 xhigh；不支持 off/max。
+    if (RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
+      return const {'low': 'low', 'medium': 'medium', 'high': 'high'};
+    }
+    // DeepSeek / QwQ / R1 等支持 off/low/medium/high/max。
+    return const {
+      'off': null,
+      'low': 'low',
+      'medium': 'medium',
+      'high': 'high',
+      'max': 'max',
+    };
   }
 
   static bool _isMissingPiAiSettings(Object error) =>

@@ -40,6 +40,10 @@ class LlmClient {
   final void Function(String error)? onError;
   final bool Function()? shouldStop;
 
+  /// 拾忆主会话的显式思考强度；null 表示沿用模型默认推断。
+  /// 该字段不承载 DSH 的会话模型协议。
+  final String? reasoningEffortOverride;
+
   /// 流诊断回调（排查截断/丢工具调用）：记录流结束方式、finish_reason、
   /// 文本尾部、tool_calls 块数等。
   final void Function(String line)? onDiag;
@@ -83,6 +87,7 @@ class LlmClient {
     this.onTurn,
     this.onError,
     this.shouldStop,
+    this.reasoningEffortOverride,
     this.onDiag,
   });
 
@@ -147,8 +152,11 @@ class LlmClient {
       // （真机复现：textLen=20 reasoningLen=0 tail=用户用英文问好…），
       // 它们只用 reasoning_effort，思考走 delta.reasoning 字段。
       var thinkingEnabled =
-          usesDeepSeekThinkingParam(model) && baseUrl.contains('deepseek.com');
-      String? reasoningEffort = defaultReasoningEffort(model);
+          reasoningEffortOverride != 'off' &&
+          usesDeepSeekThinkingParam(model) &&
+          baseUrl.contains('deepseek.com');
+      String? reasoningEffort =
+          reasoningEffortOverride ?? defaultReasoningEffort(model);
       // 网关拒绝 max_completion_tokens 时回退 max_tokens（旧网关兼容）。
       var useMaxCompletion = _useMaxCompletionTokens;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
@@ -453,6 +461,28 @@ class LlmClient {
       return 'high';
     }
     return null;
+  }
+
+  /// 根据模型名返回支持的思考强度档位列表；不支持思考的模型返回 null。
+  static Map<String, String?>? reasoningEffortsForModel(String model) {
+    if (defaultReasoningEffort(model) == null) return null;
+    final id = model.trim().toLowerCase();
+    // OpenAI o 系列支持 low/medium/high/xhigh；不支持 off/max。
+    if (RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
+      return const {
+        'low': 'low',
+        'medium': 'medium',
+        'high': 'high',
+      };
+    }
+    // DeepSeek / QwQ / R1 等支持 off/low/medium/high/max。
+    return const {
+      'off': null,
+      'low': 'low',
+      'medium': 'medium',
+      'high': 'high',
+      'max': 'max',
+    };
   }
 
   /// DeepSeek 风格的兼容接口需要 `thinking: {type: enabled}` 才会真正

@@ -12,6 +12,7 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/file_workspace.dart';
 import '../services/image_service.dart';
+import '../services/llm_client.dart';
 import '../services/tts_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/agent_question_panel.dart';
@@ -991,21 +992,26 @@ class _ChatScreenState extends State<ChatScreen>
                               alignment: Alignment.centerLeft,
                               // Windows：全局标题栏已有窗口三键，返回改用 mac 风格
                               // 箭头按钮（红绿灯仅手机端保留，兼作 busy 指示）。
-                              child: Platform.isWindows
-                                  ? MacActionButton(
-                                      icon: CupertinoIcons.chevron_left,
-                                      tooltip: '返回',
-                                      onTap: _performPop,
-                                    )
-                                  : ListenableBuilder(
-                                      listenable: widget.shiyi,
-                                      builder: (context, _) =>
-                                          TrafficLightsButton(
-                                            busy: _pageBusy,
-                                            tooltip: '返回',
-                                            onTap: _performPop,
-                                          ),
-                                    ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Platform.isWindows
+                                      ? MacActionButton(
+                                          icon: CupertinoIcons.chevron_left,
+                                          tooltip: '返回',
+                                          onTap: _performPop,
+                                        )
+                                      : ListenableBuilder(
+                                          listenable: widget.shiyi,
+                                          builder: (context, _) =>
+                                              TrafficLightsButton(
+                                                busy: _pageBusy,
+                                                tooltip: '返回',
+                                                onTap: _performPop,
+                                              ),
+                                        ),
+                                ],
+                              ),
                             ),
                           ),
                           // 右侧对称占位放工具调用信息流胶囊（与左侧返回区等宽），标题保持居中。
@@ -1420,6 +1426,42 @@ class _ChatScreenState extends State<ChatScreen>
                                 onStop: () =>
                                     widget.shiyi.stopSession(_pageSessionId),
                                 enterToSend: widget.shiyi.settings.enterToSend,
+                                thinkingOptions: buildReasoningOptions(
+                                  LlmClient.reasoningEffortsForModel(
+                                        widget.shiyi.settings.model,
+                                      ) ??
+                                      const {},
+                                ),
+                                thinkingValue:
+                                    widget.shiyi.reasoningEffortForSession(
+                                      _pageSessionId,
+                                    ) ??
+                                    '',
+                                onThinkingChanged: (value) =>
+                                    widget.shiyi.setReasoningEffortForSession(
+                                      _pageSessionId,
+                                      value,
+                                    ),
+                                thinkingEnabled: !_pageBusy,
+                                thinkingOn: widget.shiyi.thinkingOnForSession(
+                                  _pageSessionId,
+                                ),
+                                onThinkingToggled:
+                                    (LlmClient.reasoningEffortsForModel(
+                                              widget.shiyi.settings.model,
+                                            ) ??
+                                            const {})
+                                        .containsKey('off')
+                                    ? (on) =>
+                                          widget.shiyi.setThinkingOnForSession(
+                                            _pageSessionId,
+                                            on,
+                                          )
+                                    : null,
+                                onCompress: _pageBusy || _pageSessionId == null
+                                    ? null
+                                    : _compressContext,
+                                compressBusy: _pageBusy,
                               ),
                             ),
                           ],

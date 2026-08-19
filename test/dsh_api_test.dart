@@ -1471,4 +1471,212 @@ void main() {
       'sessionId': 'session-cold',
     });
   });
+
+  test('selectModel：默认省略 effort，显式档位原样发送', () async {
+    final payloads = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      final payload = (body['payload'] as Map).cast<String, dynamic>();
+      payloads.add(payload);
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'selected': {
+              'provider': payload['provider'],
+              'model': payload['model'],
+              if (payload.containsKey('reasoningEffort'))
+                'reasoningEffort': payload['reasoningEffort'],
+            },
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = clientWith(mock);
+
+    await client.selectModel('s1', 'provider', 'model');
+    await client.selectModel('s1', 'provider', 'model', reasoningEffort: '');
+    for (final effort in ['off', 'low', 'high', 'max']) {
+      await client.selectModel(
+        's1',
+        'provider',
+        'model',
+        reasoningEffort: effort,
+      );
+    }
+
+    expect(payloads[0].containsKey('reasoningEffort'), isFalse);
+    expect(payloads[1].containsKey('reasoningEffort'), isFalse);
+    expect(payloads.skip(2).map((payload) => payload['reasoningEffort']), [
+      'off',
+      'low',
+      'high',
+      'max',
+    ]);
+  });
+
+  test('compactSession：调用官方 commands/execute 并解析成功结果', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'commandId': 'cmd-1',
+            'result': {
+              'kind': 'success',
+              'text': 'Compacted 12 history items.',
+              'sourceEventSeq': 42,
+            },
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final execution = await clientWith(mock).compactSession('session-1');
+    final body = jsonDecode(captured.body) as Map<String, dynamic>;
+    expect(captured.url.toString(), 'http://test.local/api/commands/execute');
+    expect(body['method'], 'commands/execute');
+    expect(body['payload'], {
+      'args': {'agentId': 'session-1', 'line': '/compact'},
+    });
+    expect(execution.ok, isTrue);
+    expect(execution.commandId, 'cmd-1');
+    expect(execution.result, 'Compacted 12 history items.');
+    expect(execution.sourceEventSeq, 42);
+    expect(execution.error, isNull);
+  });
+
+  test('commands/execute：解析命令级错误而不是误报成功', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'commandId': 'cmd-2',
+            'result': {'kind': 'error', 'text': 'agent is busy'},
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+
+    final execution = await clientWith(
+      mock,
+    ).executeCommand(sessionId: 'session-1', line: '/compact');
+    expect(execution.ok, isFalse);
+    expect(execution.error, 'agent is busy');
+    expect(execution.result, isNull);
+  });
+
+  test('history：surface replace 用 checkpoint 替换旧 transcript', () async {
+    Map<String, dynamic> surfaced(
+      String type,
+      int seq,
+      Map<String, dynamic> data,
+      Object surfaceOp,
+    ) => {...event(type, seq, data), 'surfaceOp': surfaceOp};
+
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'events': [
+              {
+                'event': surfaced('user/message', 1, {
+                  'id': 'old-user',
+                  'role': 'user',
+                  'content': [
+                    {'type': 'text', 'text': '旧问题'},
+                  ],
+                }, 'append'),
+              },
+              {
+                'event': surfaced('assistant/message', 2, {
+                  'message': {
+                    'role': 'assistant',
+                    'content': [
+                      {'type': 'text', 'text': '旧回答'},
+                    ],
+                  },
+                }, 'append'),
+              },
+              {
+                'event': event('tool/call', 3, {
+                  'callId': 'old-call',
+                  'name': 'old_tool',
+                  'arguments': '{}',
+                }),
+              },
+              {
+                'event': surfaced('user/message', 4, {
+                  'id': 'old-user-2',
+                  'role': 'user',
+                  'content': [
+                    {'type': 'text', 'text': '旧追问'},
+                  ],
+                }, 'append'),
+              },
+              {
+                'event': surfaced('assistant/message', 5, {
+                  'message': {
+                    'role': 'assistant',
+                    'content': [
+                      {'type': 'text', 'text': '旧追答'},
+                    ],
+                  },
+                }, 'append'),
+              },
+              {
+                'event': surfaced(
+                  'user/message',
+                  6,
+                  {
+                    'id': 'compact-checkpoint',
+                    'role': 'user',
+                    'content': [
+                      {'type': 'text', 'text': '压缩摘要'},
+                    ],
+                  },
+                  {'op': 'replace', 'start': 1, 'end': 5},
+                ),
+              },
+              {
+                'event': surfaced('user/message', 7, {
+                  'id': 'new-user',
+                  'role': 'user',
+                  'content': [
+                    {'type': 'text', 'text': '压缩后问题'},
+                  ],
+                }, 'append'),
+              },
+              {
+                'event': surfaced('assistant/message', 8, {
+                  'message': {
+                    'role': 'assistant',
+                    'content': [
+                      {'type': 'text', 'text': '压缩后回答'},
+                    ],
+                  },
+                }, 'append'),
+              },
+            ],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+
+    final messages = await clientWith(mock).history('session-compact');
+    expect(messages.map((message) => message.content), [
+      '压缩摘要',
+      '压缩后问题',
+      '压缩后回答',
+    ]);
+    expect(messages.expand((message) => message.toolCalls), isEmpty);
+  });
 }
