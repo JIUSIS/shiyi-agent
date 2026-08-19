@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -8,6 +9,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../widgets/ios_style.dart';
 import '../widgets/markdown_text.dart';
 
 enum UpdateCheckStatus { failed, upToDate, updateAvailable }
@@ -150,17 +152,24 @@ class UpdateService {
     String title,
     String message,
   ) {
-    return showDialog<void>(
+    return showIosFadeDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(title),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('确定'),
+      builder: (ctx) => CupertinoTheme(
+        data: iosCupertinoTheme(ctx),
+        child: CupertinoAlertDialog(
+          title: Text(title),
+          content: Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(message),
           ),
-        ],
+          actions: [
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('好'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -172,34 +181,41 @@ class UpdateService {
     String notes, {
     bool suppressOnLater = false,
   }) {
-    return showDialog<void>(
+    return showIosFadeDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('发现新版本 v$ver'),
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 320),
-          child: SingleChildScrollView(
-            child: notes.isEmpty
-                ? const Text('有新版本可以更新。')
-                : AdaptiveMarkdownText(notes),
+      builder: (ctx) => CupertinoTheme(
+        data: iosCupertinoTheme(ctx),
+        child: CupertinoAlertDialog(
+          title: Text('发现新版本 v$ver'),
+          content: Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 280),
+              child: SingleChildScrollView(
+                child: notes.isEmpty
+                    ? const Text('有新版本可以更新。')
+                    : AdaptiveMarkdownText(notes),
+              ),
+            ),
           ),
+          actions: [
+            CupertinoDialogAction(
+              onPressed: () {
+                Navigator.pop(ctx);
+                if (suppressOnLater) _autoCheckDismissed = true;
+              },
+              child: const Text('稍后'),
+            ),
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () {
+                Navigator.pop(ctx);
+                downloadAndInstall(context, ver);
+              },
+              child: const Text('下载更新'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              if (suppressOnLater) _autoCheckDismissed = true;
-            },
-            child: const Text('稍后'),
-          ),
-          FilledButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              downloadAndInstall(context, ver);
-            },
-            child: const Text('下载更新'),
-          ),
-        ],
       ),
     );
   }
@@ -234,34 +250,39 @@ class UpdateService {
     if (!context.mounted) return;
     final dialogCtx = context;
     if (!dialogCtx.mounted) return;
-    showDialog<void>(
+    showIosFadeDialog<void>(
       context: dialogCtx,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('正在下载更新…'),
-        content: ValueListenableBuilder<double>(
-          valueListenable: progress,
-          builder: (_, p, _) => Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              LinearProgressIndicator(value: p > 0 ? p.clamp(0.0, 1.0) : null),
-              const SizedBox(height: 10),
-              Text(
-                p > 0 ? '${(p * 100).toStringAsFixed(0)}%' : '连接中…',
-                style: Theme.of(ctx).textTheme.bodySmall,
+      builder: (ctx) => CupertinoTheme(
+        data: iosCupertinoTheme(ctx),
+        child: CupertinoAlertDialog(
+          title: const Text('正在下载更新'),
+          content: Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: ValueListenableBuilder<double>(
+              valueListenable: progress,
+              builder: (_, p, _) => Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const CupertinoActivityIndicator(),
+                  const SizedBox(height: 10),
+                  Text(
+                    p > 0 ? '已下载 ${(p * 100).toStringAsFixed(0)}%' : '正在连接…',
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
+          actions: [
+            CupertinoDialogAction(
+              onPressed: () {
+                cancelled = true;
+                Navigator.pop(ctx);
+              },
+              child: const Text('取消'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              cancelled = true;
-              Navigator.pop(ctx);
-            },
-            child: const Text('取消'),
-          ),
-        ],
       ),
     );
 
@@ -318,9 +339,7 @@ class UpdateService {
     Navigator.of(dialogCtx, rootNavigator: true).pop();
     if (cancelled) return;
     if (!ok) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('下载失败：所有下载源均不可用，请稍后再试')));
+      await showPlainDialog(context, '下载失败', '所有下载源均不可用，请稍后再试。');
       return;
     }
     // 交给系统安装器
@@ -331,18 +350,14 @@ class UpdateService {
       });
       if (verified != true) {
         if (context.mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('APK 签名校验失败，已取消安装')));
+          await showPlainDialog(context, '无法安装', 'APK 签名校验失败，已取消安装。');
         }
         return;
       }
       await channel.invokeMethod('installApk', {'path': file.path});
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('打开安装器失败：$e')));
+        await showPlainDialog(context, '无法安装', '打开安装器失败：$e');
       }
     }
   }

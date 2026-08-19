@@ -335,4 +335,28 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
       expect(out, contains('web-search-shiyi-free'));
     });
   });
+
+  group('missingAndroidBuildTools', () {
+    test('探测成功且无输出视为工具链齐全', () {
+      expect(DshService.missingAndroidBuildTools(''), isEmpty);
+    });
+
+    test('只回报真正缺的工具', () {
+      expect(DshService.missingAndroidBuildTools('cmake\nninja\n'), [
+        'cmake',
+        'ninja',
+      ]);
+    });
+
+    test('探测失败视为全部缺失', () {
+      expect(DshService.missingAndroidBuildTools('', probeFailed: true), [
+        'gcc',
+        'g++',
+        'make',
+        'python3',
+        'cmake',
+        'ninja',
+      ]);
+    });
+  });
 }

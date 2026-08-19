@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shiyi_agent_app/services/update_service.dart';
@@ -42,8 +43,12 @@ void main() {
     );
     await tester.tap(find.text('检查更新'));
     await tester.pumpAndSettle();
+    expect(find.byType(CupertinoAlertDialog), findsOneWidget);
+    expect(find.text('发现新版本 v1.1.7'), findsOneWidget);
     expect(find.byType(AdaptiveMarkdownText), findsOneWidget);
     expect(find.text('版本说明'), findsOneWidget);
     expect(find.text('支持 Markdown'), findsOneWidget);
+    expect(find.text('稍后'), findsOneWidget);
+    expect(find.text('下载更新'), findsOneWidget);
   });
 }

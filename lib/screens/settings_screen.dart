@@ -2332,6 +2332,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     setState(() {
       _working = true;
       _workError = null;
+      _showInstallOutput = true;
     });
     try {
       final repaired = await _dsh.repairFullAndroidRuntime();
@@ -2543,96 +2544,116 @@ class AgentEnginePageState extends State<AgentEnginePage> {
             _ServiceRow(label: '网络代理', value: _proxyLabel),
             if (busy || _workError != null || _showInstallOutput)
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (busy || _showInstallOutput) ...[
-                      const SizedBox(height: 4),
-                      GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: () => setState(
-                          () => _showInstallOutput = !_showInstallOutput,
+                    if (busy) ...[
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: _dsh.progress.value > 0
+                              ? _dsh.progress.value.clamp(0.0, 1.0)
+                              : null,
+                          minHeight: 6,
+                          backgroundColor: dark
+                              ? const Color(0xFF3A3A3C)
+                              : const Color(0xFFE5E5EA),
+                          color: _iosBlue,
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            if (busy) ...[
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(4),
-                                child: LinearProgressIndicator(
-                                  value: _dsh.progress.value > 0
-                                      ? _dsh.progress.value
-                                      : null,
-                                  minHeight: 4,
-                                ),
-                              ),
-                              if (_dsh.statusMessage.value.isNotEmpty)
-                                const SizedBox(height: 8),
-                            ],
-                            Row(
-                              children: [
-                                if (busy &&
-                                    _dsh.statusMessage.value.isNotEmpty) ...[
-                                  Expanded(
-                                    child: Text(
-                                      _dsh.statusMessage.value,
-                                      style: const TextStyle(
-                                        fontSize: 12,
-                                        color: CupertinoColors.systemGrey,
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              _dsh.statusMessage.value.isEmpty
+                                  ? '准备中…'
+                                  : _dsh.statusMessage.value,
+                              style: TextStyle(
+                                fontSize: 13,
+                                height: 1.3,
+                                color: dark
+                                    ? CupertinoColors.white.withValues(
+                                        alpha: .65,
+                                      )
+                                    : CupertinoColors.black.withValues(
+                                        alpha: .55,
                                       ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    '${(_dsh.progress.value * 100).round()}%',
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: CupertinoColors.systemGrey,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                ],
-                                Icon(
-                                  _showInstallOutput
-                                      ? CupertinoIcons.chevron_up
-                                      : CupertinoIcons.chevron_down,
-                                  size: 14,
-                                  color: CupertinoColors.systemGrey,
-                                ),
-                              ],
-                            ),
-                            if (_showInstallOutput) ...[
-                              const SizedBox(height: 8),
-                              Container(
-                                width: double.infinity,
-                                constraints: const BoxConstraints(
-                                  maxHeight: 220,
-                                ),
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: dark
-                                      ? const Color(0xFF0C0C0E)
-                                      : const Color(0xFFF2F2F7),
-                                  borderRadius: BorderRadius.circular(6),
-                                ),
-                                child: SingleChildScrollView(
-                                  controller: _installOutputScroll,
-                                  child: Text(
-                                    _dsh.installOutput.value.isEmpty
-                                        ? '等待终端输出…'
-                                        : _dsh.installOutput.value,
-                                    style: const TextStyle(
-                                      fontFamily: 'monospace',
-                                      fontSize: 11,
-                                      height: 1.4,
-                                    ),
-                                  ),
-                                ),
                               ),
-                            ],
-                          ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            '${(_dsh.progress.value * 100).round()}%',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: dark
+                                  ? CupertinoColors.white.withValues(alpha: .8)
+                                  : CupertinoColors.black.withValues(alpha: .7),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(
+                        () => _showInstallOutput = !_showInstallOutput,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            _showInstallOutput
+                                ? CupertinoIcons.chevron_down
+                                : CupertinoIcons.chevron_right,
+                            size: 13,
+                            color: CupertinoColors.systemGrey,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            _showInstallOutput ? '隐藏终端输出' : '显示终端输出',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              color: CupertinoColors.systemGrey,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (_showInstallOutput) ...[
+                      const SizedBox(height: 8),
+                      Container(
+                        width: double.infinity,
+                        constraints: const BoxConstraints(maxHeight: 240),
+                        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                        decoration: BoxDecoration(
+                          color: dark
+                              ? const Color(0xFF1C1C1E)
+                              : const Color(0xFFF2F2F7),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: SingleChildScrollView(
+                          controller: _installOutputScroll,
+                          child: Text(
+                            _dsh.installOutput.value.isEmpty
+                                ? '等待终端输出…'
+                                : _dsh.installOutput.value,
+                            style: TextStyle(
+                              fontFamily: 'Menlo',
+                              fontFamilyFallback: const [
+                                'Courier',
+                                'monospace',
+                              ],
+                              fontSize: 11,
+                              height: 1.45,
+                              color: dark
+                                  ? const Color(0xFFD1D1D6)
+                                  : const Color(0xFF3A3A3C),
+                            ),
+                          ),
                         ),
                       ),
                     ],
@@ -2641,7 +2662,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
                       Text(
                         _workError!,
                         style: const TextStyle(
-                          fontSize: 12,
+                          fontSize: 13,
                           color: CupertinoColors.systemRed,
                         ),
                       ),

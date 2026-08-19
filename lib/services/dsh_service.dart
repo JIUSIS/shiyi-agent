@@ -370,7 +370,6 @@ class DshService {
     _postInstallWarning = null;
     progress.value = 0;
     installOutput.value = '';
-    _setPhase(0, 0.95, statusMessage.value);
     unawaited(
       _notifyDsh(
         title: isUpdate ? 'DeepSeek Harness 更新中' : 'DeepSeek Harness 安装中',
@@ -382,19 +381,21 @@ class DshService {
       if (Platform.isAndroid) {
         // 先等 rootfs 部署 + 首次 init 完成：否则 apk 与 init 并发抢数据库
         // 锁，且 _nodeReady 20s 探测会把正在跑的 init 杀掉留锁（死循环根因）。
-        _setPhase(0, 0.30, '正在准备 Android 运行环境…');
+        _setStep(0.08, '正在准备 Android 运行环境…');
         await TermuxRuntime.waitReady();
+        _setStep(0.12, '正在检查 Node.js…');
         await _ensureNode();
+        _setStep(0.18, '正在检查编译工具链…');
         // node-pty 的 install 脚本在 npm install 时编译原生模块，
         // 必须确保编译工具链（gcc/python3/cmake/ninja）先就位。
         // 已装则秒过；未装走清华优先快源下载。
         await _ensureAndroidBuildToolchain();
       }
-      _setPhase(0.30, 0.65, '正在安装 DeepSeek Harness $version …');
+      _setStep(0.22, '正在安装 DeepSeek Harness $version …');
       await _installDshPackage(version);
       // Android：安装后修正 Termux 侧运行环境（shebang / sharp wasm / 补丁）。
       if (Platform.isAndroid) {
-        _setPhase(0.65, 0.95, '正在修正运行环境（本地终端支持）…');
+        _setStep(0.78, '正在修正运行环境（本地终端支持）…');
         final postOk = await _androidPostInstall();
         if (!postOk) {
           throw DshApiException('DeepSeek Harness 安装完成，但运行环境修正失败，请查看日志');
@@ -465,7 +466,27 @@ class DshService {
     );
   }
 
-  /// 切换进度阶段：阶段边界是真实的（完成一段跳一段），段内按输出微推进。
+  /// 切到真实步骤：百分比只在步骤切换时跳，段内不再按输出字节估。
+  void _setStep(double value, String message) {
+    _phase = null;
+    progress.value = value.clamp(0.0, 1.0);
+    statusMessage.value = message;
+    installOutput.value = mergeInstallOutput(
+      installOutput.value,
+      '\n== $message（${(value * 100).round()}%） ==\n',
+    );
+    unawaited(
+      _notifyDsh(
+        title: status.value == DshStatus.installing
+            ? 'DeepSeek Harness 安装中'
+            : 'DeepSeek Harness 更新中',
+        body: message,
+        progress: value,
+      ),
+    );
+  }
+
+  /// 兼容旧调用：段内仍可按输出微推进。
   void _setPhase(double start, double end, String message) {
     _phase = (start, end);
     _npmExpectedFetches = 0;
@@ -475,7 +496,7 @@ class DshService {
     statusMessage.value = message;
     installOutput.value = mergeInstallOutput(
       installOutput.value,
-      '\n== $message（${(start * 100).round()}%-${(end * 100).round()}%） ==\n',
+      '\n== $message（${(start * 100).round()}%） ==\n',
     );
     unawaited(
       _notifyDsh(
@@ -967,6 +988,21 @@ class DshService {
     return packageJson.contains('"version": "$version"');
   }
 
+  /// 一次 `command -v` 探测的缺项。失败时视为全部缺失。
+  @visibleForTesting
+  static List<String> missingAndroidBuildTools(
+    String output, {
+    bool probeFailed = false,
+  }) {
+    const tools = ['gcc', 'g++', 'make', 'python3', 'cmake', 'ninja'];
+    if (probeFailed) return List<String>.of(tools);
+    return output
+        .split(RegExp(r'\r?\n'))
+        .map((e) => e.trim())
+        .where(tools.contains)
+        .toList();
+  }
+
   /// Android 精简预设的展示元数据。
   static const String _androidPresetMeta = '''
 name: Android 精简
@@ -1011,35 +1047,26 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
     await _patchAndroidDshHardlinks();
   }
 
-  /// 探测 node-pty 是否已可加载并真的能开 PTY。
-  /// 用脚本文件而非 `node -e` 内联：init-host 的 _shellQuote 拼接对
-  /// 含引号的 -e 字符串容易出错（实测 probe 静默失败但脚本文件正常）。
+  /// 探测 node-pty 原生模块能否加载。
+  /// 不在 proot 里 spawn bash：那会偶发 SIGSEGV，随后 node-gyp rebuild
+  /// 清掉已编译的 pty.node，运行环境就被拆掉。
   Future<bool> _androidNodePtyProbe() async {
     try {
       final dshDir = await _androidDshDir();
       final usr = await TermuxRuntime.usrDir();
-      // workingDirectory 是宿主路径，proot 内 cwd 会落回 /（#173 同款坑）：
-      // 命令内显式 cd 到 proot 内 dsh 目录，node 才能找到脚本与 node_modules。
       final probeDir = '/usr/${dshDir.substring(usr.length)}';
       final probe = File('$dshDir/.pty-probe.cjs');
-      await probe.writeAsString('''
-const p = require("node-pty");
-const t = p.spawn("bash", ["-lc", "printf pty-ok"]);
-let o = "";
-t.onData(d => { o += d; });
-t.onExit(() => {
-  console.log(o.trim());
-  process.exit(o.includes("pty-ok") ? 0 : 1);
-});
-setTimeout(() => { console.log(o.trim()); process.exit(o.includes("pty-ok") ? 0 : 1); }, 15000);
-''');
+      await probe.writeAsString(
+        'const p=require("node-pty");'
+        'console.log(typeof p.spawn==="function"?"pty-ok":"");',
+      );
       final r = await _runCommand([
         'sh',
         '-c',
         r'cd "$1" && exec node .pty-probe.cjs',
         'pty-probe',
         probeDir,
-      ], timeout: const Duration(seconds: 60));
+      ], timeout: const Duration(seconds: 40));
       if (r.exitCode != 0 || !r.output.contains('pty-ok')) {
         await _appendServiceLog(
           'node-pty probe 失败 exit=${r.exitCode} out=${r.output}',
@@ -1230,21 +1257,15 @@ setTimeout(() => { console.log(o.trim()); process.exit(o.includes("pty-ok") ? 0 
   /// 确保 Alpine rootfs 具备 node-pty / koffi 源码编译工具链
   /// （build-base: gcc/g++/make/musl-dev + python3 + cmake + ninja）。
   Future<void> _ensureAndroidBuildToolchain() async {
-    final missing = <String>[];
-    for (final tool in const [
-      'gcc',
-      'g++',
-      'make',
-      'python3',
-      'cmake',
-      'ninja',
-    ]) {
-      final r = await _runCommand([
-        tool,
-        '--version',
-      ], timeout: const Duration(seconds: 15));
-      if (r.exitCode != 0) missing.add(tool);
-    }
+    final probe = await _runCommand([
+      'sh',
+      '-c',
+      r'for t in gcc g++ make python3 cmake ninja; do command -v "$t" >/dev/null 2>&1 || echo "$t"; done',
+    ], timeout: const Duration(seconds: 20));
+    final missing = missingAndroidBuildTools(
+      probe.output,
+      probeFailed: probe.exitCode != 0,
+    );
     if (missing.isEmpty) return;
     statusMessage.value = '正在安装完整模式编译工具链（${missing.join('/')}）…';
     // 无缓存直装：重试会重下，但绕开缓存写入的 hardlink 限制。
@@ -1444,10 +1465,17 @@ done
     if (await _androidNodePtyProbe()) return true;
     statusMessage.value = '正在编译本地终端支持（node-pty，约 2-5 分钟）…';
     await _ensureNodeGypExecutable();
-    // proot 内路径 = 宿主 rootfs 路径去掉 /data/user/0/.../local/alpine 前缀。
     final usr = await TermuxRuntime.usrDir();
     final prootPtyDir =
         '/usr/${dshDir.substring(usr.length)}/node_modules/node-pty';
+    final proxy = await _detectProxy();
+    final env = <String, String>{
+      'NODEJS_ORG_MIRROR': 'https://npmmirror.com/mirrors/node',
+      'npm_config_disturl': 'https://npmmirror.com/mirrors/node',
+      'npm_config_registry': 'https://registry.npmmirror.com',
+      if (proxy != null) 'npm_config_proxy': proxy.url,
+      if (proxy != null) 'npm_config_https_proxy': proxy.url,
+    };
     final buildArgs = <String>[
       'sh',
       '-c',
@@ -1455,7 +1483,11 @@ done
       'node-gyp-pty',
       prootPtyDir,
     ];
-    var r = await _runCommand(buildArgs, timeout: const Duration(minutes: 20));
+    var r = await _runCommand(
+      buildArgs,
+      extraEnv: env,
+      timeout: const Duration(minutes: 20),
+    );
     if (r.exitCode != 0 && await _androidNodePtyProbe()) {
       // 实测：链接已完成但 dep 文件目录缺失导致 make 报错，pty.node 其实可用。
       await _appendServiceLog('node-gyp 报错但 pty.node 已可加载，按成功处理');
@@ -1463,7 +1495,11 @@ done
     }
     if (r.exitCode != 0) {
       statusMessage.value = 'node-pty 首次编译未完成，正在重试…';
-      r = await _runCommand(buildArgs, timeout: const Duration(minutes: 20));
+      r = await _runCommand(
+        buildArgs,
+        extraEnv: env,
+        timeout: const Duration(minutes: 20),
+      );
     }
     if (r.exitCode != 0) {
       final tail = npmErrorTail(r.output);
@@ -1646,7 +1682,8 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     if (wasRunning) await stop();
     status.value = DshStatus.updating;
     statusMessage.value = '正在修复完整 DeepSeek Harness 运行环境…';
-    progress.value = 0;
+    progress.value = 0.08;
+    installOutput.value = '';
     unawaited(
       _notifyDsh(
         title: 'DeepSeek Harness 完整模式修复中',
@@ -1654,6 +1691,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
       ),
     );
     try {
+      _setStep(0.18, '正在检查编译工具链…');
       await _prepareAndroidFullRuntime(force: true);
       progress.value = 1;
       status.value = DshStatus.idle;
@@ -1795,24 +1833,27 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
 
   Future<void> _installDshPackage(String version) async {
     final proxy = await _detectProxy();
-    // 全新环境：先卸载旧包再装（npm install -g 同版本会复用旧 node_modules，
-    // 残留缺失的原生模块——node-pty 的 pty.node 曾被 --ignore-scripts 跳过）。
-    final preUninstall = await _runNpm([
-      'uninstall',
-      '-g',
-      '@deepseek-ai/dsh',
-      '--no-audit',
-      '--no-fund',
-    ]).timeout(const Duration(minutes: 3));
-    if (preUninstall.exitCode != 0) {
-      await _appendServiceLog(
-        '安装前卸载旧 dsh 失败（忽略）：${npmErrorTail(preUninstall.output)}',
-      );
+    final installed = _localVersion ?? await localVersion();
+    final sameVersion =
+        installed != null &&
+        installed.isNotEmpty &&
+        compareSemver(installed, version) == 0;
+    if (!sameVersion) {
+      // 换版本才先卸旧包。同版本重装保留 node_modules，避免每次多等卸载。
+      final preUninstall = await _runNpm([
+        'uninstall',
+        '-g',
+        '@deepseek-ai/dsh',
+        '--no-audit',
+        '--no-fund',
+      ]).timeout(const Duration(minutes: 3));
+      if (preUninstall.exitCode != 0) {
+        await _appendServiceLog(
+          '安装前卸载旧 dsh 失败（忽略）：${npmErrorTail(preUninstall.output)}',
+        );
+      }
     }
     _npmExpectedFetches = _knownNpmPackageCounts[version] ?? 0;
-    if (_npmExpectedFetches == 0) {
-      _npmExpectedFetches = await _estimateNpmFetchCount(version);
-    }
     _resetPhaseOutput();
     final common = <String>[
       'install',
@@ -1858,47 +1899,23 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
       if (Platform.isAndroid) ('official-direct', [...common]),
     ];
     String last = '';
+    final sources = attempts.length;
+    var index = 0;
     for (final attempt in attempts) {
-      statusMessage.value = '正在从 ${attempt.$1} 安装 DeepSeek Harness $version …';
+      final start = 0.22 + 0.50 * (index / sources);
+      _setStep(start, '正在从 ${attempt.$1} 安装 DeepSeek Harness $version …');
       final r = await _runNpm(attempt.$2);
-      if (r.exitCode == 0) return;
+      if (r.exitCode == 0) {
+        _setStep(0.72, 'DeepSeek Harness $version 安装完成');
+        return;
+      }
       last = r.output;
       await _appendServiceLog(
         'npm 安装失败（${attempt.$1}）：\n${_tailOutput(r.output, 3000)}',
       );
+      index++;
     }
     throw DshApiException('npm 安装失败：${npmErrorTail(last)}');
-  }
-
-  /// 未知版本先用 npm dry-run 拿依赖总数（×2 估算 fetch 行数）；
-  /// 失败返回 0，走按输出字节推进的兜底进度。
-  Future<int> _estimateNpmFetchCount(String version) async {
-    try {
-      statusMessage.value = '正在计算 DeepSeek Harness 依赖总数…';
-      final r = await _runNpm([
-        'install',
-        '-g',
-        '@deepseek-ai/dsh@$version',
-        '--dry-run',
-        '--json',
-        '--no-audit',
-        '--no-fund',
-        '--fetch-timeout=60000',
-        '--fetch-retries=3',
-        '--fetch-retry-mintimeout=1000',
-        '--fetch-retry-maxtimeout=10000',
-        '--maxsockets=32',
-        '--prefer-offline',
-        if (Platform.isAndroid) '--ignore-scripts',
-        '--loglevel=error',
-        '--registry=https://registry.npmmirror.com',
-      ], captureToInstall: false).timeout(const Duration(minutes: 5));
-      final m = RegExp(r'"added"\s*:\s*(\d+)').firstMatch(r.output);
-      final added = m == null ? 0 : int.tryParse(m.group(1)!) ?? 0;
-      return added > 0 ? added * 2 : 0;
-    } catch (_) {
-      return 0;
-    }
   }
 
   void _resetPhaseOutput() {
