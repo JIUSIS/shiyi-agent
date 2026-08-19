@@ -36,29 +36,89 @@ class AboutScreen extends StatefulWidget {
 /// 功能特性（完整功能名 + 一句话说明）。
 const _features = <(IconData, Color, String, String)>[
   (
+    CupertinoIcons.sparkles,
+    _iosIndigo,
+    '双引擎切换',
+    '拾忆本地引擎或 DeepSeek Harness，会话数据各自独立',
+  ),
+  (
     CupertinoIcons.square_stack_3d_up_fill,
     _iosBlue,
     '多模型 API',
-    'OpenAI / Anthropic / Gemini / DeepSeek 等常见接口',
+    'OpenAI / Anthropic / Gemini / DeepSeek 等常见接口，会话可单独选配置',
   ),
   (
     CupertinoIcons.chat_bubble_2_fill,
     _iosGreen,
     '多轮对话与会话管理',
-    '独立会话、历史消息与滚动上下文摘要',
+    '独立会话、流式输出、思考过程与消息入场动画',
   ),
-  (CupertinoIcons.folder_fill, _iosOrange, '项目分类管理', '项目文件夹统一管理会话与工作目录'),
-  (CupertinoIcons.doc_text_fill, _iosTeal, '文件管理', '会话文件附件与文件页浏览'),
-  (CupertinoIcons.bookmark_fill, _iosPink, '长期记忆', '自动沉淀偏好、决定与项目背景'),
-  (CupertinoIcons.bolt_fill, _iosIndigo, '技能系统', '内置技能与自定义技能包'),
-  (CupertinoIcons.desktopcomputer, _iosGray, '内置终端', '内嵌 Alpine Linux / python3 / apk 装包'),
-  (CupertinoIcons.globe, _iosBlue, '网页搜索与内容提取', '联网搜索、抓取网页正文'),
-  (CupertinoIcons.photo_fill, _iosPurple, '图片与视觉模型', '图片附件、视觉模型辅助看图'),
-  (CupertinoIcons.square_on_square, _iosTeal, '上下文压缩', '大上下文自动压缩与裁剪保护'),
-  (CupertinoIcons.speedometer, _iosGreen, '缓存命中率', '服务端缓存 Token 统计显示'),
-  (CupertinoIcons.return_icon, _iosIndigo, '回车发送', '可开关的回车发送消息'),
-  (CupertinoIcons.speaker_3_fill, _iosPink, '语音朗读', '可调节语速的文本朗读'),
-  (CupertinoIcons.paintbrush_fill, _iosPurple, '深浅色主题', '浅色 / 深色 / 跟随系统'),
+  (
+    CupertinoIcons.person_2_fill,
+    _iosTeal,
+    '子代理协作',
+    '派出专项子代理分头处理任务，进度实时可见',
+  ),
+  (
+    CupertinoIcons.folder_fill,
+    _iosOrange,
+    '项目分类管理',
+    '项目文件夹统一管理会话与工作目录',
+  ),
+  (
+    CupertinoIcons.doc_text_fill,
+    _iosTeal,
+    '文件与附件',
+    '会话附件、路径浏览，以及图片视觉理解',
+  ),
+  (
+    CupertinoIcons.bookmark_fill,
+    _iosPink,
+    '长期记忆',
+    '自动沉淀偏好、决定与项目背景，支持检索管理',
+  ),
+  (
+    CupertinoIcons.bolt_fill,
+    _iosIndigo,
+    '技能系统',
+    '输入 / 快速调用，支持导入与自定义技能包',
+  ),
+  (
+    CupertinoIcons.desktopcomputer,
+    _iosGray,
+    '内置终端',
+    'Alpine Linux 沙箱，bash / python3 / apk，无需 Termux 与 root',
+  ),
+  (
+    CupertinoIcons.globe,
+    _iosBlue,
+    '网页搜索与内容提取',
+    '联网搜索、抓取网页正文',
+  ),
+  (
+    CupertinoIcons.square_on_square,
+    _iosTeal,
+    '上下文压缩',
+    '大上下文自动压缩、手动压缩与裁剪保护',
+  ),
+  (
+    CupertinoIcons.speedometer,
+    _iosGreen,
+    '缓存与思考强度',
+    '缓存命中率统计，思考开关与强度可按会话调节',
+  ),
+  (
+    CupertinoIcons.speaker_3_fill,
+    _iosPink,
+    '语音朗读',
+    '可调节语速的文本朗读',
+  ),
+  (
+    CupertinoIcons.paintbrush_fill,
+    _iosPurple,
+    '深浅色主题',
+    '浅色 / 深色 / 跟随系统',
+  ),
   (
     CupertinoIcons.cloud_download_fill,
     _iosBlue,
@@ -216,7 +276,8 @@ class _AboutScreenState extends State<AboutScreen> {
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 32),
                       child: Text(
-                        '个人 AI 工作台：对话、长期记忆、项目文件、内置终端与技能系统，一站式完成。',
+                        '与你共同成长的智能体：跨会话记忆、技能沉淀与工具调用。'
+                        '可切换拾忆本地引擎或 DeepSeek Harness，会话数据各自独立。',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 13,

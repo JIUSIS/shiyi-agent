@@ -2507,7 +2507,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
               icon: CupertinoIcons.chat_bubble_2_fill,
               color: _iosBlue,
               title: '拾忆（本地引擎）',
-              subtitle: 'Termux / WSL2 终端、本地记忆与技能库',
+              subtitle: '跨会话记忆、技能沉淀与工具调用',
               selected: _engine == 'shiyi',
               onTap: () => _select('shiyi'),
             ),
