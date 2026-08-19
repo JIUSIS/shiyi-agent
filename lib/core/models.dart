@@ -58,6 +58,9 @@ class Session {
   String id;
   String title;
   String model;
+
+  /// 本会话绑定的已保存配置名（[ApiProfile.name]）。空 = 跟随全局设置。
+  String apiProfile;
   int createdAt;
   int updatedAt;
   int messageCount;
@@ -89,6 +92,7 @@ class Session {
     required this.id,
     required this.title,
     required this.model,
+    this.apiProfile = '',
     required this.createdAt,
     required this.updatedAt,
     this.messageCount = 0,
@@ -105,6 +109,7 @@ class Session {
     'id': id,
     'title': title,
     'model': model,
+    'api_profile': apiProfile,
     'created_at': createdAt,
     'updated_at': updatedAt,
     'total_tokens': totalTokens,
@@ -120,6 +125,7 @@ class Session {
     id: m['id'],
     title: m['title'],
     model: m['model'],
+    apiProfile: m['api_profile'] == null ? '' : '${m['api_profile']}',
     createdAt: m['created_at'],
     updatedAt: m['updated_at'],
     messageCount: m['message_count'] == null

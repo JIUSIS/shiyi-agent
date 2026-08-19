@@ -147,6 +147,12 @@ bool _isTableBlock(String b) {
   return first.isNotEmpty && _isTableRow(first);
 }
 
+/// 代码围栏 / 表格在流式揭示时整块淡入，不按字符拆。
+bool isAtomicMarkdownBlock(String block) {
+  final t = block.trimLeft();
+  return t.startsWith('```') || _isTableBlock(t);
+}
+
 bool _isListBlock(String b) =>
     b.split('\n').any((l) => RegExp(r'^(\s*[-*•]|\d+[.)、\.])\s').hasMatch(l));
 

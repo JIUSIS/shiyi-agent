@@ -596,26 +596,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
     setState(() => _cachedModelIds = ids);
   }
 
-  List<ApiProfile> get _allProfiles {
-    final saved = {for (final p in _profiles) p.name: p};
-    final all = <ApiProfile>[];
-    for (final p in modelPresets) {
-      final sp = saved[p.name];
-      all.add(
-        ApiProfile(
-          name: p.name,
-          baseUrl: p.baseUrl,
-          apiKey: sp?.apiKey ?? '',
-          model: (sp?.model.isNotEmpty ?? false) ? sp!.model : p.model,
-          apiProtocol: p.apiProtocol,
-        ),
-      );
-    }
-    for (final p in _profiles) {
-      if (modelPresets.every((m) => m.name != p.name)) all.add(p);
-    }
-    return all;
-  }
+  List<ApiProfile> get _allProfiles => mergeApiProfiles(_profiles);
 
   bool get _isBuiltinPreset =>
       _presetName != null && modelPresets.any((p) => p.name == _presetName);
@@ -678,6 +659,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
     );
     _profiles = saved.values.toList();
     await SettingsService().saveProfiles(_profiles);
+    await widget.shiyi.reloadApiProfiles();
   }
 
   Future<void> _pickProfile() async {
@@ -981,6 +963,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       _baseCtrl.text = baseUrl;
     });
     await SettingsService().saveProfiles(_profiles);
+    await widget.shiyi.reloadApiProfiles();
     if (mounted) {
       if (_save.hasPending) await _save.flush();
       final next = widget.shiyi.settings.copyWith(
@@ -990,7 +973,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
         apiProtocol: _protocol,
       );
       await widget.shiyi.updateSettings(next);
-      await DshModelSync.injectNow(next);
+      await DshModelSync.injectNow(next, name: name);
       if (!mounted) return;
       await _showIosAlert(context, '完成', '配置「$name」已保存，并已注入到 DeepSeek Harness');
     }
@@ -1034,6 +1017,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       _keyHint = 'sk-...';
     });
     await SettingsService().saveProfiles(_profiles);
+    await widget.shiyi.reloadApiProfiles();
     if (mounted) {
       await _showIosAlert(context, '完成', '配置「$name」已删除');
     }
@@ -1110,6 +1094,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       }
       final settings = _modelCatalogSettings();
       await DshModelSync.rememberModelCatalog(settings, ids);
+      await widget.shiyi.reloadModelCatalogs();
       if (!mounted) return;
       setState(() => _cachedModelIds = [...ids]..sort());
       unawaited(DshModelSync.syncFromShiyi(settings));

@@ -155,7 +155,7 @@ class _DshFeaturesTabState extends State<DshFeaturesTab> {
                   icon: CupertinoIcons.square_stack_3d_up_fill,
                   color: _modelOrange,
                   title: '模型数据',
-                  subtitle: available ? '已注入模型 / 选择 / 删除' : _unavailableReason!,
+                  subtitle: available ? '已注入 API 配置 / 删除' : _unavailableReason!,
                   enabled: available,
                   onTap: available
                       ? () => Navigator.push(

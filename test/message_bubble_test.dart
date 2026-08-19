@@ -377,14 +377,87 @@ void main() {
     expect(find.text('思考中'), findsOneWidget);
     expect(find.text('思考过程'), findsNothing);
     expect(find.textContaining('已经输出一部分正文'), findsOneWidget);
-    // 流式正文由带稳定 Key 的 FadeTransition 渐显，不按正文内容重建。
-    expect(find.byKey(const ValueKey('streamingFadeMarkdown')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('streamingRevealMarkdown')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('streamingCaret')), findsNothing);
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.text('思考中'), findsOneWidget);
     await tester.tap(find.text('思考中'));
     await tester.pump(const Duration(milliseconds: 120));
     expect(find.text('收起思考'), findsOneWidget);
     expect(find.textContaining('已经产生一部分思考'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('流式增长时旧字仍在，结束后正文还在', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    Future<void> pumpLive(String text, {required bool streaming}) {
+      return _pump(
+        tester,
+        MessageBubble(
+          message: ChatMessage(
+            id: 'live-reveal',
+            sessionId: 's1',
+            role: 'assistant',
+            content: streaming ? '' : text,
+            streaming: streaming,
+            createdAt: 0,
+          ),
+          liveContent: streaming ? text : null,
+        ),
+      );
+    }
+
+    await pumpLive('已经输出一部分', streaming: true);
+    expect(find.textContaining('已经输出一部分'), findsOneWidget);
+    expect(find.byKey(const ValueKey('streamingCaret')), findsNothing);
+
+    await pumpLive('已经输出一部分正文', streaming: true);
+    await tester.pump(const Duration(milliseconds: 80));
+    expect(find.textContaining('已经输出一部分'), findsOneWidget);
+
+    await pumpLive('已经输出一部分正文', streaming: false);
+    expect(find.textContaining('已经输出一部分正文'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('streamingRevealMarkdown')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('用户入场动画结束后操作条仍靠右对齐', (tester) async {
+    tester.view.physicalSize = const Size(320, 600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await _pump(
+      tester,
+      MessageBubble(
+        message: _userMessage(),
+        animateEnter: true,
+        onCopy: (_) {},
+        onDelete: (_) {},
+        onSaveMemory: (_) {},
+        onSaveSkill: (_) {},
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final bubbleBox = tester.renderObject<RenderBox>(
+      find.byKey(const ValueKey('userBubble')),
+    );
+    final barBox = tester.renderObject<RenderBox>(
+      find.byKey(const ValueKey('messageActionBar')),
+    );
+    expect(
+      barBox.localToGlobal(Offset(barBox.size.width, 0)).dx,
+      bubbleBox.localToGlobal(Offset(bubbleBox.size.width, 0)).dx,
+    );
     expect(tester.takeException(), isNull);
   });
 

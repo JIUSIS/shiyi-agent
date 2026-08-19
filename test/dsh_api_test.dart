@@ -201,7 +201,7 @@ void main() {
     expect(msgs.single.reasoning, '先分析');
   });
 
-  test('history：assistant/chunk 增量事件被忽略，不产生消息', () async {
+  test('history：未收口的 assistant/chunk 不产生消息，留给 live', () async {
     final mock = MockClient(
       (req) async => http.Response(
         jsonEncode(
@@ -232,6 +232,155 @@ void main() {
     final client = clientWith(mock);
     final msgs = await client.history('session-test');
     expect(msgs, isEmpty);
+  });
+
+  test('history：chunks + turn/end 无 assistant/message 时冻成最后一条完整回复', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'events': [
+              {
+                'event': event('user/message', 1, {
+                  'content': [
+                    {'type': 'text', 'text': '把这段写完'},
+                  ],
+                  'role': 'user',
+                  'id': 'msg-user-1',
+                }),
+              },
+              {
+                'event': event('assistant/chunk', 2, {
+                  'turn': 1,
+                  'step': 1,
+                  'chunk': {
+                    'type': 'reasoning-delta',
+                    'index': 0,
+                    'text': '先组织后半段。',
+                  },
+                }),
+              },
+              {
+                'event': event('assistant/chunk', 3, {
+                  'turn': 1,
+                  'step': 1,
+                  'chunk': {'type': 'text-delta', 'index': 1, 'text': '这是前半'},
+                }),
+              },
+              {
+                'event': event('assistant/chunk', 4, {
+                  'turn': 1,
+                  'step': 1,
+                  'chunk': {'type': 'text-delta', 'index': 1, 'text': '段完整输出。'},
+                }),
+              },
+              {
+                'event': event('turn/end', 5, {
+                  'reason': {'kind': 'completed'},
+                }),
+              },
+            ],
+            'hasMore': false,
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    final bundle = await clientWith(mock).historyBundle('session-partial');
+    expect(bundle.messages, hasLength(2));
+    expect(bundle.messages.first.role, 'user');
+    expect(bundle.messages.last.role, 'assistant');
+    expect(bundle.messages.last.content, '这是前半段完整输出。');
+    expect(bundle.messages.last.reasoning, '先组织后半段。');
+    expect(bundle.messages.last.id, 'dsh-asst-5');
+    expect(bundle.live.open, isFalse);
+    expect(bundle.live.hasVisible, isFalse);
+    expect(bundle.turnEnded, isTrue);
+  });
+
+  test('history：chunks + aborted turn/end 同样冻成最后一条助手消息', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'events': [
+              {
+                'event': event('user/message', 1, {
+                  'content': [
+                    {'type': 'text', 'text': '继续'},
+                  ],
+                  'role': 'user',
+                  'id': 'u-abort',
+                }),
+              },
+              {
+                'event': event('assistant/chunk', 2, {
+                  'chunk': {'type': 'text-delta', 'index': 0, 'text': '已经写到一半'},
+                }),
+              },
+              {
+                'event': event('tool/call', 3, {
+                  'callId': 'call_partial',
+                  'name': 'fs_read',
+                  'arguments': '{"path":"/a"}',
+                }),
+              },
+              {
+                'event': event('turn/end', 4, {
+                  'reason': {'kind': 'aborted'},
+                }),
+              },
+            ],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    final msgs = await clientWith(mock).history('session-aborted');
+    expect(msgs, hasLength(2));
+    expect(msgs.last.content, '已经写到一半');
+    expect(msgs.last.toolCalls, hasLength(1));
+    expect(msgs.last.toolCalls.first.name, 'fs_read');
+  });
+
+  test('history：已有 assistant/message 时 chunk 缓冲不再冻成第二条', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'events': [
+              {
+                'event': event('assistant/chunk', 1, {
+                  'chunk': {'type': 'text-delta', 'index': 0, 'text': 'half'},
+                }),
+              },
+              {
+                'event': event('assistant/message', 2, {
+                  'message': {
+                    'role': 'assistant',
+                    'content': [
+                      {'type': 'text', 'text': 'full reply'},
+                    ],
+                  },
+                }),
+              },
+              {
+                'event': event('turn/end', 3, {
+                  'reason': {'kind': 'completed'},
+                }),
+              },
+            ],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    final msgs = await clientWith(mock).history('session-finalized');
+    expect(msgs, hasLength(1));
+    expect(msgs.single.content, 'full reply');
   });
 
   test('listSessions：过滤 origin=subagent 的子代理会话', () async {

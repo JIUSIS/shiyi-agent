@@ -1,3 +1,5 @@
+import 'models.dart';
+
 // 内置模型预设：一键填入 接口地址 + 模型名，方便切换服务商。
 class ModelPreset {
   final String name;
@@ -110,3 +112,41 @@ const List<ModelPreset> modelPresets = [
     suggestedMaxTokens: 32768,
   ),
 ];
+
+/// 内置预设 + 用户已保存的自定义配置。同名预设用已保存的密钥和模型覆盖。
+List<ApiProfile> mergeApiProfiles(Iterable<ApiProfile> saved) {
+  final byName = {for (final p in saved) p.name: p};
+  final all = <ApiProfile>[];
+  for (final p in modelPresets) {
+    final sp = byName[p.name];
+    all.add(
+      ApiProfile(
+        name: p.name,
+        baseUrl: p.baseUrl,
+        apiKey: sp?.apiKey ?? '',
+        model: (sp?.model.isNotEmpty ?? false) ? sp!.model : p.model,
+        apiProtocol: p.apiProtocol,
+      ),
+    );
+  }
+  for (final p in saved) {
+    if (modelPresets.every((m) => m.name != p.name)) all.add(p);
+  }
+  return all;
+}
+
+/// 按当前全局设置匹配一份已保存配置；没有精确命中时退回同接口。
+ApiProfile? profileMatchingSettings(
+  AppSettings s,
+  Iterable<ApiProfile> profiles,
+) {
+  final baseUrl = s.baseUrl.trim();
+  final model = s.model.trim();
+  for (final p in profiles) {
+    if (p.baseUrl.trim() == baseUrl && p.model.trim() == model) return p;
+  }
+  for (final p in profiles) {
+    if (p.baseUrl.trim() == baseUrl) return p;
+  }
+  return null;
+}

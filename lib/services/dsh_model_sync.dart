@@ -8,10 +8,49 @@ import '../core/models.dart';
 import 'dsh_api.dart';
 import 'dsh_service.dart';
 
+/// 一份已注入到 DSH 的 API 配置。每份对应 `llm-pi-ai.providers` 下的一个提供商。
+class DshInjectedConfig {
+  final String id;
+  final String name;
+  final String baseUrl;
+  final String apiProtocol;
+  final String model;
+  final String credentialEnv;
+
+  const DshInjectedConfig({
+    required this.id,
+    required this.name,
+    required this.baseUrl,
+    required this.apiProtocol,
+    required this.model,
+    required this.credentialEnv,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'baseUrl': baseUrl,
+    'apiProtocol': apiProtocol,
+    'model': model,
+    'credentialEnv': credentialEnv,
+  };
+
+  factory DshInjectedConfig.fromJson(Map<String, dynamic> j) =>
+      DshInjectedConfig(
+        id: (j['id'] ?? '').toString().trim(),
+        name: (j['name'] ?? '').toString().trim(),
+        baseUrl: (j['baseUrl'] ?? '').toString().trim(),
+        apiProtocol: (j['apiProtocol'] ?? 'openai').toString().trim(),
+        model: (j['model'] ?? '').toString().trim(),
+        credentialEnv: (j['credentialEnv'] ?? '').toString().trim(),
+      );
+}
+
 /// 把拾忆模型 API 配置同步到 DeepSeek Harness。
 ///
-/// 自定义网关必须手写 `llm-pi-ai.providers.shiyi` 路由：
+/// 每份已保存并注入的 API 配置写成独立的 `llm-pi-ai.providers.shiyi_*` 路由：
 /// `api` + `baseURL` + 非空 `models`，密钥只进 `.credentials.yaml`。
+/// 新注入只追加或更新对应项，不会覆盖其它已注入配置。
 class DshModelSync {
   static const providerId = 'shiyi';
   static const credentialEnv = 'SHIYI_API_KEY';
@@ -22,6 +61,8 @@ class DshModelSync {
   static const officialProvider = 'deepseek-official';
   static const _responseModelsPrefsPrefix = 'dsh_response_models_v1_';
   static const _modelCatalogPrefsPrefix = 'dsh_model_catalog_v1_';
+  static const _injectedPrefsKey = 'dsh_injected_configs_v1';
+  static const _injectedIdsPrefsKey = 'dsh_injected_provider_ids_v1';
 
   static const searchConfigFile = 'shiyi-free-search.json';
   static const searchNs = 'shiyi-free-search';
@@ -76,6 +117,194 @@ class DshModelSync {
   static bool canWriteProvider(AppSettings s) =>
       s.baseUrl.trim().isNotEmpty && s.model.trim().isNotEmpty;
 
+  /// 已保存配置名对应的 DSH 提供商 id。默认/无名配置仍用 [providerId]。
+  static String providerIdForName(String name) {
+    final slug = name
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9一-鿿]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    if (slug.isEmpty || slug == providerId) return providerId;
+    final ascii = slug.replaceAll(RegExp(r'[^\x00-\x7F]'), '');
+    if (ascii.isEmpty) {
+      final digest = base64Url
+          .encode(utf8.encode(slug))
+          .replaceAll('=', '')
+          .toLowerCase();
+      return '${providerId}_${digest.substring(0, digest.length.clamp(0, 12))}';
+    }
+    return '${providerId}_$ascii';
+  }
+
+  static String credentialEnvFor(String id) {
+    final value = id.trim();
+    if (value.isEmpty || value == providerId) return credentialEnv;
+    final suffix = value.startsWith('${providerId}_')
+        ? value.substring(providerId.length + 1)
+        : value;
+    final envSuffix = suffix
+        .toUpperCase()
+        .replaceAll(RegExp(r'[^A-Z0-9]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    if (envSuffix.isEmpty) return credentialEnv;
+    return '${credentialEnv}_$envSuffix';
+  }
+
+  static bool isManagedProviderId(String id) {
+    final value = id.trim();
+    return value == providerId || value.startsWith('${providerId}_');
+  }
+
+  static Future<List<DshInjectedConfig>> listInjectedConfigs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await _migrateLegacyInjectedIds(prefs);
+    final raw = prefs.getString(_injectedPrefsKey);
+    if (raw == null || raw.trim().isEmpty) return const [];
+    try {
+      final list = jsonDecode(raw);
+      if (list is! List) return const [];
+      return [
+        for (final item in list)
+          if (item is Map)
+            DshInjectedConfig.fromJson(item.cast<String, dynamic>()),
+      ].where((e) => e.id.isNotEmpty).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static Future<void> _saveInjectedConfigs(
+    List<DshInjectedConfig> items,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _injectedPrefsKey,
+      jsonEncode([for (final item in items) item.toJson()]),
+    );
+    await prefs.setStringList(_injectedIdsPrefsKey, [
+      for (final item in items) item.id,
+    ]);
+  }
+
+  static Future<void> _migrateLegacyInjectedIds(SharedPreferences prefs) async {
+    if (prefs.containsKey(_injectedPrefsKey)) return;
+    final ids = prefs.getStringList(_injectedIdsPrefsKey) ?? const [];
+    if (ids.isEmpty) return;
+    await prefs.setString(
+      _injectedPrefsKey,
+      jsonEncode([
+        for (final id in ids)
+          if (id.trim().isNotEmpty)
+            DshInjectedConfig(
+              id: id.trim(),
+              name: id.trim() == providerId ? displayName : id.trim(),
+              baseUrl: '',
+              apiProtocol: 'openai',
+              model: '',
+              credentialEnv: credentialEnvFor(id.trim()),
+            ).toJson(),
+      ]),
+    );
+  }
+
+  static DshInjectedConfig _configFromSettings(AppSettings s, {String? name}) {
+    final label = (name ?? '').trim();
+    final id = label.isEmpty ? providerId : providerIdForName(label);
+    return DshInjectedConfig(
+      id: id,
+      name: label.isEmpty ? displayName : label,
+      baseUrl: s.baseUrl.trim(),
+      apiProtocol: s.apiProtocol.trim().isEmpty
+          ? 'openai'
+          : s.apiProtocol.trim(),
+      model: s.model.trim(),
+      credentialEnv: credentialEnvFor(id),
+    );
+  }
+
+  static List<DshInjectedConfig> configsForDisplay({
+    required List<DshInjectedConfig> stored,
+    AppSettings? settings,
+  }) {
+    if (stored.isNotEmpty) return List<DshInjectedConfig>.from(stored);
+    if (settings != null && canWriteProvider(settings)) {
+      return [_configFromSettings(settings)];
+    }
+    return const [];
+  }
+
+  static Future<DshInjectedConfig> rememberInjectedConfig(
+    AppSettings s, {
+    String? name,
+  }) async {
+    final incoming = _configFromSettings(s, name: name);
+    final current = await listInjectedConfigs();
+    final next = <DshInjectedConfig>[];
+    var replaced = false;
+    for (final item in current) {
+      final sameId = item.id == incoming.id;
+      final sameName =
+          incoming.name.isNotEmpty &&
+          incoming.name != displayName &&
+          item.name == incoming.name;
+      if (sameId || sameName) {
+        if (!replaced) next.add(incoming);
+        replaced = true;
+      } else {
+        next.add(item);
+      }
+    }
+    if (!replaced) next.add(incoming);
+    await _saveInjectedConfigs(next);
+    return incoming;
+  }
+
+  static DshInjectedConfig? injectedConfigForSettings(
+    AppSettings s,
+    Iterable<DshInjectedConfig> injected, {
+    String? name,
+  }) {
+    final label = (name ?? '').trim();
+    if (label.isNotEmpty) {
+      final id = providerIdForName(label);
+      for (final item in injected) {
+        if (item.id == id || item.name == label) return item;
+      }
+    }
+    final baseUrl = s.baseUrl.trim();
+    final protocol = s.apiProtocol.trim();
+    for (final item in injected) {
+      if (item.baseUrl == baseUrl &&
+          (item.apiProtocol.isEmpty || item.apiProtocol == protocol)) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  static String providerIdForSettings(
+    AppSettings s,
+    Iterable<DshInjectedConfig> injected, {
+    String? name,
+  }) =>
+      injectedConfigForSettings(s, injected, name: name)?.id ??
+      ((name ?? '').trim().isEmpty ? providerId : providerIdForName(name!));
+
+  static Future<({String id, String name, String env})> _targetProvider(
+    AppSettings s, {
+    String? name,
+  }) async {
+    final injected = await listInjectedConfigs();
+    final match = injectedConfigForSettings(s, injected, name: name);
+    if (match != null) {
+      return (id: match.id, name: match.name, env: match.credentialEnv);
+    }
+    final fallback = _configFromSettings(s, name: name);
+    return (id: fallback.id, name: fallback.name, env: fallback.credentialEnv);
+  }
+
   /// llm-pi-ai 模型条目。`input` 声明模型能力（缺省只有 text，
   /// read_image 工具会因「未声明 image input」报错）；拾忆开启视觉时
   /// 主模型声明 [text, image]，视觉模型若不同则单独加入列表。
@@ -95,6 +324,9 @@ class DshModelSync {
     AppSettings s, {
     Iterable<String> responseModels = const [],
     Iterable<String> catalogModels = const [],
+    String? provider,
+    String? name,
+    String? apiKeyEnv,
   }) {
     final primary = s.model.trim();
     final vision = s.visionModel.trim();
@@ -114,9 +346,11 @@ class DshModelSync {
       if (seen.add(alias)) models.add(_modelEntry(alias, s.visionEnabled));
     }
     final reasoning = defaultReasoningEffort(primary);
+    final id = (provider ?? providerId).trim();
+    final label = (name ?? '').trim();
     return {
-      'displayName': displayName,
-      'apiKeyEnv': credentialEnv,
+      'displayName': label.isEmpty ? displayName : label,
+      'apiKeyEnv': (apiKeyEnv ?? credentialEnvFor(id)).trim(),
       'api': dshApiFor(s.apiProtocol),
       'baseURL': s.baseUrl.trim(),
       'models': models,
@@ -128,15 +362,31 @@ class DshModelSync {
     AppSettings s, {
     Iterable<String> responseModels = const [],
     Iterable<String> catalogModels = const [],
-  }) => [
+    String? provider,
+    String? name,
+    String? apiKeyEnv,
+  }) {
+    final id = (provider ?? providerId).trim();
+    return [
+      {
+        'op': 'set',
+        'path': ['providers', id],
+        'value': providerProfile(
+          s,
+          responseModels: responseModels,
+          catalogModels: catalogModels,
+          provider: id,
+          name: name,
+          apiKeyEnv: apiKeyEnv,
+        ),
+      },
+    ];
+  }
+
+  static List<Map<String, dynamic>> unsetProviderOps(String provider) => [
     {
-      'op': 'set',
-      'path': ['providers', providerId],
-      'value': providerProfile(
-        s,
-        responseModels: responseModels,
-        catalogModels: catalogModels,
-      ),
+      'op': 'unset',
+      'path': ['providers', provider.trim()],
     },
   ];
 
@@ -205,6 +455,23 @@ class DshModelSync {
     };
   }
 
+  static Future<List<Map<String, dynamic>>> _mutateOpsFor(
+    AppSettings s, {
+    Iterable<String> responseModels = const [],
+    Iterable<String> catalogModels = const [],
+    String? name,
+  }) async {
+    final target = await _targetProvider(s, name: name);
+    return mutateOps(
+      s,
+      responseModels: responseModels,
+      catalogModels: catalogModels,
+      provider: target.id,
+      name: target.name,
+      apiKeyEnv: target.env,
+    );
+  }
+
   /// 保存一次获取到的全部模型名称，并立即刷新运行中的 DSH 提供商。
   static Future<bool> rememberModelCatalog(
     AppSettings s,
@@ -228,7 +495,7 @@ class DshModelSync {
       try {
         await client.mutateSettings(
           settingsNs,
-          mutateOps(
+          await _mutateOpsFor(
             s,
             responseModels: await responseModelsFor(s),
             catalogModels: merged,
@@ -264,12 +531,77 @@ class DshModelSync {
     if (client != null && canWriteProvider(s)) {
       await client.mutateSettings(
         settingsNs,
-        mutateOps(
+        await _mutateOpsFor(
           s,
           responseModels: await responseModelsFor(s),
           catalogModels: stored,
         ),
       );
+    }
+    return true;
+  }
+
+  /// 从已注入列表和 DSH 设置里删除一份 API 配置，不影响其它已注入项。
+  static Future<bool> removeInjectedConfig(
+    String provider, {
+    DshApiClient? api,
+    Future<bool> Function()? isRunning,
+    Future<String> Function()? homeDir,
+  }) async {
+    final id = provider.trim();
+    if (id.isEmpty || !isManagedProviderId(id)) return false;
+    final current = await listInjectedConfigs();
+    DshInjectedConfig? removed;
+    final next = <DshInjectedConfig>[];
+    for (final item in current) {
+      if (item.id == id) {
+        removed = item;
+      } else {
+        next.add(item);
+      }
+    }
+    await _saveInjectedConfigs(next);
+
+    final running = await (isRunning ?? DshService.instance.isRunning)();
+    if (running) {
+      final client = api ?? DshApiClient.instance;
+      try {
+        await client.mutateSettings(settingsNs, unsetProviderOps(id));
+      } catch (e) {
+        debugPrint('DshModelSync remove provider failed: $e');
+      }
+      final env = removed?.credentialEnv ?? credentialEnvFor(id);
+      if (env != credentialEnv && env != searchCredentialEnv) {
+        try {
+          await client.unsetCredential(env);
+        } catch (e) {
+          debugPrint('DshModelSync remove credential failed: $e');
+        }
+      }
+    }
+    try {
+      final home = await (homeDir ?? DshService.instance.homeDir)();
+      await Directory(home).create(recursive: true);
+      final file = File('$home/settings.yaml');
+      if (await file.exists()) {
+        final yaml = removeProviderYaml(await file.readAsString(), id);
+        await file.writeAsString(yaml);
+      }
+      if (removed != null &&
+          removed.credentialEnv != credentialEnv &&
+          removed.credentialEnv != searchCredentialEnv) {
+        final cred = File('$home/.credentials.yaml');
+        if (await cred.exists()) {
+          final text = upsertCredentialsYaml(
+            await cred.readAsString(),
+            removed.credentialEnv,
+            '',
+          );
+          await cred.writeAsString(text);
+        }
+      }
+    } catch (e) {
+      debugPrint('DshModelSync remove files failed: $e');
     }
     return true;
   }
@@ -300,7 +632,7 @@ class DshModelSync {
       try {
         await client.mutateSettings(
           settingsNs,
-          mutateOps(
+          await _mutateOpsFor(
             s,
             responseModels: merged,
             catalogModels: await cachedModelCatalogFor(s),
@@ -313,11 +645,14 @@ class DshModelSync {
     return changed;
   }
 
-  static List<Map<String, dynamic>> defaultModelOps(AppSettings s) => [
+  static List<Map<String, dynamic>> defaultModelOps(
+    AppSettings s, {
+    String? provider,
+  }) => [
     {
       'op': 'set',
       'path': ['provider'],
-      'value': providerId,
+      'value': (provider ?? providerId).trim(),
     },
     {
       'op': 'set',
@@ -356,25 +691,29 @@ class DshModelSync {
   }
 
   /// 手动注入：把当前拾忆模型配置写入 DSH，并把所有已有会话切到当前模型。
+  /// 只追加/更新这一份配置，不会覆盖其它已注入项。
   static Future<void> injectNow(
     AppSettings s, {
     DshApiClient? api,
     Future<bool> Function()? isRunning,
     Future<String> Function()? homeDir,
+    String? name,
   }) async {
+    await rememberInjectedConfig(s, name: name);
     await syncFromShiyi(
       s,
       api: api,
       isRunning: isRunning,
       homeDir: homeDir,
       allowClear: true,
+      name: name,
     );
     final running = await (isRunning ?? DshService.instance.isRunning)();
     if (!running) return;
     final client = api ?? DshApiClient.instance;
     try {
       for (final sess in await client.listSessions()) {
-        await syncSessionToAppModel(client, sess.sessionId, s);
+        await applyToSessionIfDifferent(client, sess.sessionId, s, name: name);
       }
     } catch (e) {
       debugPrint('DshModelSync inject sessions failed: $e');
@@ -389,6 +728,7 @@ class DshModelSync {
     Future<bool> Function()? isRunning,
     Future<String> Function()? homeDir,
     bool allowClear = false,
+    String? name,
   }) async {
     try {
       final resolveHome = homeDir ?? DshService.instance.homeDir;
@@ -401,13 +741,14 @@ class DshModelSync {
             client,
             homeDir: resolveHome,
             allowClear: allowClear,
+            name: name,
           );
         } catch (e) {
           if (!_isMissingPiAiSettings(e)) rethrow;
 
           // 非法 llm-pi-ai 配置会让整个命名空间加载失败，此时 live RPC
           // 已无法自救。先重写合法文件；生产环境再重启一次 DSH 让插件恢复。
-          await syncFiles(s, await resolveHome());
+          await syncFiles(s, await resolveHome(), name: name);
           final canRestart =
               api == null && isRunning == null && homeDir == null;
           if (!canRestart) return;
@@ -418,10 +759,11 @@ class DshModelSync {
             DshApiClient.instance,
             homeDir: DshService.instance.homeDir,
             allowClear: allowClear,
+            name: name,
           );
         }
       } else {
-        await syncFiles(s, await resolveHome());
+        await syncFiles(s, await resolveHome(), name: name);
       }
     } catch (e, st) {
       debugPrint('DshModelSync failed: $e\n$st');
@@ -434,11 +776,13 @@ class DshModelSync {
     DshApiClient api, {
     Future<String> Function()? homeDir,
     bool allowClear = false,
+    String? name,
   }) async {
     final home = await (homeDir ?? DshService.instance.homeDir)();
     await writeSearchConfig(home, s);
     await cleanupLegacySearchSettingsFile(home);
-    await syncAgentDefaultModelPatch(home, s);
+    final target = await _targetProvider(s, name: name);
+    await syncAgentDefaultModelPatch(home, s, provider: target.id);
     if (canWriteProvider(s)) {
       final responseModels = await responseModelsFor(s);
       final catalogModels = await cachedModelCatalogFor(s);
@@ -448,10 +792,16 @@ class DshModelSync {
           s,
           responseModels: responseModels,
           catalogModels: catalogModels,
+          provider: target.id,
+          name: target.name,
+          apiKeyEnv: target.env,
         ),
       );
       try {
-        await api.mutateSettings(defaultModelNs, defaultModelOps(s));
+        await api.mutateSettings(
+          defaultModelNs,
+          defaultModelOps(s, provider: target.id),
+        );
       } catch (_) {
         // Android 精简预设未必挂 agent-default-model，会话创建时再 selectModel。
       }
@@ -471,22 +821,28 @@ class DshModelSync {
       }
     }
 
-    await syncCredential(credentialEnv, s.apiKey.trim());
+    await syncCredential(target.env, s.apiKey.trim());
     await syncCredential(searchCredentialEnv, effectiveSearchKey(s));
     if (!credentialsOk) {
       await writeCredentialsFile(
         home,
         s.apiKey.trim(),
         searchKey: effectiveSearchKey(s),
+        apiKeyEnv: target.env,
       );
     }
   }
 
   @visibleForTesting
-  static Future<void> syncFiles(AppSettings s, String home) async {
+  static Future<void> syncFiles(
+    AppSettings s,
+    String home, {
+    String? name,
+  }) async {
     await Directory(home).create(recursive: true);
     final file = File('$home/settings.yaml');
     var yaml = await file.exists() ? await file.readAsString() : '';
+    final target = await _targetProvider(s, name: name);
     if (canWriteProvider(s)) {
       final responseModels = await responseModelsFor(s);
       final catalogModels = await cachedModelCatalogFor(s);
@@ -498,8 +854,11 @@ class DshModelSync {
         visionEnabled: s.visionEnabled,
         visionModel: s.visionModel,
         responseModels: [...responseModels, ...catalogModels],
+        provider: target.id,
+        name: target.name,
+        apiKeyEnv: target.env,
       );
-      yaml = upsertDefaultModelYaml(yaml, s.model);
+      yaml = upsertDefaultModelYaml(yaml, s.model, provider: target.id);
     }
     yaml = removeLegacySearchSections(yaml);
     await file.writeAsString(yaml);
@@ -508,8 +867,9 @@ class DshModelSync {
       home,
       s.apiKey.trim(),
       searchKey: effectiveSearchKey(s),
+      apiKeyEnv: target.env,
     );
-    await syncAgentDefaultModelPatch(home, s);
+    await syncAgentDefaultModelPatch(home, s, provider: target.id);
   }
 
   /// 写入 Cordis 组合层默认模型，spawn/fork 子代理会读取这里而不是
@@ -517,13 +877,18 @@ class DshModelSync {
   @visibleForTesting
   static Future<void> syncAgentDefaultModelPatch(
     String home,
-    AppSettings s,
-  ) async {
+    AppSettings s, {
+    String? provider,
+  }) async {
     await Directory(home).create(recursive: true);
     final patch = File('$home/cordis.patch.yml');
     final existing = await patch.exists() ? await patch.readAsString() : '';
     final next = canWriteProvider(s)
-        ? upsertAgentDefaultModelPatchYaml(existing, s.model)
+        ? upsertAgentDefaultModelPatchYaml(
+            existing,
+            s.model,
+            provider: provider,
+          )
         : removeAgentDefaultModelPatchYaml(existing);
     if (next != existing) await patch.writeAsString(next);
   }
@@ -533,14 +898,16 @@ class DshModelSync {
   @visibleForTesting
   static String upsertAgentDefaultModelPatchYaml(
     String existing,
-    String model,
-  ) {
+    String model, {
+    String? provider,
+  }) {
+    final id = (provider ?? providerId).trim();
     final base = removeAgentDefaultModelPatchYaml(existing).trimRight();
     final block =
         '$_defaultModelPatchStart\n'
         '- id: $defaultModelNs\n'
         '  config:\n'
-        '    provider: $providerId\n'
+        '    provider: $id\n'
         '    model: ${yamlScalar(model)}\n'
         '$_defaultModelPatchEnd';
     if (base.endsWith('[]')) {
@@ -593,11 +960,12 @@ class DshModelSync {
     String home,
     String key, {
     String searchKey = '',
+    String apiKeyEnv = credentialEnv,
   }) async {
     await Directory(home).create(recursive: true);
     final cred = File('$home/.credentials.yaml');
     final existing = await cred.exists() ? await cred.readAsString() : '';
-    var text = upsertCredentialsYaml(existing, credentialEnv, key);
+    var text = upsertCredentialsYaml(existing, apiKeyEnv, key);
     text = upsertCredentialsYaml(text, searchCredentialEnv, searchKey);
     final tmp = File('$home/.credentials.yaml.tmp');
     await tmp.writeAsString(text);
@@ -654,15 +1022,20 @@ class DshModelSync {
     String visionModel = '',
     Iterable<String> responseModels = const [],
     int indent = 4,
+    String provider = providerId,
+    String? name,
+    String? apiKeyEnv,
   }) {
     final pad = ' ' * indent;
     final child = ' ' * (indent + 2);
     final item = ' ' * (indent + 4);
     final mainReasoningEfforts = reasoningEffortsForModel(model);
+    final id = provider.trim().isEmpty ? providerId : provider.trim();
+    final label = (name ?? '').trim();
     final lines = <String>[
-      '${pad}shiyi:',
-      '${child}displayName: $displayName',
-      '${child}apiKeyEnv: $credentialEnv',
+      '$pad$id:',
+      '${child}displayName: ${yamlScalar(label.isEmpty ? displayName : label)}',
+      '${child}apiKeyEnv: ${apiKeyEnv ?? credentialEnvFor(id)}',
       '${child}api: ${dshApiFor(apiProtocol)}',
       '${child}baseURL: ${yamlScalar(baseUrl)}',
     ];
@@ -724,7 +1097,11 @@ class DshModelSync {
     bool visionEnabled = false,
     String visionModel = '',
     Iterable<String> responseModels = const [],
+    String provider = providerId,
+    String? name,
+    String? apiKeyEnv,
   }) {
+    final id = provider.trim().isEmpty ? providerId : provider.trim();
     final block = renderShiyiProviderBlock(
       baseUrl: baseUrl,
       model: model,
@@ -732,6 +1109,9 @@ class DshModelSync {
       visionEnabled: visionEnabled,
       visionModel: visionModel,
       responseModels: responseModels,
+      provider: id,
+      name: name,
+      apiKeyEnv: apiKeyEnv,
     );
     final lines = _splitLines(existing);
     final ns = _findKey(lines, 0, lines.length, 0, settingsNs);
@@ -758,8 +1138,8 @@ class DshModelSync {
       return _joinLines(next);
     }
     final providersEnd = _blockEnd(lines, providers, 2);
-    final shiyi = _findKey(lines, providers + 1, providersEnd, 4, providerId);
-    if (shiyi == null) {
+    final found = _findKey(lines, providers + 1, providersEnd, 4, id);
+    if (found == null) {
       final next = [
         ...lines.sublist(0, providersEnd),
         ...block.split('\n'),
@@ -767,13 +1147,29 @@ class DshModelSync {
       ];
       return _joinLines(next);
     }
-    final shiyiEnd = _blockEnd(lines, shiyi, 4);
+    final foundEnd = _blockEnd(lines, found, 4);
     final next = [
-      ...lines.sublist(0, shiyi),
+      ...lines.sublist(0, found),
       ...block.split('\n'),
-      ...lines.sublist(shiyiEnd),
+      ...lines.sublist(foundEnd),
     ];
     return _joinLines(next);
+  }
+
+  static String removeProviderYaml(String existing, String provider) {
+    final id = provider.trim();
+    if (id.isEmpty) return existing;
+    final lines = _splitLines(existing);
+    final ns = _findKey(lines, 0, lines.length, 0, settingsNs);
+    if (ns == null) return existing;
+    final nsEnd = _blockEnd(lines, ns, 0);
+    final providers = _findKey(lines, ns + 1, nsEnd, 2, 'providers');
+    if (providers == null) return existing;
+    final providersEnd = _blockEnd(lines, providers, 2);
+    final found = _findKey(lines, providers + 1, providersEnd, 4, id);
+    if (found == null) return existing;
+    final foundEnd = _blockEnd(lines, found, 4);
+    return _joinLines([...lines.sublist(0, found), ...lines.sublist(foundEnd)]);
   }
 
   /// 搜索配置已迁移到独立 JSON；清理旧设置段，避免 DSH 加载未知命名空间。
@@ -790,10 +1186,15 @@ class DshModelSync {
     return _joinLines(_trimTrailingEmpty(lines));
   }
 
-  static String upsertDefaultModelYaml(String existing, String model) {
+  static String upsertDefaultModelYaml(
+    String existing,
+    String model, {
+    String? provider,
+  }) {
+    final id = (provider ?? providerId).trim();
     final block = [
       '$defaultModelNs:',
-      '  provider: $providerId',
+      '  provider: $id',
       '  model: ${yamlScalar(model)}',
     ].join('\n');
     final lines = _splitLines(existing);
@@ -817,13 +1218,36 @@ class DshModelSync {
   static Future<void> applyToSession(
     DshApiClient api,
     String sessionId,
-    AppSettings s,
-  ) async {
+    AppSettings s, {
+    String? name,
+  }) async {
     if (!canWriteProvider(s) || sessionId.isEmpty) return;
-    await api.selectModel(sessionId, providerId, s.model.trim());
+    final target = await _targetProvider(s, name: name);
+    await api.selectModel(sessionId, target.id, s.model.trim());
   }
 
-  /// 会话没停在拾忆当前模型时改切过去；已经是同 provider + 同模型就不打扰。
+  /// 已经是同 provider + 同模型就不打扰。
+  static Future<void> applyToSessionIfDifferent(
+    DshApiClient api,
+    String sessionId,
+    AppSettings s, {
+    String? name,
+  }) async {
+    if (!canWriteProvider(s) || sessionId.isEmpty) return;
+    final target = await _targetProvider(s, name: name);
+    try {
+      final models = await api.sessionModels(sessionId);
+      if (models.current.provider == target.id &&
+          models.current.model.trim() == s.model.trim()) {
+        return;
+      }
+    } catch (_) {
+      return;
+    }
+    await applyToSession(api, sessionId, s, name: name);
+  }
+
+  /// 会话已经选过模型时不要覆盖，避免打开旧会话把用户选择冲掉。
   static Future<void> syncSessionToAppModel(
     DshApiClient api,
     String sessionId,
@@ -832,11 +1256,7 @@ class DshModelSync {
     if (!canWriteProvider(s) || sessionId.isEmpty) return;
     try {
       final models = await api.sessionModels(sessionId);
-      final target = s.model.trim();
-      if (models.current.provider == providerId &&
-          models.current.model == target) {
-        return;
-      }
+      if (models.current.model.trim().isNotEmpty) return;
     } catch (_) {
       return;
     }

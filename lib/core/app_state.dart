@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/model_presets.dart';
 import '../core/models.dart';
 import '../services/db.dart';
 import '../services/dsh_service.dart';
@@ -146,6 +147,12 @@ class ShiyiState extends ChangeNotifier {
   static const String _lastEngineKey = 'dsh_last_engine_v1';
 
   AppSettings settings = AppSettings();
+
+  /// 用户已保存的 API 配置（不含未保存的内置预设），供会话级模型选择。
+  List<ApiProfile> apiProfiles = [];
+
+  /// 各已保存配置对应的缓存模型 ID，按配置名隔离。
+  Map<String, List<String>> modelCatalogsByProfile = {};
   List<Session> sessions = [];
   List<Project> projects = [];
   final Map<String, String> _projectIdBySession = {};
@@ -293,6 +300,121 @@ class ShiyiState extends ChangeNotifier {
     final run = _runFor(sessionId);
     run.thinkingOn = value;
     _publishRun(run);
+  }
+
+  /// 刷新已保存配置列表（设置页写入后调用）。
+  Future<void> reloadApiProfiles({bool notify = true}) async {
+    apiProfiles = await _settingsService.loadProfiles();
+    await reloadModelCatalogs(notify: false);
+    if (notify) notifyListeners();
+  }
+
+  /// 按已保存配置的接口地址刷新缓存模型目录。
+  Future<void> reloadModelCatalogs({bool notify = true}) async {
+    final next = <String, List<String>>{};
+    for (final p in apiProfiles) {
+      final ids = await DshModelSync.cachedModelCatalogFor(
+        AppSettings(
+          baseUrl: p.baseUrl,
+          apiProtocol: p.apiProtocol,
+          model: p.model,
+        ),
+      );
+      next[p.name] = ids;
+    }
+    modelCatalogsByProfile = next;
+    if (notify) notifyListeners();
+  }
+
+  /// 某份已保存配置可选的模型 ID：自身保存的模型 + 该接口缓存目录。
+  List<String> cachedModelsForProfile(ApiProfile profile) {
+    final ids = <String>{
+      if (profile.model.trim().isNotEmpty) profile.model.trim(),
+      ...?modelCatalogsByProfile[profile.name],
+    };
+    return ids.toList()..sort();
+  }
+
+  /// 当前会话绑定的已保存配置；旧会话没有绑定时按模型/全局设置回退。
+  ApiProfile? profileForSession(String? sessionId) {
+    if (sessionId == null) {
+      return profileMatchingSettings(settings, apiProfiles);
+    }
+    Session? sess;
+    for (final s in sessions) {
+      if (s.id == sessionId) {
+        sess = s;
+        break;
+      }
+    }
+    final name = sess?.apiProfile.trim() ?? '';
+    if (name.isNotEmpty) {
+      for (final p in apiProfiles) {
+        if (p.name == name) return p;
+      }
+    }
+    final model = sess?.model.trim() ?? '';
+    if (model.isNotEmpty) {
+      for (final p in apiProfiles) {
+        if (p.model.trim() == model) return p;
+      }
+      for (final p in apiProfiles) {
+        if (cachedModelsForProfile(p).contains(model)) return p;
+      }
+    }
+    return profileMatchingSettings(settings, apiProfiles);
+  }
+
+  /// 拾忆主请求使用的会话级接口配置；未绑定时回退全局设置。
+  AppSettings clientSettingsForSession(String? sessionId) {
+    Session? sess;
+    if (sessionId != null) {
+      for (final s in sessions) {
+        if (s.id == sessionId) {
+          sess = s;
+          break;
+        }
+      }
+    }
+    final p = profileForSession(sessionId);
+    if (p == null) {
+      final sessionModel = sess?.model.trim() ?? '';
+      return sessionModel.isEmpty
+          ? settings
+          : settings.copyWith(model: sessionModel);
+    }
+    final sessionModel = sess?.model.trim() ?? '';
+    return settings.copyWith(
+      baseUrl: p.baseUrl,
+      apiKey: p.apiKey.isNotEmpty ? p.apiKey : settings.apiKey,
+      model: sessionModel.isNotEmpty
+          ? sessionModel
+          : (p.model.isNotEmpty ? p.model : settings.model),
+      apiProtocol: p.apiProtocol,
+    );
+  }
+
+  /// 绑定会话到一份已保存配置，只改该会话，不改全局设置。
+  /// [model] 为空时用配置里保存的模型。
+  Future<void> setApiProfileForSession(
+    String? sessionId,
+    ApiProfile profile, {
+    String? model,
+  }) async {
+    if (sessionId == null || sessionId.isEmpty) return;
+    final chosen = (model ?? profile.model).trim();
+    await _db.touchSession(
+      sessionId,
+      model: chosen.isEmpty ? settings.model : chosen,
+      apiProfile: profile.name,
+    );
+    for (final s in sessions) {
+      if (s.id == sessionId) {
+        s.model = chosen.isEmpty ? settings.model : chosen;
+        s.apiProfile = profile.name;
+      }
+    }
+    notifyListeners();
   }
 
   @visibleForTesting
@@ -727,6 +849,8 @@ class ShiyiState extends ChangeNotifier {
     if (loaded) return;
     try {
       settings = await _settingsService.load();
+      apiProfiles = await _settingsService.loadProfiles();
+      await reloadModelCatalogs(notify: false);
       // 同步 DSH 代理开关到服务单例。
       DshService.instance.useProxyEnabled = settings.dshUseProxy;
       await FileWorkspace.ensure();
@@ -903,6 +1027,7 @@ class ShiyiState extends ChangeNotifier {
         id: id,
         title: '新会话 ${_fmtStamp(DateTime.now())}',
         model: settings.model,
+        apiProfile: profileMatchingSettings(settings, apiProfiles)?.name ?? '',
         createdAt: now,
         updatedAt: now,
         projectId: projectId,
@@ -1694,7 +1819,8 @@ class ShiyiState extends ChangeNotifier {
     if (targetSessionId == null) return;
     final run = _runFor(targetSessionId);
     if (run.active) return;
-    if (settings.apiKey.isEmpty || settings.model.isEmpty) {
+    final clientSettings = clientSettingsForSession(targetSessionId);
+    if (clientSettings.apiKey.isEmpty || clientSettings.model.isEmpty) {
       run.status = '请先在设置中配置 API 密钥与模型';
       _publishRun(run);
       return;
@@ -1942,7 +2068,10 @@ class ShiyiState extends ChangeNotifier {
       _publishRun(run);
     }
 
-    await _db.touchSession(sessionId, model: settings.model);
+    await _db.touchSession(
+      sessionId,
+      model: clientSettingsForSession(sessionId).model,
+    );
     await refreshSessions();
   }
 
@@ -2052,7 +2181,10 @@ class ShiyiState extends ChangeNotifier {
     // 历史被修改后旧 usage 不再有效，回退到估算。
     await _db.updateSessionLastUsage(sessionId, null);
     sessionLastUsageTokens = null;
-    await _db.touchSession(sessionId, model: settings.model);
+    await _db.touchSession(
+      sessionId,
+      model: clientSettingsForSession(sessionId).model,
+    );
     await refreshSessions();
     await _updateContextStats(sessionId);
     notifyListeners();
@@ -2365,9 +2497,9 @@ class ShiyiState extends ChangeNotifier {
       reasoning: finalReasoning.isEmpty ? null : finalReasoning,
       toolCalls: normalized.toolCalls.isEmpty ? null : asst.toolCalls,
     );
-    run.streamText.value = '';
-    run.streamReasoning.value = '';
     if (currentSessionId == asst.sessionId) _bumpMessages();
+    run.streamText.value = asst.content;
+    run.streamReasoning.value = asst.reasoning;
     _publishRun(run);
   }
 
@@ -2420,8 +2552,6 @@ class ShiyiState extends ChangeNotifier {
       }
       m.content = run.stopRequested ? '(已停止)' : '(生成出错)';
     }
-    run.streamText.value = '';
-    run.streamReasoning.value = '';
     await _db.updateMessageContent(
       m.id,
       m.content,
@@ -2429,6 +2559,8 @@ class ShiyiState extends ChangeNotifier {
       toolCalls: m.toolCalls,
     );
     if (currentSessionId == m.sessionId) _bumpMessages();
+    run.streamText.value = m.content;
+    run.streamReasoning.value = m.reasoning;
     _publishRun(run);
   }
 
@@ -2465,11 +2597,12 @@ class ShiyiState extends ChangeNotifier {
     TurnResult? accumulated;
     var lastStreamEmit = DateTime.now();
     var lastStreamLen = 0;
+    final clientSettings = clientSettingsForSession(sessionId);
     final client = LlmClient(
-      baseUrl: settings.baseUrl,
-      apiKey: settings.apiKey,
-      model: settings.model,
-      protocol: settings.apiProtocol,
+      baseUrl: clientSettings.baseUrl,
+      apiKey: clientSettings.apiKey,
+      model: clientSettings.model,
+      protocol: clientSettings.apiProtocol,
       temperature: settings.temperature,
       maxTokens: settings.maxOutputTokens,
       tools: _activeToolsFor(planMode: run.planMode),
@@ -3126,11 +3259,12 @@ class ShiyiState extends ChangeNotifier {
                   .map((e) => _normAbsPath(e.toString(), workingDirAbs))
                   .toList()
             : null;
+        final clientSettings = clientSettingsForSession(toolSessionId);
         final runner = SubagentRunner(
-          baseUrl: settings.baseUrl,
-          apiKey: settings.apiKey,
-          model: settings.model,
-          protocol: settings.apiProtocol,
+          baseUrl: clientSettings.baseUrl,
+          apiKey: clientSettings.apiKey,
+          model: clientSettings.model,
+          protocol: clientSettings.apiProtocol,
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
           toolsJson: _toolsJsonFor(def.allowedTools),
@@ -3507,7 +3641,10 @@ class ShiyiState extends ChangeNotifier {
   Future<({bool ok, int archived, int beforeTokens, int afterTokens})>
   compressSession(String sessionId) async {
     final fail = (ok: false, archived: 0, beforeTokens: 0, afterTokens: 0);
-    if (settings.apiKey.isEmpty || settings.model.isEmpty) return fail;
+    final clientSettings = clientSettingsForSession(sessionId);
+    if (clientSettings.apiKey.isEmpty || clientSettings.model.isEmpty) {
+      return fail;
+    }
     final msgs = await _db.listMessages(sessionId);
     final keep = msgs.where((m) => !m.streaming && !m.archived).toList();
     if (keep.length < 6) return fail;
@@ -3522,10 +3659,10 @@ class ShiyiState extends ChangeNotifier {
         : _tailChars(transcript, 12000);
 
     final client = LlmClient(
-      baseUrl: settings.baseUrl,
-      apiKey: settings.apiKey,
-      model: settings.model,
-      protocol: settings.apiProtocol,
+      baseUrl: clientSettings.baseUrl,
+      apiKey: clientSettings.apiKey,
+      model: clientSettings.model,
+      protocol: clientSettings.apiProtocol,
       temperature: 0.2,
       tools: const [],
     );
@@ -3748,7 +3885,8 @@ class ShiyiState extends ChangeNotifier {
   /// 带熔断与限频，避免频繁调用 LLM。
   Future<void> _maybeAutoRefine(String sessionId) async {
     if (!settings.enableAutoLearn || !settings.enableMemory) return;
-    if (settings.apiKey.isEmpty || settings.model.isEmpty) return;
+    final refineSettings = clientSettingsForSession(sessionId);
+    if (refineSettings.apiKey.isEmpty || refineSettings.model.isEmpty) return;
     // 限频：每 5 分钟最多提炼一次，且最多连续 3 次无收获后熔断
     final now = DateTime.now();
     if (_lastRefine != null && now.difference(_lastRefine!).inSeconds < 300) {
@@ -3780,10 +3918,10 @@ class ShiyiState extends ChangeNotifier {
           .join('\n');
 
       final client = LlmClient(
-        baseUrl: settings.baseUrl,
-        apiKey: settings.apiKey,
-        model: settings.model,
-        protocol: settings.apiProtocol,
+        baseUrl: refineSettings.baseUrl,
+        apiKey: refineSettings.apiKey,
+        model: refineSettings.model,
+        protocol: refineSettings.apiProtocol,
         temperature: 0.2,
         tools: const [],
       );

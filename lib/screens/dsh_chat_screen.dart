@@ -136,6 +136,9 @@ class _DshChatScreenState extends State<DshChatScreen>
   DateTime _lastStreamEmit = DateTime.fromMillisecondsSinceEpoch(0);
   int _lastStreamLen = 0;
   bool _autoScrollScheduled = false;
+  final Set<String> _enteredMessageIds = {};
+  final Set<String> _enteredUserTexts = {};
+  final Map<String, String> _userEnterKeys = {};
   bool _awaitingFinalReply = false;
   bool _turnEndSeen = false;
   bool _suppressDuplicateSubagentTurn = false;
@@ -449,16 +452,6 @@ class _DshChatScreenState extends State<DshChatScreen>
       _maybePoll();
       unawaited(_loadMeta());
       unawaited(_refreshSubagents());
-      final shiyi = widget.shiyi;
-      if (shiyi != null) {
-        unawaited(
-          DshModelSync.syncSessionToAppModel(
-            _api,
-            widget.sessionId,
-            shiyi.settings,
-          ),
-        );
-      }
       unawaited(_connectDownlink());
     }
 
@@ -518,16 +511,6 @@ class _DshChatScreenState extends State<DshChatScreen>
       });
       unawaited(_loadMeta());
       unawaited(_refreshSubagents());
-      final shiyi = widget.shiyi;
-      if (shiyi != null) {
-        unawaited(
-          DshModelSync.syncSessionToAppModel(
-            _api,
-            widget.sessionId,
-            shiyi.settings,
-          ),
-        );
-      }
       unawaited(_connectDownlink());
       _maybePoll();
     } catch (e) {
@@ -650,6 +633,78 @@ class _DshChatScreenState extends State<DshChatScreen>
   Future<void> _setThinkingOn(bool on) async {
     if (on == _thinkingOn) return;
     await _setReasoningEffort(on ? _lastNonOffEffort : 'off');
+  }
+
+  String get _selectedProfileName {
+    final shiyi = widget.shiyi;
+    final profiles = shiyi?.apiProfiles ?? const <ApiProfile>[];
+    final provider = _provider.trim();
+    if (provider.isNotEmpty) {
+      for (final p in profiles) {
+        if (DshModelSync.providerIdForName(p.name) == provider) return p.name;
+      }
+    }
+    final model = _model.trim();
+    for (final p in profiles) {
+      if (p.model.trim() == model) return p.name;
+    }
+    if (shiyi != null && model.isNotEmpty) {
+      for (final p in profiles) {
+        if (shiyi.cachedModelsForProfile(p).contains(model)) return p.name;
+      }
+    }
+    return model;
+  }
+
+  Future<void> _selectSessionProfile(SessionModelSelection selection) async {
+    if (_compacting || _sending || _running) return;
+    final shiyi = widget.shiyi;
+    if (shiyi == null) return;
+    ApiProfile? profile;
+    for (final p in shiyi.apiProfiles) {
+      if (p.name == selection.profile) {
+        profile = p;
+        break;
+      }
+    }
+    final modelId = selection.model.trim();
+    if (profile == null || modelId.isEmpty) return;
+    final previousModel = _model;
+    final previousProvider = _provider;
+    final providerId = DshModelSync.providerIdForName(profile.name);
+    setState(() {
+      _model = modelId;
+      _provider = providerId;
+      _applyReasoningCapabilities(_model);
+    });
+    try {
+      final selected = await _api.selectModel(
+        widget.sessionId,
+        providerId,
+        modelId,
+        reasoningEffort: _thinkingOn ? _reasoningEffort : 'off',
+      );
+      if (!mounted) return;
+      setState(() {
+        if (selected.model.isNotEmpty) _model = selected.model;
+        if (selected.provider.isNotEmpty) _provider = selected.provider;
+        _applyReasoningCapabilities(
+          _model,
+          selected: selected.reasoningEffort ?? _reasoningEffort,
+        );
+      });
+      _scheduleCacheWrite();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _model = previousModel;
+        _provider = previousProvider;
+        _applyReasoningCapabilities(previousModel);
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('切换模型失败：$e')));
+    }
   }
 
   Future<void> _loadMeta() async {
@@ -852,6 +907,7 @@ class _DshChatScreenState extends State<DshChatScreen>
       content: prompt,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
+    if (prompt.isNotEmpty) _userEnterKeys[prompt] = optimistic.id;
     _awaitingFinalReply = true;
     _turnEndSeen = false;
     _pendingPromptText = prompt;
@@ -924,24 +980,13 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   Future<void> _compactContext() async {
     if (_compacting || _sending || _running) return;
-    final confirmed = await showDialog<bool>(
+    final confirmed = await showIosConfirmDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('压缩上下文'),
-        content: const Text('将用 DSH 的 /compact 命令压缩当前会话历史，是否继续？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('压缩'),
-          ),
-        ],
-      ),
+      title: '压缩上下文？',
+      message: '较早的对话会变成摘要，完整记录仍保留。',
+      confirmLabel: '压缩',
     );
-    if (confirmed != true || !mounted) return;
+    if (!confirmed || !mounted) return;
     setState(() => _compacting = true);
     try {
       final execution = await _api.compactSession(widget.sessionId);
@@ -1757,6 +1802,17 @@ class _DshChatScreenState extends State<DshChatScreen>
     return true;
   }
 
+  String _itemKey(ChatMessage m) {
+    if (m.role == 'user') {
+      final alias = _userEnterKeys[m.content.trim()];
+      if (alias != null) return alias;
+    }
+    if (m.streaming || m.id == _liveId || m.id == dshCachedLiveMessageId) {
+      return _liveId;
+    }
+    return m.id;
+  }
+
   void _replaceMessages(List<ChatMessage> next) {
     if (!mounted || _sameMessages(_messages, next)) return;
     setState(() => _messages = next);
@@ -1836,15 +1892,18 @@ class _DshChatScreenState extends State<DshChatScreen>
         (m) => m.streaming || m.id == _liveId || m.id == dshCachedLiveMessageId,
       );
     }
+    _enteredMessageIds.remove(_liveId);
     _live.reset();
-    _resetLiveNotifiers();
+    _resetLiveNotifiers(keepVisible: preserveVisible);
     if (mounted) setState(() {});
     _scheduleCacheWrite();
   }
 
-  void _resetLiveNotifiers() {
-    _streamText.value = '';
-    _streamReasoning.value = '';
+  void _resetLiveNotifiers({bool keepVisible = false}) {
+    if (!keepVisible) {
+      _streamText.value = '';
+      _streamReasoning.value = '';
+    }
     _lastStreamLen = 0;
   }
 
@@ -2179,97 +2238,121 @@ class _DshChatScreenState extends State<DshChatScreen>
                       ],
                     ),
                   ),
-                  body: Column(
-                    children: [
-                      Expanded(child: _buildMessages()),
-                      if (_selectedSkills.isNotEmpty)
-                        _DshLoadedSkillChips(
-                          skills: _selectedSkills,
-                          onRemove: (skill) => setState(
-                            () => _selectedSkills.removeWhere(
-                              (item) => item.name == skill.name,
+                  body: ChatFloatingComposerScaffold(
+                    messages: (context, overlayHeight) =>
+                        _buildMessages(overlayHeight),
+                    overlay: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (_selectedSkills.isNotEmpty)
+                          _DshLoadedSkillChips(
+                            skills: _selectedSkills,
+                            onRemove: (skill) => setState(
+                              () => _selectedSkills.removeWhere(
+                                (item) => item.name == skill.name,
+                              ),
                             ),
                           ),
-                        ),
-                      if (_runningSubagentCount > 0)
-                        SubagentStatusBar(
-                          text:
-                              '子代理 $_runningSubagentCount/$_subagentTotalCount · 运行中',
-                        ),
-                      DshStatsBar(summary: _summary),
-                      if (_cwd.isNotEmpty) _workspaceBar(theme),
-                      AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
-                        switchInCurve: Curves.easeOutCubic,
-                        switchOutCurve: Curves.easeInCubic,
-                        transitionBuilder: (child, animation) =>
-                            SlideTransition(
-                              position: Tween<Offset>(
-                                begin: const Offset(0, .35),
-                                end: Offset.zero,
-                              ).animate(animation),
-                              child: FadeTransition(
-                                opacity: animation,
-                                child: child,
-                              ),
-                            ),
-                        child: _pendingQuestion == null
-                            ? const SizedBox.shrink(
-                                key: ValueKey('dsh-no-question'),
-                              )
-                            : AgentQuestionPanel(
-                                key: ValueKey(
-                                  'dsh-question-${_pendingQuestion!['rpcId']}',
+                        if (_runningSubagentCount > 0)
+                          SubagentStatusBar(
+                            text:
+                                '子代理 $_runningSubagentCount/$_subagentTotalCount · 运行中',
+                          ),
+                        DshStatsBar(summary: _summary),
+                        if (_cwd.isNotEmpty) _workspaceBar(theme),
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 220),
+                          switchInCurve: Curves.easeOutCubic,
+                          switchOutCurve: Curves.easeInCubic,
+                          transitionBuilder: (child, animation) =>
+                              SlideTransition(
+                                position: Tween<Offset>(
+                                  begin: const Offset(0, .35),
+                                  end: Offset.zero,
+                                ).animate(animation),
+                                child: FadeTransition(
+                                  opacity: animation,
+                                  child: child,
                                 ),
-                                title: 'DS Harness 向你提问',
-                                questions:
-                                    ((_pendingQuestion!['questions']
-                                                as List?) ??
-                                            const [])
-                                        .map(
-                                          (e) => (e as Map)
-                                              .cast<String, dynamic>(),
-                                        )
-                                        .toList(),
-                                busy: _answerBusy,
-                                showCustomAnswers: true,
-                                showSubmitActions: true,
-                                onSubmit: _submitQuestionAnswers,
-                                onCancel: _cancelQuestion,
                               ),
-                      ),
-                      if (_pendingQuestion == null)
-                        LiquidGlassChatComposer(
-                          input: _input,
-                          busy: _sending || _running,
-                          enterToSend:
-                              widget.shiyi?.settings.enterToSend ?? true,
-                          pendingImages: _pendingImages,
-                          pendingFiles: _pendingFiles,
-                          onPickAttachment: _pickAttachment,
-                          onRemoveImage: (index) =>
-                              setState(() => _pendingImages.removeAt(index)),
-                          onRemoveFile: (index) =>
-                              setState(() => _pendingFiles.removeAt(index)),
-                          onSend: _send,
-                          onStop: _stopping ? () {} : _stop,
-                          thinkingOptions: _thinkingOptions,
-                          thinkingValue: _thinkingOn
-                              ? _reasoningEffort
-                              : _lastNonOffEffort,
-                          onThinkingChanged: _setReasoningEffort,
-                          thinkingEnabled:
-                              !_compacting && !_sending && !_running,
-                          thinkingOn: _thinkingOn,
-                          onThinkingToggled: _thinkingOptions.isNotEmpty
-                              ? _setThinkingOn
-                              : null,
-                          onCompress: _compacting || _sending || _running
-                              ? null
-                              : _compactContext,
-                          compressBusy: _compacting,
+                          child: _pendingQuestion == null
+                              ? const SizedBox.shrink(
+                                  key: ValueKey('dsh-no-question'),
+                                )
+                              : AgentQuestionPanel(
+                                  key: ValueKey(
+                                    'dsh-question-${_pendingQuestion!['rpcId']}',
+                                  ),
+                                  title: 'DS Harness 向你提问',
+                                  questions:
+                                      ((_pendingQuestion!['questions']
+                                                  as List?) ??
+                                              const [])
+                                          .map(
+                                            (e) => (e as Map)
+                                                .cast<String, dynamic>(),
+                                          )
+                                          .toList(),
+                                  busy: _answerBusy,
+                                  showCustomAnswers: true,
+                                  showSubmitActions: true,
+                                  onSubmit: _submitQuestionAnswers,
+                                  onCancel: _cancelQuestion,
+                                ),
                         ),
-                    ],
+                        if (_pendingQuestion == null)
+                          LiquidGlassChatComposer(
+                            input: _input,
+                            busy: _sending || _running,
+                            enterToSend:
+                                widget.shiyi?.settings.enterToSend ?? true,
+                            pendingImages: _pendingImages,
+                            pendingFiles: _pendingFiles,
+                            onPickAttachment: _pickAttachment,
+                            onRemoveImage: (index) =>
+                                setState(() => _pendingImages.removeAt(index)),
+                            onRemoveFile: (index) =>
+                                setState(() => _pendingFiles.removeAt(index)),
+                            onSend: _send,
+                            onStop: _stopping ? () {} : _stop,
+                            modelOptions: [
+                              for (final p
+                                  in widget.shiyi?.apiProfiles ??
+                                      const <ApiProfile>[])
+                                SessionModelOption(
+                                  value: p.name,
+                                  label: p.name,
+                                  subtitle: p.model,
+                                  models:
+                                      widget.shiyi?.cachedModelsForProfile(p) ??
+                                      const <String>[],
+                                ),
+                            ],
+                            modelValue: _selectedProfileName,
+                            modelId: _model,
+                            onModelChanged: _compacting || _sending || _running
+                                ? null
+                                : _selectSessionProfile,
+                            modelEnabled:
+                                !_compacting && !_sending && !_running,
+                            thinkingOptions: _thinkingOptions,
+                            thinkingValue: _thinkingOn
+                                ? _reasoningEffort
+                                : _lastNonOffEffort,
+                            onThinkingChanged: _setReasoningEffort,
+                            thinkingEnabled:
+                                !_compacting && !_sending && !_running,
+                            thinkingOn: _thinkingOn,
+                            onThinkingToggled: _thinkingOptions.isNotEmpty
+                                ? _setThinkingOn
+                                : null,
+                            onCompress: _compacting || _sending || _running
+                                ? null
+                                : _compactContext,
+                            compressBusy: _compacting,
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -2288,6 +2371,32 @@ class _DshChatScreenState extends State<DshChatScreen>
         ],
       ),
     );
+  }
+
+  bool _shouldAnimateEnter(ChatMessage message) {
+    if (_enteredMessageIds.contains(message.id)) return false;
+    if (message.id == '$_liveId-thinking') return false;
+    var should = false;
+    if (message.role == 'user') {
+      final key = message.content.trim();
+      if (key.isNotEmpty && _enteredUserTexts.contains(key)) return false;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final fresh = message.createdAt > 0 && now - message.createdAt < 2500;
+      if (!fresh && !message.id.startsWith('dsh-opt-')) return false;
+      should = true;
+      if (key.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _enteredUserTexts.add(key);
+        });
+      }
+    } else if (message.role == 'assistant' && message.streaming) {
+      should = true;
+    }
+    if (!should) return false;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _enteredMessageIds.add(message.id);
+    });
+    return true;
   }
 
   /// 会话仍活跃但无真实流式气泡时的“思考中”占位（常驻指示）。
@@ -2375,7 +2484,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     );
   }
 
-  Widget _buildMessages() {
+  Widget _buildMessages(double overlayHeight) {
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -2433,6 +2542,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     final visible = _visible;
     if (_messages.isEmpty || visible.isEmpty) {
       return _DshWelcome(
+        bottomInset: overlayHeight,
         onPick: (s) {
           _input.text = s;
           _send();
@@ -2452,7 +2562,8 @@ class _DshChatScreenState extends State<DshChatScreen>
       child: ListView.builder(
         controller: _scroll,
         reverse: true,
-        padding: const EdgeInsets.all(12),
+        clipBehavior: Clip.none,
+        padding: EdgeInsets.fromLTRB(12, 12, 12, overlayHeight + 12),
         itemCount: itemCount,
         itemBuilder: (context, i) {
           if (thinkingNeeded && i == 0) {
@@ -2461,9 +2572,9 @@ class _DshChatScreenState extends State<DshChatScreen>
           }
           final mi = thinkingNeeded ? i - 1 : i;
           final m = items[mi];
-          if (m.streaming) {
-            return KeyedSubtree(
-              key: ValueKey(m.id),
+          return KeyedSubtree(
+            key: ValueKey(_itemKey(m)),
+            child: RepaintBoundary(
               child: ValueListenableBuilder<String>(
                 valueListenable: _streamReasoning,
                 builder: (context, reasoning, _) =>
@@ -2471,9 +2582,14 @@ class _DshChatScreenState extends State<DshChatScreen>
                       valueListenable: _streamText,
                       builder: (context, text, _) => MessageBubble(
                         message: m,
-                        liveContent: text.isEmpty ? null : text,
-                        liveReasoning: reasoning.isEmpty ? null : reasoning,
-                        busy: true,
+                        liveContent: m.streaming && text.isNotEmpty
+                            ? text
+                            : null,
+                        liveReasoning: m.streaming && reasoning.isNotEmpty
+                            ? reasoning
+                            : null,
+                        busy: m.streaming,
+                        animateEnter: _shouldAnimateEnter(m),
                         onCopy: _copy,
                         speaking: _speakingId == m.id,
                         onSpeak: _speakMessage,
@@ -2482,21 +2598,6 @@ class _DshChatScreenState extends State<DshChatScreen>
                         onSaveSkill: widget.shiyi == null ? null : _saveSkill,
                       ),
                     ),
-              ),
-            );
-          }
-          return KeyedSubtree(
-            key: ValueKey(m.id),
-            child: RepaintBoundary(
-              child: MessageBubble(
-                message: m,
-                busy: false,
-                onCopy: _copy,
-                speaking: _speakingId == m.id,
-                onSpeak: _speakMessage,
-                onStopSpeak: _stopSpeak,
-                onSaveMemory: widget.shiyi == null ? null : _saveMemory,
-                onSaveSkill: widget.shiyi == null ? null : _saveSkill,
               ),
             ),
           );
@@ -2508,14 +2609,15 @@ class _DshChatScreenState extends State<DshChatScreen>
 
 class _DshWelcome extends StatelessWidget {
   final ValueChanged<String> onPick;
-  const _DshWelcome({required this.onPick});
+  final double bottomInset;
+  const _DshWelcome({required this.onPick, this.bottomInset = 0});
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     const suggestions = ['看看当前工作区有哪些文件', '帮我总结一下这个目录在做什么', 'hi'];
     return ListView(
-      padding: const EdgeInsets.all(24),
+      padding: EdgeInsets.fromLTRB(24, 24, 24, 24 + bottomInset),
       children: [
         const SizedBox(height: 40),
         const Center(child: WelcomeAvatar(size: 240)),

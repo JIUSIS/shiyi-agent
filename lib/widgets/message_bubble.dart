@@ -35,6 +35,10 @@ class MessageBubble extends StatefulWidget {
   final VoidCallback? onStopSpeak;
   final bool speaking;
 
+  /// 刚发出的用户气泡做水滴分离；新出现的流式助手气泡做轻入场。
+  /// 打开历史、滚动回收不要打开。
+  final bool animateEnter;
+
   const MessageBubble({
     super.key,
     required this.message,
@@ -49,6 +53,7 @@ class MessageBubble extends StatefulWidget {
     this.onSpeak,
     this.onStopSpeak,
     this.speaking = false,
+    this.animateEnter = false,
   });
 
   @override
@@ -73,6 +78,15 @@ class _MessageBubbleState extends State<MessageBubble> {
 
   /// 思考区滚动控制器（流式增长时自动跟随到最新）。
   final ScrollController _reasoningCtrl = ScrollController();
+
+  /// 入场只播一次：父级下一帧就会把 animateEnter 关掉，这里锁住避免拆掉动画。
+  late final bool _playEnter;
+
+  @override
+  void initState() {
+    super.initState();
+    _playEnter = widget.animateEnter;
+  }
 
   @override
   void dispose() {
@@ -147,6 +161,11 @@ class _MessageBubbleState extends State<MessageBubble> {
         chromaticAberration: .0015,
       ),
     );
+  }
+
+  Widget _maybeEnter({required bool isUser, required Widget child}) {
+    if (!_playEnter) return child;
+    return _BubbleEnter(isUser: isUser, child: child);
   }
 
   @override
@@ -329,7 +348,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                         theme,
                         dark,
                         visibleAssistantContent,
-                        isStreaming: liveContent != null,
+                        isStreaming: message.streaming,
                       ),
                   ],
                 ),
@@ -347,34 +366,36 @@ class _MessageBubbleState extends State<MessageBubble> {
       child: body,
     );
 
-    return Column(
-      crossAxisAlignment: isUser
-          ? CrossAxisAlignment.end
-          : CrossAxisAlignment.start,
-      children: [
-        padded,
-        _actionBar(theme, isUser),
-        Padding(
-          padding: EdgeInsets.only(
-            left: isUser ? 0 : 16,
-            right: isUser ? 16 : 0,
-            top: 4,
-          ),
-          child: Text(
-            isUser ? '你' : '拾忆',
-            style: TextStyle(
-              fontSize: 11,
-              color: theme.hintColor,
-              fontWeight: FontWeight.w500,
+    return _maybeEnter(
+      isUser: isUser,
+      child: Column(
+        crossAxisAlignment: isUser
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
+        children: [
+          padded,
+          _actionBar(theme, isUser),
+          Padding(
+            padding: EdgeInsets.only(
+              left: isUser ? 0 : 16,
+              right: isUser ? 16 : 0,
+              top: 4,
+            ),
+            child: Text(
+              isUser ? '你' : '拾忆',
+              style: TextStyle(
+                fontSize: 11,
+                color: theme.hintColor,
+                fontWeight: FontWeight.w500,
+              ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
-  /// 流式助手正文：只动画稳定子组件的透明度，不用正文内容作 Key，
-  /// 避免每个 chunk 重建气泡并清空“思考过程 / 注入上下文”的展开状态。
+  /// 流式和结束后都走同一套 Markdown，避免切组件时整段消失再出现。
   Widget _assistantContent(
     ThemeData theme,
     bool dark,
@@ -386,13 +407,11 @@ class _MessageBubbleState extends State<MessageBubble> {
       height: 1.45,
       color: dark ? const Color(0xFFF2F2F7) : const Color(0xFF1C1C1E),
     );
-    if (!isStreaming || content.isEmpty) {
-      return AdaptiveMarkdownText(content, style: textStyle);
-    }
-    return _StreamingFadeMarkdown(
-      key: const ValueKey('streamingFadeMarkdown'),
+    return _StreamingRevealMarkdown(
+      key: const ValueKey('streamingRevealMarkdown'),
       content: content,
       style: textStyle,
+      streaming: isStreaming,
     );
   }
 
@@ -1121,46 +1140,59 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 }
 
-/// 稳定的流式正文渐显组件。State 不随正文 chunk 替换，仅在内容增长时重播淡入。
-class _StreamingFadeMarkdown extends StatefulWidget {
-  final String content;
-  final TextStyle style;
+/// 刚发出的气泡入场：用户从输入区水滴分离，助手从左侧同样水滴入场。
+class _BubbleEnter extends StatefulWidget {
+  final bool isUser;
+  final Widget child;
 
-  const _StreamingFadeMarkdown({
-    super.key,
-    required this.content,
-    required this.style,
-  });
+  const _BubbleEnter({required this.isUser, required this.child});
 
   @override
-  State<_StreamingFadeMarkdown> createState() => _StreamingFadeMarkdownState();
+  State<_BubbleEnter> createState() => _BubbleEnterState();
 }
 
-class _StreamingFadeMarkdownState extends State<_StreamingFadeMarkdown>
+class _BubbleEnterState extends State<_BubbleEnter>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
-  late final Animation<double> _opacity;
+  late final Animation<double> _fade;
+  late final Animation<double> _scale;
+  late final Animation<Offset> _slide;
+  late final Animation<double> _stretch;
 
   @override
   void initState() {
     super.initState();
     _controller = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 180),
+      duration: Duration(milliseconds: widget.isUser ? 560 : 640),
     );
-    _opacity = CurvedAnimation(
+    final curve = CurvedAnimation(
       parent: _controller,
-      curve: Curves.easeOut,
-    ).drive(Tween<double>(begin: .65, end: 1));
+      curve: Curves.easeOutCubic,
+    );
+    _fade = Tween<double>(begin: widget.isUser ? .55 : .35, end: 1).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0, .4, curve: Curves.easeOut),
+      ),
+    );
+    _scale = Tween<double>(begin: widget.isUser ? .42 : .46, end: 1).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: widget.isUser
+            ? const Interval(0, .72, curve: Curves.easeOutBack)
+            : const Interval(0, .78, curve: Curves.easeOutBack),
+      ),
+    );
+    _slide = Tween<Offset>(begin: Offset.zero, end: Offset.zero).animate(curve);
+    _stretch = Tween<double>(begin: widget.isUser ? 1.38 : 1.32, end: 1)
+        .animate(
+          CurvedAnimation(
+            parent: _controller,
+            curve: const Interval(.28, 1, curve: Curves.easeOutBack),
+          ),
+        );
     _controller.forward();
-  }
-
-  @override
-  void didUpdateWidget(covariant _StreamingFadeMarkdown oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.content != oldWidget.content) {
-      _controller.forward(from: 0);
-    }
   }
 
   @override
@@ -1172,12 +1204,210 @@ class _StreamingFadeMarkdownState extends State<_StreamingFadeMarkdown>
   @override
   Widget build(BuildContext context) {
     return FadeTransition(
-      opacity: _opacity,
-      child: AdaptiveMarkdownText(
+      opacity: _fade,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, child) {
+          final t = Curves.easeOutCubic.transform(_controller.value);
+          final dx = widget.isUser ? 14.0 : -18.0;
+          final dy = widget.isUser ? 112.0 : 96.0;
+          return Transform.translate(
+            offset: Offset(dx * (1 - t), dy * (1 - t)),
+            child: Transform(
+              alignment: widget.isUser
+                  ? Alignment.bottomRight
+                  : Alignment.bottomLeft,
+              transform: Matrix4.diagonal3Values(
+                _scale.value,
+                _stretch.value,
+                1,
+              ),
+              child: child,
+            ),
+          );
+        },
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+/// 流式正文：旧字稳住，只让新增后缀从左到右淡入。
+/// 始终同一套 Markdown 树，结束后不换组件。
+class _StreamingRevealMarkdown extends StatefulWidget {
+  final String content;
+  final TextStyle style;
+  final bool streaming;
+
+  const _StreamingRevealMarkdown({
+    super.key,
+    required this.content,
+    required this.style,
+    required this.streaming,
+  });
+
+  @override
+  State<_StreamingRevealMarkdown> createState() =>
+      _StreamingRevealMarkdownState();
+}
+
+class _StreamingRevealMarkdownState extends State<_StreamingRevealMarkdown>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _reveal;
+  late final Animation<double> _progress;
+  int _stableLen = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _reveal = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 720),
+    );
+    _progress = CurvedAnimation(parent: _reveal, curve: Curves.easeOutCubic);
+    _stableLen = widget.content.length;
+    _reveal.value = 1;
+  }
+
+  @override
+  void didUpdateWidget(covariant _StreamingRevealMarkdown oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.content == oldWidget.content) {
+      if (!widget.streaming) _reveal.value = 1;
+      return;
+    }
+    if (widget.content.startsWith(oldWidget.content) &&
+        widget.content.length > oldWidget.content.length) {
+      if (_reveal.isAnimating) {
+        _stableLen = oldWidget.content.length < _stableLen
+            ? oldWidget.content.length
+            : _stableLen;
+      } else {
+        _stableLen = oldWidget.content.length;
+      }
+      if (widget.streaming) {
+        _reveal.forward(from: 0);
+      } else {
+        _stableLen = widget.content.length;
+        _reveal.value = 1;
+      }
+      return;
+    }
+    if (oldWidget.content.startsWith(widget.content)) {
+      _stableLen = widget.content.length;
+      _reveal.value = 1;
+      return;
+    }
+    _stableLen = 0;
+    if (widget.streaming) {
+      _reveal.forward(from: 0);
+    } else {
+      _stableLen = widget.content.length;
+      _reveal.value = 1;
+    }
+  }
+
+  @override
+  void dispose() {
+    _reveal.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.content.isEmpty) return const SizedBox.shrink();
+    final prefix = widget.content.substring(
+      0,
+      _stableLen.clamp(0, widget.content.length),
+    );
+    final incoming = widget.content.substring(prefix.length);
+    if (!widget.streaming || incoming.isEmpty) {
+      return AdaptiveMarkdownText(
         widget.content,
         isStreaming: true,
         style: widget.style,
-      ),
+      );
+    }
+    return AnimatedBuilder(
+      animation: _progress,
+      builder: (context, _) {
+        return _StreamingFollowBody(
+          prefix: prefix,
+          incoming: incoming,
+          progress: _progress.value,
+          style: widget.style,
+        );
+      },
+    );
+  }
+}
+
+class _StreamingFollowBody extends StatelessWidget {
+  final String prefix;
+  final String incoming;
+  final double progress;
+  final TextStyle style;
+
+  const _StreamingFollowBody({
+    required this.prefix,
+    required this.incoming,
+    required this.progress,
+    required this.style,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final full = prefix + incoming;
+    final blocks = splitMarkdownBlocks(full);
+    if (blocks.isEmpty) {
+      return AdaptiveMarkdownText(full, isStreaming: true, style: style);
+    }
+    var consumed = 0;
+    final children = <Widget>[];
+    for (var i = 0; i < blocks.length; i++) {
+      final block = blocks[i];
+      final start = consumed;
+      final end = start + block.length;
+      consumed = end;
+      final isLast = i == blocks.length - 1;
+      if (end <= prefix.length) {
+        children.add(MarkdownBlock(block, style: style));
+        continue;
+      }
+      if (!isLast || isAtomicMarkdownBlock(block)) {
+        children.add(
+          Opacity(
+            opacity: .35 + .65 * progress,
+            child: MarkdownBlock(block, style: style),
+          ),
+        );
+        continue;
+      }
+      final localStable = (prefix.length - start).clamp(0, block.length);
+      final stablePart = block.substring(0, localStable);
+      final fadePart = block.substring(localStable);
+      final color = style.color ?? DefaultTextStyle.of(context).style.color;
+      children.add(
+        Text.rich(
+          TextSpan(
+            style: style,
+            children: [
+              if (stablePart.isNotEmpty) TextSpan(text: stablePart),
+              if (fadePart.isNotEmpty)
+                TextSpan(
+                  text: fadePart,
+                  style: style.copyWith(
+                    color: color?.withValues(alpha: .28 + .72 * progress),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
     );
   }
 }

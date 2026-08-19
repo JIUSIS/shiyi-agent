@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
@@ -52,6 +53,94 @@ Future<T?> showIosFadeDialog<T>({
           child: child,
         ),
   );
+}
+
+Future<void> _unfocusBeforeOverlay() async {
+  final focus = FocusManager.instance.primaryFocus;
+  if (focus == null || !focus.hasFocus) return;
+  focus.unfocus(disposition: UnfocusDisposition.scope);
+  await WidgetsBinding.instance.endOfFrame;
+}
+
+/// Apple 风格确认框：居中标题 + 短说明 + 取消/确认并排。
+Future<bool> showIosConfirmDialog({
+  required BuildContext context,
+  required String title,
+  required String message,
+  String cancelLabel = '取消',
+  String confirmLabel = '确定',
+  bool isDestructiveAction = false,
+  bool barrierDismissible = true,
+}) async {
+  await _unfocusBeforeOverlay();
+  if (!context.mounted) return false;
+  final result = await showIosFadeDialog<bool>(
+    context: context,
+    barrierDismissible: barrierDismissible,
+    builder: (ctx) => CupertinoTheme(
+      data: iosCupertinoTheme(ctx),
+      child: CupertinoAlertDialog(
+        title: Text(title),
+        content: Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Text(message),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(cancelLabel),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: !isDestructiveAction,
+            isDestructiveAction: isDestructiveAction,
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(confirmLabel),
+          ),
+        ],
+      ),
+    ),
+  );
+  return result == true;
+}
+
+/// Apple 风格进度框：短文案 + 系统转圈，任务结束后自动关闭。
+Future<T> showIosProgressDialog<T>({
+  required BuildContext context,
+  required String message,
+  required Future<T> Function() task,
+}) async {
+  await _unfocusBeforeOverlay();
+  if (!context.mounted) return await task();
+  var open = true;
+  unawaited(
+    showIosFadeDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => PopScope(
+        canPop: false,
+        child: CupertinoTheme(
+          data: iosCupertinoTheme(ctx),
+          child: CupertinoAlertDialog(
+            content: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CupertinoActivityIndicator(),
+                const SizedBox(width: 14),
+                Flexible(child: Text(message)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ).whenComplete(() => open = false),
+  );
+  try {
+    return await task();
+  } finally {
+    if (context.mounted && open) {
+      Navigator.of(context, rootNavigator: true).pop();
+    }
+  }
 }
 
 /// 底部操作面板：保持底部弹出位置，动画统一改为淡入淡出。

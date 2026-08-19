@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -55,6 +56,8 @@ class _ChatScreenState extends State<ChatScreen>
   MacPageRoute? _route;
   bool _showToolLog = false;
   bool _autoScrollScheduled = false;
+  final Set<String> _enteredMessageIds = {};
+  final Set<String> _enteredUserTexts = {};
 
   String? get _pageSessionId =>
       widget.sessionId ?? widget.shiyi.currentSessionId;
@@ -158,12 +161,14 @@ class _ChatScreenState extends State<ChatScreen>
     String? liveContent,
     String? liveReasoning,
   }) {
+    final enter = _shouldAnimateEnter(m);
     return MessageBubble(
       message: m,
       liveContent: liveContent,
       liveReasoning: liveReasoning,
       busy: _pageBusy,
       speaking: _speakingId == m.id,
+      animateEnter: enter,
       onCopy: _copyMessage,
       onDelete: _confirmDelete,
       onRegenerate: _confirmRegenerate,
@@ -178,6 +183,31 @@ class _ChatScreenState extends State<ChatScreen>
         _saveSkillDialog(msg.content);
       },
     );
+  }
+
+  bool _shouldAnimateEnter(ChatMessage message) {
+    if (_enteredMessageIds.contains(message.id)) return false;
+    var should = false;
+    if (message.role == 'user') {
+      final key = message.content.trim();
+      if (key.isNotEmpty && _enteredUserTexts.contains(key)) return false;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final fresh = message.createdAt > 0 && now - message.createdAt < 2500;
+      if (!fresh) return false;
+      should = true;
+      if (key.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _enteredUserTexts.add(key);
+        });
+      }
+    } else if (message.role == 'assistant' && message.streaming) {
+      should = true;
+    }
+    if (!should) return false;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _enteredMessageIds.add(message.id);
+    });
+    return true;
   }
 
   /// 新消息加入时自动跟随到底部；流式文本增长由 [_onStreamTextChanged]
@@ -1075,9 +1105,18 @@ class _ChatScreenState extends State<ChatScreen>
                                       fontWeight: FontWeight.w600,
                                     ),
                                   ),
-                                  if (widget.shiyi.settings.model.isNotEmpty)
+                                  if (widget.shiyi
+                                      .clientSettingsForSession(
+                                        widget.shiyi.currentSessionId,
+                                      )
+                                      .model
+                                      .isNotEmpty)
                                     Text(
-                                      widget.shiyi.settings.model,
+                                      widget.shiyi
+                                          .clientSettingsForSession(
+                                            widget.shiyi.currentSessionId,
+                                          )
+                                          .model,
                                       style: theme.textTheme.bodySmall!
                                           .copyWith(color: theme.hintColor),
                                     ),
@@ -1086,385 +1125,406 @@ class _ChatScreenState extends State<ChatScreen>
                             },
                           ),
                         ),
-                        body: Column(
-                          children: [
-                            Expanded(
-                              child: ListenableBuilder(
-                                // 只监听消息版本：status/token/工具轮等状态变化
-                                // 不再重建整个消息列表（流式文本由气泡内部
-                                // ValueListenableBuilder 单独驱动）。
-                                listenable: widget.shiyi.messagesRevision,
-                                builder: (context, _) {
-                                  final messages = widget.shiyi.messages;
-                                  // 工具调用已集中到右上角信息流胶囊，对话流里不再显示工具消息与纯工具回合。
-                                  final visible = messages
-                                      .where(
-                                        (m) =>
-                                            m.role != 'tool' &&
-                                            !(m.role == 'assistant' &&
-                                                m.hasToolCalls &&
-                                                m.content.trim().isEmpty &&
-                                                m.reasoning.trim().isEmpty &&
-                                                m.subagentResult
-                                                    .trim()
-                                                    .isEmpty &&
-                                                !m.streaming),
-                                      )
-                                      .toList();
-                                  _maybeAutoScroll(visible);
-                                  if (messages.isEmpty) {
-                                    return _Welcome(
-                                      shiyi: widget.shiyi,
-                                      onPick: _sendSuggestion,
+                        body: ChatFloatingComposerScaffold(
+                          messages: (context, overlayHeight) {
+                            return ListenableBuilder(
+                              // 只监听消息版本：status/token/工具轮等状态变化
+                              // 不再重建整个消息列表（流式文本由气泡内部
+                              // ValueListenableBuilder 单独驱动）。
+                              listenable: widget.shiyi.messagesRevision,
+                              builder: (context, _) {
+                                final messages = widget.shiyi.messages;
+                                // 工具调用已集中到右上角信息流胶囊，对话流里不再显示工具消息与纯工具回合。
+                                final visible = messages
+                                    .where(
+                                      (m) =>
+                                          m.role != 'tool' &&
+                                          !(m.role == 'assistant' &&
+                                              m.hasToolCalls &&
+                                              m.content.trim().isEmpty &&
+                                              m.reasoning.trim().isEmpty &&
+                                              m.subagentResult.trim().isEmpty &&
+                                              !m.streaming),
+                                    )
+                                    .toList();
+                                _maybeAutoScroll(visible);
+                                if (messages.isEmpty) {
+                                  return _Welcome(
+                                    shiyi: widget.shiyi,
+                                    onPick: _sendSuggestion,
+                                    bottomInset: overlayHeight,
+                                  );
+                                }
+                                if (visible.isEmpty) {
+                                  return const SizedBox.shrink();
+                                }
+                                final archivedCount = visible
+                                    .where((m) => m.archived)
+                                    .length;
+                                // 反转显示：index 0 是最新消息；归档历史放在最上方，
+                                // 与仍然活跃的消息之间插入一条分隔提示。
+                                final items = <Object>[];
+                                for (var i = visible.length - 1; i >= 0; i--) {
+                                  if (archivedCount > 0 &&
+                                      i == archivedCount - 1) {
+                                    items.add(
+                                      _ArchivedDivider(count: archivedCount),
                                     );
                                   }
-                                  if (visible.isEmpty) {
-                                    return const SizedBox.shrink();
-                                  }
-                                  final archivedCount = visible
-                                      .where((m) => m.archived)
-                                      .length;
-                                  // 反转显示：index 0 是最新消息；归档历史放在最上方，
-                                  // 与仍然活跃的消息之间插入一条分隔提示。
-                                  final items = <Object>[];
-                                  for (
-                                    var i = visible.length - 1;
-                                    i >= 0;
-                                    i--
-                                  ) {
-                                    if (archivedCount > 0 &&
-                                        i == archivedCount - 1) {
-                                      items.add(
-                                        _ArchivedDivider(count: archivedCount),
-                                      );
-                                    }
-                                    items.add(visible[i]);
-                                  }
-                                  return ScrollConfiguration(
-                                    behavior: ScrollConfiguration.of(
-                                      context,
-                                    ).copyWith(overscroll: false),
-                                    child: ListView.builder(
-                                      controller: _scroll,
-                                      reverse: true,
-                                      padding: const EdgeInsets.all(12),
-                                      itemCount: items.length,
-                                      itemBuilder: (context, i) {
-                                        final item = items[i];
-                                        if (item is _ArchivedDivider) {
-                                          return item;
-                                        }
-                                        final m = item as ChatMessage;
-                                        // 流式消息：只监听自己的实时文本，单独重建。
-                                        if (m.streaming) {
-                                          return KeyedSubtree(
-                                            key: ValueKey(m.id),
-                                            child: ValueListenableBuilder<String>(
-                                              valueListenable: widget.shiyi
-                                                  .streamReasoningForSession(
-                                                    _pageSessionId,
-                                                  ),
-                                              builder: (context, reasoning, _) =>
-                                                  ValueListenableBuilder<
-                                                    String
-                                                  >(
-                                                    valueListenable: widget
-                                                        .shiyi
-                                                        .streamTextForSession(
-                                                          _pageSessionId,
-                                                        ),
-                                                    builder:
-                                                        (context, text, _) =>
-                                                            _messageItem(
-                                                              m,
-                                                              liveContent: text,
-                                                              liveReasoning:
-                                                                  reasoning,
-                                                            ),
-                                                  ),
-                                            ),
-                                          );
-                                        }
-                                        // 历史消息：稳定不变，隔离重绘。
-                                        return KeyedSubtree(
-                                          key: ValueKey(m.id),
-                                          child: RepaintBoundary(
-                                            child: _messageItem(m),
-                                          ),
-                                        );
-                                      },
+                                  items.add(visible[i]);
+                                }
+                                return ScrollConfiguration(
+                                  behavior: ScrollConfiguration.of(
+                                    context,
+                                  ).copyWith(overscroll: false),
+                                  child: ListView.builder(
+                                    controller: _scroll,
+                                    reverse: true,
+                                    clipBehavior: Clip.none,
+                                    padding: EdgeInsets.fromLTRB(
+                                      12,
+                                      12,
+                                      12,
+                                      overlayHeight + 12,
                                     ),
+                                    itemCount: items.length,
+                                    itemBuilder: (context, i) {
+                                      final item = items[i];
+                                      if (item is _ArchivedDivider) {
+                                        return item;
+                                      }
+                                      final m = item as ChatMessage;
+                                      // 流式结束也保持同一棵包装树，避免切 VLB / RepaintBoundary
+                                      // 时整段气泡被拆掉再挂上。
+                                      return KeyedSubtree(
+                                        key: ValueKey(m.id),
+                                        child: RepaintBoundary(
+                                          child: ValueListenableBuilder<String>(
+                                            valueListenable: widget.shiyi
+                                                .streamReasoningForSession(
+                                                  _pageSessionId,
+                                                ),
+                                            builder: (context, reasoning, _) =>
+                                                ValueListenableBuilder<String>(
+                                                  valueListenable: widget.shiyi
+                                                      .streamTextForSession(
+                                                        _pageSessionId,
+                                                      ),
+                                                  builder: (context, text, _) =>
+                                                      _messageItem(
+                                                        m,
+                                                        liveContent: m.streaming
+                                                            ? text
+                                                            : null,
+                                                        liveReasoning:
+                                                            m.streaming
+                                                            ? reasoning
+                                                            : null,
+                                                      ),
+                                                ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                          overlay: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              ListenableBuilder(
+                                listenable: widget.shiyi,
+                                builder: (context, _) {
+                                  final status = widget.shiyi.statusForSession(
+                                    _pageSessionId,
+                                  );
+                                  return Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (status != null &&
+                                          status.startsWith('子代理'))
+                                        SubagentStatusBar(text: status)
+                                      else if (status != null)
+                                        Builder(
+                                          builder: (context) {
+                                            final isError = status.startsWith(
+                                              '错误',
+                                            );
+                                            return ChatGlassNoticeBar(
+                                              text: status,
+                                              tint: isError
+                                                  ? theme
+                                                        .colorScheme
+                                                        .errorContainer
+                                                        .withValues(alpha: .55)
+                                                  : null,
+                                              foreground: isError
+                                                  ? theme
+                                                        .colorScheme
+                                                        .onErrorContainer
+                                                  : theme
+                                                        .colorScheme
+                                                        .onSurfaceVariant,
+                                            );
+                                          },
+                                        ),
+                                      if (widget.shiyi.trimNotice != null)
+                                        ChatGlassNoticeBar(
+                                          text: widget.shiyi.trimNotice!,
+                                          tint: theme
+                                              .colorScheme
+                                              .tertiaryContainer
+                                              .withValues(alpha: .55),
+                                          foreground: theme
+                                              .colorScheme
+                                              .onTertiaryContainer,
+                                        ),
+                                    ],
                                   );
                                 },
                               ),
-                            ),
-                            ListenableBuilder(
-                              listenable: widget.shiyi,
-                              builder: (context, _) {
-                                final status = widget.shiyi.statusForSession(
-                                  _pageSessionId,
-                                );
-                                return Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    if (status != null &&
-                                        status.startsWith('子代理'))
-                                      SubagentStatusBar(text: status)
-                                    else if (status != null)
-                                      Builder(
-                                        builder: (context) {
-                                          final isError = status.startsWith(
-                                            '错误',
-                                          );
-                                          final bg = isError
-                                              ? theme.colorScheme.errorContainer
-                                                    .withValues(alpha: .4)
-                                              : theme
-                                                    .colorScheme
-                                                    .surfaceContainerHigh
-                                                    .withValues(alpha: .7);
-                                          final fg = isError
-                                              ? theme
-                                                    .colorScheme
-                                                    .onErrorContainer
-                                              : theme
-                                                    .colorScheme
-                                                    .onSurfaceVariant;
-                                          return Container(
-                                            width: double.infinity,
-                                            color: bg,
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 12,
-                                              vertical: 6,
-                                            ),
-                                            child: Text(
-                                              status,
-                                              style: theme.textTheme.bodySmall!
-                                                  .copyWith(color: fg),
-                                            ),
-                                          );
-                                        },
-                                      ),
-                                    if (widget.shiyi.trimNotice != null)
-                                      Container(
-                                        width: double.infinity,
-                                        color: theme
-                                            .colorScheme
-                                            .tertiaryContainer
-                                            .withValues(alpha: .55),
+                              ListenableBuilder(
+                                listenable: widget.shiyi,
+                                builder: (context, _) =>
+                                    _TokenStats(shiyi: widget.shiyi),
+                              ),
+                              ListenableBuilder(
+                                listenable: widget.shiyi,
+                                builder: (context, _) => _LoadedSkillChips(
+                                  skills: widget.shiyi.loadedSkills,
+                                  onRemove: (s) =>
+                                      widget.shiyi.toggleLoadedSkill(s),
+                                ),
+                              ),
+                              ListenableBuilder(
+                                listenable: widget.shiyi,
+                                builder: (context, _) => _PlanModeChip(
+                                  planMode: widget.shiyi.planModeForSession(
+                                    _pageSessionId,
+                                  ),
+                                ),
+                              ),
+                              // 当前会话项目目录条：点击可修改。
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  12,
+                                  0,
+                                  12,
+                                  4,
+                                ),
+                                child: LiquidGlassLens(
+                                  style: chatLiquidGlassStyle(
+                                    context,
+                                    cornerRadius: 10,
+                                  ),
+                                  child: Material(
+                                    color: Colors.transparent,
+                                    child: InkWell(
+                                      onTap: _pickWorkspace,
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: Padding(
                                         padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
-                                          vertical: 6,
+                                          horizontal: 10,
+                                          vertical: 5,
                                         ),
-                                        child: Text(
-                                          widget.shiyi.trimNotice!,
-                                          style: theme.textTheme.bodySmall!
-                                              .copyWith(
-                                                color: theme
-                                                    .colorScheme
-                                                    .onTertiaryContainer,
-                                              ),
-                                        ),
-                                      ),
-                                  ],
-                                );
-                              },
-                            ),
-                            ListenableBuilder(
-                              listenable: widget.shiyi,
-                              builder: (context, _) =>
-                                  _TokenStats(shiyi: widget.shiyi),
-                            ),
-                            ListenableBuilder(
-                              listenable: widget.shiyi,
-                              builder: (context, _) => _LoadedSkillChips(
-                                skills: widget.shiyi.loadedSkills,
-                                onRemove: (s) =>
-                                    widget.shiyi.toggleLoadedSkill(s),
-                              ),
-                            ),
-                            ListenableBuilder(
-                              listenable: widget.shiyi,
-                              builder: (context, _) => _PlanModeChip(
-                                planMode: widget.shiyi.planModeForSession(
-                                  _pageSessionId,
-                                ),
-                              ),
-                            ),
-                            // 当前会话项目目录条：点击可修改。
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-                              child: LiquidGlassLens(
-                                style: chatLiquidGlassStyle(
-                                  context,
-                                  cornerRadius: 10,
-                                ),
-                                child: Material(
-                                  color: Colors.transparent,
-                                  child: InkWell(
-                                    onTap: _pickWorkspace,
-                                    borderRadius: BorderRadius.circular(10),
-                                    child: Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 10,
-                                        vertical: 5,
-                                      ),
-                                      child: Row(
-                                        children: [
-                                          Icon(
-                                            Icons.folder_outlined,
-                                            size: 14,
-                                            color: theme.colorScheme.primary,
-                                          ),
-                                          const SizedBox(width: 6),
-                                          Expanded(
-                                            child: Text(
-                                              _workspace ?? '项目目录…',
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: theme.textTheme.labelSmall!
-                                                  .copyWith(
-                                                    color: theme
-                                                        .colorScheme
-                                                        .onSurfaceVariant,
-                                                  ),
+                                        child: Row(
+                                          children: [
+                                            Icon(
+                                              Icons.folder_outlined,
+                                              size: 14,
+                                              color: theme.colorScheme.primary,
                                             ),
-                                          ),
-                                          const SizedBox(width: 4),
-                                          Icon(
-                                            Icons.edit_outlined,
-                                            size: 13,
-                                            color: theme.hintColor,
-                                          ),
-                                        ],
+                                            const SizedBox(width: 6),
+                                            Expanded(
+                                              child: Text(
+                                                _workspace ?? '项目目录…',
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: theme
+                                                    .textTheme
+                                                    .labelSmall!
+                                                    .copyWith(
+                                                      color: theme
+                                                          .colorScheme
+                                                          .onSurfaceVariant,
+                                                    ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 4),
+                                            Icon(
+                                              Icons.edit_outlined,
+                                              size: 13,
+                                              color: theme.hintColor,
+                                            ),
+                                          ],
+                                        ),
                                       ),
                                     ),
                                   ),
                                 ),
                               ),
-                            ),
-                            // 模型提问面板：内嵌在输入框上方，从下方滑入，不遮挡会话内容。
-                            ListenableBuilder(
-                              listenable: widget.shiyi,
-                              builder: (context, _) {
-                                final q = _pageQuestion;
-                                return AnimatedSwitcher(
-                                  duration: const Duration(milliseconds: 220),
-                                  switchInCurve: Curves.easeOutCubic,
-                                  switchOutCurve: Curves.easeInCubic,
-                                  transitionBuilder: (child, animation) =>
-                                      SlideTransition(
-                                        position: Tween<Offset>(
-                                          begin: const Offset(0, 0.35),
-                                          end: Offset.zero,
-                                        ).animate(animation),
-                                        child: FadeTransition(
-                                          opacity: animation,
-                                          child: child,
-                                        ),
-                                      ),
-                                  child: q == null
-                                      ? const SizedBox.shrink(
-                                          key: ValueKey('no-question'),
-                                        )
-                                      : AgentQuestionPanel(
-                                          key: ValueKey(
-                                            'question-${q.hashCode}',
+                              // 模型提问面板：内嵌在输入框上方，从下方滑入，不遮挡会话内容。
+                              ListenableBuilder(
+                                listenable: widget.shiyi,
+                                builder: (context, _) {
+                                  final q = _pageQuestion;
+                                  return AnimatedSwitcher(
+                                    duration: const Duration(milliseconds: 220),
+                                    switchInCurve: Curves.easeOutCubic,
+                                    switchOutCurve: Curves.easeInCubic,
+                                    transitionBuilder: (child, animation) =>
+                                        SlideTransition(
+                                          position: Tween<Offset>(
+                                            begin: const Offset(0, 0.35),
+                                            end: Offset.zero,
+                                          ).animate(animation),
+                                          child: FadeTransition(
+                                            opacity: animation,
+                                            child: child,
                                           ),
-                                          title: '拾忆 向你提问',
-                                          questions: [
-                                            {
-                                              'id': 'shiyi-question',
-                                              'question': q['question'],
-                                              'options': q['options'],
-                                            },
-                                          ],
-                                          instantSingleChoice: true,
-                                          onCancel: () => widget.shiyi
-                                              .answerQuestionForSession(
-                                                _pageSessionId,
-                                                null,
-                                              ),
-                                          onSubmit: (answers) {
-                                            final selected =
-                                                (answers.first['selected']
-                                                        as List?)
-                                                    ?.firstOrNull
-                                                    ?.toString() ??
-                                                '';
-                                            final options =
-                                                (q['options'] as List?)
-                                                    ?.map((e) => e.toString())
-                                                    .toList() ??
-                                                const <String>[];
-                                            final index = options.indexOf(
-                                              selected,
-                                            );
-                                            widget.shiyi
+                                        ),
+                                    child: q == null
+                                        ? const SizedBox.shrink(
+                                            key: ValueKey('no-question'),
+                                          )
+                                        : AgentQuestionPanel(
+                                            key: ValueKey(
+                                              'question-${q.hashCode}',
+                                            ),
+                                            title: '拾忆 向你提问',
+                                            questions: [
+                                              {
+                                                'id': 'shiyi-question',
+                                                'question': q['question'],
+                                                'options': q['options'],
+                                              },
+                                            ],
+                                            instantSingleChoice: true,
+                                            onCancel: () => widget.shiyi
                                                 .answerQuestionForSession(
                                                   _pageSessionId,
-                                                  index < 0 ? null : index,
-                                                );
-                                          },
-                                        ),
-                                );
-                              },
-                            ),
-                            ListenableBuilder(
-                              listenable: widget.shiyi,
-                              builder: (context, _) => LiquidGlassChatComposer(
-                                input: _input,
-                                busy: _pageBusy,
-                                questionActive: _pageQuestion != null,
-                                allowSendWhileBusy: true,
-                                pendingImages: _pendingImages,
-                                pendingFiles: _pendingFiles,
-                                onPickAttachment: _pickAttachmentSheet,
-                                onRemoveImage: _removeImage,
-                                onRemoveFile: _removeFile,
-                                onSend: _send,
-                                onStop: () =>
-                                    widget.shiyi.stopSession(_pageSessionId),
-                                enterToSend: widget.shiyi.settings.enterToSend,
-                                thinkingOptions: buildReasoningOptions(
-                                  LlmClient.reasoningEffortsForModel(
-                                        widget.shiyi.settings.model,
-                                      ) ??
-                                      const {},
-                                ),
-                                thinkingValue:
-                                    widget.shiyi.reasoningEffortForSession(
-                                      _pageSessionId,
-                                    ) ??
-                                    '',
-                                onThinkingChanged: (value) =>
-                                    widget.shiyi.setReasoningEffortForSession(
-                                      _pageSessionId,
-                                      value,
-                                    ),
-                                thinkingEnabled: !_pageBusy,
-                                thinkingOn: widget.shiyi.thinkingOnForSession(
-                                  _pageSessionId,
-                                ),
-                                onThinkingToggled:
-                                    (LlmClient.reasoningEffortsForModel(
-                                              widget.shiyi.settings.model,
-                                            ) ??
-                                            const {})
-                                        .containsKey('off')
-                                    ? (on) =>
-                                          widget.shiyi.setThinkingOnForSession(
-                                            _pageSessionId,
-                                            on,
-                                          )
-                                    : null,
-                                onCompress: _pageBusy || _pageSessionId == null
-                                    ? null
-                                    : _compressContext,
-                                compressBusy: _pageBusy,
+                                                  null,
+                                                ),
+                                            onSubmit: (answers) {
+                                              final selected =
+                                                  (answers.first['selected']
+                                                          as List?)
+                                                      ?.firstOrNull
+                                                      ?.toString() ??
+                                                  '';
+                                              final options =
+                                                  (q['options'] as List?)
+                                                      ?.map((e) => e.toString())
+                                                      .toList() ??
+                                                  const <String>[];
+                                              final index = options.indexOf(
+                                                selected,
+                                              );
+                                              widget.shiyi
+                                                  .answerQuestionForSession(
+                                                    _pageSessionId,
+                                                    index < 0 ? null : index,
+                                                  );
+                                            },
+                                          ),
+                                  );
+                                },
                               ),
-                            ),
-                          ],
+                              ListenableBuilder(
+                                listenable: widget.shiyi,
+                                builder: (context, _) {
+                                  final sessionSettings = widget.shiyi
+                                      .clientSettingsForSession(_pageSessionId);
+                                  final sessionProfile = widget.shiyi
+                                      .profileForSession(_pageSessionId);
+                                  final thinkingCaps =
+                                      LlmClient.reasoningEffortsForModel(
+                                        sessionSettings.model,
+                                      ) ??
+                                      const {};
+                                  return LiquidGlassChatComposer(
+                                    input: _input,
+                                    busy: _pageBusy,
+                                    questionActive: _pageQuestion != null,
+                                    allowSendWhileBusy: true,
+                                    pendingImages: _pendingImages,
+                                    pendingFiles: _pendingFiles,
+                                    onPickAttachment: _pickAttachmentSheet,
+                                    onRemoveImage: _removeImage,
+                                    onRemoveFile: _removeFile,
+                                    onSend: _send,
+                                    onStop: () => widget.shiyi.stopSession(
+                                      _pageSessionId,
+                                    ),
+                                    enterToSend:
+                                        widget.shiyi.settings.enterToSend,
+                                    modelOptions: [
+                                      for (final p in widget.shiyi.apiProfiles)
+                                        SessionModelOption(
+                                          value: p.name,
+                                          label: p.name,
+                                          subtitle: p.model,
+                                          models: widget.shiyi
+                                              .cachedModelsForProfile(p),
+                                        ),
+                                    ],
+                                    modelValue: sessionProfile?.name ?? '',
+                                    modelId: sessionSettings.model,
+                                    onModelChanged: _pageBusy
+                                        ? null
+                                        : (selection) {
+                                            for (final p
+                                                in widget.shiyi.apiProfiles) {
+                                              if (p.name == selection.profile) {
+                                                unawaited(
+                                                  widget.shiyi
+                                                      .setApiProfileForSession(
+                                                        _pageSessionId,
+                                                        p,
+                                                        model: selection.model,
+                                                      ),
+                                                );
+                                                break;
+                                              }
+                                            }
+                                          },
+                                    modelEnabled: !_pageBusy,
+                                    thinkingOptions: buildReasoningOptions(
+                                      thinkingCaps,
+                                    ),
+                                    thinkingValue:
+                                        widget.shiyi.reasoningEffortForSession(
+                                          _pageSessionId,
+                                        ) ??
+                                        '',
+                                    onThinkingChanged: (value) => widget.shiyi
+                                        .setReasoningEffortForSession(
+                                          _pageSessionId,
+                                          value,
+                                        ),
+                                    thinkingEnabled: !_pageBusy,
+                                    thinkingOn: widget.shiyi
+                                        .thinkingOnForSession(_pageSessionId),
+                                    onThinkingToggled:
+                                        thinkingCaps.containsKey('off')
+                                        ? (on) => widget.shiyi
+                                              .setThinkingOnForSession(
+                                                _pageSessionId,
+                                                on,
+                                              )
+                                        : null,
+                                    onCompress:
+                                        _pageBusy || _pageSessionId == null
+                                        ? null
+                                        : _compressContext,
+                                    compressBusy: _pageBusy,
+                                  );
+                                },
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -1563,57 +1623,22 @@ class _ChatScreenState extends State<ChatScreen>
     if (!mounted) return;
     final limit = shiyi.settings.contextLimit;
     final pct = limit <= 0 ? 0.0 : (tokens / limit * 100).clamp(0, 100);
-    final ok = await showIosFadeDialog<bool>(
+    final occupancy = limit > 0 ? '当前占用约 ${pct.toStringAsFixed(0)}%。' : '';
+    final ok = await showIosConfirmDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('压缩上下文'),
-        content: Text(
-          '当前会话上下文约 ${pct.toStringAsFixed(0)}%'
-          '（${(tokens / 10000).toStringAsFixed(1)}w token / 上限 ${(limit / 10000).toStringAsFixed(0)}w token）。\n'
-          '压缩会把早期历史归档为滚动摘要，只发送摘要和最近完整消息；'
-          '完整历史仍保留在本地，不会删除。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('压缩'),
-          ),
-        ],
-      ),
+      title: '压缩上下文？',
+      message: occupancy.isEmpty
+          ? '较早的对话会变成摘要，完整记录仍保留在本地。'
+          : '较早的对话会变成摘要，完整记录仍保留在本地。\n$occupancy',
+      confirmLabel: '压缩',
     );
-    if (ok != true) return;
-    if (!mounted) return;
-    showIosFadeDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const PopScope(
-        canPop: false,
-        child: AlertDialog(
-          content: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 24,
-                height: 24,
-                child: CircularProgressIndicator(strokeWidth: 3),
-              ),
-              SizedBox(width: 16),
-              Text('正在压缩上下文…'),
-            ],
-          ),
-        ),
-      ),
-    );
-    final ({bool ok, int archived, int beforeTokens, int afterTokens}) result;
-    try {
-      result = await shiyi.compressSession(sessionId);
-    } finally {
-      if (mounted) Navigator.of(context, rootNavigator: true).pop();
-    }
+    if (!ok || !mounted) return;
+    final ({bool ok, int archived, int beforeTokens, int afterTokens}) result =
+        await showIosProgressDialog(
+          context: context,
+          message: '正在压缩…',
+          task: () => shiyi.compressSession(sessionId),
+        );
     final done = result.ok;
     if (!mounted) return;
     final msg = done
@@ -1895,7 +1920,12 @@ class _PlanModeChip extends StatelessWidget {
 class _Welcome extends StatelessWidget {
   final ShiyiState shiyi;
   final ValueChanged<String> onPick;
-  const _Welcome({required this.shiyi, required this.onPick});
+  final double bottomInset;
+  const _Welcome({
+    required this.shiyi,
+    required this.onPick,
+    this.bottomInset = 0,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1906,7 +1936,7 @@ class _Welcome extends StatelessWidget {
       '帮我搜索记忆里关于「项目」的内容',
     ];
     return ListView(
-      padding: const EdgeInsets.all(24),
+      padding: EdgeInsets.fromLTRB(24, 24, 24, 24 + bottomInset),
       children: [
         const SizedBox(height: 40),
         const Center(child: WelcomeAvatar(size: 240)),

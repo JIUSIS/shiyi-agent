@@ -1272,8 +1272,10 @@ class DshApiClient {
   }
 
   /// 拉取会话历史并重建为消息列表。
-  /// 事件流是 delta 模型（assistant/chunk 占绝大多数），这里只取
-  /// 消息级事件（user/message、assistant/message、tool/call）重建。
+  /// 事件流是 delta 模型：正式气泡来自 user/message、assistant/message、
+  /// tool/call；若一轮在 turn/end 时仍只有 assistant/chunk、没有正式
+  /// assistant/message，则把未收口缓冲冻成最后一条助手消息（与官方
+  /// 客户端的 interrupted 节点一致）。
   Future<List<ChatMessage>> history(String sessionId) async {
     return (await historyBundle(sessionId)).messages;
   }
@@ -1353,6 +1355,8 @@ class DshApiClient {
     final seenMessageIds = <String>{};
     final surfaceSeqs = <int>[];
     final messageEventSeqs = <ChatMessage, int>{};
+    final pendingLive = DshLiveTurn();
+    var pendingStepFinalized = false;
     var pendingContext = '';
     var pendingSubagentSummary = false;
     var suppressDuplicateSubagentReply = false;
@@ -1366,6 +1370,20 @@ class DshApiClient {
       if (pendingContext.isEmpty) return;
       msg.runtimeContext = pendingContext;
       pendingContext = '';
+    }
+
+    bool pendingLiveVisible() =>
+        pendingLive.text.trim().isNotEmpty ||
+        pendingLive.reasoning.trim().isNotEmpty ||
+        pendingLive.toolCalls.isNotEmpty;
+
+    void resetPendingLive({required bool keepReasoning}) {
+      if (keepReasoning) {
+        pendingLive.continueTurn();
+      } else {
+        pendingLive.reset();
+      }
+      pendingStepFinalized = false;
     }
 
     String markedText(String text, String marker) {
@@ -1423,6 +1441,44 @@ class DshApiClient {
       return true;
     }
 
+    /// 官方客户端在 turn/end 时若本步没有 assistant/message，会把
+    /// 已发出的 chunk 冻成 interrupted 节点。这里同样冻成一条助手消息，
+    /// 避免拉取历史时最后输出被截断。
+    void freezePendingLive({required int seq, required int time}) {
+      if (pendingStepFinalized || !pendingLiveVisible()) {
+        resetPendingLive(keepReasoning: false);
+        return;
+      }
+      if (suppressDuplicateSubagentReply) {
+        suppressDuplicateSubagentReply = false;
+        pendingSubagentSummary = false;
+        resetPendingLive(keepReasoning: false);
+        return;
+      }
+      final text = pendingLive.text.trim();
+      final reasoning = pendingLive.reasoning.trim();
+      if (takeIfContext(text)) {
+        resetPendingLive(keepReasoning: false);
+        return;
+      }
+      final isSubagentSummary = pendingSubagentSummary && reasoning.isNotEmpty;
+      final item = ChatMessage(
+        id: 'dsh-asst-$seq',
+        sessionId: '',
+        role: 'assistant',
+        content: text,
+        reasoning: isSubagentSummary ? '' : reasoning,
+        subagentSummary: isSubagentSummary ? reasoning : '',
+        toolCalls: List<ToolCall>.of(pendingLive.toolCalls),
+        createdAt: time,
+      );
+      attachContext(item);
+      messages.add(item);
+      messageEventSeqs[item] = seq;
+      if (pendingSubagentSummary) pendingSubagentSummary = false;
+      resetPendingLive(keepReasoning: false);
+    }
+
     void applySurfaceOp(Map<String, dynamic> event, String type, int seq) {
       if (type != 'user/message' &&
           type != 'assistant/message' &&
@@ -1469,6 +1525,7 @@ class DshApiClient {
       pendingContext = '';
       pendingSubagentSummary = false;
       suppressDuplicateSubagentReply = false;
+      resetPendingLive(keepReasoning: false);
     }
 
     for (final entry in entries) {
@@ -1532,6 +1589,7 @@ class DshApiClient {
           trackSubagentSummary(presentation);
         }
       } else if (type == 'turn/end') {
+        freezePendingLive(seq: seq, time: time);
         final reason = (data['reason'] as Map?)?.cast<String, dynamic>();
         if (reason != null && reason['kind']?.toString() == 'error') {
           pendingSubagentSummary = false;
@@ -1553,11 +1611,14 @@ class DshApiClient {
         } else {
           rolledBack.clear();
         }
+      } else if (type == 'assistant/chunk') {
+        if (pendingLive.ingest(ev)) pendingStepFinalized = false;
       } else if (type == 'user/message') {
         final content = (data['content'] as List?) ?? const [];
         final text = _joinTextParts(content);
         if (text.trim().isEmpty) continue;
         if (takeIfContext(text)) continue;
+        resetPendingLive(keepReasoning: false);
         final presentation = presentUserMessage(text, [
           data['source'],
           data['metadata'],
@@ -1589,6 +1650,8 @@ class DshApiClient {
         seenMessageIds.add(id);
         trackSubagentSummary(presentation);
       } else if (type == 'assistant/message') {
+        resetPendingLive(keepReasoning: true);
+        pendingStepFinalized = true;
         if (suppressDuplicateSubagentReply) {
           suppressDuplicateSubagentReply = false;
           pendingSubagentSummary = false;
@@ -1621,7 +1684,10 @@ class DshApiClient {
         messageEventSeqs[item] = seq;
         if (pendingSubagentSummary) pendingSubagentSummary = false;
       } else if (type == 'tool/call') {
-        // 工具调用：阶段 1 只做轻量记录（追加到前一条助手消息的 toolCalls）。
+        pendingLive.ingest(ev);
+        // 本步已有正式 assistant/message 时挂到该气泡；否则留给
+        // turn/end 的 freeze，避免工具误挂到上一轮助手消息。
+        if (!pendingStepFinalized) continue;
         final last = messages.isEmpty ? null : messages.last;
         if (last != null && last.role == 'assistant') {
           last.toolCalls.add(

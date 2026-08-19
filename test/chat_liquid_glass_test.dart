@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 import 'package:shiyi_agent_app/widgets/chat_liquid_glass.dart';
 
 Widget _composer({
@@ -13,6 +14,11 @@ Widget _composer({
   ValueChanged<bool>? onThinkingToggled,
   VoidCallback? onCompress,
   bool compressBusy = false,
+  List<SessionModelOption> modelOptions = const [],
+  String modelValue = '',
+  String modelId = '',
+  ValueChanged<SessionModelSelection>? onModelChanged,
+  bool modelEnabled = true,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -39,6 +45,11 @@ Widget _composer({
             onThinkingToggled: onThinkingToggled,
             onCompress: onCompress,
             compressBusy: compressBusy,
+            modelOptions: modelOptions,
+            modelValue: modelValue,
+            modelId: modelId,
+            onModelChanged: onModelChanged,
+            modelEnabled: modelEnabled,
           ),
         ),
       ),
@@ -238,5 +249,174 @@ void main() {
       tester.widget<IconButton>(find.byType(IconButton)).onPressed,
       isNull,
     );
+  });
+
+  testWidgets('会话模型抽屉只列出配置，点进去再选缓存模型 ID', (tester) async {
+    final input = TextEditingController();
+    addTearDown(input.dispose);
+    SessionModelSelection? selected;
+
+    tester.view.physicalSize = const Size(1600, 1200);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final originalOnError = FlutterError.onError;
+    FlutterError.onError = (details) {
+      if (details.exceptionAsString().contains('RenderFlex overflowed')) return;
+      originalOnError?.call(details);
+    };
+    addTearDown(() => FlutterError.onError = originalOnError);
+
+    await tester.pumpWidget(
+      _composer(
+        input: input,
+        allowSendWhileBusy: false,
+        modelOptions: const [
+          SessionModelOption(
+            value: 'DeepSeek',
+            label: 'DeepSeek',
+            subtitle: 'deepseek-chat',
+            models: ['deepseek-chat', 'deepseek-reasoner'],
+          ),
+          SessionModelOption(
+            value: '家里的网关',
+            label: '家里的网关',
+            subtitle: 'local-model',
+            models: ['local-model', 'cached-id'],
+          ),
+        ],
+        modelValue: 'DeepSeek',
+        modelId: 'deepseek-chat',
+        onModelChanged: (value) => selected = value,
+      ),
+    );
+
+    expect(find.text('DeepSeek'), findsOneWidget);
+    final trigger = tester.getRect(find.byTooltip('选择模型'));
+    await tester.tap(find.byTooltip('选择模型'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('家里的网关'), findsOneWidget);
+    expect(find.text('cached-id'), findsNothing);
+
+    final menu = tester.getRect(find.text('家里的网关'));
+    expect(menu.bottom, lessThanOrEqualTo(trigger.top + 8));
+    expect(menu.left, closeTo(trigger.left, 24));
+    expect(menu.width, lessThanOrEqualTo(280));
+
+    final list = tester.widget<ListView>(find.byType(ListView).last);
+    final listBox = tester.renderObject<RenderBox>(find.byType(ListView).last);
+    expect(list.shrinkWrap, isTrue);
+    expect(listBox.size.height, lessThanOrEqualTo(240));
+
+    await tester.tap(find.text('家里的网关'));
+    await tester.pumpAndSettle();
+    expect(selected, isNull);
+    expect(find.text('返回'), findsOneWidget);
+    expect(find.text('cached-id'), findsOneWidget);
+    expect(find.text('local-model'), findsOneWidget);
+
+    await tester.tap(find.text('cached-id'));
+    await tester.pumpAndSettle();
+    expect(selected?.profile, '家里的网关');
+    expect(selected?.model, 'cached-id');
+  });
+
+  testWidgets('禁用的会话模型选择器不会打开抽屉', (tester) async {
+    final input = TextEditingController();
+    addTearDown(input.dispose);
+    var changes = 0;
+
+    tester.view.physicalSize = const Size(1600, 1200);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final originalOnError = FlutterError.onError;
+    FlutterError.onError = (details) {
+      if (details.exceptionAsString().contains('RenderFlex overflowed')) return;
+      originalOnError?.call(details);
+    };
+    addTearDown(() => FlutterError.onError = originalOnError);
+
+    await tester.pumpWidget(
+      _composer(
+        input: input,
+        allowSendWhileBusy: false,
+        modelOptions: const [
+          SessionModelOption(value: 'DeepSeek', label: 'DeepSeek'),
+          SessionModelOption(value: '家里的网关', label: '家里的网关'),
+        ],
+        modelValue: 'DeepSeek',
+        onModelChanged: (_) => changes++,
+        modelEnabled: false,
+      ),
+    );
+
+    await tester.tap(find.byTooltip('选择模型'));
+    await tester.pumpAndSettle();
+    expect(find.text('家里的网关'), findsNothing);
+    expect(changes, 0);
+  });
+
+  testWidgets('浮动输入叠层量高且根节点透明', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    var measured = 0.0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ChatFloatingComposerScaffold(
+            messages: (context, overlayHeight) {
+              measured = overlayHeight;
+              return const ColoredBox(
+                color: Colors.red,
+                child: SizedBox.expand(child: Text('消息')),
+              );
+            },
+            overlay: const SizedBox(
+              height: 96,
+              width: double.infinity,
+              child: Text('输入区'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(measured, closeTo(96, 0.5));
+    expect(find.text('消息'), findsOneWidget);
+    expect(find.text('输入区'), findsOneWidget);
+
+    final overlayBox = tester.widget<ColoredBox>(
+      find.descendant(
+        of: find.byType(ChatFloatingComposerScaffold),
+        matching: find.byWidgetPredicate(
+          (widget) =>
+              widget is ColoredBox && widget.color == Colors.transparent,
+        ),
+      ),
+    );
+    expect(overlayBox.color, Colors.transparent);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('玻璃提示条是胶囊而不是满宽实心底', (tester) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: ChatGlassNoticeBar(text: '上下文已压缩')),
+      ),
+    );
+
+    expect(find.text('上下文已压缩'), findsOneWidget);
+    expect(find.byType(LiquidGlassLens), findsOneWidget);
+    final bar = tester.getRect(find.text('上下文已压缩'));
+    expect(bar.width, lessThan(tester.view.physicalSize.width));
+    expect(tester.takeException(), isNull);
   });
 }

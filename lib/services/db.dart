@@ -40,7 +40,7 @@ class AppDatabase {
           : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 17,
+        version: 18,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -70,6 +70,7 @@ class AppDatabase {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       model TEXT,
+      api_profile TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -297,6 +298,13 @@ class AppDatabase {
         );
       }
     }
+    // v17 -> v18：sessions 加 api_profile（会话绑定的已保存配置名）。
+    if (oldV < 18) {
+      final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+      if (!cols.any((c) => c['name'] == 'api_profile')) {
+        await db.execute('ALTER TABLE sessions ADD COLUMN api_profile TEXT');
+      }
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -327,6 +335,9 @@ class AppDatabase {
     }
     if (!sessionCols.any((c) => c['name'] == 'project_id')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN project_id TEXT');
+    }
+    if (!sessionCols.any((c) => c['name'] == 'api_profile')) {
+      await db.execute('ALTER TABLE sessions ADD COLUMN api_profile TEXT');
     }
     final cacheCols = await db.rawQuery('PRAGMA table_info(sessions)');
     if (!cacheCols.any((c) => c['name'] == 'cache_hit_tokens')) {
@@ -448,12 +459,18 @@ class AppDatabase {
     );
   }
 
-  Future<void> touchSession(String id, {String? title, String? model}) async {
+  Future<void> touchSession(
+    String id, {
+    String? title,
+    String? model,
+    String? apiProfile,
+  }) async {
     final db = await this.db;
     final now = DateTime.now().millisecondsSinceEpoch;
     final updates = <String, dynamic>{'updated_at': now};
     if (title != null) updates['title'] = title;
     if (model != null) updates['model'] = model;
+    if (apiProfile != null) updates['api_profile'] = apiProfile;
     await db.update('sessions', updates, where: 'id = ?', whereArgs: [id]);
   }
 

@@ -233,6 +233,108 @@ void main() {
       ]);
     });
 
+    test('不同配置名写成不同 provider，不会互相覆盖', () {
+      final first = AppSettings(
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat',
+      );
+      final second = AppSettings(
+        baseUrl: 'https://gateway.example/v1',
+        model: 'local-model',
+      );
+      expect(DshModelSync.providerIdForName('DeepSeek'), 'shiyi_deepseek');
+      final firstOps = DshModelSync.mutateOps(
+        first,
+        provider: DshModelSync.providerIdForName('DeepSeek'),
+        name: 'DeepSeek',
+      );
+      final secondOps = DshModelSync.mutateOps(
+        second,
+        provider: DshModelSync.providerIdForName('家里的网关'),
+        name: '家里的网关',
+      );
+      expect(firstOps.single['path'], ['providers', 'shiyi_deepseek']);
+      expect(secondOps.single['path'], isNot(['providers', 'shiyi_deepseek']));
+      expect(
+        (firstOps.single['value'] as Map)['baseURL'],
+        'https://api.deepseek.com/v1',
+      );
+      expect(
+        (secondOps.single['value'] as Map)['baseURL'],
+        'https://gateway.example/v1',
+      );
+    });
+
+    test('新注入只替换同名配置，保留其它已注入项', () {
+      const existing = '''
+llm-pi-ai:
+  providers:
+    shiyi_deepseek:
+      displayName: DeepSeek
+      api: openai-completions
+      baseURL: "https://api.deepseek.com/v1"
+      models:
+        - id: deepseek-chat
+''';
+      final yaml = DshModelSync.upsertSettingsYaml(
+        existing,
+        baseUrl: 'https://gateway.example/v1',
+        model: 'local-model',
+        apiProtocol: 'openai',
+        provider: 'shiyi_home',
+        name: '家里的网关',
+      );
+      expect(yaml, contains('    shiyi_deepseek:'));
+      expect(yaml, contains('      baseURL: "https://api.deepseek.com/v1"'));
+      expect(yaml, contains('        - id: deepseek-chat'));
+      expect(yaml, contains('    shiyi_home:'));
+      expect(yaml, contains('      baseURL: "https://gateway.example/v1"'));
+      expect(yaml, contains('        - id: local-model'));
+    });
+
+    test('删除一份已注入配置不会带走其它配置', () {
+      const existing = '''
+llm-pi-ai:
+  providers:
+    shiyi_deepseek:
+      displayName: DeepSeek
+      api: openai-completions
+    shiyi_home:
+      displayName: 家里的网关
+      api: openai-completions
+''';
+      final yaml = DshModelSync.removeProviderYaml(existing, 'shiyi_home');
+      expect(yaml, contains('    shiyi_deepseek:'));
+      expect(yaml, isNot(contains('    shiyi_home:')));
+    });
+
+    test('记住已注入配置时新配置追加，同名才覆盖', () async {
+      final first = AppSettings(
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat',
+      );
+      final second = AppSettings(
+        baseUrl: 'https://gateway.example/v1',
+        model: 'local-model',
+      );
+      await DshModelSync.rememberInjectedConfig(first, name: 'DeepSeek');
+      await DshModelSync.rememberInjectedConfig(second, name: '家里的网关');
+      var listed = await DshModelSync.listInjectedConfigs();
+      expect(listed.map((e) => e.name), ['DeepSeek', '家里的网关']);
+
+      await DshModelSync.rememberInjectedConfig(
+        first.copyWith(model: 'deepseek-reasoner'),
+        name: 'DeepSeek',
+      );
+      listed = await DshModelSync.listInjectedConfigs();
+      expect(listed, hasLength(2));
+      expect(
+        listed.firstWhere((e) => e.name == 'DeepSeek').model,
+        'deepseek-reasoner',
+      );
+      expect(listed.firstWhere((e) => e.name == '家里的网关').model, 'local-model');
+    });
+
     test('默认模型 mutate 切到 shiyi / 当前模型', () {
       final s = AppSettings(model: 'deepseek-v4-flash');
       final ops = DshModelSync.defaultModelOps(s);
@@ -781,6 +883,86 @@ llm-pi-ai:
         homeDir: () async => dir.path,
       );
       expect(calls, isEmpty);
+    });
+  });
+
+  group('会话级模型同步不覆盖已有选择', () {
+    Map<String, dynamic> okValue(Map<String, dynamic> value) => {
+      'type': 'server-response',
+      'rpcId': 'x',
+      'result': {'ok': true, 'value': value},
+    };
+
+    http.Response ok(Map<String, dynamic> value) => http.Response(
+      jsonEncode(okValue(value)),
+      200,
+      headers: {'content-type': 'application/json'},
+    );
+
+    test('syncSessionToAppModel 已有模型时不 selectModel', () async {
+      final calls = <String>[];
+      final mock = MockClient((req) async {
+        final body = jsonDecode(req.body) as Map<String, dynamic>;
+        final method = body['method'] as String? ?? '';
+        if (method == 'session.models') {
+          return ok({
+            'current': {'provider': 'shiyi', 'model': 'user-chosen-model'},
+            'groups': [],
+          });
+        }
+        if (method == 'session.selectModel') {
+          calls.add('unexpected');
+        }
+        return ok({});
+      });
+      final api = DshApiClient(baseUrl: 'http://test.local', client: mock);
+      await DshModelSync.syncSessionToAppModel(
+        api,
+        's1',
+        AppSettings(
+          baseUrl: 'https://api.test/v1',
+          apiKey: 'sk-test',
+          model: 'deepseek-v4-flash',
+        ),
+      );
+      expect(calls, isEmpty);
+    });
+
+    test('syncSessionToAppModel 空模型时补上当前全局模型', () async {
+      final calls = <String>[];
+      final mock = MockClient((req) async {
+        final body = jsonDecode(req.body) as Map<String, dynamic>;
+        final method = body['method'] as String? ?? '';
+        final payload =
+            (body['payload'] as Map?)?.cast<String, dynamic>() ?? {};
+        if (method == 'session.models') {
+          return ok({
+            'current': {'provider': 'shiyi', 'model': ''},
+            'groups': [],
+          });
+        }
+        if (method == 'session.selectModel') {
+          calls.add('${payload['provider']}:${payload['model']}');
+          return ok({
+            'selected': {
+              'provider': payload['provider'],
+              'model': payload['model'],
+            },
+          });
+        }
+        return ok({});
+      });
+      final api = DshApiClient(baseUrl: 'http://test.local', client: mock);
+      await DshModelSync.syncSessionToAppModel(
+        api,
+        's1',
+        AppSettings(
+          baseUrl: 'https://api.test/v1',
+          apiKey: 'sk-test',
+          model: 'deepseek-v4-flash',
+        ),
+      );
+      expect(calls, ['shiyi:deepseek-v4-flash']);
     });
   });
 }

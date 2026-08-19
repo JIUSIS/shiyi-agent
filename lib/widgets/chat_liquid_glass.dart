@@ -37,6 +37,109 @@ LiquidGlassStyle chatLiquidGlassStyle(
   );
 }
 
+/// 消息列表铺满，底部输入区 / 状态条透明叠在上面。
+/// 滑动时气泡能从液态玻璃后透出，玻璃底下不再垫一层 Scaffold 底色。
+class ChatFloatingComposerScaffold extends StatefulWidget {
+  final Widget Function(BuildContext context, double overlayHeight) messages;
+  final Widget overlay;
+
+  const ChatFloatingComposerScaffold({
+    super.key,
+    required this.messages,
+    required this.overlay,
+  });
+
+  @override
+  State<ChatFloatingComposerScaffold> createState() =>
+      _ChatFloatingComposerScaffoldState();
+}
+
+class _ChatFloatingComposerScaffoldState
+    extends State<ChatFloatingComposerScaffold> {
+  double _overlayHeight = 148;
+  final _overlayKey = GlobalKey();
+
+  void _scheduleMeasure() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final box = _overlayKey.currentContext?.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) return;
+      final height = box.size.height;
+      if ((height - _overlayHeight).abs() < 0.5) return;
+      setState(() => _overlayHeight = height);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _scheduleMeasure();
+    return Stack(
+      fit: StackFit.expand,
+      clipBehavior: Clip.none,
+      children: [
+        widget.messages(context, _overlayHeight),
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: NotificationListener<SizeChangedLayoutNotification>(
+            onNotification: (_) {
+              _scheduleMeasure();
+              return true;
+            },
+            child: SizeChangedLayoutNotifier(
+              child: KeyedSubtree(
+                key: _overlayKey,
+                child: ColoredBox(
+                  color: Colors.transparent,
+                  child: widget.overlay,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// 输入区上方的提示胶囊：液态玻璃，不满宽铺实心底。
+class ChatGlassNoticeBar extends StatelessWidget {
+  final String text;
+  final Color? tint;
+  final Color? foreground;
+
+  const ChatGlassNoticeBar({
+    super.key,
+    required this.text,
+    this.tint,
+    this.foreground,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
+      child: LiquidGlassLens(
+        style: chatLiquidGlassStyle(context, cornerRadius: 10, tint: tint),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Text(
+            text,
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall!.copyWith(
+              color: foreground ?? theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 拾忆与 DSH 共用的子代理运行状态条。
 /// 只负责统一液态玻璃外观，状态文本和可见性由各引擎提供。
 class SubagentStatusBar extends StatelessWidget {
@@ -247,38 +350,30 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
           width: menuWidth,
           child: Material(
             color: Colors.transparent,
+            elevation: 12,
+            shadowColor: Colors.black.withValues(alpha: dark ? .36 : .14),
+            borderRadius: BorderRadius.circular(14),
+            clipBehavior: Clip.antiAlias,
             child: SizeTransition(
               sizeFactor: _reveal,
-              alignment: Alignment.bottomRight,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(14),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: dark ? .36 : .14),
-                      blurRadius: 24,
-                      offset: const Offset(0, 8),
-                    ),
-                  ],
-                ),
-                child: LiquidGlassLens(
-                  style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        for (final item in items)
-                          _ThinkingMenuRow(
-                            label: item.label,
-                            onTap: () {
-                              HapticFeedback.selectionClick();
-                              _dismissPopup();
-                              widget.onChanged(item.value);
-                            },
-                          ),
-                      ],
-                    ),
+              axisAlignment: 1,
+              child: LiquidGlassLens(
+                style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (final item in items)
+                        _ThinkingMenuRow(
+                          label: item.label,
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            _dismissPopup();
+                            widget.onChanged(item.value);
+                          },
+                        ),
+                    ],
                   ),
                 ),
               ),
@@ -425,6 +520,436 @@ class ThinkingToggleButton extends StatelessWidget {
   }
 }
 
+/// 会话级模型配置选项。只负责展示，不持有引擎或密钥。
+class SessionModelOption {
+  final String value;
+  final String label;
+  final String subtitle;
+  final List<String> models;
+
+  const SessionModelOption({
+    required this.value,
+    required this.label,
+    this.subtitle = '',
+    this.models = const [],
+  });
+}
+
+class SessionModelSelection {
+  final String profile;
+  final String model;
+
+  const SessionModelSelection({required this.profile, required this.model});
+}
+
+/// 输入区左侧的会话模型抽屉：一级已保存配置，二级缓存模型 ID。
+class SessionModelSelector extends StatefulWidget {
+  final List<SessionModelOption> options;
+  final String value;
+  final String modelId;
+  final ValueChanged<SessionModelSelection> onChanged;
+  final bool enabled;
+
+  const SessionModelSelector({
+    super.key,
+    required this.options,
+    required this.value,
+    required this.onChanged,
+    this.modelId = '',
+    this.enabled = true,
+  });
+
+  @override
+  State<SessionModelSelector> createState() => _SessionModelSelectorState();
+}
+
+class _SessionModelSelectorState extends State<SessionModelSelector>
+    with SingleTickerProviderStateMixin {
+  final _buttonKey = GlobalKey();
+  OverlayEntry? _popup;
+  Rect _anchor = Rect.zero;
+  late final AnimationController _anim;
+  late final Animation<double> _reveal;
+  String? _openProfile;
+
+  static const _gap = 6.0;
+  static const _minMenuWidth = 168.0;
+  static const _maxMenuWidth = 280.0;
+  static const _maxMenuHeight = 240.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+      reverseDuration: const Duration(milliseconds: 160),
+    );
+    _reveal = CurvedAnimation(
+      parent: _anim,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
+
+  bool get _isOpen => _popup != null;
+
+  String get _selectedValue {
+    if (widget.options.any((item) => item.value == widget.value)) {
+      return widget.value;
+    }
+    return widget.options.isEmpty ? '' : widget.options.first.value;
+  }
+
+  SessionModelOption? get _selectedOption {
+    for (final item in widget.options) {
+      if (item.value == _selectedValue) return item;
+    }
+    return widget.options.isEmpty ? null : widget.options.first;
+  }
+
+  void _togglePopup() {
+    if (_isOpen) {
+      _dismissPopup();
+    } else {
+      _showPopup();
+    }
+  }
+
+  Future<void> _dismissPopup() async {
+    final entry = _popup;
+    if (entry == null) return;
+    _popup = null;
+    _openProfile = null;
+    if (mounted) setState(() {});
+    if (_anim.value > 0) {
+      try {
+        await _anim.reverse();
+      } catch (_) {}
+    }
+    entry.remove();
+  }
+
+  void _showPopup() {
+    if (widget.options.isEmpty) return;
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    _anchor = box.localToGlobal(Offset.zero) & box.size;
+    _openProfile = null;
+    HapticFeedback.selectionClick();
+    _popup = OverlayEntry(builder: _buildOverlay);
+    Overlay.of(context, rootOverlay: true).insert(_popup!);
+    _anim.forward(from: 0);
+    setState(() {});
+  }
+
+  void _markDirty() => _popup?.markNeedsBuild();
+
+  List<String> _modelsFor(SessionModelOption item) {
+    final ids = <String>{
+      if (item.subtitle.trim().isNotEmpty) item.subtitle.trim(),
+      ...item.models.map((e) => e.trim()).where((e) => e.isNotEmpty),
+    };
+    return ids.toList();
+  }
+
+  double _menuWidthFor(BuildContext context, {SessionModelOption? nested}) {
+    final titleStyle =
+        Theme.of(
+          context,
+        ).textTheme.bodyLarge?.copyWith(fontSize: 15, letterSpacing: -0.24) ??
+        const TextStyle(fontSize: 15, letterSpacing: -0.24);
+    final subStyle =
+        Theme.of(context).textTheme.bodySmall?.copyWith(fontSize: 12) ??
+        const TextStyle(fontSize: 12);
+    final painter = TextPainter(textDirection: TextDirection.ltr);
+    var maxWidth = 0.0;
+    void measure(String text, TextStyle style) {
+      if (text.isEmpty) return;
+      painter.text = TextSpan(text: text, style: style);
+      painter.layout();
+      if (painter.width > maxWidth) maxWidth = painter.width;
+    }
+
+    if (nested == null) {
+      for (final item in widget.options) {
+        measure(item.label, titleStyle);
+        measure(item.subtitle, subStyle);
+      }
+    } else {
+      measure('返回', titleStyle);
+      for (final id in _modelsFor(nested)) {
+        measure(id, titleStyle);
+      }
+    }
+    painter.dispose();
+    return (maxWidth + 48).clamp(_minMenuWidth, _maxMenuWidth);
+  }
+
+  Widget _buildOverlay(BuildContext overlayContext) {
+    final dark = Theme.of(overlayContext).brightness == Brightness.dark;
+    final mq = MediaQuery.of(overlayContext);
+    if (widget.options.isEmpty) return const SizedBox.shrink();
+    SessionModelOption? nested;
+    if (_openProfile != null) {
+      for (final item in widget.options) {
+        if (item.value == _openProfile) {
+          nested = item;
+          break;
+        }
+      }
+    }
+    final menuWidth = _menuWidthFor(overlayContext, nested: nested);
+    final left = _anchor.left.clamp(8.0, mq.size.width - menuWidth - 8.0);
+    final bottom = (mq.size.height - _anchor.top + _gap).clamp(
+      mq.padding.bottom + 8.0,
+      mq.size.height - mq.padding.top - 48.0,
+    );
+    final children = <Widget>[];
+    if (nested == null) {
+      for (final item in widget.options) {
+        children.add(
+          _SessionModelMenuRow(
+            label: item.label,
+            subtitle: item.subtitle,
+            selected: item.value == _selectedValue,
+            trailing: true,
+            onTap: () {
+              HapticFeedback.selectionClick();
+              _openProfile = item.value;
+              _markDirty();
+            },
+          ),
+        );
+      }
+    } else {
+      children.add(
+        _SessionModelMenuRow(
+          label: '返回',
+          subtitle: nested.label,
+          selected: false,
+          leading: true,
+          onTap: () {
+            HapticFeedback.selectionClick();
+            _openProfile = null;
+            _markDirty();
+          },
+        ),
+      );
+      final models = _modelsFor(nested);
+      if (models.isEmpty) {
+        children.add(
+          const _SessionModelMenuRow(
+            label: '暂无缓存模型',
+            subtitle: '请先在设置里获取模型目录',
+            selected: false,
+          ),
+        );
+      } else {
+        for (final id in models) {
+          children.add(
+            _SessionModelMenuRow(
+              label: id,
+              selected:
+                  nested.value == _selectedValue && id == widget.modelId.trim(),
+              onTap: () {
+                HapticFeedback.selectionClick();
+                _dismissPopup();
+                widget.onChanged(
+                  SessionModelSelection(profile: nested!.value, model: id),
+                );
+              },
+            ),
+          );
+        }
+      }
+    }
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: _dismissPopup,
+          ),
+        ),
+        Positioned(
+          left: left,
+          bottom: bottom,
+          width: menuWidth,
+          child: Material(
+            color: Colors.transparent,
+            elevation: 12,
+            shadowColor: Colors.black.withValues(alpha: dark ? .36 : .14),
+            borderRadius: BorderRadius.circular(14),
+            clipBehavior: Clip.antiAlias,
+            child: SizeTransition(
+              sizeFactor: _reveal,
+              axisAlignment: 1,
+              child: LiquidGlassLens(
+                style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: _maxMenuHeight),
+                  child: ListView(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    shrinkWrap: true,
+                    children: children,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  void dispose() {
+    _popup?.remove();
+    _popup = null;
+    _anim.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.options.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final selected = _selectedOption;
+    final label = selected?.label ?? '选择模型';
+    final accent = widget.enabled
+        ? (_isOpen ? _iosBlue : theme.colorScheme.onSurfaceVariant)
+        : theme.disabledColor;
+
+    return Tooltip(
+      message: '选择模型',
+      child: GestureDetector(
+        key: _buttonKey,
+        onTap: widget.enabled ? _togglePopup : null,
+        behavior: HitTestBehavior.opaque,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 160),
+          opacity: widget.enabled ? 1 : 0.38,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(2, 4, 8, 4),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 168),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        color: accent,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: -0.24,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 1),
+                  Icon(
+                    _isOpen
+                        ? CupertinoIcons.chevron_down
+                        : CupertinoIcons.chevron_up,
+                    size: 11,
+                    color: accent,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SessionModelMenuRow extends StatelessWidget {
+  final String label;
+  final String subtitle;
+  final bool selected;
+  final bool trailing;
+  final bool leading;
+  final VoidCallback? onTap;
+
+  const _SessionModelMenuRow({
+    required this.label,
+    this.subtitle = '',
+    required this.selected,
+    this.trailing = false,
+    this.leading = false,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = selected ? _iosBlue : theme.colorScheme.onSurface;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        child: Row(
+          children: [
+            if (leading) ...[
+              Icon(
+                CupertinoIcons.chevron_back,
+                size: 13,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 6),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      fontSize: 15,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      color: color,
+                      letterSpacing: -0.24,
+                    ),
+                  ),
+                  if (subtitle.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontSize: 12,
+                        color: selected
+                            ? _iosBlue.withValues(alpha: .78)
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            if (trailing)
+              Icon(
+                CupertinoIcons.chevron_forward,
+                size: 13,
+                color: selected ? _iosBlue : theme.colorScheme.onSurfaceVariant,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// 会话页共用的紧凑压缩入口；压缩实现仍由各引擎自己的回调负责。
 class ChatCompressionButton extends StatelessWidget {
   final VoidCallback? onPressed;
@@ -480,6 +1005,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final ValueChanged<bool>? onThinkingToggled;
   final VoidCallback? onCompress;
   final bool compressBusy;
+  final List<SessionModelOption> modelOptions;
+  final String modelValue;
+  final String modelId;
+  final ValueChanged<SessionModelSelection>? onModelChanged;
+  final bool modelEnabled;
 
   const LiquidGlassChatComposer({
     super.key,
@@ -505,6 +1035,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.onThinkingToggled,
     this.onCompress,
     this.compressBusy = false,
+    this.modelOptions = const [],
+    this.modelValue = '',
+    this.modelId = '',
+    this.onModelChanged,
+    this.modelEnabled = true,
   });
 
   bool _handleKey(KeyEvent event) {
@@ -566,37 +1101,49 @@ class LiquidGlassChatComposer extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (thinkingOptions.isNotEmpty && onThinkingChanged != null ||
+                if (modelOptions.isNotEmpty && onModelChanged != null ||
+                    thinkingOptions.isNotEmpty && onThinkingChanged != null ||
                     onThinkingToggled != null ||
                     onCompress != null) ...[
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (onCompress != null)
-                          ChatCompressionButton(
-                            onPressed: onCompress,
-                            busy: compressBusy,
+                  Row(
+                    children: [
+                      if (modelOptions.isNotEmpty && onModelChanged != null)
+                        Flexible(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: SessionModelSelector(
+                              options: modelOptions,
+                              value: modelValue,
+                              modelId: modelId,
+                              onChanged: onModelChanged!,
+                              enabled: modelEnabled,
+                            ),
                           ),
-                        if (onThinkingToggled != null &&
-                            thinkingOptions.isNotEmpty)
-                          ThinkingToggleButton(
-                            on: thinkingOn,
-                            onPressed: thinkingEnabled
-                                ? () => onThinkingToggled!(!thinkingOn)
-                                : null,
-                          ),
-                        if (thinkingOptions.isNotEmpty &&
-                            onThinkingChanged != null)
-                          ThinkingIntensitySelector(
-                            options: thinkingOptions,
-                            value: thinkingValue,
-                            onChanged: onThinkingChanged!,
-                            enabled: thinkingEnabled,
-                          ),
-                      ],
-                    ),
+                        )
+                      else
+                        const Spacer(),
+                      if (onCompress != null)
+                        ChatCompressionButton(
+                          onPressed: onCompress,
+                          busy: compressBusy,
+                        ),
+                      if (onThinkingToggled != null &&
+                          thinkingOptions.isNotEmpty)
+                        ThinkingToggleButton(
+                          on: thinkingOn,
+                          onPressed: thinkingEnabled
+                              ? () => onThinkingToggled!(!thinkingOn)
+                              : null,
+                        ),
+                      if (thinkingOptions.isNotEmpty &&
+                          onThinkingChanged != null)
+                        ThinkingIntensitySelector(
+                          options: thinkingOptions,
+                          value: thinkingValue,
+                          onChanged: onThinkingChanged!,
+                          enabled: thinkingEnabled,
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 4),
                 ],

@@ -7,9 +7,7 @@ import '../services/dsh_model_sync.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 
-/// 模型选择页（Apple HIG Inset Grouped）：
-/// 当前会话模型 + 提供商分组目录。会话模式直接切换（session.selectModel），
-/// 无会话时只读浏览全量目录（llm.models）。
+/// 已注入 API 配置页：只列出、删除注入到 DSH 的多份配置，不再勾选模型 ID。
 class DshModelsScreen extends StatefulWidget {
   final String? sessionId;
   final ShiyiState? shiyi;
@@ -20,12 +18,10 @@ class DshModelsScreen extends StatefulWidget {
 }
 
 class _DshModelsScreenState extends State<DshModelsScreen> {
-  List<DshModelGroup> _groups = [];
-  DshModelSelection? _current;
-  Set<String> _deletableModelIds = const {};
+  List<DshInjectedConfig> _configs = [];
   bool _loading = true;
   String? _error;
-  bool _selecting = false;
+  bool _deleting = false;
 
   DshApiClient get _api => DshApiClient.instance;
 
@@ -41,55 +37,35 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
       _error = null;
     });
     try {
-      final sid = widget.sessionId;
-      List<DshModelGroup> groups;
-      if (sid != null) {
-        final r = await _api.sessionModels(sid);
-        _current = r.current;
-        groups = r.groups;
-      } else {
-        groups = await _api.llmModels();
-      }
-      final shiyi = widget.shiyi;
-      var injected = groups
-          .where((group) => group.id == DshModelSync.providerId)
-          .toList();
-      if (shiyi != null) {
-        final cached = await DshModelSync.cachedModelCatalogFor(shiyi.settings);
-        _deletableModelIds = cached.toSet();
-        if (injected.isEmpty) {
-          final models = await DshModelSync.modelCatalogFor(shiyi.settings);
-          if (models.isNotEmpty) {
-            final items = models.toList()..sort();
-            injected = [
-              DshModelGroup(
-                id: DshModelSync.providerId,
-                name: DshModelSync.displayName,
-                models: [
-                  for (final id in items)
-                    DshModelInfo(
-                      id: id,
-                      name: id,
-                      providerId: DshModelSync.providerId,
-                      providerName: DshModelSync.displayName,
-                    ),
-                ],
-              ),
-            ];
-          }
-        }
-        // “模型数据”是全局目录页，没有 session.models 可回读当前项；
-        // 用拾忆设置里的模型恢复勾选，返回再进入时仍保持选择。
-        if (sid == null && shiyi.settings.model.trim().isNotEmpty) {
-          _current = DshModelSelection(
-            provider: DshModelSync.providerId,
-            model: shiyi.settings.model.trim(),
-          );
-        }
+      final stored = await DshModelSync.listInjectedConfigs();
+      var configs = DshModelSync.configsForDisplay(
+        stored: stored,
+        settings: widget.shiyi?.settings,
+      );
+      if (configs.isEmpty) {
+        try {
+          final groups = widget.sessionId != null
+              ? (await _api.sessionModels(widget.sessionId!)).groups
+              : await _api.llmModels();
+          configs = [
+            for (final group in groups)
+              if (DshModelSync.isManagedProviderId(group.id))
+                DshInjectedConfig(
+                  id: group.id,
+                  name: group.name.trim().isEmpty
+                      ? DshModelSync.displayName
+                      : group.name.trim(),
+                  baseUrl: '',
+                  apiProtocol: 'openai',
+                  model: group.models.isEmpty ? '' : group.models.first.id,
+                  credentialEnv: DshModelSync.credentialEnvFor(group.id),
+                ),
+          ];
+        } catch (_) {}
       }
       if (!mounted) return;
       setState(() {
-        _groups = injected;
+        _configs = configs;
         _loading = false;
       });
     } catch (e) {
@@ -101,85 +77,28 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
     }
   }
 
-  Future<void> _select(DshModelInfo m) async {
-    final sid = widget.sessionId;
-    if (_selecting) return;
-    setState(() => _selecting = true);
-    try {
-      DshModelSelection sel;
-      if (sid != null) {
-        sel = await _api.selectModel(sid, m.providerId, m.id);
-      } else {
-        final shiyi = widget.shiyi;
-        if (shiyi == null) return;
-        final next = shiyi.settings.copyWith(model: m.id);
-        await shiyi.updateSettings(next);
-        await DshModelSync.injectNow(next);
-        sel = DshModelSelection(provider: m.providerId, model: m.id);
-      }
-      if (!mounted) return;
-      setState(() => _current = sel);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('已切换模型：${m.name}')));
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('切换失败：$e')));
-    } finally {
-      if (mounted) setState(() => _selecting = false);
-    }
-  }
-
-  Future<void> _delete(DshModelInfo model) async {
-    final shiyi = widget.shiyi;
-    if (shiyi == null || !_deletableModelIds.contains(model.id)) return;
-    if (model.id == shiyi.settings.model.trim() ||
-        model.id == shiyi.settings.visionModel.trim()) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('当前使用中的模型不能删除，请先切换模型')));
-      return;
-    }
-    final confirmed = await showIosFadeDialog<bool>(
+  Future<void> _delete(DshInjectedConfig config) async {
+    if (_deleting) return;
+    final confirmed = await showIosConfirmDialog(
       context: context,
-      builder: (ctx) => CupertinoAlertDialog(
-        title: const Text('删除模型'),
-        content: Text('从模型数据中删除「${model.name}」？'),
-        actions: [
-          CupertinoDialogAction(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          CupertinoDialogAction(
-            isDestructiveAction: true,
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
+      title: '删除配置？',
+      message: '从模型数据中删除「${config.name}」。会话选择不会再看到这份接口。',
+      confirmLabel: '删除',
+      isDestructiveAction: true,
     );
-    if (confirmed != true || !mounted) return;
+    if (!confirmed || !mounted) return;
+    setState(() => _deleting = true);
     try {
-      final removed = await DshModelSync.removeCachedModel(
-        shiyi.settings,
-        model.id,
-        api: _api,
-      );
+      await DshModelSync.removeInjectedConfig(config.id, api: _api);
       if (!mounted) return;
-      if (!removed) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('该模型由当前配置或兼容规则提供，不能删除')));
-        return;
-      }
       await _load();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('删除失败：$e')));
+    } finally {
+      if (mounted) setState(() => _deleting = false);
     }
   }
 
@@ -247,76 +166,46 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
         ),
       );
     }
-    if (_groups.isEmpty) {
-      return const Center(child: Text('暂无已注入模型，请先在设置中获取或填写模型'));
+    if (_configs.isEmpty) {
+      return const Center(child: Text('暂无已注入配置，请先在设置中保存并注入'));
     }
     return ListView(
       padding: const EdgeInsets.only(top: 4, bottom: 24),
       children: [
-        if (_current != null)
-          CupertinoListSection.insetGrouped(
-            margin: iosSectionMargin,
-            decoration: iosSectionDecoration(context),
-            children: [
+        CupertinoListSection.insetGrouped(
+          header: const Text('已注入 API 配置'),
+          margin: iosSectionMargin,
+          decoration: iosSectionDecoration(context),
+          children: [
+            for (final config in _configs)
               CupertinoListTile(
-                leading: const Icon(
-                  CupertinoIcons.sparkles,
-                  color: CupertinoColors.activeBlue,
+                key: ValueKey(config.id),
+                title: Text(
+                  config.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
-                title: const Text('当前模型'),
                 subtitle: Text(
-                  '${_current!.provider} / ${_current!.model}'
-                  '${_current!.reasoningEffort != null && _current!.reasoningEffort!.isNotEmpty ? ' · ${_current!.reasoningEffort}' : ''}',
+                  [
+                    if (config.baseUrl.isNotEmpty) config.baseUrl,
+                    if (config.model.isNotEmpty) config.model,
+                  ].join('\n'),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                trailing: CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(32, 32),
+                  onPressed: _deleting ? null : () => _delete(config),
+                  child: const Icon(
+                    CupertinoIcons.delete,
+                    size: 18,
+                    color: CupertinoColors.systemRed,
+                  ),
                 ),
               ),
-            ],
-          ),
-        for (final g in _groups)
-          CupertinoListSection.insetGrouped(
-            header: Text(g.name),
-            margin: iosSectionMargin,
-            decoration: iosSectionDecoration(context),
-            children: [
-              for (final m in g.models)
-                CupertinoListTile(
-                  key: ValueKey('${g.id}/${m.id}'),
-                  title: Text(
-                    m.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: m.contextWindow != null
-                      ? Text('上下文 ${(m.contextWindow! / 1000).round()}k')
-                      : null,
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (_current != null &&
-                          _current!.provider == m.providerId &&
-                          _current!.model == m.id)
-                        const Icon(
-                          CupertinoIcons.checkmark_circle_fill,
-                          color: CupertinoColors.activeBlue,
-                        ),
-                      if (_deletableModelIds.contains(m.id)) ...[
-                        const SizedBox(width: 8),
-                        CupertinoButton(
-                          padding: EdgeInsets.zero,
-                          minimumSize: const Size(32, 32),
-                          onPressed: _selecting ? null : () => _delete(m),
-                          child: const Icon(
-                            CupertinoIcons.delete,
-                            size: 18,
-                            color: CupertinoColors.systemRed,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                  onTap: _selecting ? null : () => _select(m),
-                ),
-            ],
-          ),
+          ],
+        ),
       ],
     );
   }
