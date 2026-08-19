@@ -2267,6 +2267,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
       setState(() {
         _working = true;
         _workError = null;
+        _showInstallOutput = true;
       });
       try {
         latest = await _dsh.checkLatestVersion();
@@ -2275,6 +2276,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
         setState(() {
           _working = false;
           _workError = '$e';
+          _showInstallOutput = true;
         });
         return;
       }
@@ -2293,6 +2295,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     setState(() {
       _working = true;
       _workError = null;
+      _showInstallOutput = true;
     });
     try {
       await _dsh.installOrUpdate(latest, isUpdate: isUpdate);
@@ -2301,6 +2304,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
         _localVersion = latest;
         _working = false;
       });
+      if (_engine != 'dsh') _select('dsh');
       unawaited(_refreshFullRuntimeStatus());
       unawaited(_refreshStatus());
     } catch (e) {
@@ -2308,6 +2312,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
       setState(() {
         _working = false;
         _workError = '$e';
+        _showInstallOutput = true;
       });
     }
   }
@@ -2662,7 +2667,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
               subtitle: Text(
                 installed
                     ? '卸载 npm 全局包，保留 .dsh 数据'
-                    : '从 npm 拉取安装 @deepseek-ai/dsh',
+                    : '从 npm 拉取安装，首次含 Node.js 与编译工具链，可能要几分钟',
               ),
               onTap: busy
                   ? null
