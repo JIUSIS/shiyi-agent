@@ -137,13 +137,17 @@ bool _isTableRow(String line) {
   final t = line.trim();
   if (t.isEmpty || !t.contains('|')) return false;
   if (t.startsWith('#') || t.startsWith('```')) return false;
-  final cells = t.replaceAll(RegExp(r'^\|'), '').replaceAll(RegExp(r'\|$'), '').split('|');
+  final cells = t
+      .replaceAll(RegExp(r'^\|'), '')
+      .replaceAll(RegExp(r'\|$'), '')
+      .split('|');
   return cells.length >= 2;
 }
 
 bool _isTableBlock(String b) {
-  final first =
-      b.split('\n').firstWhere((l) => l.trim().isNotEmpty, orElse: () => '');
+  final first = b
+      .split('\n')
+      .firstWhere((l) => l.trim().isNotEmpty, orElse: () => '');
   return first.isNotEmpty && _isTableRow(first);
 }
 
@@ -210,8 +214,8 @@ class AdaptiveMarkdownText extends StatelessWidget {
   /// 超过该字符数时启用懒加载渲染。
   final int lazyThreshold;
 
-  /// 流式中：固定使用 Column 渲染，不跨阈值切换渲染树
-  /// （边增长边切换子树会中途重排跳动）；停止后按长度决定懒加载。
+  /// 流式中：只画纯文本，不拆 Markdown，避免每个 token 重建卡顿。
+  /// 结束后再按长度决定完整渲染或懒加载。
   final bool isStreaming;
 
   const AdaptiveMarkdownText(
@@ -224,7 +228,10 @@ class AdaptiveMarkdownText extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!isStreaming && data.length > lazyThreshold) {
+    if (isStreaming) {
+      return Text(data, style: style);
+    }
+    if (data.length > lazyThreshold) {
       final blocks = splitMarkdownBlocks(data);
       return ConstrainedBox(
         constraints: const BoxConstraints(maxHeight: 400),
@@ -273,7 +280,8 @@ class MarkdownInlineText extends StatelessWidget {
 List<InlineSpan> _renderInline(String text, TextStyle base, Color accent) {
   final spans = <InlineSpan>[];
   final regex = RegExp(
-      r'(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\[[^\]]+\]\([^)\s]+\)|\*[^*]+\*|_[^_]+_)');
+    r'(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\[[^\]]+\]\([^)\s]+\)|\*[^*]+\*|_[^_]+_)',
+  );
   var pos = 0;
   for (final m in regex.allMatches(text)) {
     if (m.start > pos) {
@@ -281,44 +289,56 @@ List<InlineSpan> _renderInline(String text, TextStyle base, Color accent) {
     }
     final group = m.group(0)!;
     if (group.startsWith('`')) {
-      spans.add(TextSpan(
-        text: group.substring(1, group.length - 1),
-        style: base.copyWith(
-          fontFamily: 'monospace',
-          fontSize: (base.fontSize ?? 14) - 1.5,
-          color: accent,
-          backgroundColor: accent.withValues(alpha: .08),
+      spans.add(
+        TextSpan(
+          text: group.substring(1, group.length - 1),
+          style: base.copyWith(
+            fontFamily: 'monospace',
+            fontSize: (base.fontSize ?? 14) - 1.5,
+            color: accent,
+            backgroundColor: accent.withValues(alpha: .08),
+          ),
         ),
-      ));
+      );
     } else if (group.startsWith('**') || group.startsWith('__')) {
-      spans.add(TextSpan(
+      spans.add(
+        TextSpan(
           text: group.substring(2, group.length - 2),
-          style: base.copyWith(fontWeight: FontWeight.bold)));
+          style: base.copyWith(fontWeight: FontWeight.bold),
+        ),
+      );
     } else if (group.startsWith('~~')) {
-      spans.add(TextSpan(
+      spans.add(
+        TextSpan(
           text: group.substring(2, group.length - 2),
-          style: base.copyWith(decoration: TextDecoration.lineThrough)));
+          style: base.copyWith(decoration: TextDecoration.lineThrough),
+        ),
+      );
     } else if (group.startsWith('[')) {
       final m2 = RegExp(r'^\[([^\]]+)\]\(([^)\s]+)\)$').firstMatch(group);
       if (m2 != null) {
         final url = m2.group(2)!;
-        spans.add(TextSpan(
-          text: m2.group(1),
-          style: base.copyWith(
-            color: accent,
-            decoration: TextDecoration.underline,
-            decorationColor: accent,
+        spans.add(
+          TextSpan(
+            text: m2.group(1),
+            style: base.copyWith(
+              color: accent,
+              decoration: TextDecoration.underline,
+              decorationColor: accent,
+            ),
+            recognizer: TapGestureRecognizer()..onTap = () => _openUrl(url),
           ),
-          recognizer: TapGestureRecognizer()
-            ..onTap = () => _openUrl(url),
-        ));
+        );
       } else {
         spans.add(TextSpan(text: group, style: base));
       }
     } else if (group.startsWith('*') || group.startsWith('_')) {
-      spans.add(TextSpan(
+      spans.add(
+        TextSpan(
           text: group.substring(1, group.length - 1),
-          style: base.copyWith(fontStyle: FontStyle.italic)));
+          style: base.copyWith(fontStyle: FontStyle.italic),
+        ),
+      );
     } else {
       spans.add(TextSpan(text: group, style: base));
     }
@@ -347,7 +367,11 @@ class _TableBlock extends StatelessWidget {
   final String block;
   final TextStyle base;
   final Color accent;
-  const _TableBlock({required this.block, required this.base, required this.accent});
+  const _TableBlock({
+    required this.block,
+    required this.base,
+    required this.accent,
+  });
 
   List<List<String>> _parseRows() {
     final rows = <List<String>>[];
@@ -407,8 +431,9 @@ class _TableBlock extends StatelessWidget {
   }
 
   Widget _tableRow(List<String> cells, {required bool isHeader}) {
-    final cellStyle =
-        isHeader ? base.copyWith(fontWeight: FontWeight.bold) : base;
+    final cellStyle = isHeader
+        ? base.copyWith(fontWeight: FontWeight.bold)
+        : base;
     return Container(
       color: isHeader ? accent.withValues(alpha: .08) : null,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -421,7 +446,8 @@ class _TableBlock extends StatelessWidget {
                 padding: EdgeInsets.only(right: i == cells.length - 1 ? 0 : 8),
                 child: Text.rich(
                   TextSpan(
-                      children: _renderInline(cells[i], cellStyle, accent)),
+                    children: _renderInline(cells[i], cellStyle, accent),
+                  ),
                   style: cellStyle,
                 ),
               ),
@@ -437,7 +463,11 @@ class _QuoteBlock extends StatelessWidget {
   final String block;
   final TextStyle base;
   final Color accent;
-  const _QuoteBlock({required this.block, required this.base, required this.accent});
+  const _QuoteBlock({
+    required this.block,
+    required this.base,
+    required this.accent,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -505,22 +535,45 @@ class _CodeBlock extends StatelessWidget {
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .5),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: theme.colorScheme.primary.withValues(alpha: .25)),
+        border: Border.all(
+          color: theme.colorScheme.primary.withValues(alpha: .25),
+        ),
       ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Text(lang,
-              style: TextStyle(fontSize: 11, letterSpacing: 1, color: theme.colorScheme.primary)),
-          const Spacer(),
-          GestureDetector(
-            onTap: () => Clipboard.setData(ClipboardData(text: code)),
-            child: Icon(Icons.copy_rounded, size: 15, color: theme.colorScheme.primary),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                lang,
+                style: TextStyle(
+                  fontSize: 11,
+                  letterSpacing: 1,
+                  color: theme.colorScheme.primary,
+                ),
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: () => Clipboard.setData(ClipboardData(text: code)),
+                child: Icon(
+                  Icons.copy_rounded,
+                  size: 15,
+                  color: theme.colorScheme.primary,
+                ),
+              ),
+            ],
           ),
-        ]),
-        const SizedBox(height: 6),
-        Text(code,
-            style: TextStyle(fontFamily: 'monospace', fontSize: base.fontSize, height: 1.4)),
-      ]),
+          const SizedBox(height: 6),
+          Text(
+            code,
+            style: TextStyle(
+              fontFamily: 'monospace',
+              fontSize: base.fontSize,
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -529,24 +582,29 @@ class _ListBlock extends StatelessWidget {
   final String block;
   final TextStyle base;
   final Color accent;
-  const _ListBlock({required this.block, required this.base, required this.accent});
+  const _ListBlock({
+    required this.block,
+    required this.base,
+    required this.accent,
+  });
 
   @override
   Widget build(BuildContext context) {
     final children = <Widget>[];
     for (final line in block.split('\n')) {
-      final m =
-          RegExp(r'^(\s*)([-*•]|\d+[.)、\.])\s+(.*)$').firstMatch(line);
+      final m = RegExp(r'^(\s*)([-*•]|\d+[.)、\.])\s+(.*)$').firstMatch(line);
       if (m == null) {
         // 混合块中非列表行不能丢，按普通段落保留，避免内容缺失
         if (line.trim().isNotEmpty) {
-          children.add(Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: Text.rich(
-              TextSpan(children: _renderInline(line.trim(), base, accent)),
-              style: base,
+          children.add(
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Text.rich(
+                TextSpan(children: _renderInline(line.trim(), base, accent)),
+                style: base,
+              ),
             ),
-          ));
+          );
         }
         continue;
       }
@@ -558,49 +616,68 @@ class _ListBlock extends StatelessWidget {
       final taskM = RegExp(r'^\[([ xX])\]\s+(.*)$').firstMatch(content);
       if (taskM != null && !isNumbered) {
         final checked = taskM.group(1)!.toLowerCase() == 'x';
-        children.add(Padding(
-          padding: const EdgeInsets.symmetric(vertical: 1),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            SizedBox(width: indentPx),
-            Icon(
-              checked
-                  ? Icons.check_box_rounded
-                  : Icons.check_box_outline_blank_rounded,
-              size: 19,
-              color: checked ? accent : Colors.grey.shade500,
+        children.add(
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 1),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(width: indentPx),
+                Icon(
+                  checked
+                      ? Icons.check_box_rounded
+                      : Icons.check_box_outline_blank_rounded,
+                  size: 19,
+                  color: checked ? accent : Colors.grey.shade500,
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text.rich(
+                    TextSpan(
+                      children: _renderInline(taskM.group(2)!, base, accent),
+                    ),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text.rich(
-                TextSpan(
-                    children: _renderInline(taskM.group(2)!, base, accent)),
-              ),
-            ),
-          ]),
-        ));
+          ),
+        );
         continue;
       }
       final bullet = isNumbered
           ? '${prefix.replaceAll(RegExp(r'[.)、。）]'), '')}.'
           : prefix;
-      children.add(Padding(
-        padding: const EdgeInsets.symmetric(vertical: 1),
-        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          SizedBox(width: indentPx),
-          SizedBox(
-            width: 22,
-            child: Text(bullet,
-                style: base.copyWith(color: accent, fontWeight: FontWeight.bold)),
+      children.add(
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 1),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(width: indentPx),
+              SizedBox(
+                width: 22,
+                child: Text(
+                  bullet,
+                  style: base.copyWith(
+                    color: accent,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Text.rich(
+                  TextSpan(children: _renderInline(content, base, accent)),
+                ),
+              ),
+            ],
           ),
-          Expanded(
-            child: Text.rich(
-              TextSpan(children: _renderInline(content, base, accent)),
-            ),
-          ),
-        ]),
-      ));
+        ),
+      );
     }
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: children);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    );
   }
 }
 
@@ -608,7 +685,11 @@ class _Heading extends StatelessWidget {
   final String text;
   final TextStyle base;
   final Color accent;
-  const _Heading({required this.text, required this.base, required this.accent});
+  const _Heading({
+    required this.text,
+    required this.base,
+    required this.accent,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -618,22 +699,30 @@ class _Heading extends StatelessWidget {
     final size = level == 1 ? 20.0 : (level == 2 ? 17.0 : 15.0);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(children: [
-        Container(
+      child: Row(
+        children: [
+          Container(
             width: 3,
             height: size * 1.2,
             margin: const EdgeInsets.only(right: 8),
-            decoration:
-                BoxDecoration(color: accent, borderRadius: BorderRadius.circular(2))),
-        Expanded(
-          child: Text.rich(
-            TextSpan(
-              children: _renderInline(
-                  content, base.copyWith(fontSize: size, fontWeight: FontWeight.bold), accent),
+            decoration: BoxDecoration(
+              color: accent,
+              borderRadius: BorderRadius.circular(2),
             ),
           ),
-        ),
-      ]),
+          Expanded(
+            child: Text.rich(
+              TextSpan(
+                children: _renderInline(
+                  content,
+                  base.copyWith(fontSize: size, fontWeight: FontWeight.bold),
+                  accent,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

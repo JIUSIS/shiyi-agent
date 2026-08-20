@@ -377,10 +377,6 @@ void main() {
     expect(find.text('思考中'), findsOneWidget);
     expect(find.text('思考过程'), findsNothing);
     expect(find.textContaining('已经输出一部分正文'), findsOneWidget);
-    expect(
-      find.byKey(const ValueKey('streamingRevealMarkdown')),
-      findsOneWidget,
-    );
     expect(find.byKey(const ValueKey('streamingCaret')), findsNothing);
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.text('思考中'), findsOneWidget);
@@ -423,10 +419,6 @@ void main() {
 
     await pumpLive('已经输出一部分正文', streaming: false);
     expect(find.textContaining('已经输出一部分正文'), findsOneWidget);
-    expect(
-      find.byKey(const ValueKey('streamingRevealMarkdown')),
-      findsOneWidget,
-    );
     expect(tester.takeException(), isNull);
   });
 

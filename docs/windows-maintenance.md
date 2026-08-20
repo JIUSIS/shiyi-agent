@@ -120,7 +120,7 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 ## 5. 维护铁律（改代码前必读）
 
 1. **平台隔离**：任何平台差异一律 `Platform.isWindows` 分支，禁止影响 Android 路径。
-2. **全量测试守护**：`flutter test` 当前 266 用例全绿才可交付；快照测试
+2. **全量测试守护**：`flutter test` 必须全绿才可交付；快照测试
    （tools.json / system-prompt-*.txt）已平台无关化（normalize 删除平台段落/打码），
    改动工具描述、人设、注入段落后跑测试会触发 diff，属预期变更时用
    `--dart-define=GENERATE_SNAPSHOTS=true` 重建快照。
@@ -164,7 +164,7 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 
 ```powershell
 flutter analyze                      # 必须 0 issues
-flutter test                         # 必须全绿（266 用例）
+flutter test                         # 必须全绿
 flutter build windows --release      # 必须成功
 ```
 
@@ -333,3 +333,10 @@ DS Harness 引擎验证点（#114，两端共享）：
   始终保持 `streamText` / `streamReasoning` 分离。新增 6 个流式 reasoning 回归用例。
   共享验证：`flutter analyze` 0 issues；`flutter test` 414 项全绿；`flutter build apk --debug`
   成功；真机 `9LKZL7TGZTJFZ575` 使用 `adb install -r` 覆盖安装 Success，未卸载、未清数据。
+
+- **2026-08-20**（共享 `lib/` 改动；Windows 无新增平台分支；详见 `docs/fix-log.md` 会话页与 DSH 同步条目）：
+  拾忆与 DSH 会话页统一为悬空液态玻璃输入区、消息入场动画、流式跟随；输入区增加思考开关、思考强度与手动压缩。
+  DSH 多配置注入、安装进度按真实步骤推进、安装完成后自动切到 DSH 引擎。启动 DSH 期间发送消息或切换模型
+  不再损坏 `settings.yaml`：文件同步改为进程内串行队列 + 原子 rename；已损坏 YAML 启动时备份为
+  `settings.yaml.corrupt` 后重建。Windows 继续复用同一套 `DshModelSync`，无平台分支。
+  共享验证：`flutter analyze` 0 issues；`flutter test test/dsh_model_sync_test.dart` 42 项全绿。

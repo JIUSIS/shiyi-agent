@@ -51,7 +51,7 @@ const _features = <(IconData, Color, String, String)>[
     CupertinoIcons.chat_bubble_2_fill,
     _iosGreen,
     '多轮对话与会话管理',
-    '独立会话、流式输出、思考过程与消息入场动画',
+    '独立会话、流式输出、思考过程、悬空输入区与消息入场动画',
   ),
   (
     CupertinoIcons.person_2_fill,
@@ -99,7 +99,7 @@ const _features = <(IconData, Color, String, String)>[
     CupertinoIcons.square_on_square,
     _iosTeal,
     '上下文压缩',
-    '大上下文自动压缩、手动压缩与裁剪保护',
+    '大上下文自动压缩、手动压缩、思考开关与强度可按会话调节',
   ),
   (
     CupertinoIcons.speedometer,

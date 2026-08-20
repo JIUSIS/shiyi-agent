@@ -407,11 +407,10 @@ class _MessageBubbleState extends State<MessageBubble> {
       height: 1.45,
       color: dark ? const Color(0xFFF2F2F7) : const Color(0xFF1C1C1E),
     );
-    return _StreamingRevealMarkdown(
-      key: const ValueKey('streamingRevealMarkdown'),
-      content: content,
+    return AdaptiveMarkdownText(
+      content,
+      isStreaming: isStreaming,
       style: textStyle,
-      streaming: isStreaming,
     );
   }
 
@@ -1156,7 +1155,6 @@ class _BubbleEnterState extends State<_BubbleEnter>
   late final AnimationController _controller;
   late final Animation<double> _fade;
   late final Animation<double> _scale;
-  late final Animation<Offset> _slide;
   late final Animation<double> _stretch;
 
   @override
@@ -1165,10 +1163,6 @@ class _BubbleEnterState extends State<_BubbleEnter>
     _controller = AnimationController(
       vsync: this,
       duration: Duration(milliseconds: widget.isUser ? 560 : 640),
-    );
-    final curve = CurvedAnimation(
-      parent: _controller,
-      curve: Curves.easeOutCubic,
     );
     _fade = Tween<double>(begin: widget.isUser ? .55 : .35, end: 1).animate(
       CurvedAnimation(
@@ -1184,7 +1178,6 @@ class _BubbleEnterState extends State<_BubbleEnter>
             : const Interval(0, .78, curve: Curves.easeOutBack),
       ),
     );
-    _slide = Tween<Offset>(begin: Offset.zero, end: Offset.zero).animate(curve);
     _stretch = Tween<double>(begin: widget.isUser ? 1.38 : 1.32, end: 1)
         .animate(
           CurvedAnimation(
@@ -1228,186 +1221,6 @@ class _BubbleEnterState extends State<_BubbleEnter>
         },
         child: widget.child,
       ),
-    );
-  }
-}
-
-/// 流式正文：旧字稳住，只让新增后缀从左到右淡入。
-/// 始终同一套 Markdown 树，结束后不换组件。
-class _StreamingRevealMarkdown extends StatefulWidget {
-  final String content;
-  final TextStyle style;
-  final bool streaming;
-
-  const _StreamingRevealMarkdown({
-    super.key,
-    required this.content,
-    required this.style,
-    required this.streaming,
-  });
-
-  @override
-  State<_StreamingRevealMarkdown> createState() =>
-      _StreamingRevealMarkdownState();
-}
-
-class _StreamingRevealMarkdownState extends State<_StreamingRevealMarkdown>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _reveal;
-  late final Animation<double> _progress;
-  int _stableLen = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    _reveal = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 720),
-    );
-    _progress = CurvedAnimation(parent: _reveal, curve: Curves.easeOutCubic);
-    _stableLen = widget.content.length;
-    _reveal.value = 1;
-  }
-
-  @override
-  void didUpdateWidget(covariant _StreamingRevealMarkdown oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.content == oldWidget.content) {
-      if (!widget.streaming) _reveal.value = 1;
-      return;
-    }
-    if (widget.content.startsWith(oldWidget.content) &&
-        widget.content.length > oldWidget.content.length) {
-      if (_reveal.isAnimating) {
-        _stableLen = oldWidget.content.length < _stableLen
-            ? oldWidget.content.length
-            : _stableLen;
-      } else {
-        _stableLen = oldWidget.content.length;
-      }
-      if (widget.streaming) {
-        _reveal.forward(from: 0);
-      } else {
-        _stableLen = widget.content.length;
-        _reveal.value = 1;
-      }
-      return;
-    }
-    if (oldWidget.content.startsWith(widget.content)) {
-      _stableLen = widget.content.length;
-      _reveal.value = 1;
-      return;
-    }
-    _stableLen = 0;
-    if (widget.streaming) {
-      _reveal.forward(from: 0);
-    } else {
-      _stableLen = widget.content.length;
-      _reveal.value = 1;
-    }
-  }
-
-  @override
-  void dispose() {
-    _reveal.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (widget.content.isEmpty) return const SizedBox.shrink();
-    final prefix = widget.content.substring(
-      0,
-      _stableLen.clamp(0, widget.content.length),
-    );
-    final incoming = widget.content.substring(prefix.length);
-    if (!widget.streaming || incoming.isEmpty) {
-      return AdaptiveMarkdownText(
-        widget.content,
-        isStreaming: true,
-        style: widget.style,
-      );
-    }
-    return AnimatedBuilder(
-      animation: _progress,
-      builder: (context, _) {
-        return _StreamingFollowBody(
-          prefix: prefix,
-          incoming: incoming,
-          progress: _progress.value,
-          style: widget.style,
-        );
-      },
-    );
-  }
-}
-
-class _StreamingFollowBody extends StatelessWidget {
-  final String prefix;
-  final String incoming;
-  final double progress;
-  final TextStyle style;
-
-  const _StreamingFollowBody({
-    required this.prefix,
-    required this.incoming,
-    required this.progress,
-    required this.style,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final full = prefix + incoming;
-    final blocks = splitMarkdownBlocks(full);
-    if (blocks.isEmpty) {
-      return AdaptiveMarkdownText(full, isStreaming: true, style: style);
-    }
-    var consumed = 0;
-    final children = <Widget>[];
-    for (var i = 0; i < blocks.length; i++) {
-      final block = blocks[i];
-      final start = consumed;
-      final end = start + block.length;
-      consumed = end;
-      final isLast = i == blocks.length - 1;
-      if (end <= prefix.length) {
-        children.add(MarkdownBlock(block, style: style));
-        continue;
-      }
-      if (!isLast || isAtomicMarkdownBlock(block)) {
-        children.add(
-          Opacity(
-            opacity: .35 + .65 * progress,
-            child: MarkdownBlock(block, style: style),
-          ),
-        );
-        continue;
-      }
-      final localStable = (prefix.length - start).clamp(0, block.length);
-      final stablePart = block.substring(0, localStable);
-      final fadePart = block.substring(localStable);
-      final color = style.color ?? DefaultTextStyle.of(context).style.color;
-      children.add(
-        Text.rich(
-          TextSpan(
-            style: style,
-            children: [
-              if (stablePart.isNotEmpty) TextSpan(text: stablePart),
-              if (fadePart.isNotEmpty)
-                TextSpan(
-                  text: fadePart,
-                  style: style.copyWith(
-                    color: color?.withValues(alpha: .28 + .72 * progress),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      );
-    }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: children,
     );
   }
 }

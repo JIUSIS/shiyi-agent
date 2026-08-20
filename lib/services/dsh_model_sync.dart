@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:yaml/yaml.dart';
 
 import '../core/models.dart';
 import 'dsh_api.dart';
@@ -69,6 +70,44 @@ class DshModelSync {
   static const legacySearchNs = 'web-search-deepseek';
   static const _defaultModelPatchStart = '# ShiYi agent default model: begin';
   static const _defaultModelPatchEnd = '# ShiYi agent default model: end';
+
+  // All read/modify/write operations on DSH files share this queue.  Settings
+  // changes can originate from several unawaited UI callbacks while DSH is
+  // starting, so a per-call lock would still allow stale snapshots to race.
+  static Future<void> _fileSyncTail = Future<void>.value();
+
+  static Future<T> _withFileSyncLock<T>(Future<T> Function() action) {
+    final result = _fileSyncTail.then<T>((_) => action());
+    _fileSyncTail = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  @visibleForTesting
+  static Future<void> waitForFileSyncs() => _fileSyncTail;
+
+  static Future<void> _writeAtomically(File target, String contents) async {
+    final tmp = File('${target.path}.tmp');
+    await tmp.writeAsString(contents, flush: true);
+    // Do not delete the target first: rename keeps either the old complete
+    // document or the new complete document visible to the DSH parser.
+    await tmp.rename(target.path);
+  }
+
+  /// A previous interrupted synchronization may have left an invalid document
+  /// behind.  Do not feed that snapshot back through the line-based upserter:
+  /// preserve it for diagnosis and rebuild a clean managed settings document.
+  static bool _isValidYaml(String text) {
+    if (text.trim().isEmpty) return true;
+    try {
+      loadYaml(text);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// 拾忆协议 -> DSH 手写路由协议。
   static String dshApiFor(String protocol) =>
@@ -305,15 +344,15 @@ class DshModelSync {
     return (id: fallback.id, name: fallback.name, env: fallback.credentialEnv);
   }
 
-  /// llm-pi-ai 模型条目。`input` 声明模型能力（缺省只有 text，
-  /// read_image 工具会因「未声明 image input」报错）；拾忆开启视觉时
-  /// 主模型声明 [text, image]，视觉模型若不同则单独加入列表。
-  static Map<String, dynamic> _modelEntry(String id, bool vision) {
+  /// llm-pi-ai 模型条目。`input` 声明模型能力。注入拾忆 provider 时统一声明
+  /// `[text, image]`，这样 DSH 的 `read_image` 工具不会因 provider 条目缺少
+  /// image 能力而在调用前被拒绝；是否配置独立视觉模型仍由视觉设置控制。
+  static Map<String, dynamic> _modelEntry(String id) {
     final reasoningEfforts = reasoningEffortsForModel(id);
     return {
       'id': id,
       'name': id,
-      'input': vision ? ['text', 'image'] : ['text'],
+      'input': ['text', 'image'],
       ...?(reasoningEfforts == null
           ? null
           : {'reasoningEfforts': reasoningEfforts}),
@@ -331,11 +370,9 @@ class DshModelSync {
     final primary = s.model.trim();
     final vision = s.visionModel.trim();
     final seen = <String>{primary};
-    final models = <Map<String, dynamic>>[
-      _modelEntry(primary, s.visionEnabled),
-    ];
+    final models = <Map<String, dynamic>>[_modelEntry(primary)];
     if (s.visionEnabled && vision.isNotEmpty && seen.add(vision)) {
-      models.add(_modelEntry(vision, true));
+      models.add(_modelEntry(vision));
     }
     final aliases = _normalizedResponseModels([
       ..._compatibilityResponseModels(primary),
@@ -343,7 +380,7 @@ class DshModelSync {
       ...catalogModels,
     ]).toList()..sort();
     for (final alias in aliases) {
-      if (seen.add(alias)) models.add(_modelEntry(alias, s.visionEnabled));
+      if (seen.add(alias)) models.add(_modelEntry(alias));
     }
     final reasoning = defaultReasoningEffort(primary);
     final id = (provider ?? providerId).trim();
@@ -580,26 +617,28 @@ class DshModelSync {
       }
     }
     try {
-      final home = await (homeDir ?? DshService.instance.homeDir)();
-      await Directory(home).create(recursive: true);
-      final file = File('$home/settings.yaml');
-      if (await file.exists()) {
-        final yaml = removeProviderYaml(await file.readAsString(), id);
-        await file.writeAsString(yaml);
-      }
-      if (removed != null &&
-          removed.credentialEnv != credentialEnv &&
-          removed.credentialEnv != searchCredentialEnv) {
-        final cred = File('$home/.credentials.yaml');
-        if (await cred.exists()) {
-          final text = upsertCredentialsYaml(
-            await cred.readAsString(),
-            removed.credentialEnv,
-            '',
-          );
-          await cred.writeAsString(text);
+      await _withFileSyncLock<void>(() async {
+        final home = await (homeDir ?? DshService.instance.homeDir)();
+        await Directory(home).create(recursive: true);
+        final file = File('$home/settings.yaml');
+        if (await file.exists()) {
+          final yaml = removeProviderYaml(await file.readAsString(), id);
+          await _writeAtomically(file, yaml);
         }
-      }
+        if (removed != null &&
+            removed.credentialEnv != credentialEnv &&
+            removed.credentialEnv != searchCredentialEnv) {
+          final cred = File('$home/.credentials.yaml');
+          if (await cred.exists()) {
+            final text = upsertCredentialsYaml(
+              await cred.readAsString(),
+              removed.credentialEnv,
+              '',
+            );
+            await _writeAtomically(cred, text);
+          }
+        }
+      });
     } catch (e) {
       debugPrint('DshModelSync remove files failed: $e');
     }
@@ -666,6 +705,10 @@ class DshModelSync {
       before.apiKey != after.apiKey ||
       before.model != after.model ||
       before.apiProtocol != after.apiProtocol ||
+      before.visionEnabled != after.visionEnabled ||
+      before.visionBaseUrl != after.visionBaseUrl ||
+      before.visionApiKey != after.visionApiKey ||
+      before.visionModel != after.visionModel ||
       before.dshSearchProvider != after.dshSearchProvider ||
       before.dshSearchKey != after.dshSearchKey;
 
@@ -839,43 +882,59 @@ class DshModelSync {
     String home, {
     String? name,
   }) async {
-    await Directory(home).create(recursive: true);
-    final file = File('$home/settings.yaml');
-    var yaml = await file.exists() ? await file.readAsString() : '';
-    final target = await _targetProvider(s, name: name);
-    if (canWriteProvider(s)) {
-      final responseModels = await responseModelsFor(s);
-      final catalogModels = await cachedModelCatalogFor(s);
-      yaml = upsertSettingsYaml(
-        yaml,
-        baseUrl: s.baseUrl,
-        model: s.model,
-        apiProtocol: s.apiProtocol,
-        visionEnabled: s.visionEnabled,
-        visionModel: s.visionModel,
-        responseModels: [...responseModels, ...catalogModels],
-        provider: target.id,
-        name: target.name,
+    await _withFileSyncLock<void>(() async {
+      await Directory(home).create(recursive: true);
+      final file = File('$home/settings.yaml');
+      var yaml = await file.exists() ? await file.readAsString() : '';
+      if (!_isValidYaml(yaml)) {
+        // Keep the bad snapshot outside the file DSH parses so a user can
+        // diagnose the original corruption, then rebuild from a clean root.
+        await File('${file.path}.corrupt').writeAsString(yaml, flush: true);
+        yaml = '';
+      }
+      final target = await _targetProvider(s, name: name);
+      if (canWriteProvider(s)) {
+        final responseModels = await responseModelsFor(s);
+        final catalogModels = await cachedModelCatalogFor(s);
+        yaml = upsertSettingsYaml(
+          yaml,
+          baseUrl: s.baseUrl,
+          model: s.model,
+          apiProtocol: s.apiProtocol,
+          visionEnabled: s.visionEnabled,
+          visionModel: s.visionModel,
+          responseModels: [...responseModels, ...catalogModels],
+          provider: target.id,
+          name: target.name,
+          apiKeyEnv: target.env,
+        );
+        yaml = upsertDefaultModelYaml(yaml, s.model, provider: target.id);
+      }
+      yaml = removeLegacySearchSections(yaml);
+      await _writeAtomically(file, yaml);
+      await writeSearchConfig(home, s);
+      await _writeCredentialsFile(
+        home,
+        s.apiKey.trim(),
+        searchKey: effectiveSearchKey(s),
         apiKeyEnv: target.env,
       );
-      yaml = upsertDefaultModelYaml(yaml, s.model, provider: target.id);
-    }
-    yaml = removeLegacySearchSections(yaml);
-    await file.writeAsString(yaml);
-    await writeSearchConfig(home, s);
-    await writeCredentialsFile(
-      home,
-      s.apiKey.trim(),
-      searchKey: effectiveSearchKey(s),
-      apiKeyEnv: target.env,
-    );
-    await syncAgentDefaultModelPatch(home, s, provider: target.id);
+      await _syncAgentDefaultModelPatch(home, s, provider: target.id);
+    });
   }
 
   /// 写入 Cordis 组合层默认模型，spawn/fork 子代理会读取这里而不是
   /// settings.yaml 的网页 Agent 默认配置。该受管区块不改动用户其他补丁。
   @visibleForTesting
   static Future<void> syncAgentDefaultModelPatch(
+    String home,
+    AppSettings s, {
+    String? provider,
+  }) => _withFileSyncLock(
+    () => _syncAgentDefaultModelPatch(home, s, provider: provider),
+  );
+
+  static Future<void> _syncAgentDefaultModelPatch(
     String home,
     AppSettings s, {
     String? provider,
@@ -944,19 +1003,33 @@ class DshModelSync {
 
   @visibleForTesting
   static Future<void> cleanupLegacySearchSettingsFile(String home) async {
-    final target = File('$home/settings.yaml');
-    if (!await target.exists()) return;
-    final existing = await target.readAsString();
-    final next = removeLegacySearchSections(existing);
-    if (next == existing) return;
-    final tmp = File('$home/settings.yaml.tmp');
-    await tmp.writeAsString(next);
-    await tmp.rename(target.path);
+    await _withFileSyncLock<void>(() async {
+      final target = File('$home/settings.yaml');
+      if (!await target.exists()) return;
+      final existing = await target.readAsString();
+      final next = removeLegacySearchSections(existing);
+      if (next == existing) return;
+      await _writeAtomically(target, next);
+    });
   }
 
   /// DSH 只认 owner-only（0600）的 `.credentials.yaml`，group/other 可读会拒读。
   @visibleForTesting
   static Future<void> writeCredentialsFile(
+    String home,
+    String key, {
+    String searchKey = '',
+    String apiKeyEnv = credentialEnv,
+  }) => _withFileSyncLock(
+    () => _writeCredentialsFile(
+      home,
+      key,
+      searchKey: searchKey,
+      apiKeyEnv: apiKeyEnv,
+    ),
+  );
+
+  static Future<void> _writeCredentialsFile(
     String home,
     String key, {
     String searchKey = '',
@@ -1045,7 +1118,7 @@ class DshModelSync {
       '${child}models:',
       '$item- id: ${yamlScalar(model)}',
       '$item  name: ${yamlScalar(model)}',
-      '$item  input: ${visionEnabled ? '[text, image]' : '[text]'}',
+      '$item  input: [text, image]',
     ]);
     if (mainReasoningEfforts != null) {
       lines.addAll(_renderReasoningEfforts(item));
@@ -1072,7 +1145,7 @@ class DshModelSync {
       lines.addAll([
         '$item- id: ${yamlScalar(alias)}',
         '$item  name: ${yamlScalar(alias)}',
-        '$item  input: ${visionEnabled ? '[text, image]' : '[text]'}',
+        '$item  input: [text, image]',
       ]);
       if (reasoningEffortsForModel(alias) != null) {
         lines.addAll(_renderReasoningEfforts(item));

@@ -292,7 +292,7 @@ void main() {
       ),
     );
 
-    expect(find.text('DeepSeek'), findsOneWidget);
+    expect(find.text('deepseek-chat'), findsOneWidget);
     final trigger = tester.getRect(find.byTooltip('选择模型'));
     await tester.tap(find.byTooltip('选择模型'));
     await tester.pumpAndSettle();

@@ -15,7 +15,7 @@
   - 注意：因此**构建 debug 同样需要 `KEYSTORE_PASSWORD`**（`android/local.properties` 或环境变量），缺密码时 debug 构建直接报错。
 
 ## 真机环境
-- 常用测试设备：`2509FPN0BC`（Android 16 / API 36）
+- 常用测试设备：`9LKZL7TGZTJFZ575`（近期覆盖安装验证）、`2509FPN0BC`（Android 16 / API 36）
 - 应用包名：`com.shiyi.agent`（由 `com.hermes.hermes_agent_app` 改名而来）
 
 ## Android 内嵌终端（Alpine，2026-08-15 起）
@@ -54,7 +54,7 @@
   手机端部署/排错见本文件顶部与 `docs/fix-log.md`。
 - 构建：`flutter build windows --release` → `build\windows\x64\runner\Release\shiyi_agent.exe`。
 - 注意：桌面版与 Android 版共享同一套 lib/ 代码，所有平台差异用 `Platform.isWindows`
-  分支隔离；改共享代码时不要破坏 Android 侧行为（`flutter test` 266 用例守护）。
+  分支隔离；改共享代码时不要破坏 Android 侧行为（`flutter test` 全量守护）。
 
 ## 拾忆 / DSH UI 同步规则
 - 拾忆与 DSH 的聊天 UI 必须保持同一套视觉语言、液态玻璃样式和交互逻辑。
@@ -67,3 +67,11 @@
 - 停止、引导、流式正文、思考过程、工具事件、模型提问、子代理进度、计划模式和本轮统计必须按会话隔离，禁止重新退化为单个全局运行状态。
 - `isBusy` 只表示“至少一个会话在运行”，不能用于拦截其他会话发送；页面和会话卡片必须使用 `isBusyForSession(sessionId)`。
 - 修改拾忆生成链路时必须保留跨会话并行回归测试：A/B 同时 active，停止 B 不得设置 A 的停止令牌，流式内容和工具事件不得串线。
+
+## DSH 配置同步规则
+- 拾忆与 DSH 的协议/状态路径必须分开：模型注入走 `DshModelSync`，会话发送与模型选择走各自 API，禁止把拾忆请求误写成 DSH 文件协议。
+- 所有会读改写 DSH 文件（`settings.yaml` / `.credentials.yaml` / `cordis.patch.yml`）的入口必须走 `DshModelSync` 共享串行队列；`unawaited(syncFromShiyi)` 可以保留，但不能各自加锁。
+- `settings.yaml` 必须临时文件写完再 `rename` 原子替换，禁止直接 `writeAsString` 截断目标。DSH 启动解析时只能看到完整旧文件或完整新文件。
+- 启动同步若发现 `settings.yaml` 已损坏，先备份为 `settings.yaml.corrupt` 再重建干净配置；不要把坏快照再喂给行级 upsert。
+- 密钥只进 credentials / `.credentials.yaml`，禁止写入 provider settings。
+- 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML。YAML 损坏应靠启动同步自愈，不要误导用户点修复环境。

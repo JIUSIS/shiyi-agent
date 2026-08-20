@@ -817,7 +817,8 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
     if (widget.options.isEmpty) return const SizedBox.shrink();
     final theme = Theme.of(context);
     final selected = _selectedOption;
-    final label = selected?.label ?? '选择模型';
+    final modelId = widget.modelId.trim();
+    final label = modelId.isNotEmpty ? modelId : selected?.label ?? '选择模型';
     final accent = widget.enabled
         ? (_isOpen ? _iosBlue : theme.colorScheme.onSurfaceVariant)
         : theme.disabledColor;

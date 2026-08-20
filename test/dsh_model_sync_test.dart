@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:yaml/yaml.dart';
 import 'package:shiyi_agent_app/services/dsh_api.dart';
 import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/services/dsh_model_sync.dart';
@@ -13,6 +14,73 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  group('DshModelSync file synchronization', () {
+    test('并发同步串行替换 settings.yaml 且保留完整配置', () async {
+      final dir = await Directory.systemTemp.createTemp('dsh-sync-race-');
+      addTearDown(() => dir.delete(recursive: true));
+      await File('${dir.path}/settings.yaml').writeAsString('''
+custom:
+  keep: true
+''');
+
+      final first = AppSettings(
+        baseUrl: 'https://alpha.example/v1',
+        apiKey: 'sk-alpha',
+        model: 'alpha-model',
+      );
+      final second = AppSettings(
+        baseUrl: 'https://beta.example/v1',
+        apiKey: 'sk-beta',
+        model: 'beta-model',
+      );
+
+      await Future.wait([
+        for (var i = 0; i < 4; i++)
+          DshModelSync.syncFiles(first, dir.path, name: 'Alpha'),
+        for (var i = 0; i < 4; i++)
+          DshModelSync.syncFiles(second, dir.path, name: 'Beta'),
+      ]);
+      await DshModelSync.waitForFileSyncs();
+
+      final text = await File('${dir.path}/settings.yaml').readAsString();
+      expect(text, startsWith('custom:\n  keep: true'));
+      expect(text, contains('shiyi_alpha:'));
+      expect(text, contains('shiyi_beta:'));
+      expect(text, contains('baseURL: "https://alpha.example/v1"'));
+      expect(text, contains('baseURL: "https://beta.example/v1"'));
+      expect(await File('${dir.path}/settings.yaml.tmp').exists(), isFalse);
+    });
+
+    test('已有损坏 settings.yaml 时重建可解析文件', () async {
+      final dir = await Directory.systemTemp.createTemp('dsh-sync-repair-');
+      addTearDown(() => dir.delete(recursive: true));
+      await File('${dir.path}/settings.yaml').writeAsString('''
+llm-pi-ai:
+  providers:
+    shiyi:
+      models:
+        - id: broken
+          inputs: [text]
+      broken:
+ invalid: true
+''');
+
+      await DshModelSync.syncFiles(
+        AppSettings(
+          baseUrl: 'https://repair.example/v1',
+          apiKey: 'sk-repair',
+          model: 'repair-model',
+        ),
+        dir.path,
+      );
+
+      final text = await File('${dir.path}/settings.yaml').readAsString();
+      expect(() => loadYaml(text), returnsNormally);
+      expect(text, contains('baseURL: "https://repair.example/v1"'));
+      expect(await File('${dir.path}/settings.yaml.corrupt').exists(), isTrue);
+    });
   });
 
   group('DshModelSync protocol / patch', () {
@@ -57,7 +125,7 @@ void main() {
         {
           'id': 'deepseek-chat',
           'name': 'deepseek-chat',
-          'input': ['text'],
+          'input': ['text', 'image'],
           'reasoningEfforts': {
             'off': null,
             'low': 'low',
@@ -69,7 +137,7 @@ void main() {
         {
           'id': 'deepseek-v4-flash',
           'name': 'deepseek-v4-flash',
-          'input': ['text'],
+          'input': ['text', 'image'],
           'reasoningEfforts': {
             'off': null,
             'low': 'low',
@@ -113,7 +181,7 @@ void main() {
       ]);
     });
 
-    test('未开启视觉时只有 text input，视觉模型不加入', () {
+    test('未开启视觉时主模型仍声明 image，视觉模型不加入', () {
       final s = AppSettings(
         baseUrl: 'https://api.example.com/v1',
         model: 'mimo-v2.5',
@@ -125,7 +193,7 @@ void main() {
         {
           'id': 'mimo-v2.5',
           'name': 'mimo-v2.5',
-          'input': ['text'],
+          'input': ['text', 'image'],
           'reasoningEfforts': {
             'off': null,
             'low': 'low',
@@ -156,12 +224,12 @@ void main() {
         {
           'id': 'request-alias',
           'name': 'request-alias',
-          'input': ['text'],
+          'input': ['text', 'image'],
         },
         {
           'id': 'gateway-real-model',
           'name': 'gateway-real-model',
-          'input': ['text'],
+          'input': ['text', 'image'],
         },
       ]);
 
@@ -355,6 +423,17 @@ llm-pi-ai:
       expect(DshModelSync.isModelSettingsChange(a, b), isFalse);
       expect(
         DshModelSync.isModelSettingsChange(a, AppSettings(model: 'm2')),
+        isTrue,
+      );
+      expect(
+        DshModelSync.isModelSettingsChange(a, a.copyWith(visionEnabled: true)),
+        isTrue,
+      );
+      expect(
+        DshModelSync.isModelSettingsChange(
+          a,
+          a.copyWith(visionModel: 'vision-model'),
+        ),
         isTrue,
       );
       expect(

@@ -7,25 +7,27 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.0.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.0.0/shiyi-agent-v2.0.0.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.5.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.0/shiyi-agent-v2.5.0.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
 ## 关于拾忆
 
-拾忆（ShiYi）是一款运行在 Android 手机上的个人 AI 工作台。它将大语言模型、长期记忆、项目文件管理、内置终端与技能系统整合为一个应用，让 AI 从"聊天助手"升级为"随身工作伙伴"——你可以把资料丢给它、把项目交给它、把重复任务委托给它，它会在你的手机里完成实际工作。界面按 Apple 设计理念（HIG）统一重构，使用毛玻璃导航、Inset Grouped 分组卡片与深浅色跟随。
+拾忆（ShiYi）是一款运行在 Android 手机上的个人 AI 工作台。它将大语言模型、长期记忆、项目文件管理、内置终端与技能系统整合为一个应用，并可切换拾忆本地引擎或 DeepSeek Harness。AI 从"聊天助手"升级为"随身工作伙伴"——你可以把资料丢给它、把项目交给它、把重复任务委托给它，它会在你的手机里完成实际工作。界面按 Apple 设计理念（HIG）统一重构，使用毛玻璃导航、Inset Grouped 分组卡片与深浅色跟随。
 
 ## 功能特性
 
 ### 智能对话
 
-- 多模型接入：内置 OpenAI / Anthropic / Gemini / DeepSeek 等常见 API 预设，支持自定义接口配置管理、一键获取模型 ID 与测试连接
+- 双引擎切换：拾忆本地引擎或 DeepSeek Harness，会话数据各自独立
+- 多模型接入：内置 OpenAI / Anthropic / Gemini / DeepSeek 等常见 API 预设，支持自定义接口配置管理、一键获取模型 ID 与测试连接；已保存配置可分别注入 DSH
 - 多轮对话与独立会话管理：搜索 / 重命名 / 删除 / 左滑快捷操作
 - 项目分类管理会话：新建项目时选择文件夹，项目横幅点击展开 / 收起，左滑支持新建会话 / 文件夹 / 重命名 / 删除
 - 项目级工作目录：项目设置一次，项目下会话自动继承；会话也可单独覆盖
 - 文件 / 图片多选附件，支持视觉模型图片理解
 - 流式输出、自动重试、上下文自动压缩与硬窗口保护
-- 思考过程流式展示，长思考自动滚动跟随；思考时红绿灯全局状态反馈
+- 思考过程流式展示，长思考自动滚动跟随；思考开关与思考强度可按会话调节
+- 悬空液态玻璃输入区、消息入场动画与流式跟随
 - 输出上限可调（512~384000），长任务自动续写不打断
 - 缓存命中优化：输入框统计栏实时显示服务端缓存命中率，稳定前缀跨分钟复用，首字更快更省钱
 - 回车键发送可开关；长按消息气泡支持选择文字 / 复制 / 朗读 / 重新生成 / 保存记忆 / 保存技能
@@ -65,14 +67,14 @@
 ### 体验与设计
 
 - 按 Apple 设计理念（HIG）统一重构：毛玻璃底栏、Inset Grouped 分组卡片、深浅色跟随
-- 底部三 Tab：会话 / 功能 / 文件，入口更集中
+- 底部三 Tab：会话 / 功能 / 文件；切换到 DeepSeek Harness 后为工作区 / 功能 / 文件
 - 设置页 iOS 风格分组：模型 / 对话 / 通用 / 支持，二级菜单渐显渐隐
 - 语音朗读、任务完成通知、浅色 / 深色 / 跟随系统主题
 - 内置日志与排障能力
 
 ## 界面预览
 
-### 2.0 界面预览
+### 2.5 界面预览
 
 **首页与会话**
 
@@ -102,7 +104,7 @@
 
 ### 1.0 旧版界面预览
 
-> 2.0 已按 Apple 设计理念（HIG）统一重构，以下为 1.0 版本的历史界面，保留作对比参考。
+> 2.5 延续 2.0 的 Apple 设计理念（HIG），以下为 1.0 版本的历史界面，保留作对比参考。
 
 | 主页 | 侧边栏 | 记忆 |
 | --- | --- | --- |
@@ -116,7 +118,7 @@
 
 1. 从 [Releases](https://github.com/JIUSIS/shiyi-agent/releases) 下载 APK（Android 8.0+）
 2. 安装后打开应用，完成初始配置
-3. 首次启动会自动部署内置终端环境（约 40MB），请耐心等待
+3. 首次启动会自动部署内置 Alpine 终端环境（约 4MB 资产 + 首次初始化），请耐心等待
 
 > 提示：更新版本请直接覆盖安装（`adb install -r` 或允许系统覆盖），不会清除本地数据。
 
