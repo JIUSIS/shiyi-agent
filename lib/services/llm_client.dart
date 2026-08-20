@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../core/reasoning_models.dart';
+
 class LlmException implements Exception {
   final String message;
   LlmException(this.message);
@@ -151,12 +153,18 @@ class LlmClient {
       // 下发：opencode.ai/zen 等网关不识别该参数时会把思考链灌进 content
       // （真机复现：textLen=20 reasoningLen=0 tail=用户用英文问好…），
       // 它们只用 reasoning_effort，思考走 delta.reasoning 字段。
+      final profile = ReasoningModels.profile(model);
+      String? reasoningEffort =
+          reasoningEffortOverride ?? profile?.defaultEffort;
       var thinkingEnabled =
           reasoningEffortOverride != 'off' &&
-          usesDeepSeekThinkingParam(model) &&
-          baseUrl.contains('deepseek.com');
-      String? reasoningEffort =
-          reasoningEffortOverride ?? defaultReasoningEffort(model);
+          reasoningEffort != null &&
+          reasoningEffort.isNotEmpty &&
+          reasoningEffort != 'off' &&
+          ((profile?.usesDeepSeekThinkingParam == true &&
+                  baseUrl.contains('deepseek.com')) ||
+              (protocol == 'anthropic' &&
+                  profile?.usesAnthropicThinking == true));
       // 网关拒绝 max_completion_tokens 时回退 max_tokens（旧网关兼容）。
       var useMaxCompletion = _useMaxCompletionTokens;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
@@ -201,7 +209,8 @@ class LlmClient {
               onDiag?.call('[stream] max_completion_tokens 被拒绝，回退 max_tokens');
               continue;
             }
-            if (thinkingEnabled && e.contains('thinking')) {
+            if (thinkingEnabled &&
+                (e.contains('thinking') || e.contains('budget_tokens'))) {
               thinkingEnabled = false;
               onDiag?.call('[stream] thinking 参数被网关拒绝，去掉后重试');
               continue;
@@ -304,18 +313,31 @@ class LlmClient {
           apiMessages.add(m);
         }
       }
+      final effort = reasoningEffort;
+      final thinkingOn =
+          thinkingEnabled &&
+          effort != null &&
+          effort.isNotEmpty &&
+          effort != 'off';
       return <String, dynamic>{
         'model': model,
         if (systemParts.isNotEmpty) 'system': systemParts.join('\n\n'),
         'messages': _toAnthropicMessages(apiMessages),
         'max_tokens': maxTokens,
         'stream': stream,
-        'temperature': temperature,
+        // extended thinking 开启时 Anthropic 要求不传 temperature。
+        if (!thinkingOn) 'temperature': temperature,
+        if (thinkingOn)
+          'thinking': {
+            'type': 'enabled',
+            'budget_tokens': ReasoningModels.anthropicBudget(effort, maxTokens),
+          },
         if (tools.isNotEmpty) 'tools': _toAnthropicTools(tools),
         if (tools.isNotEmpty)
           'tool_choice': {'type': 'auto', 'disable_parallel_tool_use': false},
       };
     }
+    final effortField = _openAiReasoningEffort(reasoningEffort);
     return <String, dynamic>{
       'model': model,
       'messages': messages,
@@ -327,7 +349,7 @@ class LlmClient {
       // 从不带；真机对照：带 temperature=0.2 + tool_choice=auto 时网关把
       // 思考链折叠进 content（reasoning_content 恒 null），DSH 引擎不带
       // 时 reasoning_content 正常下发。
-      if (reasoningEffort == null || reasoningEffort.isEmpty)
+      if (effortField == null || effortField.isEmpty)
         'temperature': temperature,
       // opencode.ai 等 OpenAI 风格网关用 max_completion_tokens 区分新旧
       // 请求路径（与 DSH 内置 pi-ai 的 detectCompat 一致）；发 max_tokens
@@ -338,11 +360,21 @@ class LlmClient {
       else
         'max_tokens': maxTokens,
       if (thinkingEnabled) 'thinking': {'type': 'enabled'},
-      if (reasoningEffort != null && reasoningEffort.isNotEmpty)
-        'reasoning_effort': reasoningEffort,
+      if (effortField != null && effortField.isNotEmpty)
+        'reasoning_effort': effortField,
       if (tools.isNotEmpty) 'tools': tools,
       // tool_choice 与 pi-ai 对齐：不显式发送（OpenAI 默认 auto）。
     };
+  }
+
+  /// GPT-5 关闭思考发 `none`；其余模型沿用 `off` / 档位原值。
+  String? _openAiReasoningEffort(String? effort) {
+    if (effort == null || effort.isEmpty) return effort;
+    if (effort == 'off' &&
+        ReasoningModels.profile(model)?.usesNoneForOff == true) {
+      return 'none';
+    }
+    return effort;
   }
 
   /// 与 DSH 内置 pi-ai（detectCompat）保持一致的网关判定：
@@ -448,53 +480,17 @@ class LlmClient {
   }
 
   /// 与 DSH 模型同步一致的默认思考档位判定。
-  static String? defaultReasoningEffort(String model) {
-    final id = model.trim().toLowerCase();
-    if (id.isEmpty) return null;
-    if (id.contains('deepseek') ||
-        id.contains('reasoner') ||
-        id.contains('thinking') ||
-        id.contains('mimo') ||
-        id.contains('qwq') ||
-        id.contains('r1') ||
-        RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
-      return 'high';
-    }
-    return null;
-  }
+  static String? defaultReasoningEffort(String model) =>
+      ReasoningModels.defaultEffort(model);
 
   /// 根据模型名返回支持的思考强度档位列表；不支持思考的模型返回 null。
-  static Map<String, String?>? reasoningEffortsForModel(String model) {
-    if (defaultReasoningEffort(model) == null) return null;
-    final id = model.trim().toLowerCase();
-    // OpenAI o 系列支持 low/medium/high/xhigh；不支持 off/max。
-    if (RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
-      return const {
-        'low': 'low',
-        'medium': 'medium',
-        'high': 'high',
-      };
-    }
-    // DeepSeek / QwQ / R1 等支持 off/low/medium/high/max。
-    return const {
-      'off': null,
-      'low': 'low',
-      'medium': 'medium',
-      'high': 'high',
-      'max': 'max',
-    };
-  }
+  static Map<String, String?>? reasoningEffortsForModel(String model) =>
+      ReasoningModels.effortsFor(model);
 
   /// DeepSeek 风格的兼容接口需要 `thinking: {type: enabled}` 才会真正
   /// 推送 reasoning_content；OpenAI 风格模型仍只使用 reasoning_effort。
-  static bool usesDeepSeekThinkingParam(String model) {
-    final id = model.trim().toLowerCase();
-    if (id.isEmpty) return false;
-    return id.contains('deepseek') ||
-        id.contains('reasoner') ||
-        id.contains('kimi-k2-thinking') ||
-        RegExp(r'(^|[-_/])r1(?:$|[-_/])').hasMatch(id);
-  }
+  static bool usesDeepSeekThinkingParam(String model) =>
+      ReasoningModels.usesDeepSeekThinkingParam(model);
 
   /// 判断 HTTP 400 是否由 max_tokens 参数过大/不被支持引起。
   static bool _isMaxTokensParamError(String err) {
@@ -560,16 +556,51 @@ class LlmClient {
     }
   }
 
-  /// 获取模型列表（GET /models），返回模型 id 列表。
+  /// 获取模型列表，返回模型 id。
+  /// OpenAI 兼容走 GET `{base}/models`；Anthropic Messages 走 GET `{root}/v1/models`。
   Future<List<String>> listModels() async {
     if (protocol == 'anthropic') {
-      throw LlmException('Anthropic 协议不提供模型列表，请手动填写模型名');
+      return _listAnthropicModels();
     }
     final url = '${baseUrl.replaceAll(RegExp(r'/*$'), '')}/models';
+    return (await _fetchModelsPage(Uri.parse(url))).ids;
+  }
+
+  /// Anthropic 官方与兼容网关：GET /v1/models，按 last_id 翻页直到没有更多。
+  Future<List<String>> _listAnthropicModels() async {
+    final root = normalizeAnthropicBaseUrl(baseUrl);
+    final ids = <String>[];
+    String? afterId;
     final client = http.Client();
     try {
-      final res = await client
-          .get(Uri.parse(url), headers: _headers(streaming: false))
+      for (var i = 0; i < 20; i++) {
+        final uri = Uri.parse('$root/v1/models').replace(
+          queryParameters: {
+            'limit': '100',
+            if (afterId != null && afterId.isNotEmpty) 'after_id': afterId,
+          },
+        );
+        final fetched = await _fetchModelsPage(uri, client: client);
+        ids.addAll(fetched.ids);
+        if (fetched.ids.isEmpty) break;
+        afterId = fetched.lastId;
+        if (!fetched.hasMore || afterId == null || afterId.isEmpty) break;
+      }
+      return ids;
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<({List<String> ids, bool hasMore, String? lastId})> _fetchModelsPage(
+    Uri uri, {
+    http.Client? client,
+  }) async {
+    final owned = client == null;
+    final httpClient = client ?? http.Client();
+    try {
+      final res = await httpClient
+          .get(uri, headers: _headers(streaming: false))
           .timeout(const Duration(seconds: 30));
       if (res.statusCode != 200) {
         throw LlmException('HTTP ${res.statusCode}: ${_short(res.body)}');
@@ -577,15 +608,20 @@ class LlmClient {
       final json = _tryDecode(res.body);
       if (json == null) throw LlmException('响应解析失败');
       final data = json['data'] as List<dynamic>? ?? [];
-      return data
+      final ids = data
           .map(
             (e) =>
                 (e is Map<String, dynamic>) ? (e['id']?.toString() ?? '') : '',
           )
           .where((s) => s.isNotEmpty)
           .toList();
+      return (
+        ids: ids,
+        hasMore: json['has_more'] == true,
+        lastId: json['last_id']?.toString(),
+      );
     } finally {
-      client.close();
+      if (owned) httpClient.close();
     }
   }
 

@@ -2,6 +2,27 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.5.1] - 2026-08-20
+
+相对 2.5.0：自定义 Claude / GPT / Grok 等模型在会话页显示思考按钮；Anthropic 原生协议可刷新模型列表。
+
+### 新增
+
+- **思考档位按模型 ID 关键字识别**：`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认 `deepseek`，不绑死版本号。覆盖 Claude、GPT、o 系列、Grok、Gemini、DeepSeek、Qwen、GLM、Kimi、豆包等常见家族。
+- **对不上关键字也显示思考按钮**：llama、本地 7B 等给出通用档位，默认不自动往请求里塞 thinking。
+- **拾忆与 DSH 共用同一套目录**：`ReasoningModels` 同时驱动会话页按钮和 DSH `settings.yaml` 注入。
+
+### 修复
+
+- Anthropic Messages「刷新模型」不再提示协议不支持，改为 `GET /v1/models` 分页拉取（含 `x-api-key` + `anthropic-version`）。
+- Claude 原生协议开启思考时发送 `thinking.budget_tokens`，且不发 `temperature`；budget 始终小于 `max_tokens`。
+- GPT 关闭思考发 `reasoning_effort: none`（不能发 `off`）。
+
+### 验证
+
+- `flutter analyze` 针对思考目录与 Anthropic 列表无告警。
+- `flutter test test/reasoning_models_test.dart test/llm_continuation_test.dart test/dsh_model_sync_test.dart test/reasoning_state_test.dart` 全部通过。
+
 ## [2.5.0] - 2026-08-20
 
 相对 GitHub `v2.0.0` 的增量：双引擎工作台、Alpine 内嵌终端、会话页液态玻璃与思考控制，以及 DSH 配置自愈。

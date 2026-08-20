@@ -68,6 +68,12 @@
 - `isBusy` 只表示“至少一个会话在运行”，不能用于拦截其他会话发送；页面和会话卡片必须使用 `isBusyForSession(sessionId)`。
 - 修改拾忆生成链路时必须保留跨会话并行回归测试：A/B 同时 active，停止 B 不得设置 A 的停止令牌，流式内容和工具事件不得串线。
 
+## 思考档位规则
+- 会话页思考开关 / 档位按模型 ID 关键字识别，不绑死版本号：`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认 `deepseek`。拾忆直连与 DSH 注入共用 `lib/core/reasoning_models.dart`。
+- 命中家族关键字时有默认档位（多为 `high`）并按协议组包：OpenAI 兼容发 `reasoning_effort`，GPT 关闭发 `none`；DeepSeek 官方额外发 `thinking: {type: enabled}`；Anthropic Messages 发 `thinking.budget_tokens` 且不发 `temperature`。
+- 对不上关键字的非空模型 ID 仍显示通用档位（off/low/medium/high/max），但默认不自动往请求或 DSH provider 里塞 thinking。空模型 ID 不显示按钮。
+- DSH 会话页按钮读同一套目录；真正发请求走 `session.selectModel` 的 `reasoningEffort`，不要把拾忆请求体误写成 DSH 文件协议。
+
 ## DSH 配置同步规则
 - 拾忆与 DSH 的协议/状态路径必须分开：模型注入走 `DshModelSync`，会话发送与模型选择走各自 API，禁止把拾忆请求误写成 DSH 文件协议。
 - 所有会读改写 DSH 文件（`settings.yaml` / `.credentials.yaml` / `cordis.patch.yml`）的入口必须走 `DshModelSync` 共享串行队列；`unawaited(syncFromShiyi)` 可以保留，但不能各自加锁。

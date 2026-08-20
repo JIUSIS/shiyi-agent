@@ -10,7 +10,7 @@ void main() {
     expect(LlmClient.defaultReasoningEffort('deepseek-v4-flash'), 'high');
     expect(LlmClient.defaultReasoningEffort('vendor/qwq-32b'), 'high');
     expect(LlmClient.defaultReasoningEffort('o3-mini'), 'high');
-    expect(LlmClient.defaultReasoningEffort('gpt-4.1-mini'), isNull);
+    expect(LlmClient.defaultReasoningEffort('llama-3.3-70b-versatile'), isNull);
     expect(LlmClient.usesDeepSeekThinkingParam('deepseek-v4-flash'), isTrue);
     expect(LlmClient.usesDeepSeekThinkingParam('deepseek-reasoner'), isTrue);
     expect(LlmClient.usesDeepSeekThinkingParam('o3-mini'), isFalse);
@@ -204,7 +204,7 @@ void main() {
       final client = LlmClient(
         baseUrl: 'http://${server.address.host}:${server.port}/v1',
         apiKey: 'test-key',
-        model: 'gpt-4.1-mini',
+        model: 'llama-3.3-70b-versatile',
         temperature: 0.2,
         maxTokens: 1024,
         tools: const [],
@@ -215,6 +215,115 @@ void main() {
       await handled;
       expect(requestBody.containsKey('thinking'), isFalse);
       expect(requestBody.containsKey('reasoning_effort'), isFalse);
+    } finally {
+      await server.close(force: true);
+    }
+  });
+
+  test('Claude 原生协议开启思考时发 thinking.budget_tokens，不发 temperature', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    late Map<String, dynamic> requestBody;
+    final handled = () async {
+      final request = await server.first;
+      requestBody =
+          jsonDecode(await utf8.decoder.bind(request).join())
+              as Map<String, dynamic>;
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType(
+          'text',
+          'event-stream',
+          charset: 'utf-8',
+        )
+        ..write(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":0,'
+          '"delta":{"type":"thinking_delta","thinking":"先想"}}\n\n',
+        )
+        ..write(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":1,'
+          '"delta":{"type":"text_delta","text":"答案"}}\n\n',
+        )
+        ..write(
+          'event: message_delta\n'
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+        )
+        ..write(
+          'event: message_stop\n'
+          'data: {"type":"message_stop"}\n\n',
+        );
+      await request.response.close();
+    }();
+
+    TurnResult? lastTurn;
+    try {
+      final client = LlmClient(
+        baseUrl: 'http://${server.address.host}:${server.port}',
+        apiKey: 'sk-ant-test',
+        model: 'claude-sonnet-4-5',
+        protocol: 'anthropic',
+        temperature: 0.2,
+        maxTokens: 16384,
+        tools: const [],
+        onTurn: (turn) => lastTurn = turn,
+      );
+      await client.send([
+        {'role': 'user', 'content': '测试'},
+      ]);
+      await handled;
+      expect(requestBody.containsKey('temperature'), isFalse);
+      expect(requestBody.containsKey('reasoning_effort'), isFalse);
+      expect(requestBody['thinking'], {
+        'type': 'enabled',
+        'budget_tokens': 15360,
+      });
+      expect(lastTurn?.reasoning, '先想');
+      expect(lastTurn?.text, '答案');
+    } finally {
+      await server.close(force: true);
+    }
+  });
+
+  test('GPT-5 关闭思考发 reasoning_effort=none', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    late Map<String, dynamic> requestBody;
+    final handled = () async {
+      final request = await server.first;
+      requestBody =
+          jsonDecode(await utf8.decoder.bind(request).join())
+              as Map<String, dynamic>;
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType(
+          'text',
+          'event-stream',
+          charset: 'utf-8',
+        )
+        ..write(
+          'data: {"choices":[{"delta":{"content":"答案"},'
+          '"finish_reason":"stop"}]}\n\n',
+        )
+        ..write('data: [DONE]\n\n');
+      await request.response.close();
+    }();
+
+    try {
+      final client = LlmClient(
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        apiKey: 'test-key',
+        model: 'gpt-5',
+        temperature: 0.2,
+        maxTokens: 1024,
+        tools: const [],
+        reasoningEffortOverride: 'off',
+      );
+      await client.send([
+        {'role': 'user', 'content': '测试'},
+      ]);
+      await handled;
+      expect(requestBody['reasoning_effort'], 'none');
+      expect(requestBody.containsKey('thinking'), isFalse);
     } finally {
       await server.close(force: true);
     }
@@ -406,6 +515,166 @@ void main() {
 
       expect(prompt, contains('继续完成上述输出'));
       expect(prompt, isNot(contains('直接调用需要的工具')));
+    });
+  });
+
+  group('listModels', () {
+    LlmClient makeClient({
+      required String baseUrl,
+      String protocol = 'openai',
+    }) {
+      return LlmClient(
+        baseUrl: baseUrl,
+        apiKey: 'sk-ant-test',
+        model: 'claude-sonnet-4-5',
+        protocol: protocol,
+        temperature: 0,
+        tools: const [],
+      );
+    }
+
+    test('Anthropic 协议请求 GET /v1/models 并带原生请求头', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      late Uri hit;
+      late String? apiKeyHeader;
+      late String? versionHeader;
+      late String? authHeader;
+      server.listen((request) async {
+        hit = request.uri;
+        apiKeyHeader = request.headers.value('x-api-key');
+        versionHeader = request.headers.value('anthropic-version');
+        authHeader = request.headers.value('authorization');
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(
+            jsonEncode({
+              'data': [
+                {'id': 'claude-sonnet-4-5'},
+                {'id': 'claude-opus-4-1'},
+              ],
+              'has_more': false,
+            }),
+          );
+        await request.response.close();
+      });
+
+      try {
+        final ids = await makeClient(
+          baseUrl: 'http://${server.address.host}:${server.port}',
+          protocol: 'anthropic',
+        ).listModels();
+        expect(hit.path, '/v1/models');
+        expect(hit.queryParameters['limit'], '100');
+        expect(apiKeyHeader, 'sk-ant-test');
+        expect(versionHeader, '2023-06-01');
+        expect(authHeader, isNull);
+        expect(ids, ['claude-sonnet-4-5', 'claude-opus-4-1']);
+      } finally {
+        await server.close(force: true);
+      }
+    });
+
+    test('Anthropic 结尾带 /v1 的网关不会拼成 /v1/v1/models', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      late String path;
+      server.listen((request) async {
+        path = request.uri.path;
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(
+            jsonEncode({
+              'data': [
+                {'id': 'claude-haiku-4-5'},
+              ],
+            }),
+          );
+        await request.response.close();
+      });
+
+      try {
+        final ids = await makeClient(
+          baseUrl: 'http://${server.address.host}:${server.port}/v1',
+          protocol: 'anthropic',
+        ).listModels();
+        expect(path, '/v1/models');
+        expect(ids, ['claude-haiku-4-5']);
+      } finally {
+        await server.close(force: true);
+      }
+    });
+
+    test('Anthropic has_more 时按 last_id 翻页合并全部模型', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final afterIds = <String?>[];
+      server.listen((request) async {
+        final after = request.uri.queryParameters['after_id'];
+        afterIds.add(after);
+        final page = after == null
+            ? {
+                'data': [
+                  {'id': 'claude-sonnet-4-5'},
+                ],
+                'has_more': true,
+                'last_id': 'claude-sonnet-4-5',
+              }
+            : {
+                'data': [
+                  {'id': 'claude-opus-4-1'},
+                ],
+                'has_more': false,
+                'last_id': 'claude-opus-4-1',
+              };
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode(page));
+        await request.response.close();
+      });
+
+      try {
+        final ids = await makeClient(
+          baseUrl: 'http://${server.address.host}:${server.port}',
+          protocol: 'anthropic',
+        ).listModels();
+        expect(afterIds, [null, 'claude-sonnet-4-5']);
+        expect(ids, ['claude-sonnet-4-5', 'claude-opus-4-1']);
+      } finally {
+        await server.close(force: true);
+      }
+    });
+
+    test('OpenAI 协议仍走 GET {base}/models', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      late String path;
+      late String? authHeader;
+      server.listen((request) async {
+        path = request.uri.path;
+        authHeader = request.headers.value('authorization');
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(
+            jsonEncode({
+              'data': [
+                {'id': 'gpt-4o'},
+              ],
+            }),
+          );
+        await request.response.close();
+      });
+
+      try {
+        final ids = await makeClient(
+          baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        ).listModels();
+        expect(path, '/v1/models');
+        expect(authHeader, 'Bearer sk-ant-test');
+        expect(ids, ['gpt-4o']);
+      } finally {
+        await server.close(force: true);
+      }
     });
   });
 }

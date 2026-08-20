@@ -89,7 +89,7 @@ llm-pi-ai:
       expect(DshModelSync.dshApiFor('anthropic'), 'anthropic-messages');
     });
 
-    test('mimo 与 deepseek 一样声明思考档位，普通模型不声明', () {
+    test('mimo 与 deepseek 一样声明思考档位，对不上家族关键字的也有通用档位', () {
       expect(DshModelSync.defaultReasoningEffort('mimo-v2.5'), 'high');
       expect(DshModelSync.defaultReasoningEffort('mimo-v2.5-pro'), 'high');
       expect(DshModelSync.reasoningEffortsForModel('mimo-v2.5'), {
@@ -99,8 +99,17 @@ llm-pi-ai:
         'high': 'high',
         'max': 'max',
       });
-      expect(DshModelSync.defaultReasoningEffort('gpt-4.1-mini'), isNull);
-      expect(DshModelSync.reasoningEffortsForModel('gpt-4.1-mini'), isNull);
+      expect(
+        DshModelSync.defaultReasoningEffort('llama-3.3-70b-versatile'),
+        isNull,
+      );
+      expect(DshModelSync.reasoningEffortsForModel('llama-3.3-70b-versatile'), {
+        'off': null,
+        'low': 'low',
+        'medium': 'medium',
+        'high': 'high',
+        'max': 'max',
+      });
     });
 
     test('手写路由 patch 含 api + baseURL + 非空 models，密钥不进 settings', () {
@@ -177,6 +186,13 @@ llm-pi-ai:
           'id': 'vision-model-x',
           'name': 'vision-model-x',
           'input': ['text', 'image'],
+          'reasoningEfforts': {
+            'off': null,
+            'low': 'low',
+            'medium': 'medium',
+            'high': 'high',
+            'max': 'max',
+          },
         },
       ]);
     });
@@ -225,11 +241,25 @@ llm-pi-ai:
           'id': 'request-alias',
           'name': 'request-alias',
           'input': ['text', 'image'],
+          'reasoningEfforts': {
+            'off': null,
+            'low': 'low',
+            'medium': 'medium',
+            'high': 'high',
+            'max': 'max',
+          },
         },
         {
           'id': 'gateway-real-model',
           'name': 'gateway-real-model',
           'input': ['text', 'image'],
+          'reasoningEfforts': {
+            'off': null,
+            'low': 'low',
+            'medium': 'medium',
+            'high': 'high',
+            'max': 'max',
+          },
         },
       ]);
 

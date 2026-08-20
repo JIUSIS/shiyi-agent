@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.5.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.0/shiyi-agent-v2.5.0.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.5.1.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.1/shiyi-agent-v2.5.1.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -26,7 +26,7 @@
 - 项目级工作目录：项目设置一次，项目下会话自动继承；会话也可单独覆盖
 - 文件 / 图片多选附件，支持视觉模型图片理解
 - 流式输出、自动重试、上下文自动压缩与硬窗口保护
-- 思考过程流式展示，长思考自动滚动跟随；思考开关与思考强度可按会话调节
+- 思考过程流式展示，长思考自动滚动跟随；思考开关与思考强度按模型 ID 关键字识别，常见家族与自定义模型都可调节
 - 悬空液态玻璃输入区、消息入场动画与流式跟随
 - 输出上限可调（512~384000），长任务自动续写不打断
 - 缓存命中优化：输入框统计栏实时显示服务端缓存命中率，稳定前缀跨分钟复用，首字更快更省钱

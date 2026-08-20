@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:yaml/yaml.dart';
 
 import '../core/models.dart';
+import '../core/reasoning_models.dart';
 import 'dsh_api.dart';
 import 'dsh_service.dart';
 
@@ -116,37 +117,11 @@ class DshModelSync {
   /// DSH 的 pi-ai provider 需要显式的 reasoning 档位才会向部分网关请求
   /// `reasoning_content`。只给明显支持思考输出的模型加默认档位，普通模型
   /// 不注入该字段，避免把不支持 reasoning 的模型误切到 thinking 请求。
-  static String? defaultReasoningEffort(String model) {
-    final id = model.trim().toLowerCase();
-    if (id.isEmpty) return null;
-    if (id.contains('deepseek') ||
-        id.contains('reasoner') ||
-        id.contains('thinking') ||
-        id.contains('mimo') ||
-        id.contains('qwq') ||
-        id.contains('r1') ||
-        RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
-      return 'high';
-    }
-    return null;
-  }
+  static String? defaultReasoningEffort(String model) =>
+      ReasoningModels.defaultEffort(model);
 
-  static Map<String, String?>? reasoningEffortsForModel(String model) {
-    if (defaultReasoningEffort(model) == null) return null;
-    final id = model.trim().toLowerCase();
-    // OpenAI o 系列支持 low/medium/high，部分支持 xhigh；不支持 off/max。
-    if (RegExp(r'(^|[-_/])o[134](?:$|[-_/])').hasMatch(id)) {
-      return const {'low': 'low', 'medium': 'medium', 'high': 'high'};
-    }
-    // DeepSeek / QwQ / R1 等支持 off/low/medium/high/max。
-    return const {
-      'off': null,
-      'low': 'low',
-      'medium': 'medium',
-      'high': 'high',
-      'max': 'max',
-    };
-  }
+  static Map<String, String?>? reasoningEffortsForModel(String model) =>
+      ReasoningModels.effortsFor(model);
 
   static bool _isMissingPiAiSettings(Object error) =>
       error is DshApiException &&
