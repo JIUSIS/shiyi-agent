@@ -3,6 +3,8 @@
 ///
 /// 只认家族关键字，不绑死版本号：`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认
 /// `deepseek`。网关前缀（`openai/gpt-5`、`anthropic/claude-opus-4`）同样生效。
+/// `gpt-4o` / `gpt-4.1` / `gpt-3.5` 没有 reasoning 参数，不能跟 `gpt-5` 一起
+/// 被裸关键字 `gpt` 命中。
 class ReasoningProfile {
   /// 未手动选档时的默认强度。
   final String defaultEffort;
@@ -72,7 +74,10 @@ class ReasoningModels {
         efforts: oSeriesEfforts,
       );
     }
-    if (_has(id, const ['gpt', 'codex'])) {
+    // gpt-4o / gpt-4.1 / gpt-3.5 没有 reasoning 参数；只有 gpt-5 / Codex
+    // 才走思考档位。裸关键字 `gpt` 会误伤 OpenRouter 的 `openai/gpt-4o`。
+    if (_has(id, const ['codex']) ||
+        (_has(id, const ['gpt']) && !_has(id, const ['gpt-4', 'gpt-3']))) {
       return const ReasoningProfile(
         defaultEffort: 'high',
         efforts: offLowHighXhigh,

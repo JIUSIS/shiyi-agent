@@ -2,6 +2,23 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.5.3] - 2026-08-22
+
+相对 2.5.2：DSH 0.1.1 启动不再被旧凭据文件拦住；OpenRouter 注入不再 HTTP 400；安装 DSH 不再因过期 npm 清单漏掉已发布版本。
+
+### 修复
+
+- **DSH 0.1.1 凭据文档**：`.credentials.yaml` 改为 `version: 1` + `refs:`。旧扁平 `SHIYI_API_KEY:` 顶层映射、以及 DSH 迁完 version 后又被旧写入器追加到顶层的密钥，启动同步都会收进 `refs`，不再报 `unknown top-level key`。「修复完整运行环境」修不了这件事，冷启动会先改文件再拉 DSH。
+- **OpenRouter 在 DSH 返回 400**：注入 `compat.supportsStore: false`，避免 pi-ai 把 `store: false` 转发给 OpenRouter。`openai/gpt-4o` 不再被裸关键字 `gpt` 当成思考模型，因而也不会误发 `reasoning`。
+- **gpt-4o / gpt-4.1 / gpt-3.5 不是思考模型**：只有 gpt-5 / Codex 才默认 `high` 并走思考档位。
+- **安装 DSH 不再带 `--prefer-offline`**：Alpine 里过期 packument 会把已发布的 `0.1.1-rc.x` 当成不存在。依赖 tarball 仍走本地缓存，只强制刷新清单。
+
+### 验证
+
+- `flutter analyze` 针对同步与思考目录无告警。
+- `flutter test test/dsh_model_sync_test.dart test/dsh_service_test.dart test/reasoning_models_test.dart` 全部通过。
+- 真机 `2509FPN0BC` 使用 `adb install -r` 覆盖安装 debug 包验证凭据迁移路径；正式包同签名覆盖安装。
+
 ## [2.5.2] - 2026-08-21
 
 ### 修复

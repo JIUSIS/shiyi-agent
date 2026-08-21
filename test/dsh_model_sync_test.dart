@@ -112,6 +112,72 @@ llm-pi-ai:
       });
     });
 
+    test('OpenRouter 注入关闭 store，且不把 gpt-4o 当成思考模型', () {
+      final s = AppSettings(
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'sk-or-secret',
+        model: 'openai/gpt-4o',
+        apiProtocol: 'openai',
+      );
+      final value = DshModelSync.mutateOps(s).single['value'] as Map;
+      expect(value['api'], 'openai-completions');
+      expect(value['baseURL'], 'https://openrouter.ai/api/v1');
+      expect(value.containsKey('reasoning'), isFalse);
+      expect(value['compat'], {'supportsStore': false});
+      expect((value['models'] as List).first, {
+        'id': 'openai/gpt-4o',
+        'name': 'openai/gpt-4o',
+        'input': ['text', 'image'],
+      });
+      expect(value.containsKey('apiKey'), isFalse);
+    });
+
+    test('OpenRouter 思考模型仍声明 reasoning，同时关闭 store', () {
+      final value =
+          DshModelSync.mutateOps(
+                AppSettings(
+                  baseUrl: 'https://openrouter.ai/api/v1',
+                  model: 'openai/gpt-5',
+                ),
+              ).single['value']
+              as Map;
+      expect(value['reasoning'], 'high');
+      expect(value['compat'], {'supportsStore': false});
+      expect(((value['models'] as List).first as Map)['reasoningEfforts'], {
+        'off': null,
+        'low': 'low',
+        'medium': 'medium',
+        'high': 'high',
+        'xhigh': 'xhigh',
+      });
+    });
+
+    test('OpenRouter settings.yaml 写出 compat.supportsStore=false', () {
+      final yaml = DshModelSync.upsertSettingsYaml(
+        '',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        model: 'openai/gpt-4o',
+        apiProtocol: 'openai',
+      );
+      expect(yaml, contains('      baseURL: "https://openrouter.ai/api/v1"'));
+      expect(yaml, contains('      compat:'));
+      expect(yaml, contains('        supportsStore: false'));
+      expect(yaml, isNot(contains('      reasoning: high')));
+      expect(yaml, isNot(contains('          reasoningEfforts:')));
+    });
+
+    test('非 OpenRouter 网关不写 store compat', () {
+      final value =
+          DshModelSync.mutateOps(
+                AppSettings(
+                  baseUrl: 'https://api.deepseek.com/v1',
+                  model: 'deepseek-chat',
+                ),
+              ).single['value']
+              as Map;
+      expect(value.containsKey('compat'), isFalse);
+    });
+
     test('手写路由 patch 含 api + baseURL + 非空 models，密钥不进 settings', () {
       final s = AppSettings(
         baseUrl: 'https://api.deepseek.com/v1',
@@ -715,15 +781,20 @@ web-search-deepseek:
         'SHIYI_API_KEY',
         'sk-new',
       );
-      expect(added, contains('OPENAI_API_KEY: sk-old'));
-      expect(added, contains('SHIYI_API_KEY: sk-new'));
+      expectDshCredentials(added, {
+        'OPENAI_API_KEY': 'sk-old',
+        'SHIYI_API_KEY': 'sk-new',
+      });
 
       final updated = DshModelSync.upsertCredentialsYaml(
         added,
         'SHIYI_API_KEY',
         'sk-newer',
       );
-      expect(updated, contains('SHIYI_API_KEY: sk-newer'));
+      expectDshCredentials(updated, {
+        'OPENAI_API_KEY': 'sk-old',
+        'SHIYI_API_KEY': 'sk-newer',
+      });
       expect(updated, isNot(contains('sk-new\n')));
 
       final cleared = DshModelSync.upsertCredentialsYaml(
@@ -731,7 +802,7 @@ web-search-deepseek:
         'SHIYI_API_KEY',
         '',
       );
-      expect(cleared, contains('OPENAI_API_KEY: sk-old'));
+      expectDshCredentials(cleared, {'OPENAI_API_KEY': 'sk-old'});
       expect(cleared, isNot(contains('SHIYI_API_KEY')));
     });
 
@@ -742,7 +813,11 @@ web-search-deepseek:
         'sk-line1\nsk-line2',
       );
       expect(out, contains(r'SHIYI_API_KEY: "sk-line1\nsk-line2"'));
-      expect(out.split('\n'), hasLength(2));
+      expectDshCredentials(out, {'SHIYI_API_KEY': 'sk-line1\nsk-line2'});
+      expect(
+        out.split('\n').where((l) => l.contains('SHIYI_API_KEY')),
+        hasLength(1),
+      );
     });
 
     test('含引号/反斜杠/制表符的密钥正确转义', () {
@@ -752,6 +827,7 @@ web-search-deepseek:
         'sk-a"b\\c\td',
       );
       expect(out, contains(r'"sk-a\"b\\c\td"'));
+      expectDshCredentials(out, {'SHIYI_API_KEY': 'sk-a"b\\c\td'});
     });
 
     test('读入已损坏文件时清洗非法行并重写', () {
@@ -766,10 +842,81 @@ OPENAI_API_KEY: sk-keep
         'SHIYI_API_KEY',
         'sk-good',
       );
-      expect(out, contains('SHIYI_API_KEY: sk-good'));
-      expect(out, contains('OPENAI_API_KEY: sk-keep'));
+      expectDshCredentials(out, {
+        'OPENAI_API_KEY': 'sk-keep',
+        'SHIYI_API_KEY': 'sk-good',
+      });
       expect(out, isNot(contains('sk-part1')));
       expect(out, isNot(contains('garbage line')));
+    });
+
+    test('DSH 0.1.1 versioned 文档上 upsert 不得把密钥写回顶层', () {
+      const existing = '''
+version: 1
+refs:
+  OPENAI_API_KEY: sk-old
+  SHIYI_API_KEY: sk-stale
+''';
+      final out = DshModelSync.upsertCredentialsYaml(
+        existing,
+        'SHIYI_API_KEY',
+        'sk-new',
+      );
+      expectDshCredentials(out, {
+        'OPENAI_API_KEY': 'sk-old',
+        'SHIYI_API_KEY': 'sk-new',
+      });
+    });
+
+    test('versioned 文档夹杂顶层 SHIYI_API_KEY 时收进 refs', () {
+      // DSH 0.1.1-rc.2 会先把旧扁平文件迁成 version:1；拾忆旧写入器再把
+      // SHIYI_API_KEY 追加到顶层，启动即 unknown top-level key。
+      const mixed = '''
+version: 1
+refs:
+  OPENAI_API_KEY: sk-old
+  SHIYI_DSH_SEARCH_KEY: sk-search
+SHIYI_API_KEY: sk-stray
+''';
+      final out = DshModelSync.upsertCredentialsYaml(
+        mixed,
+        'SHIYI_API_KEY',
+        'sk-fixed',
+      );
+      expectDshCredentials(out, {
+        'OPENAI_API_KEY': 'sk-old',
+        'SHIYI_DSH_SEARCH_KEY': 'sk-search',
+        'SHIYI_API_KEY': 'sk-fixed',
+      });
+    });
+
+    test('upsert 保留 records 段', () {
+      const existing = '''
+version: 1
+refs:
+  DEEPSEEK_API_KEY: sk-ds
+records:
+  llm-pi-ai/amazon-bedrock:
+    kind: api-key
+    env:
+      AWS_PROFILE: prod
+''';
+      final out = DshModelSync.upsertCredentialsYaml(
+        existing,
+        'SHIYI_API_KEY',
+        'sk-new',
+      );
+      expectDshCredentials(out, {
+        'DEEPSEEK_API_KEY': 'sk-ds',
+        'SHIYI_API_KEY': 'sk-new',
+      });
+      final doc = loadYaml(out) as YamlMap;
+      expect(doc['records'], isA<YamlMap>());
+      expect(
+        ((doc['records'] as YamlMap)['llm-pi-ai/amazon-bedrock']
+            as YamlMap)['kind'],
+        'api-key',
+      );
     });
   });
 
@@ -783,8 +930,10 @@ OPENAI_API_KEY: sk-keep
         searchKey: 'sk-search',
       );
       final text = await File('${dir.path}/.credentials.yaml').readAsString();
-      expect(text, contains('SHIYI_API_KEY: sk-file'));
-      expect(text, contains('SHIYI_DSH_SEARCH_KEY: sk-search'));
+      expectDshCredentials(text, {
+        'SHIYI_API_KEY': 'sk-file',
+        'SHIYI_DSH_SEARCH_KEY': 'sk-search',
+      });
     });
 
     test('credentials.set 失败时回退写文件', () async {
@@ -830,7 +979,7 @@ OPENAI_API_KEY: sk-keep
         homeDir: () async => dir.path,
       );
       final text = await File('${dir.path}/.credentials.yaml').readAsString();
-      expect(text, contains('SHIYI_API_KEY: sk-live'));
+      expectDshCredentials(text, {'SHIYI_API_KEY': 'sk-live'});
     });
 
     test('llm-pi-ai 未注册时回退修复 settings.yaml', () async {
@@ -1074,4 +1223,27 @@ llm-pi-ai:
       expect(calls, ['shiyi:deepseek-v4-flash']);
     });
   });
+}
+
+/// DSH 0.1.1-rc.2 `parseCredentialsDocument`：顶层只认 version / refs / records。
+void expectDshCredentials(String text, Map<String, String> refs) {
+  final doc = loadYaml(text);
+  expect(doc, isA<YamlMap>());
+  final root = doc as YamlMap;
+  expect(root['version'], 1, reason: 'DSH 0.1.1 拒绝无 version 的扁平文档');
+  for (final key in root.keys) {
+    expect(
+      const {'version', 'refs', 'records'},
+      contains(key.toString()),
+      reason: 'DSH 0.1.1 会 unknown top-level key "$key"',
+    );
+  }
+  final stored = <String, String>{};
+  final refsNode = root['refs'];
+  if (refsNode is YamlMap) {
+    for (final e in refsNode.entries) {
+      stored[e.key.toString()] = e.value.toString();
+    }
+  }
+  expect(stored, refs);
 }

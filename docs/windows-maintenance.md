@@ -133,13 +133,15 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 6. **通知 GUID 固定**：`c4a7d0e2-9f3b-4a5c-b6d7-8e9f0a1b2c3d` 勿改（卸载重装沿用）。
 7. **思考档位按模型 ID 关键字**：拾忆与 DSH 共用 `lib/core/reasoning_models.dart`，
    不绑死版本号（`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认 `deepseek`）。
-   命中家族时默认 `high`：OpenAI 兼容发 `reasoning_effort`（GPT 关闭发 `none`），
-   DeepSeek 官方额外发 `thinking: {type: enabled}`，Anthropic Messages 发
-   `thinking.budget_tokens` 且不发 `temperature`。对不上关键字的非空 ID 仍显示
-   通用档位，但不自动塞 thinking。网关拒绝思考参数时分别去掉不兼容字段重试。
-   拾忆解析 `reasoning_content` / `reasoning` / `thinking` 专用字段 + 正文
-   `<thinking>` 标签兜底；禁止对正文做启发式拆思考。DSH 会话页按钮读同一目录，
-   真正发请求走 `session.selectModel`。
+   `gpt-4o` / `gpt-4.1` / `gpt-3.5` 没有 reasoning，不能跟 `gpt-5` / Codex 一起
+   被裸关键字 `gpt` 命中。命中家族时默认 `high`：OpenAI 兼容发 `reasoning_effort`
+   （GPT 关闭发 `none`），DeepSeek 官方额外发 `thinking: {type: enabled}`，
+   Anthropic Messages 发 `thinking.budget_tokens` 且不发 `temperature`。
+   对不上关键字的非空 ID 仍显示通用档位，但不自动塞 thinking。网关拒绝思考参数时
+   分别去掉不兼容字段重试。拾忆解析 `reasoning_content` / `reasoning` / `thinking`
+   专用字段 + 正文 `<thinking>` 标签兜底；禁止对正文做启发式拆思考。DSH 会话页
+   按钮读同一目录，真正发请求走 `session.selectModel`。OpenRouter 注入必须
+   `compat.supportsStore: false`。
 
 ---
 
@@ -157,6 +159,8 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 | 模拟点击三键无效（自动化测试时） | 窗口未激活时首次点击被系统用于激活 | 先点击内容区激活窗口，再点三键 |
 | 拾忆思考进正文、折叠面板空 | 网关不带思考参数时不回 `reasoning_content`，思考被灌进 `content` | 命中家族关键字的模型默认带 `thinking`/`reasoning_effort`（拒绝时降级重试），正文 `<thinking>` 标签兜底拆分。见 `docs/fix-log.md` #219 / #222 |
 | 自定义 Claude/GPT/Grok 会话页没有思考按钮 | 旧逻辑只认少量写死 ID，刷新 Anthropic 模型还会直接报不支持 | 按模型 ID 关键字识别；对不上关键字也显示通用档位。Anthropic 走 `GET /v1/models`。见 `docs/fix-log.md` #222 |
+| OpenRouter 在拾忆可用、DSH 返回 400 | pi-ai 给 OpenRouter 发 `store: false`，且 `openai/gpt-4o` 被 `gpt` 当成思考模型误发 `reasoning` | 注入 `compat.supportsStore: false`；gpt-4o/4.1/3.5 不声明思考。见 `docs/fix-log.md` #223 |
+| DSH 0.1.1 启动即崩，修复完整运行环境没用 | `.credentials.yaml` 顶层仍是 `SHIYI_API_KEY:`，解析器只认 `version`/`refs`/`records` | 启动同步写成 `version: 1` + `refs:`，并把顶层密钥收进去。见 `docs/fix-log.md` #224 |
 
 ---
 
@@ -346,3 +350,10 @@ DS Harness 引擎验证点（#114，两端共享）：
   「刷新模型」走 `GET /v1/models` 分页；Claude 原生思考发 `budget_tokens`；GPT 关闭发 `none`。
   对不上关键字的模型也显示通用思考按钮，默认不自动发 thinking。Windows 继续复用同一套
   `LlmClient` / `DshModelSync`，无平台分支。
+
+- **2026-08-22**（共享 `lib/` 改动；Windows 无新增平台分支；详见 `docs/fix-log.md` #223/#224/#225）：
+  1. OpenRouter 注入关闭 `store`，`gpt-4o`/`gpt-4.1`/`gpt-3.5` 不再当思考模型；
+  2. `.credentials.yaml` 改为 DSH 0.1.1 的 `version: 1` + `refs:`，启动同步迁移旧扁平/混写文档；
+  3. 安装 DSH 去掉 `--prefer-offline`，避免过期 packument 漏掉已发布 rc。
+  Windows 继续复用同一套 `DshModelSync` / `DshService`，无平台分支。
+  共享验证：`flutter analyze` 0 issues；相关单测全绿。

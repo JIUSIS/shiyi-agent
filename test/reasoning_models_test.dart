@@ -78,6 +78,15 @@ void main() {
     expect(ReasoningModels.usesDeepSeekThinkingParam('gpt-5.6'), isFalse);
   });
 
+  test('gpt-4o / gpt-4.1 不是思考模型；gpt-5 才默认 high', () {
+    expect(ReasoningModels.defaultEffort('gpt-4o'), isNull);
+    expect(ReasoningModels.defaultEffort('openai/gpt-4o'), isNull);
+    expect(ReasoningModels.defaultEffort('gpt-4.1-mini'), isNull);
+    expect(ReasoningModels.defaultEffort('gpt-5'), 'high');
+    expect(ReasoningModels.defaultEffort('openai/gpt-5-mini'), 'high');
+    expect(ReasoningModels.profile('gpt-5.6')!.usesNoneForOff, isTrue);
+  });
+
   test('Anthropic budget_tokens 始终小于 max_tokens', () {
     expect(ReasoningModels.anthropicBudget('high', 16384), lessThan(16384));
     expect(ReasoningModels.anthropicBudget('max', 8192), lessThan(8192));

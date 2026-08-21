@@ -59,8 +59,8 @@ android {
         // sepolicy 补丁解决（见 TermuxRuntime._ensureApkLinkPolicy），
         // 无需再牺牲 targetSdk（新装 app 不再按旧版安卓设计渲染）。
         targetSdk = 36
-        versionCode = 16
-        versionName = "2.5.2"
+        versionCode = 17
+        versionName = "2.5.3"
     }
 
     signingConfigs {

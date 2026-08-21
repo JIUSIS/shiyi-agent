@@ -356,6 +356,37 @@ class DshService {
     return newest;
   }
 
+  /// npm 全局安装 DSH 的公共参数。
+  /// 不带 `--prefer-offline`：Alpine 里旧 packument 会把已发布版本（如
+  /// `0.1.1-rc.1`）当成不存在，四个源都 `ETARGET`。依赖 tarball 仍走
+  /// npm 本地缓存，只强制刷新清单。
+  static List<String> npmInstallArgs(String version, {required bool android}) {
+    return [
+      'install',
+      '-g',
+      '@deepseek-ai/dsh@$version',
+      '--no-audit',
+      '--no-fund',
+      // 网络超时/重试防护：避免代理抖动或死源导致单次尝试卡死。
+      // 实测（2026-08-16）：npm 慢不是带宽——单包 p50=254ms，
+      // 但约 10% 请求长尾 20-256s（镜像 CDN 回源抖动）。fetch-timeout
+      // 是"无进度超时"：设 300s 会让一个卡死的请求拖满 5 分钟×3 次重试，
+      // 整体被长尾拖到 30-60 分钟。改 60s 无进度即放弃重试（重试通常
+      // 命中 CDN 缓存反而快），maxsockets=32 让长尾不阻塞其他下载。
+      '--fetch-timeout=60000',
+      '--fetch-retries=3',
+      '--fetch-retry-mintimeout=1000',
+      '--fetch-retry-maxtimeout=10000',
+      '--maxsockets=32',
+      // 必须 --ignore-scripts：dsh 依赖里 @google/genai 等带 preinstall 脚本，
+      // 在 proot 里跑会 MODULE_NOT_FOUND 导致整体安装失败（实测）。node-pty
+      // 的原生模块由 _prepareAndroidFullRuntime(force) 单独 npm rebuild 编译。
+      if (android) '--ignore-scripts',
+      // 非 TTY 下 npm 默认静默；http 级别才逐包输出，终端和进度才看得见。
+      '--loglevel=http',
+    ];
+  }
+
   /// HTTP GET：检测到代理时经代理请求（Dart HttpClient.findProxy）。
   Future<http.Response> _httpGet(String url, ProxyInfo? proxy) async {
     if (proxy == null) {
@@ -1898,31 +1929,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     }
     _npmExpectedFetches = _knownNpmPackageCounts[version] ?? 0;
     _resetPhaseOutput();
-    final common = <String>[
-      'install',
-      '-g',
-      '@deepseek-ai/dsh@$version',
-      '--no-audit',
-      '--no-fund',
-      // 网络超时/重试防护：避免代理抖动或死源导致单次尝试卡死。
-      // 实测（2026-08-16）：npm 慢不是带宽——单包 p50=254ms，
-      // 但约 10% 请求长尾 20-256s（镜像 CDN 回源抖动）。fetch-timeout
-      // 是"无进度超时"：设 300s 会让一个卡死的请求拖满 5 分钟×3 次重试，
-      // 整体被长尾拖到 30-60 分钟。改 60s 无进度即放弃重试（重试通常
-      // 命中 CDN 缓存反而快），maxsockets=32 让长尾不阻塞其他下载。
-      '--fetch-timeout=60000',
-      '--fetch-retries=3',
-      '--fetch-retry-mintimeout=1000',
-      '--fetch-retry-maxtimeout=10000',
-      '--maxsockets=32',
-      '--prefer-offline',
-      // 必须 --ignore-scripts：dsh 依赖里 @google/genai 等带 preinstall 脚本，
-      // 在 proot 里跑会 MODULE_NOT_FOUND 导致整体安装失败（实测）。node-pty
-      // 的原生模块由 _prepareAndroidFullRuntime(force) 单独 npm rebuild 编译。
-      if (Platform.isAndroid) '--ignore-scripts',
-      // 非 TTY 下 npm 默认静默；http 级别才逐包输出，终端和进度才看得见。
-      '--loglevel=http',
-    ];
+    final common = npmInstallArgs(version, android: Platform.isAndroid);
     final attempts = <(String, List<String>)>[
       if (Platform.isAndroid)
         ('npmmirror', [...common, '--registry=https://registry.npmmirror.com']),

@@ -82,6 +82,21 @@ void main() {
     });
   });
 
+  group('npmInstallArgs', () {
+    test('不带 --prefer-offline，避免过期 packument 把已发布版本当成不存在', () {
+      final args = DshService.npmInstallArgs('0.1.1-rc.1', android: true);
+      expect(args, isNot(contains('--prefer-offline')));
+      expect(args, contains('@deepseek-ai/dsh@0.1.1-rc.1'));
+      expect(args, contains('--ignore-scripts'));
+    });
+
+    test('非 Android 不带 --ignore-scripts', () {
+      final args = DshService.npmInstallArgs('0.1.1-rc.1', android: false);
+      expect(args, isNot(contains('--prefer-offline')));
+      expect(args, isNot(contains('--ignore-scripts')));
+    });
+  });
+
   group('parseCliVersion', () {
     test('成功输出才抽版本', () {
       expect(DshService.parseCliVersion('0.1.0-rc.6', 0), '0.1.0-rc.6');

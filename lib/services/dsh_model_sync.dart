@@ -114,6 +114,32 @@ class DshModelSync {
   static String dshApiFor(String protocol) =>
       protocol == 'anthropic' ? 'anthropic-messages' : 'openai-completions';
 
+  /// pi-ai 按 URL 识别 OpenRouter；手写 `shiyi_*` 路由也必须走同一套判断。
+  static bool isOpenRouterBase(String baseUrl) =>
+      baseUrl.toLowerCase().contains('openrouter.ai');
+
+  /// OpenRouter 不是 OpenAI：`store` 会被原样转发并 400。
+  /// pi-ai 只把 deepseek/moonshot 等标成非标准网关，openrouter.ai 仍
+  /// `supportsStore: true`。手写注入必须显式关掉。
+  /// Anthropic 协议没有 `supportsStore`，写进去会被 llm-pi-ai 直接拒配置。
+  static Map<String, dynamic>? completionsCompatFor(
+    String baseUrl, {
+    String protocol = 'openai',
+  }) {
+    if (dshApiFor(protocol) != 'openai-completions') return null;
+    if (!isOpenRouterBase(baseUrl)) return null;
+    return const {'supportsStore': false};
+  }
+
+  /// OpenRouter 在 `model.reasoning=true` 且思考关闭时仍发送
+  /// `reasoning: {effort: none}`，非思考模型会 HTTP 400。只给真正的思考
+  /// 模型声明档位；其它网关保持原样（会话页通用按钮仍可显示）。
+  static bool declareReasoningCapability(String model, String baseUrl) {
+    if (defaultReasoningEffort(model) != null) return true;
+    if (isOpenRouterBase(baseUrl)) return false;
+    return reasoningEffortsForModel(model) != null;
+  }
+
   /// DSH 的 pi-ai provider 需要显式的 reasoning 档位才会向部分网关请求
   /// `reasoning_content`。只给明显支持思考输出的模型加默认档位，普通模型
   /// 不注入该字段，避免把不支持 reasoning 的模型误切到 thinking 请求。
@@ -322,8 +348,10 @@ class DshModelSync {
   /// llm-pi-ai 模型条目。`input` 声明模型能力。注入拾忆 provider 时统一声明
   /// `[text, image]`，这样 DSH 的 `read_image` 工具不会因 provider 条目缺少
   /// image 能力而在调用前被拒绝；是否配置独立视觉模型仍由视觉设置控制。
-  static Map<String, dynamic> _modelEntry(String id) {
-    final reasoningEfforts = reasoningEffortsForModel(id);
+  static Map<String, dynamic> _modelEntry(String id, {String baseUrl = ''}) {
+    final reasoningEfforts = declareReasoningCapability(id, baseUrl)
+        ? reasoningEffortsForModel(id)
+        : null;
     return {
       'id': id,
       'name': id,
@@ -344,10 +372,13 @@ class DshModelSync {
   }) {
     final primary = s.model.trim();
     final vision = s.visionModel.trim();
+    final baseUrl = s.baseUrl.trim();
     final seen = <String>{primary};
-    final models = <Map<String, dynamic>>[_modelEntry(primary)];
+    final models = <Map<String, dynamic>>[
+      _modelEntry(primary, baseUrl: baseUrl),
+    ];
     if (s.visionEnabled && vision.isNotEmpty && seen.add(vision)) {
-      models.add(_modelEntry(vision));
+      models.add(_modelEntry(vision, baseUrl: baseUrl));
     }
     final aliases = _normalizedResponseModels([
       ..._compatibilityResponseModels(primary),
@@ -355,17 +386,19 @@ class DshModelSync {
       ...catalogModels,
     ]).toList()..sort();
     for (final alias in aliases) {
-      if (seen.add(alias)) models.add(_modelEntry(alias));
+      if (seen.add(alias)) models.add(_modelEntry(alias, baseUrl: baseUrl));
     }
     final reasoning = defaultReasoningEffort(primary);
+    final compat = completionsCompatFor(baseUrl, protocol: s.apiProtocol);
     final id = (provider ?? providerId).trim();
     final label = (name ?? '').trim();
     return {
       'displayName': label.isEmpty ? displayName : label,
       'apiKeyEnv': (apiKeyEnv ?? credentialEnvFor(id)).trim(),
       'api': dshApiFor(s.apiProtocol),
-      'baseURL': s.baseUrl.trim(),
+      'baseURL': baseUrl,
       'models': models,
+      ...?(compat == null ? null : {'compat': compat}),
       ...?(reasoning == null ? null : {'reasoning': reasoning}),
     };
   }
@@ -1087,6 +1120,13 @@ class DshModelSync {
       '${child}api: ${dshApiFor(apiProtocol)}',
       '${child}baseURL: ${yamlScalar(baseUrl)}',
     ];
+    final compat = completionsCompatFor(baseUrl, protocol: apiProtocol);
+    if (compat != null) {
+      lines.add('${child}compat:');
+      for (final e in compat.entries) {
+        lines.add('$item${e.key}: ${e.value}');
+      }
+    }
     final reasoning = defaultReasoningEffort(model);
     if (reasoning != null) lines.add('${child}reasoning: $reasoning');
     lines.addAll([
@@ -1095,7 +1135,8 @@ class DshModelSync {
       '$item  name: ${yamlScalar(model)}',
       '$item  input: [text, image]',
     ]);
-    if (mainReasoningEfforts != null) {
+    if (mainReasoningEfforts != null &&
+        declareReasoningCapability(model, baseUrl)) {
       lines.addAll(_renderReasoningEfforts(item));
     }
     if (visionEnabled &&
@@ -1106,7 +1147,7 @@ class DshModelSync {
         '$item  name: ${yamlScalar(visionModel.trim())}',
         '$item  input: [text, image]',
       ]);
-      if (reasoningEffortsForModel(visionModel) != null) {
+      if (declareReasoningCapability(visionModel, baseUrl)) {
         lines.addAll(_renderReasoningEfforts(item));
       }
     }
@@ -1122,7 +1163,7 @@ class DshModelSync {
         '$item  name: ${yamlScalar(alias)}',
         '$item  input: [text, image]',
       ]);
-      if (reasoningEffortsForModel(alias) != null) {
+      if (declareReasoningCapability(alias, baseUrl)) {
         lines.addAll(_renderReasoningEfforts(item));
       }
     }
@@ -1311,6 +1352,9 @@ class DshModelSync {
     await applyToSession(api, sessionId, s);
   }
 
+  /// DSH 0.1.1 `credentialRef`：POSIX 标识符。顶层只认 version / refs / records。
+  static final _credentialRefRe = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');
+
   /// 清洗 credentials 文档：只保留 `key:` 行与注释行，丢弃其他行。
   /// 旧版本 yamlScalar 不转义换行时可能写出非法 YAML（DSH 启动即崩），
   /// 清洗让「读入坏文件 → 重写」自动修复，而不是把坏行原样保留。
@@ -1323,26 +1367,128 @@ class DshModelSync {
     }).toList();
   }
 
+  /// 写出 DSH 0.1.1-rc.2 认的 version-1 文档。
+  ///
+  /// 旧扁平 `SHIYI_API_KEY:` 顶层映射、以及 DSH 迁完 version 后又被
+  /// 旧写入器追加到顶层的密钥，都会收进 `refs:`。`records` 原样保留。
   static String upsertCredentialsYaml(
     String existing,
     String key,
     String value,
   ) {
-    final lines = _sanitizeCredentialLines(_splitLines(existing));
-    final kept = <String>[];
-    final prefix = '$key:';
-    for (final line in lines) {
-      final trimmed = line.trimLeft();
-      if (trimmed == prefix || trimmed.startsWith('$prefix ')) continue;
-      kept.add(line);
+    final doc = _parseCredentialsDocument(existing);
+    if (value.trim().isEmpty) {
+      doc.refs.remove(key);
+    } else {
+      doc.refs[key] = value;
     }
-    final compact = _trimTrailingEmpty(kept);
-    if (value.isEmpty) {
-      return compact.isEmpty ? '' : '${compact.join('\n')}\n';
-    }
-    compact.add('$key: ${yamlScalar(value)}');
-    return '${compact.join('\n')}\n';
+    return _renderCredentialsDocument(doc);
   }
+
+  static _CredentialsDocument _parseCredentialsDocument(String existing) {
+    if (existing.trim().isEmpty) {
+      return _CredentialsDocument();
+    }
+    try {
+      final yaml = loadYaml(existing);
+      if (yaml is YamlMap) return _credentialsFromYaml(yaml, existing);
+    } catch (_) {}
+    final sanitized = _joinLines(
+      _sanitizeCredentialLines(_splitLines(existing)),
+    );
+    if (sanitized.trim().isEmpty) return _CredentialsDocument();
+    try {
+      final yaml = loadYaml(sanitized);
+      if (yaml is YamlMap) return _credentialsFromYaml(yaml, sanitized);
+    } catch (_) {}
+    return _credentialsFromLines(sanitized);
+  }
+
+  static _CredentialsDocument _credentialsFromYaml(YamlMap yaml, String text) {
+    final refs = <String, String>{};
+    void collect(YamlMap map) {
+      for (final e in map.entries) {
+        final k = e.key.toString();
+        if (k == 'version' || k == 'refs' || k == 'records') continue;
+        if (!_credentialRefRe.hasMatch(k)) continue;
+        final v = e.value;
+        if (v is String && v.isNotEmpty) refs[k] = v;
+      }
+    }
+
+    final nested = yaml['refs'];
+    if (nested is YamlMap) collect(nested);
+    collect(yaml);
+    String? recordsBlock;
+    if (yaml['records'] is YamlMap) {
+      recordsBlock = _extractTopLevelBlock(text, 'records');
+    }
+    return _CredentialsDocument(refs: refs, recordsBlock: recordsBlock);
+  }
+
+  static _CredentialsDocument _credentialsFromLines(String text) {
+    final refs = <String, String>{};
+    final lines = _splitLines(text);
+    final versioned = lines.any((line) {
+      final t = line.trim();
+      return t == 'version: 1' || t.startsWith('version:');
+    });
+    for (final line in lines) {
+      final t = line.trimLeft();
+      if (t.isEmpty || t.startsWith('#')) continue;
+      final indent = line.length - t.length;
+      final colon = t.indexOf(':');
+      if (colon <= 0) continue;
+      final k = t.substring(0, colon).trim();
+      if (k == 'version' || k == 'refs' || k == 'records') continue;
+      if (!_credentialRefRe.hasMatch(k)) continue;
+      if (versioned) {
+        if (indent != 0 && indent != 2) continue;
+      } else if (indent != 0) {
+        continue;
+      }
+      final v = t.substring(colon + 1).trim();
+      if (v.isEmpty) continue;
+      refs[k] = v;
+    }
+    return _CredentialsDocument(refs: refs);
+  }
+
+  static String? _extractTopLevelBlock(String text, String key) {
+    final lines = _splitLines(text);
+    final start = _findKey(lines, 0, lines.length, 0, key);
+    if (start == null) return null;
+    final end = _blockEnd(lines, start, 0);
+    final block = _joinLines(lines.sublist(start, end));
+    return block.trim().isEmpty ? null : block.trimRight();
+  }
+
+  static String _renderCredentialsDocument(_CredentialsDocument doc) {
+    final hasRefs = doc.refs.isNotEmpty;
+    final records = doc.recordsBlock?.trimRight();
+    final hasRecords = records != null && records.isNotEmpty;
+    if (!hasRefs && !hasRecords) return '';
+    final buf = StringBuffer('version: 1\n');
+    if (hasRefs) {
+      buf.writeln('refs:');
+      for (final e in doc.refs.entries) {
+        buf.writeln('  ${e.key}: ${yamlScalar(e.value)}');
+      }
+    }
+    if (hasRecords) {
+      buf.write(records);
+      if (!records.endsWith('\n')) buf.write('\n');
+    }
+    return buf.toString();
+  }
+}
+
+class _CredentialsDocument {
+  _CredentialsDocument({Map<String, String>? refs, this.recordsBlock})
+    : refs = refs ?? <String, String>{};
+
+  final Map<String, String> refs;
+  final String? recordsBlock;
 }
 
 List<String> _splitLines(String text) {

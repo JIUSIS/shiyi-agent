@@ -70,9 +70,11 @@
 
 ## 思考档位规则
 - 会话页思考开关 / 档位按模型 ID 关键字识别，不绑死版本号：`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认 `deepseek`。拾忆直连与 DSH 注入共用 `lib/core/reasoning_models.dart`。
+- `gpt-4o` / `gpt-4.1` / `gpt-3.5` 没有 reasoning 参数，不能跟 `gpt-5` / Codex 一起被裸关键字 `gpt` 命中（OpenRouter 的 `openai/gpt-4o` 同理）。
 - 命中家族关键字时有默认档位（多为 `high`）并按协议组包：OpenAI 兼容发 `reasoning_effort`，GPT 关闭发 `none`；DeepSeek 官方额外发 `thinking: {type: enabled}`；Anthropic Messages 发 `thinking.budget_tokens` 且不发 `temperature`。
 - 对不上关键字的非空模型 ID 仍显示通用档位（off/low/medium/high/max），但默认不自动往请求或 DSH provider 里塞 thinking。空模型 ID 不显示按钮。
 - DSH 会话页按钮读同一套目录；真正发请求走 `session.selectModel` 的 `reasoningEffort`，不要把拾忆请求体误写成 DSH 文件协议。
+- OpenRouter 手写注入必须 `compat.supportsStore: false`（pi-ai 会把 `store: false` 转发给 OpenRouter 导致 400）；Anthropic 协议不要写 `supportsStore`。
 
 ## DSH 配置同步规则
 - 拾忆与 DSH 的协议/状态路径必须分开：模型注入走 `DshModelSync`，会话发送与模型选择走各自 API，禁止把拾忆请求误写成 DSH 文件协议。
@@ -80,4 +82,5 @@
 - `settings.yaml` 必须临时文件写完再 `rename` 原子替换，禁止直接 `writeAsString` 截断目标。DSH 启动解析时只能看到完整旧文件或完整新文件。
 - 启动同步若发现 `settings.yaml` 已损坏，先备份为 `settings.yaml.corrupt` 再重建干净配置；不要把坏快照再喂给行级 upsert。
 - 密钥只进 credentials / `.credentials.yaml`，禁止写入 provider settings。
-- 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML。YAML 损坏应靠启动同步自愈，不要误导用户点修复环境。
+- DSH 0.1.1 的 `.credentials.yaml` 只认 `version: 1` + `refs` / `records`。禁止把 `SHIYI_API_KEY` 写到顶层；启动同步必须把旧扁平文档和混写文档收进 `refs`。
+- 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML / 凭据文档。YAML 或凭据损坏应靠启动同步自愈，不要误导用户点修复环境。
