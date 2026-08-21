@@ -276,8 +276,9 @@ class _AboutScreenState extends State<AboutScreen> {
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 32),
                       child: Text(
-                        '与你共同成长的智能体：跨会话记忆、技能沉淀与工具调用。'
-                        '可切换拾忆本地引擎或 DeepSeek Harness，会话数据各自独立。',
+                        '愿中国青年都摆脱冷气，只是向上走，不必听自暴自弃者流的话。'
+                        '能做事的做事，能发声的发声。有一分热，发一分光，'
+                        '就令萤火一般，也可以在黑暗里发一点光，不必等候炬火。',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 13,

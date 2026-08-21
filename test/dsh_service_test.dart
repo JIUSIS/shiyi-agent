@@ -37,6 +37,51 @@ void main() {
     });
   });
 
+  group('pickNewestPublishedVersion', () {
+    test('latest 停在 rc.7 时仍能检出已发布的 rc.8', () {
+      expect(
+        DshService.pickNewestPublishedVersion({
+          'dist-tags': {'latest': '0.1.0-rc.7'},
+          'versions': {'0.1.0-rc.6': {}, '0.1.0-rc.7': {}, '0.1.0-rc.8': {}},
+        }),
+        '0.1.0-rc.8',
+      );
+    });
+
+    test('next 在另一条线上时不覆盖当前 latest 线', () {
+      expect(
+        DshService.pickNewestPublishedVersion({
+          'dist-tags': {'latest': '0.1.0-rc.7', 'next': '0.1.1-rc.1'},
+          'versions': {'0.1.0-rc.7': {}, '0.1.0-rc.8': {}, '0.1.1-rc.1': {}},
+        }),
+        '0.1.0-rc.8',
+      );
+    });
+
+    test('latest 已迁到新线时跟新线走', () {
+      expect(
+        DshService.pickNewestPublishedVersion({
+          'dist-tags': {'latest': '0.1.1-rc.1'},
+          'versions': {'0.1.0-rc.8': {}, '0.1.1-rc.1': {}, '0.1.1-rc.2': {}},
+        }),
+        '0.1.1-rc.2',
+      );
+    });
+
+    test('没有 versions 时回退 dist-tags', () {
+      expect(
+        DshService.pickNewestPublishedVersion({
+          'dist-tags': {'latest': '0.1.0-rc.7', 'next': '0.1.0-rc.6'},
+        }),
+        '0.1.0-rc.7',
+      );
+    });
+
+    test('空文档返回 null', () {
+      expect(DshService.pickNewestPublishedVersion(const {}), isNull);
+    });
+  });
+
   group('parseCliVersion', () {
     test('成功输出才抽版本', () {
       expect(DshService.parseCliVersion('0.1.0-rc.6', 0), '0.1.0-rc.6');

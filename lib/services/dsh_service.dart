@@ -285,6 +285,9 @@ class DshService {
   /// 检测 npm 最新版本。分层探测（实测：npmjs 国内直连/代理常不通，
   /// npmmirror 镜像直连最稳）：
   /// 镜像直连 → npmjs 直连 → 镜像走代理 → npmjs 走代理。
+  ///
+  /// 不只信 `dist-tags.latest`：官方可能已发 `0.1.0-rc.8` 却不把 latest
+  /// 从 `0.1.0-rc.7` 推上去。扫描 dist-tags 与 `versions` 后取 semver 最高。
   Future<String?> checkLatestVersion() async {
     final proxy = await _detectProxy();
     final attempts = <(String, ProxyInfo?)>[
@@ -300,8 +303,7 @@ class DshService {
         final res = await _httpGet(url, p).timeout(const Duration(seconds: 12));
         if (res.statusCode != 200) continue;
         final body = jsonDecode(res.body) as Map<String, dynamic>;
-        final tags = (body['dist-tags'] as Map?)?.cast<String, dynamic>();
-        final latest = tags?['latest']?.toString();
+        final latest = pickNewestPublishedVersion(body);
         if (latest != null && latest.isNotEmpty) {
           latestVersion = latest;
           return latest;
@@ -311,6 +313,47 @@ class DshService {
       }
     }
     return null;
+  }
+
+  /// 从 npm registry 文档挑最新已发布版本。
+  /// `dist-tags.latest` 可能落后于实际 `versions`（例如 rc.8 已发、latest 仍 rc.7）。
+  /// 只跟 latest 同一条 `major.minor.patch` 线，避免把 `next`（如 0.1.1-rc.1）
+  /// 当成当前线的更新。
+  static String? pickNewestPublishedVersion(Map<String, dynamic> body) {
+    final candidates = <String>{};
+    final tags = body['dist-tags'];
+    String? latestTag;
+    if (tags is Map) {
+      latestTag = tags['latest']?.toString().trim();
+      if (latestTag != null && latestTag.isEmpty) latestTag = null;
+      for (final value in tags.values) {
+        final version = value?.toString().trim() ?? '';
+        if (version.isNotEmpty) candidates.add(version);
+      }
+    }
+    final versions = body['versions'];
+    if (versions is Map) {
+      for (final key in versions.keys) {
+        final version = key.toString().trim();
+        if (version.isNotEmpty) candidates.add(version);
+      }
+    }
+    var pool = candidates;
+    if (latestTag != null) {
+      final core = _parseSemver(latestTag).$1;
+      final sameLine = candidates.where((version) {
+        final nums = _parseSemver(version).$1;
+        return nums[0] == core[0] && nums[1] == core[1] && nums[2] == core[2];
+      }).toSet();
+      if (sameLine.isNotEmpty) pool = sameLine;
+    }
+    String? newest;
+    for (final version in pool) {
+      if (newest == null || compareSemver(version, newest) > 0) {
+        newest = version;
+      }
+    }
+    return newest;
   }
 
   /// HTTP GET：检测到代理时经代理请求（Dart HttpClient.findProxy）。
