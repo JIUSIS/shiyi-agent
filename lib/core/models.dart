@@ -548,9 +548,8 @@ class AppSettings {
   bool enableMemory;
   bool enableAutoLearn;
 
-  /// 活人感（在场）：打开后按对话更新内部需求状态，并在人设后注入语气指令。
-  /// 参考 LAAP 的 PSI 循环（需求 → 主导需求 → 语气），不接外部进程。
-  /// 默认关，不影响工作台腔与工具调用。
+  /// 活人感（在场）：打开后按对话更新内部需求状态，并在人设后注入本轮内心。
+  /// 不接外部进程。默认关，不影响工作台腔与工具调用。
   bool enablePresence;
   bool ttsEnabled;
   double ttsRate;

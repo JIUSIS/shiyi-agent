@@ -1,4 +1,4 @@
-/// 活人感引擎：参考 LAAP 的精华——本地先有内心状态，模型只负责把它讲出来。
+/// 活人感引擎：本地先有内心状态，模型只负责把它讲出来。
 ///
 /// 不是再贴一段「请像人说话」的 soul。每轮 [onUserMessage] 后，
 /// [innerLine] 生成本轮具体内心话；[promptSection] 要求模型翻译它，
@@ -174,7 +174,7 @@ class PresenceEngine {
     _updateBond(text);
   }
 
-  /// 对话后：按回复长度和用词回写需求（对齐 LAAP proxy 的 psi_on_response）。
+  /// 对话后：按回复长度和用词回写需求。
   void onAssistantReply(String text) {
     if (text.length > 200) {
       needs['competence'] = _clip((needs['competence'] ?? 0.5) + 0.03);

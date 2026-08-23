@@ -1641,7 +1641,7 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
               icon: CupertinoIcons.person_crop_circle,
               color: _iosTeal,
               title: '活人感',
-              subtitle: '新会话先当固定搭档说话，再随对话调整。默认关闭，不影响工具',
+              subtitle: '按对话生成这轮内心再讲出来。默认关闭，不影响工具',
               value: _presence,
               onChanged: (v) {
                 setState(() => _presence = v);
