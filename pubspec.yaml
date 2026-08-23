@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.5.3+17
+version: 2.5.5+19
 
 environment:
   sdk: ^3.12.2
@@ -55,6 +55,7 @@ dependencies:
   # 解析 DSH Cordis 插件清单 cordis.patch.yml（plugin 管理页与 LLM 操作共用）。
   yaml: ^3.1.2
   liquid_glass_easy: ^4.0.0
+  socks5_proxy: ^2.1.1
 dependency_overrides:
   file_picker:
     path: third_party/file_picker_patch

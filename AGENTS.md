@@ -76,6 +76,18 @@
 - DSH 会话页按钮读同一套目录；真正发请求走 `session.selectModel` 的 `reasoningEffort`，不要把拾忆请求体误写成 DSH 文件协议。
 - OpenRouter 手写注入必须 `compat.supportsStore: false`（pi-ai 会把 `store: false` 转发给 OpenRouter 导致 400）；Anthropic 协议不要写 `supportsStore`。
 
+## SOCKS5 代理通道
+- 设置 → 通用 → SOCKS5 代理：`off` / `auto` / `custom`。`auto` 扫本机 Clash mixed/socks、V2RayN、SS 常见端口并做 SOCKS5 握手；`custom` 用已保存服务器或临时主机端口。
+- 对话（`LlmClient`）、拉模型、联网搜索（`web_tools`）走 `Socks5Proxy.client()`。DSH npm 安装用的 HTTP 自动代理（`NetworkProxyDetector`）不要混进这条 SOCKS5。
+- 服务器密码走 `flutter_secure_storage`，不要写进 prefs JSON。分组底部说明必须是 12 号灰色提示，不要用默认正文字号。
+- 手机连电脑 Clash：Clash 开允许局域网，自定义里填电脑局域网 IP，不要填 `127.0.0.1`。
+
+## 活人感
+- `enablePresence` 默认关。打开后 `PresenceEngine` 每轮生成本轮内心话，经 `PromptSection` 注入；模型只翻译内心，不改工具工作台管线。不要把它改回静态 soul 段落。
+
+## 会话压缩入口
+- 输入区常驻 `ChatCompressionButton` 是唯一手动压缩入口。禁止再在达到阈值时弹出右下角「压缩上下文」胶囊。
+
 ## DSH 配置同步规则
 - 拾忆与 DSH 的协议/状态路径必须分开：模型注入走 `DshModelSync`，会话发送与模型选择走各自 API，禁止把拾忆请求误写成 DSH 文件协议。
 - 所有会读改写 DSH 文件（`settings.yaml` / `.credentials.yaml` / `cordis.patch.yml`）的入口必须走 `DshModelSync` 共享串行队列；`unawaited(syncFromShiyi)` 可以保留，但不能各自加锁。

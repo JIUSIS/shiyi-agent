@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'models.dart';
 import '../services/file_workspace.dart';
+import 'presence_engine.dart';
 import 'prompt_section.dart';
 
 /// 系统提示词构建器：把「组装系统提示词」从 [ShiyiState] 中独立出来。
@@ -32,6 +33,9 @@ class PromptBuilder {
   /// （Windows 上由设置 + WSL2/pwsh 探测决定，Android 恒为 android）。
   final Future<String> Function() terminalBackend;
 
+  /// 活人感引擎快照；开关关闭或未注入时为 null，不注册 presence 段落。
+  final PresenceEngine? Function()? presence;
+
   PromptBuilder({
     required this.settings,
     required this.skills,
@@ -40,6 +44,7 @@ class PromptBuilder {
     required this.currentWorkspace,
     required this.memories,
     required this.terminalBackend,
+    this.presence,
   });
 
   /// 组装完整系统提示词。
@@ -76,6 +81,16 @@ class PromptBuilder {
         );
       },
     ),
+    if (settings().enablePresence)
+      PromptSection(
+        name: 'presence',
+        order: 50,
+        builder: () async {
+          final engine = presence?.call();
+          if (engine == null) return '';
+          return engine.promptSection();
+        },
+      ),
     PromptSection(name: 'tool-rules', order: 100, text: _toolRulesText),
     PromptSection(
       name: 'workspace',

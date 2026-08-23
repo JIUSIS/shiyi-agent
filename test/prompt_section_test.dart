@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:shiyi_agent_app/core/app_state.dart';
 import 'package:shiyi_agent_app/core/models.dart';
+import 'package:shiyi_agent_app/core/presence_engine.dart';
 import 'package:shiyi_agent_app/core/prompt_section.dart';
 
 void main() {
@@ -114,6 +115,50 @@ void main() {
       final sections = makeState().buildPromptSectionsForTest('输入');
       final names = sections.map((s) => s.name).toList();
       expect(names.toSet().length, names.length);
+    });
+
+    test('活人感关闭时不注册 presence 段落', () {
+      final sections = makeState().buildPromptSectionsForTest('输入');
+      expect(sections.any((s) => s.name == 'presence'), isFalse);
+    });
+
+    test('活人感开启时注入 presence，且排在人设之后、工具规则之前', () async {
+      final shiyi = makeState();
+      shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
+      shiyi.presence.onUserMessage('我们一起把这个做完');
+      final sections = shiyi.buildPromptSectionsForTest('输入');
+      final presence = sections.singleWhere((s) => s.name == 'presence');
+      final persona = sections.singleWhere((s) => s.name == 'persona');
+      final toolRules = sections.singleWhere((s) => s.name == 'tool-rules');
+      expect(presence.order, greaterThan(persona.order));
+      expect(presence.order, lessThan(toolRules.order));
+
+      final text = await presence.build();
+      expect(text, contains('【在场】'));
+      expect(text, contains('本轮内心'));
+      expect(text, contains('不要直接说出来'));
+      expect(text, contains('不要工作汇报腔'));
+      expect(text, isNot(contains('PSI')));
+    });
+
+    test('活人感开启时完整提示词含在场段，默认人设仍在', () async {
+      final shiyi = makeState();
+      shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
+      shiyi.presence.onUserMessage('输入');
+      final prompt = await shiyi.buildSystemPromptForTest('输入');
+      expect(prompt, contains('【在场】'));
+      expect(prompt, contains('你是「拾忆」'));
+      expect(prompt, contains('【工具使用规则】'));
+    });
+
+    test('活人感开启时提示词随用户输入改变主导需求', () async {
+      final shiyi = makeState();
+      shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
+      shiyi.presence = PresenceEngine();
+      shiyi.presence.onUserMessage('今晚一起吃饭，有你陪伴真好');
+      final prompt = await shiyi.buildSystemPromptForTest('今晚一起吃饭，有你陪伴真好');
+      expect(prompt, contains('联结'));
+      expect(prompt, contains('relatedness'));
     });
 
     test('时间段落 order 最大（永远排最后，缓存前缀稳定）', () {

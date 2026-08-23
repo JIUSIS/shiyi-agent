@@ -357,3 +357,9 @@ DS Harness 引擎验证点（#114，两端共享）：
   3. 安装 DSH 去掉 `--prefer-offline`，避免过期 packument 漏掉已发布 rc。
   Windows 继续复用同一套 `DshModelSync` / `DshService`，无平台分支。
   共享验证：`flutter analyze` 0 issues；相关单测全绿。
+
+- **2026-08-23**（共享 `lib/` 改动；Windows 无新增平台分支）：
+  1. SOCKS5 自定义通道：设置 → 通用 → SOCKS5 代理。`auto` 扫本机 Clash / V2Ray / SS 常见端口；`custom` 可保存多台服务器。对话、拉模型、联网搜索走 `Socks5Proxy`。DSH npm HTTP 自动代理仍用 `NetworkProxyDetector`，不要混用。
+  2. 可选活人感（默认关）：`PresenceEngine` 本地内心状态循环，不改工具管线。
+  3. 去掉会话页阈值弹出的压缩胶囊，只留输入区常驻压缩按钮。
+  Windows 本机 Clash 默认 7890/7891 可被自动检测；桌面版与 Android 共用同一套设置页与客户端。

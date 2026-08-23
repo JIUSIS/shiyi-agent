@@ -547,6 +547,11 @@ class AppSettings {
   bool enableTools;
   bool enableMemory;
   bool enableAutoLearn;
+
+  /// 活人感（在场）：打开后按对话更新内部需求状态，并在人设后注入语气指令。
+  /// 参考 LAAP 的 PSI 循环（需求 → 主导需求 → 语气），不接外部进程。
+  /// 默认关，不影响工作台腔与工具调用。
+  bool enablePresence;
   bool ttsEnabled;
   double ttsRate;
   String themeMode; // light / dark / system
@@ -603,6 +608,21 @@ class AppSettings {
   /// DSH DeepSeek 官方搜索 API Key（仅 provider=deepseek 时使用）。
   String dshSearchKey;
 
+  /// 自定义 SOCKS5 通道：打开后对话 / 拉模型 / 联网搜索走该代理。
+  /// 给国内 IP 被中转站拦截时换境外出口用，默认关。
+  bool socks5Enabled;
+
+  /// off / auto / custom。auto 扫本机 Clash 等；custom 用手动服务器。
+  String socks5Mode;
+  String socks5Host;
+  int socks5Port;
+  String socks5User;
+  String socks5Password;
+
+  /// 手动保存的代理服务器列表；[socks5ActiveId] 指向当前选用的一条。
+  List<Socks5Server> socks5Servers;
+  String socks5ActiveId;
+
   AppSettings({
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
@@ -613,6 +633,7 @@ class AppSettings {
     this.enableTools = true,
     this.enableMemory = true,
     this.enableAutoLearn = true,
+    this.enablePresence = false,
     this.ttsEnabled = false,
     this.ttsRate = 1.0,
     this.themeMode = 'dark',
@@ -633,6 +654,14 @@ class AppSettings {
     this.dshStopOnExit = true,
     this.dshSearchProvider = 'auto',
     this.dshSearchKey = '',
+    this.socks5Enabled = false,
+    this.socks5Mode = 'off',
+    this.socks5Host = '',
+    this.socks5Port = 1080,
+    this.socks5User = '',
+    this.socks5Password = '',
+    this.socks5Servers = const [],
+    this.socks5ActiveId = '',
   });
 
   AppSettings copyWith({
@@ -645,6 +674,7 @@ class AppSettings {
     bool? enableTools,
     bool? enableMemory,
     bool? enableAutoLearn,
+    bool? enablePresence,
     bool? ttsEnabled,
     double? ttsRate,
     String? themeMode,
@@ -665,6 +695,14 @@ class AppSettings {
     bool? dshStopOnExit,
     String? dshSearchProvider,
     String? dshSearchKey,
+    bool? socks5Enabled,
+    String? socks5Mode,
+    String? socks5Host,
+    int? socks5Port,
+    String? socks5User,
+    String? socks5Password,
+    List<Socks5Server>? socks5Servers,
+    String? socks5ActiveId,
   }) => AppSettings(
     baseUrl: baseUrl ?? this.baseUrl,
     apiKey: apiKey ?? this.apiKey,
@@ -675,6 +713,7 @@ class AppSettings {
     enableTools: enableTools ?? this.enableTools,
     enableMemory: enableMemory ?? this.enableMemory,
     enableAutoLearn: enableAutoLearn ?? this.enableAutoLearn,
+    enablePresence: enablePresence ?? this.enablePresence,
     ttsEnabled: ttsEnabled ?? this.ttsEnabled,
     ttsRate: ttsRate ?? this.ttsRate,
     themeMode: themeMode ?? this.themeMode,
@@ -696,6 +735,14 @@ class AppSettings {
     dshStopOnExit: dshStopOnExit ?? this.dshStopOnExit,
     dshSearchProvider: dshSearchProvider ?? this.dshSearchProvider,
     dshSearchKey: dshSearchKey ?? this.dshSearchKey,
+    socks5Enabled: socks5Enabled ?? this.socks5Enabled,
+    socks5Mode: socks5Mode ?? this.socks5Mode,
+    socks5Host: socks5Host ?? this.socks5Host,
+    socks5Port: socks5Port ?? this.socks5Port,
+    socks5User: socks5User ?? this.socks5User,
+    socks5Password: socks5Password ?? this.socks5Password,
+    socks5Servers: socks5Servers ?? this.socks5Servers,
+    socks5ActiveId: socks5ActiveId ?? this.socks5ActiveId,
   );
 
   Map<String, dynamic> toJson() => {
@@ -708,6 +755,7 @@ class AppSettings {
     'enableTools': enableTools,
     'enableMemory': enableMemory,
     'enableAutoLearn': enableAutoLearn,
+    'enablePresence': enablePresence,
     'ttsEnabled': ttsEnabled,
     'ttsRate': ttsRate,
     'themeMode': themeMode,
@@ -728,6 +776,13 @@ class AppSettings {
     'dshStopOnExit': dshStopOnExit,
     'dshSearchProvider': dshSearchProvider,
     'dshSearchKey': dshSearchKey,
+    'socks5Enabled': socks5Enabled,
+    'socks5Mode': socks5Mode,
+    'socks5Host': socks5Host,
+    'socks5Port': socks5Port,
+    'socks5User': socks5User,
+    'socks5Servers': socks5Servers.map((e) => e.toJson()).toList(),
+    'socks5ActiveId': socks5ActiveId,
   };
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
@@ -740,6 +795,7 @@ class AppSettings {
     enableTools: j['enableTools'] ?? true,
     enableMemory: j['enableMemory'] ?? true,
     enableAutoLearn: j['enableAutoLearn'] ?? true,
+    enablePresence: j['enablePresence'] ?? false,
     ttsEnabled: j['ttsEnabled'] ?? false,
     ttsRate: (j['ttsRate'] as num?)?.toDouble() ?? 1.0,
     themeMode: j['themeMode'] ?? 'dark',
@@ -761,6 +817,86 @@ class AppSettings {
     dshStopOnExit: j['dshStopOnExit'] ?? true,
     dshSearchProvider: j['dshSearchProvider'] ?? 'auto',
     dshSearchKey: j['dshSearchKey'] ?? '',
+    socks5Enabled: j['socks5Enabled'] ?? false,
+    socks5Mode: _socks5ModeFromJson(j),
+    socks5Host: j['socks5Host'] ?? '',
+    socks5Port: (j['socks5Port'] as num?)?.toInt() ?? 1080,
+    socks5User: j['socks5User'] ?? '',
+    socks5Password: j['socks5Password'] ?? '',
+    socks5Servers: _socks5ServersFromJson(j['socks5Servers']),
+    socks5ActiveId: j['socks5ActiveId'] ?? '',
+  );
+}
+
+String _socks5ModeFromJson(Map<String, dynamic> j) {
+  final raw = (j['socks5Mode'] ?? '').toString();
+  if (raw == 'off' || raw == 'auto' || raw == 'custom') return raw;
+  if (j['socks5Enabled'] == true) return 'custom';
+  return 'off';
+}
+
+List<Socks5Server> _socks5ServersFromJson(dynamic raw) {
+  if (raw is! List) return const [];
+  return raw
+      .whereType<Map>()
+      .map((e) => Socks5Server.fromJson(Map<String, dynamic>.from(e)))
+      .toList();
+}
+
+/// 一条可保存的 SOCKS5 服务器（密码不进 JSON，由安全存储单独写）。
+class Socks5Server {
+  final String id;
+  final String name;
+  final String host;
+  final int port;
+  final String user;
+  final String password;
+
+  const Socks5Server({
+    required this.id,
+    required this.name,
+    required this.host,
+    required this.port,
+    this.user = '',
+    this.password = '',
+  });
+
+  String get label {
+    final n = name.trim();
+    if (n.isNotEmpty) return n;
+    return '$host:$port';
+  }
+
+  Socks5Server copyWith({
+    String? name,
+    String? host,
+    int? port,
+    String? user,
+    String? password,
+  }) => Socks5Server(
+    id: id,
+    name: name ?? this.name,
+    host: host ?? this.host,
+    port: port ?? this.port,
+    user: user ?? this.user,
+    password: password ?? this.password,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'host': host,
+    'port': port,
+    'user': user,
+  };
+
+  factory Socks5Server.fromJson(Map<String, dynamic> j) => Socks5Server(
+    id: j['id'] ?? '',
+    name: j['name'] ?? '',
+    host: j['host'] ?? '',
+    port: (j['port'] as num?)?.toInt() ?? 1080,
+    user: j['user'] ?? '',
+    password: j['password'] ?? '',
   );
 }
 

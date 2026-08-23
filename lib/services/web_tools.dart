@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 
 import '../core/tool_result_pruner.dart';
+import 'socks5_config.dart';
 
 /// 单条搜索结果。
 class WebSearchResult {
@@ -38,6 +39,19 @@ class WebTools {
   static const Map<String, String> _ua = {
     'User-Agent': 'Mozilla/5.0 (Linux; Android 14) ShiYi/1.0',
   };
+
+  static Future<http.Response> _get(
+    Uri uri, {
+    Map<String, String>? headers,
+    required Duration timeout,
+  }) async {
+    final client = await Socks5Proxy.client();
+    try {
+      return await client.get(uri, headers: headers).timeout(timeout);
+    } finally {
+      client.close();
+    }
+  }
 
   /// 联网搜索，返回结构化结果列表。
   /// 先探测 DuckDuckGo：能访问（开了代理）直接用 DuckDuckGo，被墙则用 Bing；
@@ -85,18 +99,17 @@ class WebTools {
 
   static Future<String> _fetchDirect(Uri u, int maxChars) async {
     await _rejectPrivateHost(u);
-    final resp = await http
-        .get(
-          u,
-          headers: {
-            'User-Agent':
-                'Mozilla/5.0 (Linux; Android 14; ShiYi/1.0) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,text/plain,*/*',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          },
-        )
-        .timeout(_extractTimeout);
+    final resp = await _get(
+      u,
+      headers: {
+        'User-Agent':
+            'Mozilla/5.0 (Linux; Android 14; ShiYi/1.0) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,text/plain,*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      },
+      timeout: _extractTimeout,
+    );
     // 重定向兜底：http 包自动跟随 3xx，公开站点可能 302 到内网地址
     //（如 169.254.169.254 云元数据）。内容即使已被拉回也不返回给模型——
     // SSRF 目标是防数据外泄，最终地址命中内网即整体拒绝。
@@ -124,15 +137,14 @@ class WebTools {
   static Future<String> _fetchViaJina(Uri u, int maxChars) async {
     http.Response resp;
     try {
-      resp = await http
-          .get(
-            Uri.parse('https://r.jina.ai/${u.toString()}'),
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Linux; Android 14) ShiYi/1.0',
-              'Accept': 'text/plain, text/markdown',
-            },
-          )
-          .timeout(_extractTimeout);
+      resp = await _get(
+        Uri.parse('https://r.jina.ai/${u.toString()}'),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 14) ShiYi/1.0',
+          'Accept': 'text/plain, text/markdown',
+        },
+        timeout: _extractTimeout,
+      );
     } on TimeoutException {
       throw Exception('Jina 抓取超时（15 秒）：目标站点可能响应慢或被防爬拦截（验证码/Cloudflare 等）。');
     }
@@ -244,9 +256,7 @@ class WebTools {
     http.Response? resp;
     for (final u in urls) {
       try {
-        resp = await http
-            .get(Uri.parse(u), headers: _ua)
-            .timeout(_searchTimeout);
+        resp = await _get(Uri.parse(u), headers: _ua, timeout: _searchTimeout);
         if (resp.statusCode == 200) break;
       } catch (_) {
         resp = null;
@@ -293,9 +303,11 @@ class WebTools {
     }
     var reachable = false;
     try {
-      final resp = await http
-          .get(Uri.parse('https://duckduckgo.com/'), headers: _ua)
-          .timeout(_probeTimeout);
+      final resp = await _get(
+        Uri.parse('https://duckduckgo.com/'),
+        headers: _ua,
+        timeout: _probeTimeout,
+      );
       reachable = resp.statusCode == 200;
     } catch (_) {
       reachable = false;
@@ -309,9 +321,11 @@ class WebTools {
     String q,
     int limit,
   ) async {
-    final resp = await http
-        .get(Uri.parse('https://html.duckduckgo.com/html/?q=$q'), headers: _ua)
-        .timeout(_searchTimeout);
+    final resp = await _get(
+      Uri.parse('https://html.duckduckgo.com/html/?q=$q'),
+      headers: _ua,
+      timeout: _searchTimeout,
+    );
     if (resp.statusCode != 200) {
       throw Exception('DuckDuckGo 搜索失败：HTTP ${resp.statusCode}');
     }

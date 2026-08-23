@@ -2,6 +2,30 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.5.5] - 2026-08-23
+
+相对 2.5.3：对话和搜索可走自定义 SOCKS5（本机 Clash 自动检测或手动添加服务器）；可选「活人感」；去掉会话页阈值弹出的压缩按钮。
+
+### 新增
+
+- **SOCKS5 代理通道**：设置 → 通用 → SOCKS5 代理。国内 IP 被小蓝等中转站拦截时可走境外出口。三种模式：
+  - 关闭（直连）
+  - 自动检测本机 Clash / FlClash / V2RayN / SS 常见端口（7890 / 7891 / 7897 / 10808 / 1080），握手确认为 SOCKS5 才采用
+  - 自定义：可保存多台服务器，支持粘贴 `socks5://user:pass@host:port` 或 `host:port`，点选切换
+- 对话、拉模型列表、联网搜索走该 SOCKS5；密码进安全存储，不进明文 JSON。DSH 安装用的 HTTP 自动代理仍是另一套。
+- **可选活人感**（默认关）：参考 LAAP 的内心状态循环，本地先生成本轮内心话，模型只负责讲出来，不改工具工作台管线。
+
+### 优化
+
+- 会话上下文达到阈值时不再弹出右下角「压缩上下文」胶囊，只保留输入区常驻压缩按钮。
+- SOCKS5 设置页分组底部说明改为 12 号灰色提示，不再跟标题一样大。
+
+### 验证
+
+- `flutter analyze` 针对 SOCKS5 / 活人感 / 会话页改动无告警。
+- `flutter test test/socks5_proxy_test.dart test/settings_model_test.dart test/web_tools_test.dart test/presence_engine_test.dart test/prompt_section_test.dart` 全部通过。
+- 正式包同签名覆盖安装，未卸载、未清数据。
+
 ## [2.5.3] - 2026-08-22
 
 相对 2.5.2：DSH 0.1.1 启动不再被旧凭据文件拦住；OpenRouter 注入不再 HTTP 400；安装 DSH 不再因过期 npm 清单漏掉已发布版本。

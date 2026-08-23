@@ -10,6 +10,8 @@ class SettingsService {
   static const FlutterSecureStorage _secure = FlutterSecureStorage();
   static const _mainApiKeyKey = 'shiyi_api_key';
   static const _visionApiKeyKey = 'shiyi_vision_api_key';
+  static const _socks5PasswordKey = 'shiyi_socks5_password';
+  static const _socks5ServerPasswordsKey = 'shiyi_socks5_server_passwords';
   static const _profileKeyPrefix = 'shiyi_profile_api_key_';
 
   Future<AppSettings> load() async {
@@ -36,6 +38,8 @@ class SettingsService {
       final s = AppSettings.fromJson(json);
       s.apiKey = await _readKey(_mainApiKeyKey);
       s.visionApiKey = await _readKey(_visionApiKeyKey);
+      s.socks5Password = await _readKey(_socks5PasswordKey);
+      s.socks5Servers = await _attachServerPasswords(s.socks5Servers);
       // 迁移旧默认：此前按“字符”计、默认 100 万；现按 token 计，默认 128k。
       if (s.contextLimit >= 500000) s.contextLimit = 128000;
       // 旧版本没有输出上限字段：按已选预设带出建议值，
@@ -67,9 +71,12 @@ class SettingsService {
   Future<void> save(AppSettings s) async {
     final json = s.toJson()
       ..remove('apiKey')
-      ..remove('visionApiKey');
+      ..remove('visionApiKey')
+      ..remove('socks5Password');
     await _writeKey(_mainApiKeyKey, s.apiKey);
     await _writeKey(_visionApiKeyKey, s.visionApiKey);
+    await _writeKey(_socks5PasswordKey, s.socks5Password);
+    await _writeServerPasswords(s.socks5Servers);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, jsonEncode(json));
   }
@@ -152,6 +159,40 @@ class SettingsService {
       return await _secure.read(key: key) ?? '';
     } catch (_) {
       return '';
+    }
+  }
+
+  Future<List<Socks5Server>> _attachServerPasswords(
+    List<Socks5Server> servers,
+  ) async {
+    if (servers.isEmpty) return servers;
+    Map<String, dynamic> map = const {};
+    try {
+      final raw = await _secure.read(key: _socks5ServerPasswordsKey);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) map = Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {}
+    if (map.isEmpty) return servers;
+    return [
+      for (final s in servers)
+        s.copyWith(password: map[s.id]?.toString() ?? s.password),
+    ];
+  }
+
+  Future<void> _writeServerPasswords(List<Socks5Server> servers) async {
+    final map = <String, String>{
+      for (final s in servers)
+        if (s.password.isNotEmpty) s.id: s.password,
+    };
+    if (map.isEmpty) {
+      await _secure.delete(key: _socks5ServerPasswordsKey);
+    } else {
+      await _secure.write(
+        key: _socks5ServerPasswordsKey,
+        value: jsonEncode(map),
+      );
     }
   }
 }

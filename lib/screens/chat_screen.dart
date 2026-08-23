@@ -1551,68 +1551,12 @@ class _ChatScreenState extends State<ChatScreen>
                     );
                   },
                 ),
-                // 上下文达到压缩阈值后，右下角悬浮「压缩上下文」胶囊。
-                Positioned(
-                  right: 14,
-                  bottom: 110,
-                  child: ListenableBuilder(
-                    listenable: widget.shiyi,
-                    builder: (context, _) {
-                      if (!_compressNeeded()) return const SizedBox.shrink();
-                      final theme = Theme.of(context);
-                      return Material(
-                        color: theme.colorScheme.primary,
-                        borderRadius: BorderRadius.circular(20),
-                        elevation: 3,
-                        shadowColor: Colors.black.withValues(alpha: .3),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(20),
-                          onTap: _compressContext,
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 9,
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.compress_outlined,
-                                  size: 16,
-                                  color: theme.colorScheme.onPrimary,
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  '压缩上下文',
-                                  style: TextStyle(
-                                    color: theme.colorScheme.onPrimary,
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
               ],
             ),
           ),
         ),
       ),
     );
-  }
-
-  /// 上下文是否已超过压缩阈值（达到限制后显示悬浮压缩胶囊）。
-  bool _compressNeeded() {
-    final s = widget.shiyi;
-    final limit = s.settings.contextLimit;
-    final pct = s.settings.compressThresholdPercent;
-    if (limit <= 0 || pct <= 0) return false;
-    return s.sessionContextTokensFull > limit * pct / 100;
   }
 
   Future<void> _compressContext() async {

@@ -13,6 +13,7 @@ import '../services/dsh_service.dart';
 import '../services/llm_client.dart';
 import '../services/network_proxy.dart';
 import '../services/permission_service.dart';
+import '../services/socks5_config.dart';
 import '../services/settings_service.dart';
 import '../services/termux_runtime.dart';
 import '../services/update_service.dart';
@@ -289,6 +290,16 @@ class SettingsScreen extends StatelessWidget {
                               ),
                             ),
                           _navTile(
+                            icon: CupertinoIcons.lock_shield_fill,
+                            color: _iosTeal,
+                            title: 'SOCKS5 代理',
+                            subtitle: _socks5Subtitle(s),
+                            onTap: () => _open(
+                              context,
+                              _Socks5SectionPage(shiyi: shiyi),
+                            ),
+                          ),
+                          _navTile(
                             icon: CupertinoIcons.slider_horizontal_3,
                             color: _iosGray,
                             title: '高级',
@@ -353,6 +364,39 @@ class SettingsScreen extends StatelessWidget {
       },
     );
   }
+}
+
+/// 设置分组底部说明：12 号次要色，只当提示。
+Widget _iosSectionFooter(String text) {
+  return DefaultTextStyle.merge(
+    style: const TextStyle(
+      fontSize: 12,
+      height: 1.35,
+      fontWeight: FontWeight.w400,
+      color: CupertinoColors.secondaryLabel,
+    ),
+    child: Text(text),
+  );
+}
+
+String _socks5Subtitle(AppSettings s) {
+  final mode = Socks5Endpoint.modeOf(s);
+  if (mode == 'auto') return '自动检测本机 Clash / V2Ray';
+  if (mode == 'custom') {
+    Socks5Server? active;
+    for (final e in s.socks5Servers) {
+      if (e.id == s.socks5ActiveId) {
+        active = e;
+        break;
+      }
+    }
+    if (active != null && active.host.isNotEmpty) {
+      return '${active.label}  ${active.host}:${active.port}';
+    }
+    if (s.socks5Host.isNotEmpty) return '${s.socks5Host}:${s.socks5Port}';
+    return '自定义（未选服务器）';
+  }
+  return '关闭（直连）';
 }
 
 Widget _navTile({
@@ -1509,6 +1553,7 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
   late bool _tools;
   late bool _memory;
   late bool _autoLearn;
+  late bool _presence;
   late bool _notifications;
   late bool _enterToSend;
   late final _DebouncedSave _save;
@@ -1520,6 +1565,7 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
     _tools = s.enableTools;
     _memory = s.enableMemory;
     _autoLearn = s.enableAutoLearn;
+    _presence = s.enablePresence;
     _notifications = s.enableNotifications;
     _enterToSend = s.enterToSend;
     _save = _DebouncedSave(
@@ -1528,6 +1574,7 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
         enableTools: _tools,
         enableMemory: _memory,
         enableAutoLearn: _autoLearn,
+        enablePresence: _presence,
         enableNotifications: _notifications,
         enterToSend: _enterToSend,
       ),
@@ -1587,6 +1634,17 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
               value: _autoLearn,
               onChanged: (v) {
                 setState(() => _autoLearn = v);
+                _save.schedule();
+              },
+            ),
+            _switchTile(
+              icon: CupertinoIcons.person_crop_circle,
+              color: _iosTeal,
+              title: '活人感',
+              subtitle: '新会话先当固定搭档说话，再随对话调整。默认关闭，不影响工具',
+              value: _presence,
+              onChanged: (v) {
+                setState(() => _presence = v);
                 _save.schedule();
               },
             ),
@@ -2985,6 +3043,537 @@ class _IosSlider extends StatelessWidget {
         divisions: divisions,
         onChanged: onChanged,
       ),
+    );
+  }
+}
+
+class _Socks5SectionPage extends StatefulWidget {
+  final ShiyiState shiyi;
+  const _Socks5SectionPage({required this.shiyi});
+
+  @override
+  State<_Socks5SectionPage> createState() => _Socks5SectionPageState();
+}
+
+class _Socks5SectionPageState extends State<_Socks5SectionPage> {
+  late String _mode;
+  late List<Socks5Server> _servers;
+  late String _activeId;
+  late final TextEditingController _hostCtrl;
+  late final TextEditingController _portCtrl;
+  late final TextEditingController _userCtrl;
+  late final TextEditingController _passCtrl;
+  late final _DebouncedSave _save;
+  bool _showPass = false;
+  bool _detecting = false;
+  String? _detectHint;
+
+  @override
+  void initState() {
+    super.initState();
+    final s = widget.shiyi.settings;
+    _mode = Socks5Endpoint.modeOf(s);
+    _servers = [...s.socks5Servers];
+    _activeId = s.socks5ActiveId;
+    _hostCtrl = TextEditingController(text: s.socks5Host);
+    _portCtrl = TextEditingController(text: '${s.socks5Port}');
+    _userCtrl = TextEditingController(text: s.socks5User);
+    _passCtrl = TextEditingController(text: s.socks5Password);
+    _save = _DebouncedSave(widget.shiyi, _build);
+    if (_mode == 'auto') {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_detect(silent: true));
+      });
+    }
+  }
+
+  AppSettings _build() {
+    final parsed = int.tryParse(_portCtrl.text.trim()) ?? 1080;
+    return widget.shiyi.settings.copyWith(
+      socks5Enabled: _mode != 'off',
+      socks5Mode: _mode,
+      socks5Host: _hostCtrl.text.trim(),
+      socks5Port: parsed.clamp(1, 65535),
+      socks5User: _userCtrl.text.trim(),
+      socks5Password: _passCtrl.text,
+      socks5Servers: _servers,
+      socks5ActiveId: _activeId,
+    );
+  }
+
+  @override
+  void dispose() {
+    if (_save.hasPending) unawaited(_save.flush());
+    _save.dispose();
+    _hostCtrl.dispose();
+    _portCtrl.dispose();
+    _userCtrl.dispose();
+    _passCtrl.dispose();
+    super.dispose();
+  }
+
+  void _setMode(String mode) {
+    setState(() {
+      _mode = mode;
+      if (mode == 'auto') _detectHint = null;
+    });
+    _save.schedule();
+    if (mode == 'auto') unawaited(_detect());
+  }
+
+  Future<void> _detect({bool silent = false}) async {
+    if (_detecting) return;
+    setState(() {
+      _detecting = true;
+      if (!silent) _detectHint = '正在扫描本机 Clash / V2Ray / SS…';
+    });
+    final found = await Socks5LocalProbe.detect();
+    if (!mounted) return;
+    setState(() {
+      _detecting = false;
+      if (found == null) {
+        _detectHint = '没扫到本机 SOCKS5。确认 Clash 已开，mixed/socks 口在 7890/7891。';
+      } else {
+        _detectHint = '已检测到 127.0.0.1:${found.port}，对话和搜索会走它。';
+      }
+    });
+  }
+
+  void _applyPasted(String raw) {
+    final ep = Socks5Endpoint.parse(raw);
+    if (ep == null) return;
+    setState(() {
+      _hostCtrl.text = ep.host;
+      _portCtrl.text = '${ep.port}';
+      if (ep.username != null) _userCtrl.text = ep.username!;
+      if (ep.password != null) _passCtrl.text = ep.password!;
+    });
+    _syncActiveFromFields();
+    _save.schedule();
+  }
+
+  void _syncActiveFromFields() {
+    if (_activeId.isEmpty) return;
+    final port = int.tryParse(_portCtrl.text.trim()) ?? 1080;
+    setState(() {
+      _servers = [
+        for (final e in _servers)
+          if (e.id == _activeId)
+            e.copyWith(
+              host: _hostCtrl.text.trim(),
+              port: port.clamp(1, 65535),
+              user: _userCtrl.text.trim(),
+              password: _passCtrl.text,
+            )
+          else
+            e,
+      ];
+    });
+  }
+
+  Future<void> _addOrEditServer({Socks5Server? existing}) async {
+    final nameCtrl = TextEditingController(text: existing?.name ?? '');
+    final hostCtrl = TextEditingController(text: existing?.host ?? '');
+    final portCtrl = TextEditingController(
+      text: '${existing?.port ?? 1080}',
+    );
+    final userCtrl = TextEditingController(text: existing?.user ?? '');
+    final passCtrl = TextEditingController(text: existing?.password ?? '');
+    var showPass = false;
+    final ok = await showIosFadeDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) {
+          final dark = CupertinoTheme.brightnessOf(ctx) == Brightness.dark;
+          final fieldFill = dark
+              ? const Color(0xFF2C2C2E)
+              : const Color(0xFFF2F2F7);
+          Widget field(
+            String placeholder,
+            TextEditingController c, {
+            bool obscure = false,
+            TextInputType? keyboard,
+            ValueChanged<String>? onChanged,
+          }) {
+            return Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: CupertinoTextField(
+                controller: c,
+                placeholder: placeholder,
+                obscureText: obscure,
+                keyboardType: keyboard,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: fieldFill,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                onChanged: onChanged,
+              ),
+            );
+          }
+
+          return CupertinoAlertDialog(
+            title: Text(existing == null ? '添加代理服务器' : '编辑代理服务器'),
+            content: Column(
+              children: [
+                const SizedBox(height: 8),
+                field('名称（可空，如 机场 A）', nameCtrl),
+                field(
+                  '主机 或 socks5://user:pass@host:port',
+                  hostCtrl,
+                  onChanged: (v) {
+                    final ep = Socks5Endpoint.parse(v);
+                    if (ep == null) return;
+                    hostCtrl.text = ep.host;
+                    portCtrl.text = '${ep.port}';
+                    if (ep.username != null) userCtrl.text = ep.username!;
+                    if (ep.password != null) passCtrl.text = ep.password!;
+                  },
+                ),
+                field('端口', portCtrl, keyboard: TextInputType.number),
+                field('用户名（可空）', userCtrl),
+                field('密码（可空）', passCtrl, obscure: !showPass),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: CupertinoButton(
+                    padding: EdgeInsets.zero,
+                    onPressed: () => setDlg(() => showPass = !showPass),
+                    child: Text(showPass ? '隐藏密码' : '显示密码'),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              CupertinoDialogAction(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('取消'),
+              ),
+              CupertinoDialogAction(
+                isDefaultAction: true,
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('保存'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    final name = nameCtrl.text;
+    final hostRaw = hostCtrl.text;
+    final portRaw = portCtrl.text;
+    final user = userCtrl.text;
+    final pass = passCtrl.text;
+    nameCtrl.dispose();
+    hostCtrl.dispose();
+    portCtrl.dispose();
+    userCtrl.dispose();
+    passCtrl.dispose();
+    if (ok != true || !mounted) return;
+    var host = hostRaw.trim();
+    var port = int.tryParse(portRaw.trim()) ?? 1080;
+    var username = user.trim();
+    var password = pass;
+    final pasted = Socks5Endpoint.parse(host);
+    if (pasted != null) {
+      host = pasted.host;
+      port = pasted.port;
+      username = pasted.username ?? username;
+      password = pasted.password ?? password;
+    }
+    if (host.isEmpty) {
+      await _showIosAlert(context, '提示', '请填写主机，例如 127.0.0.1 或代理域名');
+      return;
+    }
+    final server = Socks5Server(
+      id: existing?.id ??
+          DateTime.now().microsecondsSinceEpoch.toRadixString(16),
+      name: name.trim(),
+      host: host,
+      port: port.clamp(1, 65535),
+      user: username,
+      password: password,
+    );
+    setState(() {
+      if (existing == null) {
+        _servers = [..._servers, server];
+      } else {
+        _servers = [
+          for (final e in _servers) e.id == server.id ? server : e,
+        ];
+      }
+      _activeId = server.id;
+      _hostCtrl.text = server.host;
+      _portCtrl.text = '${server.port}';
+      _userCtrl.text = server.user;
+      _passCtrl.text = server.password;
+      _mode = 'custom';
+    });
+    _save.schedule();
+  }
+
+  void _selectServer(Socks5Server server) {
+    setState(() {
+      _activeId = server.id;
+      _hostCtrl.text = server.host;
+      _portCtrl.text = '${server.port}';
+      _userCtrl.text = server.user;
+      _passCtrl.text = server.password;
+      _mode = 'custom';
+    });
+    _save.schedule();
+  }
+
+  Future<void> _deleteServer(Socks5Server server) async {
+    final ok = await showIosFadeDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('删除这台代理？'),
+        content: Text(server.label),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() {
+      _servers = [for (final e in _servers) if (e.id != server.id) e];
+      if (_activeId == server.id) {
+        _activeId = _servers.isEmpty ? '' : _servers.first.id;
+        if (_servers.isNotEmpty) {
+          final n = _servers.first;
+          _hostCtrl.text = n.host;
+          _portCtrl.text = '${n.port}';
+          _userCtrl.text = n.user;
+          _passCtrl.text = n.password;
+        }
+      }
+    });
+    _save.schedule();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = _isDark(context, widget.shiyi.settings.themeMode);
+    return _IosSettingsPage(
+      shiyi: widget.shiyi,
+      title: 'SOCKS5 代理',
+      children: [
+        CupertinoListSection.insetGrouped(
+          decoration: _iosSectionDecoration(dark),
+          backgroundColor: _iosGroupedBackground(dark),
+          header: const Text('通道'),
+          footer: _iosSectionFooter(
+            '国内 IP 被中转站拦截时走 SOCKS5。本机开了 Clash / FlClash / V2RayN 选自动检测；'
+            '境外代理填自定义。对话、拉模型和联网搜索都会走这条通道。',
+          ),
+          children: [
+            CupertinoListTile(
+              leading: const _IosIconTile(
+                icon: CupertinoIcons.xmark_circle_fill,
+                color: _iosGray,
+              ),
+              title: const Text('关闭（直连）'),
+              trailing: _mode == 'off'
+                  ? const Icon(
+                      CupertinoIcons.checkmark_circle_fill,
+                      color: CupertinoColors.activeBlue,
+                    )
+                  : null,
+              onTap: () => _setMode('off'),
+            ),
+            CupertinoListTile(
+              leading: const _IosIconTile(
+                icon: CupertinoIcons.antenna_radiowaves_left_right,
+                color: _iosTeal,
+              ),
+              title: const Text('自动检测本机代理'),
+              subtitle: const Text('扫描 Clash mixed/socks、V2RayN、SS 常见端口'),
+              trailing: _mode == 'auto'
+                  ? const Icon(
+                      CupertinoIcons.checkmark_circle_fill,
+                      color: CupertinoColors.activeBlue,
+                    )
+                  : null,
+              onTap: () => _setMode('auto'),
+            ),
+            CupertinoListTile(
+              leading: const _IosIconTile(
+                icon: CupertinoIcons.lock_shield_fill,
+                color: _iosBlue,
+              ),
+              title: const Text('自定义代理服务器'),
+              subtitle: const Text('手动填写或粘贴 socks5://…'),
+              trailing: _mode == 'custom'
+                  ? const Icon(
+                      CupertinoIcons.checkmark_circle_fill,
+                      color: CupertinoColors.activeBlue,
+                    )
+                  : null,
+              onTap: () => _setMode('custom'),
+            ),
+          ],
+        ),
+        if (_mode == 'auto')
+          CupertinoListSection.insetGrouped(
+            decoration: _iosSectionDecoration(dark),
+            backgroundColor: _iosGroupedBackground(dark),
+            header: const Text('本机'),
+            footer: _iosSectionFooter(
+              _detectHint ??
+                  '会探测 127.0.0.1 的 7890 / 7891 / 7897 / 10808 / 1080。'
+                  '手机上 Clash 需开允许局域网，地址填电脑 IP。',
+            ),
+            children: [
+              CupertinoListTile(
+                leading: _IosIconTile(
+                  icon: _detecting
+                      ? CupertinoIcons.hourglass
+                      : CupertinoIcons.search,
+                  color: _iosTeal,
+                ),
+                title: Text(_detecting ? '正在扫描…' : '重新扫描'),
+                subtitle: const Text('Clash 改端口后点这里刷新'),
+                onTap: _detecting ? null : () => _detect(),
+              ),
+            ],
+          ),
+        if (_mode == 'custom') ...[
+          CupertinoListSection.insetGrouped(
+            decoration: _iosSectionDecoration(dark),
+            backgroundColor: _iosGroupedBackground(dark),
+            header: const Text('已保存的服务器'),
+            children: [
+              if (_servers.isEmpty)
+                const CupertinoListTile(
+                  title: Text('还没有服务器'),
+                  subtitle: Text('点下面添加，或直接填主机端口当临时通道'),
+                ),
+              for (final server in _servers)
+                CupertinoListTile(
+                  leading: _IosIconTile(
+                    icon: server.id == _activeId
+                        ? CupertinoIcons.checkmark_seal_fill
+                        : CupertinoIcons.globe,
+                    color: server.id == _activeId ? _iosGreen : _iosBlue,
+                  ),
+                  title: Text(server.label),
+                  subtitle: Text(
+                    '${server.host}:${server.port}'
+                    '${server.user.isEmpty ? '' : '  ·  ${server.user}'}',
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CupertinoButton(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(28, 28),
+                        onPressed: () => _addOrEditServer(existing: server),
+                        child: const Icon(
+                          CupertinoIcons.pencil,
+                          size: 20,
+                          color: CupertinoColors.activeBlue,
+                        ),
+                      ),
+                      CupertinoButton(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(28, 28),
+                        onPressed: () => _deleteServer(server),
+                        child: const Icon(
+                          CupertinoIcons.delete,
+                          size: 20,
+                          color: CupertinoColors.systemRed,
+                        ),
+                      ),
+                    ],
+                  ),
+                  onTap: () => _selectServer(server),
+                ),
+              CupertinoListTile(
+                leading: const _IosIconTile(
+                  icon: CupertinoIcons.add_circled_solid,
+                  color: _iosGreen,
+                ),
+                title: const Text('添加代理服务器'),
+                subtitle: const Text('支持粘贴 socks5://user:pass@host:port'),
+                onTap: () => _addOrEditServer(),
+              ),
+            ],
+          ),
+          CupertinoListSection.insetGrouped(
+            decoration: _iosSectionDecoration(dark),
+            backgroundColor: _iosGroupedBackground(dark),
+            header: const Text('当前通道'),
+            footer: _iosSectionFooter(
+              '没选已保存服务器时，用下面这组临时填写。也可直接把完整 URL 贴进主机栏。',
+            ),
+            children: [
+              _IosTextFieldTile(
+                icon: CupertinoIcons.globe,
+                color: _iosBlue,
+                title: '主机',
+                controller: _hostCtrl,
+                placeholder: '127.0.0.1 或 socks5://user:pass@host:1080',
+                onChanged: (v) {
+                  _applyPasted(v);
+                  _save.schedule();
+                },
+              ),
+              CupertinoListTile(
+                leading: const _IosIconTile(
+                  icon: CupertinoIcons.number,
+                  color: _iosIndigo,
+                ),
+                title: const Text('端口'),
+                trailing: _IosValueField(
+                  controller: _portCtrl,
+                  keyboardType: TextInputType.number,
+                  width: 90,
+                  onChanged: (_) {
+                    _syncActiveFromFields();
+                    _save.schedule();
+                  },
+                ),
+              ),
+              _IosTextFieldTile(
+                icon: CupertinoIcons.person,
+                color: _iosPurple,
+                title: '用户名',
+                controller: _userCtrl,
+                placeholder: '可空',
+                onChanged: (_) {
+                  _syncActiveFromFields();
+                  _save.schedule();
+                },
+              ),
+              _IosSecretFieldTile(
+                icon: CupertinoIcons.lock,
+                color: _iosOrange,
+                title: '密码',
+                controller: _passCtrl,
+                placeholder: '可空',
+                obscure: !_showPass,
+                onToggleVisibility: () =>
+                    setState(() => _showPass = !_showPass),
+                onChanged: (_) {
+                  _syncActiveFromFields();
+                  _save.schedule();
+                },
+              ),
+            ],
+          ),
+        ],
+      ],
     );
   }
 }

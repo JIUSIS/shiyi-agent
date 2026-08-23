@@ -19,6 +19,8 @@ import '../services/subagent.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
 import '../services/notifier.dart';
+import '../services/socks5_config.dart';
+import 'presence_engine.dart';
 import 'prompt_builder.dart';
 import 'prompt_section.dart';
 import 'tool_result_pruner.dart';
@@ -147,6 +149,11 @@ class ShiyiState extends ChangeNotifier {
   static const String _lastEngineKey = 'dsh_last_engine_v1';
 
   AppSettings settings = AppSettings();
+
+  /// 活人感引擎：开关打开时随对话更新需求状态并注入语气指令。
+  PresenceEngine presence = PresenceEngine();
+
+  static const String _presenceKey = 'shiyi_presence_v1';
 
   /// 用户已保存的 API 配置（不含未保存的内置预设），供会话级模型选择。
   List<ApiProfile> apiProfiles = [];
@@ -849,6 +856,8 @@ class ShiyiState extends ChangeNotifier {
     if (loaded) return;
     try {
       settings = await _settingsService.load();
+      Socks5Proxy.apply(settings);
+      await _loadPresence();
       apiProfiles = await _settingsService.loadProfiles();
       await reloadModelCatalogs(notify: false);
       // 同步 DSH 代理开关到服务单例。
@@ -1895,6 +1904,10 @@ class ShiyiState extends ChangeNotifier {
       _publishRun(run);
 
       final cleanText = stripImageMarkers(trimText);
+      if (settings.enablePresence && cleanText.isNotEmpty) {
+        presence.onUserMessage(cleanText);
+        unawaited(_savePresence());
+      }
       final s = await _db.getSession(targetSessionId);
       if (s != null && s.title.startsWith('新会话')) {
         final title = cleanText.isEmpty
@@ -2245,6 +2258,10 @@ class ShiyiState extends ChangeNotifier {
     _publishRun(run);
 
     try {
+      if (settings.enablePresence && hint.trim().isNotEmpty) {
+        presence.onUserMessage(hint);
+        unawaited(_savePresence());
+      }
       await _generateWithHistory(
         run,
         firstAsst,
@@ -2481,6 +2498,10 @@ class ShiyiState extends ChangeNotifier {
 
     asst.content = finalText;
     asst.reasoning = finalReasoning;
+    if (settings.enablePresence && finalText.trim().isNotEmpty) {
+      presence.onAssistantReply(finalText);
+      unawaited(_savePresence());
+    }
     asst.toolCalls = normalized.toolCalls
         .map(
           (tc) => ToolCall(
@@ -2729,6 +2750,7 @@ class ShiyiState extends ChangeNotifier {
           : workspaceForSession(sessionId),
       memories: (t) => _db.recentMemoriesWithTerms(_keywords(t), 8),
       terminalBackend: _actualTerminalBackend,
+      presence: () => settings.enablePresence ? presence : null,
     );
   }
 
@@ -4090,6 +4112,7 @@ echo "[rc=\$?]"
       _imageDescCache.clear();
     }
     settings = s;
+    Socks5Proxy.apply(s);
     notifyListeners();
     await _settingsService.save(s);
     if (engineChanged) {
@@ -4098,6 +4121,27 @@ echo "[rc=\$?]"
     if (modelChanged) {
       unawaited(DshModelSync.syncFromShiyi(s, allowClear: true));
     }
+  }
+
+  Future<void> _loadPresence() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_presenceKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) {
+        presence = PresenceEngine.fromJson(decoded);
+      } else if (decoded is Map) {
+        presence = PresenceEngine.fromJson(Map<String, dynamic>.from(decoded));
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _savePresence() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_presenceKey, jsonEncode(presence.toJson()));
+    } catch (_) {}
   }
 
   Future<void> _rememberLastEngine(String engine) async {

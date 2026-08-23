@@ -4,6 +4,19 @@ import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/services/llm_client.dart';
 
 void main() {
+  test('enablePresence 默认关闭，并随设置 JSON 往返持久化', () {
+    expect(AppSettings().enablePresence, isFalse);
+    expect(AppSettings.fromJson({}).enablePresence, isFalse);
+    expect(AppSettings.fromJson({'enablePresence': true}).enablePresence, isTrue);
+
+    final saved = AppSettings(enablePresence: true).toJson();
+    expect(AppSettings.fromJson(saved).enablePresence, isTrue);
+    expect(
+      AppSettings().copyWith(enablePresence: true).enablePresence,
+      isTrue,
+    );
+  });
+
   test('enterToSend 默认开启，并随设置 JSON 往返持久化', () {
     expect(AppSettings().enterToSend, isTrue);
     expect(AppSettings.fromJson({}).enterToSend, isTrue);

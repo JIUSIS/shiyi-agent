@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.5.3.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.3/shiyi-agent-v2.5.3.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.5.5.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.5/shiyi-agent-v2.5.5.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -25,7 +25,9 @@
 - 项目分类管理会话：新建项目时选择文件夹，项目横幅点击展开 / 收起，左滑支持新建会话 / 文件夹 / 重命名 / 删除
 - 项目级工作目录：项目设置一次，项目下会话自动继承；会话也可单独覆盖
 - 文件 / 图片多选附件，支持视觉模型图片理解
-- 流式输出、自动重试、上下文自动压缩与硬窗口保护
+- 流式输出、自动重试、上下文自动压缩与硬窗口保护；手动压缩走输入区常驻按钮
+- 自定义 SOCKS5 通道：自动检测本机 Clash / V2Ray，或手动添加境外代理服务器；对话、拉模型、联网搜索可走该出口
+- 可选活人感（默认关）：本地内心状态循环，模型只负责把本轮内心讲出来
 - 思考过程流式展示，长思考自动滚动跟随；思考开关与思考强度按模型 ID 关键字识别，常见家族与自定义模型都可调节
 - 悬空液态玻璃输入区、消息入场动画与流式跟随
 - 输出上限可调（512~384000），长任务自动续写不打断
@@ -68,7 +70,7 @@
 
 - 按 Apple 设计理念（HIG）统一重构：毛玻璃底栏、Inset Grouped 分组卡片、深浅色跟随
 - 底部三 Tab：会话 / 功能 / 文件；切换到 DeepSeek Harness 后为工作区 / 功能 / 文件
-- 设置页 iOS 风格分组：模型 / 对话 / 通用 / 支持，二级菜单渐显渐隐
+- 设置页 iOS 风格分组：模型 / 对话 / 通用 / 支持，二级菜单渐显渐隐；通用里可配 SOCKS5 代理
 - 语音朗读、任务完成通知、浅色 / 深色 / 跟随系统主题
 - 内置日志与排障能力
 

@@ -93,7 +93,13 @@ const _features = <(IconData, Color, String, String)>[
     CupertinoIcons.globe,
     _iosBlue,
     '网页搜索与内容提取',
-    '联网搜索、抓取网页正文',
+    '联网搜索、抓取网页正文；可走自定义 SOCKS5',
+  ),
+  (
+    CupertinoIcons.lock_shield_fill,
+    _iosTeal,
+    'SOCKS5 代理',
+    '自动检测本机 Clash，或手动添加境外代理服务器',
   ),
   (
     CupertinoIcons.square_on_square,

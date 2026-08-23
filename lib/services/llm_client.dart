@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../core/reasoning_models.dart';
+import 'socks5_config.dart';
 
 class LlmException implements Exception {
   final String message;
@@ -142,7 +143,7 @@ class LlmClient {
     lastInputTokens = null;
     lastCachedTokens = null;
     _lastRoundReasoning = '';
-    final client = http.Client();
+    final client = await Socks5Proxy.client();
     try {
       var includeUsage = true;
       // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级到 8192 重试。
@@ -521,7 +522,7 @@ class LlmClient {
       ..headers.addAll(_headers(streaming: false))
       ..body = jsonEncode(body);
 
-    final client = http.Client();
+    final client = await Socks5Proxy.client();
     try {
       final response = await client
           .send(request)
@@ -571,7 +572,7 @@ class LlmClient {
     final root = normalizeAnthropicBaseUrl(baseUrl);
     final ids = <String>[];
     String? afterId;
-    final client = http.Client();
+    final client = await Socks5Proxy.client();
     try {
       for (var i = 0; i < 20; i++) {
         final uri = Uri.parse('$root/v1/models').replace(
@@ -597,7 +598,7 @@ class LlmClient {
     http.Client? client,
   }) async {
     final owned = client == null;
-    final httpClient = client ?? http.Client();
+    final httpClient = client ?? await Socks5Proxy.client();
     try {
       final res = await httpClient
           .get(uri, headers: _headers(streaming: false))
@@ -638,7 +639,7 @@ class LlmClient {
     final request = http.Request('POST', Uri.parse(_endpoint))
       ..headers.addAll(_headers(streaming: false))
       ..body = jsonEncode(body);
-    final client = http.Client();
+    final client = await Socks5Proxy.client();
     try {
       final res = await client
           .send(request)
