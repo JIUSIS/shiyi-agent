@@ -41,6 +41,8 @@
   修复完整模式，app uid）。
 - 关键路径：rootfs=`files/termux/local/alpine`、proot/脚本=`local/bin`、库=`local/lib`、
   版本标记=`files/termux/.env_version`（alpine-vN，结构变更时递增）。
+- **主页「终端」栏**：底部第四栏，拾忆与 DSH 都有。命令走 `EmbeddedShell` → `/system/bin/sh` + `init-host -c`，与 `run_terminal` 同一套 proot，禁止再拉一套 Termux。无 PTY，交互是一行命令一次 init-host。
+- **终端交互铁律**：没有底部独立输入框，点画面输入；执行中输入仍可用（busy 时回车喂 stdin）。切引擎不发 Ctrl+C。输入法弹出贴底、滑动历史不弹键盘。输入 / 正常输出 / 警告 / 错误分色。独立 `/` 才弹技能。
 
 ## Windows 桌面版（exe）
 - 2026-08-14 起项目支持 Windows 桌面完整版：命令后端**用户可选**（设置 → 通用 → 终端）：

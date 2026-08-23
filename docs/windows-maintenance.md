@@ -13,7 +13,7 @@
 
 | 模块 | Android（手机） | Windows（桌面 exe） |
 |---|---|---|
-| 命令执行后端 | 内嵌 Alpine Linux（proot + minirootfs，apk 包管理，2026-08-15 起取代 Termux bootstrap） | **用户可选**（设置 → 通用 → 终端）：自动（WSL2 优先 → PowerShell 7 → cmd）/ WSL2 / PowerShell 7 / cmd |
+| 命令执行后端 | 内嵌 Alpine Linux（proot + minirootfs，apk 包管理，2026-08-15 起取代 Termux bootstrap）。主页第四栏「终端」走同一套 `init-host` | **用户可选**（设置 → 通用 → 终端）：自动（WSL2 优先 → PowerShell 7 → cmd）/ WSL2 / PowerShell 7 / cmd。主页第四栏「终端」走该后端 |
 | 数据库 | sqflite 原生（`/storage/emulated/0/...` Documents） | `sqflite_common_ffi`（sqlite3.dll）；库文件 `%APPDATA%\com.shiyi\拾忆 ShiYi\shiyi_agent.db` |
 | 技能包 zip | Android 原生 ZipInputStream（MethodChannel `shiyi/skillpack`） | archive 包纯 Dart（channel 抛 MissingPluginException 时回退） |
 | 图片 | 相册/相机 + flutter_image_compress 压缩 | 相册（相机降级相册）、跳过压缩原图保存 |
@@ -183,7 +183,7 @@ flutter build windows --release      # 必须成功
 
 DS Harness 引擎验证点（#114，两端共享）：
 
-1. 设置 → Agent 引擎切到 DS Harness：侧栏/底部 tab 变为 工作区/功能/文件
+1. 设置 → Agent 引擎切到 DS Harness：侧栏/底部 tab 变为 工作区/功能/文件/终端
 2. 工作区页：红绿灯=添加工作区（选手机文件夹/目录）、分组点击展开/收回、
    左滑三键（新建会话/重命名/删除）；默认工作区删除按钮隐藏，删除
    方法仍保护性拦截；会话左滑（重命名/归档/复制 ID）；无工作区时
@@ -363,3 +363,7 @@ DS Harness 引擎验证点（#114，两端共享）：
   2. 可选活人感（默认关）：`PresenceEngine` 本地内心状态循环，不改工具管线。
   3. 去掉会话页阈值弹出的压缩胶囊，只留输入区常驻压缩按钮。
   Windows 本机 Clash 默认 7890/7891 可被自动检测；桌面版与 Android 共用同一套设置页与客户端。
+
+- **2026-08-24**（共享 `lib/` 改动；Windows 无新增平台分支）：
+  主页底部第四栏「终端」。Android 走 `EmbeddedShell` → `init-host -c` 进同一套 Alpine；Windows 仍走设置里的终端后端（WSL2 / pwsh / cmd）。两端共用 `TerminalSession.shared`，切引擎不中断。点画面输入、无独立输入框；输入浅蓝、正常输出灰绿、警告黄、错误红。独立 `/` 才弹技能。
+  共享验证：`flutter test test/home_tabs_test.dart test/terminal_pane_test.dart test/slash_trigger_test.dart` 全绿。

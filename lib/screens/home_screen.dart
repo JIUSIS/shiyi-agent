@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/app_state.dart';
+import '../core/home_tabs.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_service.dart';
@@ -26,6 +27,7 @@ import 'features_screen.dart';
 import 'files_screen.dart';
 import 'project_actions.dart';
 import 'settings_screen.dart';
+import 'terminal_screen.dart';
 
 const _iosBlue = Color(0xFF0A84FF);
 const _iosRed = Color(0xFFFF3B30);
@@ -111,7 +113,14 @@ class _HomeScreenState extends State<HomeScreen>
     final engine = widget.shiyi.settings.agentEngine;
     if (engine == _lastAgentEngine) return;
     _lastAgentEngine = engine;
-    _tabCache.clear();
+    final keep = <int, Widget>{};
+    for (final i in HomeTabs.keepAcrossEngineSwitch) {
+      final w = _tabCache[i];
+      if (w != null) keep[i] = w;
+    }
+    _tabCache
+      ..clear()
+      ..addAll(keep);
     if (mounted) setState(() {});
   }
 
@@ -134,7 +143,7 @@ class _HomeScreenState extends State<HomeScreen>
   void _prebuildTabs() {
     var i = 1;
     void next() {
-      if (!mounted || i > 2) return;
+      if (!mounted || i > HomeTabs.terminalIndex) return;
       _tabCache[i] = _buildTabFor(i);
       setState(() {});
       i++;
@@ -200,9 +209,11 @@ class _HomeScreenState extends State<HomeScreen>
     // Windows 宽窗口：桌面侧边导航；窄窗口/手机：底部 Tab。
     final desktopNav =
         Platform.isWindows && MediaQuery.sizeOf(context).width >= 720;
-    // 引擎决定主页 tab 套件：拾忆（会话/功能/文件）或 DS Harness
-    //（工作数据/功能/文件）。
-    final tabs = shiyi.settings.agentEngine == 'dsh' ? _dshTabs : _iosTabs;
+    // 引擎决定主页 tab 套件：拾忆（会话/功能/文件/终端）或 DS Harness
+    //（工作数据/功能/文件/终端）。终端两端都接内嵌 proot。
+    final tabs = shiyi.settings.agentEngine == 'dsh'
+        ? HomeTabs.dsh
+        : HomeTabs.shiyi;
     final content = ListenableBuilder(
       listenable: Listenable.merge([
         shiyi.loadedNotifier,
@@ -237,7 +248,7 @@ class _HomeScreenState extends State<HomeScreen>
           child: IndexedStack(
             index: _tab,
             children: [
-              for (var i = 0; i <= 2; i++)
+              for (var i = 0; i <= HomeTabs.terminalIndex; i++)
                 if (i == _tab)
                   _tabCache[i] ??= _buildTabFor(i)
                 else
@@ -269,6 +280,7 @@ class _HomeScreenState extends State<HomeScreen>
         child: Scaffold(
           backgroundColor: iosGroupedBackground(context),
           // 键盘只应压缩当前 tab 的内容，不能把悬浮侧边栏一起压矮。
+          // 终端页自己读 viewInsets 垫底，主页不整体抬底栏。
           resizeToAvoidBottomInset: false,
           body: desktopNav
               ? Row(
@@ -322,9 +334,8 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _buildTabFor(int i) {
     final shiyi = widget.shiyi;
-    // Agent 引擎：DS Harness 时主页三个 tab 整体切换（外观复用拾忆，
-    // 数据源为 DeepSeek Harness）：会话（工作区分组）/ 功能（DSH 功能
-    // 入口集合）/ 文件。
+    // Agent 引擎：DS Harness 时主页 tab 整体切换（外观复用拾忆，
+    // 数据源为 DeepSeek Harness）：工作数据 / 功能 / 文件 / 终端。
     if (shiyi.settings.agentEngine == 'dsh') {
       switch (i) {
         case 0:
@@ -332,8 +343,9 @@ class _HomeScreenState extends State<HomeScreen>
         case 1:
           return DshFeaturesTab(shiyi: shiyi);
         case 2:
-          // DSH 文件页使用主机目录 API；拾忆引擎仍使用本地文件页。
           return buildFilesTabForEngine(shiyi);
+        case 3:
+          return TerminalScreen(shiyi: shiyi);
       }
       return const SizedBox.shrink();
     }
@@ -348,6 +360,8 @@ class _HomeScreenState extends State<HomeScreen>
         return FeaturesScreen(shiyi: shiyi);
       case 2:
         return FilesScreen(shiyi: shiyi);
+      case 3:
+        return TerminalScreen(shiyi: shiyi);
     }
     return const SizedBox.shrink();
   }
@@ -387,20 +401,6 @@ class _HomeScreenState extends State<HomeScreen>
   }
 }
 
-const _iosTabs = <(IconData, IconData, String)>[
-  (CupertinoIcons.chat_bubble_2, CupertinoIcons.chat_bubble_2_fill, '会话'),
-  (CupertinoIcons.square_grid_2x2, CupertinoIcons.square_grid_2x2_fill, '功能'),
-  (CupertinoIcons.folder, CupertinoIcons.folder_fill, '文件'),
-];
-
-/// DS Harness 引擎下的主页 tab：工作数据 / 功能 / 文件（拾忆同款布局，
-/// 功能页的「技能」卡片走 DeepSeek Harness 接口）。
-const _dshTabs = <(IconData, IconData, String)>[
-  (CupertinoIcons.archivebox, CupertinoIcons.archivebox_fill, '工作数据'),
-  (CupertinoIcons.square_grid_2x2, CupertinoIcons.square_grid_2x2_fill, '功能'),
-  (CupertinoIcons.folder, CupertinoIcons.folder_fill, '文件'),
-];
-
 /// 返回当前 Agent 引擎对应的文件页。
 /// DSH 使用主机目录 API；拾忆使用本地文件工作区。
 /// 单独保留为纯路由选择点，避免两个引擎的文件数据源再次串线。
@@ -414,7 +414,7 @@ Widget buildFilesTabForEngine(ShiyiState shiyi) {
 class _IosTabBar extends StatelessWidget {
   final int currentIndex;
   final ValueChanged<int> onTap;
-  final List<(IconData, IconData, String)> tabs;
+  final List<HomeTabSpec> tabs;
   const _IosTabBar({
     required this.currentIndex,
     required this.onTap,
@@ -445,9 +445,9 @@ class _IosTabBar extends StatelessWidget {
                   for (var i = 0; i < tabs.length; i++)
                     Expanded(
                       child: _IosTabItem(
-                        icon: tabs[i].$1,
-                        selectedIcon: tabs[i].$2,
-                        label: tabs[i].$3,
+                        icon: tabs[i].icon,
+                        selectedIcon: tabs[i].selectedIcon,
+                        label: tabs[i].label,
                         selected: i == currentIndex,
                         onTap: () => onTap(i),
                       ),
@@ -516,7 +516,7 @@ class _DesktopNavBar extends StatelessWidget {
   final ValueChanged<int> onTap;
   final VoidCallback onOpenSettings;
   final double width;
-  final List<(IconData, IconData, String)> tabs;
+  final List<HomeTabSpec> tabs;
   const _DesktopNavBar({
     required this.currentIndex,
     required this.onTap,
@@ -562,9 +562,9 @@ class _DesktopNavBar extends StatelessWidget {
                   ),
                   for (var i = 0; i < tabs.length; i++)
                     _DesktopNavItem(
-                      icon: tabs[i].$1,
-                      selectedIcon: tabs[i].$2,
-                      label: tabs[i].$3,
+                      icon: tabs[i].icon,
+                      selectedIcon: tabs[i].selectedIcon,
+                      label: tabs[i].label,
                       selected: i == currentIndex,
                       onTap: () => onTap(i),
                     ),

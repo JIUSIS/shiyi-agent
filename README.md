@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.5.5.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.5/shiyi-agent-v2.5.5.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.5.6.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.6/shiyi-agent-v2.5.6.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -49,7 +49,7 @@
 
 ### 内置终端
 
-- 集成移动端终端环境（bash / python3 / apk），**无需安装 Termux、无需 root**
+- 底部「终端」栏与 AI 的 `run_terminal` 共用内嵌 Alpine（bash / python3 / apk），**无需安装 Termux、无需 root**；点画面输入，输入 / 输出 / 警告 / 错误分色
 - **2026-08-15 起基于 Alpine Linux**（proot + minirootfs，APK 内置约 3.9MB，取代旧 Termux bootstrap 40MB+）：
   - 包管理 `apk`（清华镜像优先 + 官方兜底，网络抖动自动重试），命令全部在 Alpine 沙箱内执行；
   - Node.js 环境（`apk add nodejs npm`）随 DeepSeek Harness 引擎自动安装，无需手动配置；
@@ -69,7 +69,7 @@
 ### 体验与设计
 
 - 按 Apple 设计理念（HIG）统一重构：毛玻璃底栏、Inset Grouped 分组卡片、深浅色跟随
-- 底部三 Tab：会话 / 功能 / 文件；切换到 DeepSeek Harness 后为工作区 / 功能 / 文件
+- 底部四栏：会话 / 功能 / 文件 / 终端；切换到 DeepSeek Harness 后为工作区 / 功能 / 文件 / 终端。终端栏接入内嵌 Alpine proot（init-host），不是另装一套 Termux
 - 设置页 iOS 风格分组：模型 / 对话 / 通用 / 支持，二级菜单渐显渐隐；通用里可配 SOCKS5 代理
 - 语音朗读、任务完成通知、浅色 / 深色 / 跟随系统主题
 - 内置日志与排障能力
@@ -139,7 +139,7 @@
 
 ### 内置终端（免 root）
 
-应用内集成了移动端终端环境（bash + python3），不需要额外安装 Termux，也不需要 root。它基于 Android 应用沙箱 + 内嵌用户空间（proot + Alpine Linux minirootfs）实现，首次启动自动部署，开箱即用。
+应用内集成了移动端终端环境（bash + python3），不需要额外安装 Termux，也不需要 root。它基于 Android 应用沙箱 + 内嵌用户空间（proot + Alpine Linux minirootfs）实现，首次启动自动部署。主页底部「终端」栏与 AI 工具走同一条 `init-host` 启动链。
 
 ### 技能系统
 

@@ -11,6 +11,7 @@ import 'package:path/path.dart' as p;
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../core/slash_trigger.dart';
 import '../services/file_workspace.dart';
 import '../services/image_service.dart';
 import '../services/llm_client.dart';
@@ -694,7 +695,7 @@ class _ChatScreenState extends State<ChatScreen>
       _pickAtTarget();
       return;
     }
-    if (t.endsWith('/')) {
+    if (isSkillSlashTrigger(t)) {
       if (_lastSlashTrigger != null &&
           now.difference(_lastSlashTrigger!).inMilliseconds < 600) {
         return;
@@ -780,11 +781,10 @@ class _ChatScreenState extends State<ChatScreen>
 
   /// 选择成功后把触发用的 / 从输入框删掉。
   void _stripSlash() {
-    final t = _input.text;
-    if (t.endsWith('/')) {
-      _input.text = t.substring(0, t.length - 1);
-      _input.selection = TextSelection.collapsed(offset: _input.text.length);
-    }
+    final next = stripSkillSlashTrigger(_input.text);
+    if (next == _input.text) return;
+    _input.text = next;
+    _input.selection = TextSelection.collapsed(offset: _input.text.length);
   }
 
   void _pickAtTarget() {

@@ -11,6 +11,7 @@ import 'package:path/path.dart' as p;
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../core/slash_trigger.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
 import '../services/dsh_live.dart';
@@ -1117,7 +1118,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   void _onInputChanged() {
-    if (!_input.text.endsWith('/')) return;
+    if (!isSkillSlashTrigger(_input.text)) return;
     final now = DateTime.now();
     if (_lastSlashTrigger != null &&
         now.difference(_lastSlashTrigger!).inMilliseconds < 600) {
@@ -1129,9 +1130,8 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   /// 选择技能后移除触发选择器用的末尾斜杠，保留用户已经输入的正文。
   void _stripSlash() {
-    final text = _input.text;
-    if (!text.endsWith('/')) return;
-    final next = text.substring(0, text.length - 1);
+    final next = stripSkillSlashTrigger(_input.text);
+    if (next == _input.text) return;
     _input.value = TextEditingValue(
       text: next,
       selection: TextSelection.collapsed(offset: next.length),
