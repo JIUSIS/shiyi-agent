@@ -67,6 +67,16 @@ void main() {
     expect(restored.summary!.outputTokens, 20);
   });
 
+  test('DSH 会话自定义上下文独立于聊天快照，压缩不清掉', () async {
+    await DshChatCache.writeContextLimit('s1', 1000000);
+    expect(await DshChatCache.readContextLimit('s1'), 1000000);
+    expect(await DshChatCache.effectiveContextLimitFor('s1', 128000), 1000000);
+    expect(await DshChatCache.effectiveContextLimitFor('s2', 256000), 256000);
+
+    await DshChatCache.clear('s1');
+    expect(await DshChatCache.readContextLimit('s1'), 1000000);
+  });
+
   test('空正文的思考消息缓存往返后仍保持折叠字段', () async {
     await DshChatCache.write(
       's1',

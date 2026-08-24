@@ -109,6 +109,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   String _lastNonOffEffort = '';
   Map<String, String?> _reasoningCapabilities = const {};
   bool _compacting = false;
+  int _contextLimit = kDefaultContextLimit;
   late String _cwd = widget.initialSummary?.cwd ?? '';
   bool _stopping = false;
   bool _showToolLog = false;
@@ -168,6 +169,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (_model.isNotEmpty) {
       _applyReasoningCapabilities(_model);
     }
+    unawaited(_loadContextLimit());
     final snapshot = widget.initialSnapshot;
     if (snapshot?.hasUiData == true) {
       _restoreSnapshot(snapshot!, notify: false);
@@ -977,6 +979,28 @@ class _DshChatScreenState extends State<DshChatScreen>
     } finally {
       if (mounted) setState(() => _stopping = false);
     }
+  }
+
+  Future<void> _loadContextLimit() async {
+    final global = widget.shiyi?.settings.contextLimit ?? kDefaultContextLimit;
+    final limit = await DshChatCache.effectiveContextLimitFor(
+      widget.sessionId,
+      global,
+    );
+    if (!mounted) return;
+    setState(() => _contextLimit = limit);
+  }
+
+  Future<void> _editContextLimit() async {
+    if (_compacting || _sending || _running) return;
+    final next = await showSessionContextLimitDialog(
+      context: context,
+      currentLimit: _contextLimit,
+    );
+    if (next == null || !mounted) return;
+    await DshChatCache.writeContextLimit(widget.sessionId, next);
+    if (!mounted) return;
+    setState(() => _contextLimit = next);
   }
 
   Future<void> _compactContext() async {
@@ -2350,6 +2374,13 @@ class _DshChatScreenState extends State<DshChatScreen>
                                 ? null
                                 : _compactContext,
                             compressBusy: _compacting,
+                            onContextLimit:
+                                _compacting || _sending || _running
+                                ? null
+                                : _editContextLimit,
+                            contextLimitLabel: formatContextLimitLabel(
+                              _contextLimit,
+                            ),
                           ),
                       ],
                     ),
@@ -2563,7 +2594,12 @@ class _DshChatScreenState extends State<DshChatScreen>
         controller: _scroll,
         reverse: true,
         clipBehavior: Clip.none,
-        padding: EdgeInsets.fromLTRB(12, 12, 12, overlayHeight + 12),
+        padding: EdgeInsets.fromLTRB(
+          messageListSidePadding,
+          12,
+          messageListSidePadding,
+          overlayHeight + 12,
+        ),
         itemCount: itemCount,
         itemBuilder: (context, i) {
           if (thinkingNeeded && i == 0) {

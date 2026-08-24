@@ -32,8 +32,8 @@ void main() {
       expect(normalized.text, '根据分析，答案是：');
     });
 
-    test('最终落库时，如果只有 reasoning 没有 text，应该保持原样（由 _applyTurn 处理转换）', () {
-      // _normalizeMisplacedReasoning 不再做 text.isEmpty 转换
+    test('最终落库时，如果只有 reasoning 没有 text，应该保持原样', () {
+      // 空正文不得把思考升成正文。
       final result = TurnResult(
         text: '',
         reasoning: '这是一个只有思考没有正文的回复',
@@ -45,6 +45,57 @@ void main() {
       // 保持原样，转换逻辑由 _applyTurn 负责
       expect(normalized.reasoning, '这是一个只有思考没有正文的回复');
       expect(normalized.text, '');
+    });
+
+    test('落库时空正文的思考不得升成正文', () {
+      final stored = ShiyiState.finalizeAssistantTurnForTest(
+        TurnResult(text: '', reasoning: '用户想要一张内容比较多的表格。'),
+      );
+      expect(stored.text, isEmpty);
+      expect(stored.reasoning, '用户想要一张内容比较多的表格。');
+    });
+
+    test('落库时工具轮空正文也保留思考，不把思考写进正文', () {
+      final stored = ShiyiState.finalizeAssistantTurnForTest(
+        TurnResult(
+          text: '',
+          reasoning: '先调研两件事：模型怎么下载、Rust 里怎么跑推理。',
+          toolCalls: [
+            {'id': 'c1', 'name': 'web_search', 'arguments': '{}'},
+          ],
+        ),
+      );
+      expect(stored.text, isEmpty);
+      expect(stored.reasoning, '先调研两件事：模型怎么下载、Rust 里怎么跑推理。');
+    });
+
+    test('落库时正文和思考都有则分别保留', () {
+      final stored = ShiyiState.finalizeAssistantTurnForTest(
+        TurnResult(text: '好的，来个信息量足一点的。', reasoning: '用户想要内容比较多的表格。'),
+      );
+      expect(stored.text, '好的，来个信息量足一点的。');
+      expect(stored.reasoning, '用户想要内容比较多的表格。');
+    });
+
+    test('思考增量立即推送，不跟正文布局一起节流', () {
+      expect(
+        ShiyiState.shouldThrottleReasoningStream(
+          lastEmit: DateTime(2026, 8, 24, 14, 33, 3, 100),
+          now: DateTime(2026, 8, 24, 14, 33, 3, 140),
+          lastLen: 4,
+          totalLen: 6,
+        ),
+        isFalse,
+      );
+      expect(
+        ShiyiState.shouldThrottleContentStream(
+          lastEmit: DateTime(2026, 8, 24, 14, 33, 3, 100),
+          now: DateTime(2026, 8, 24, 14, 33, 3, 140),
+          lastLen: 4,
+          totalLen: 6,
+        ),
+        isTrue,
+      );
     });
 
     test('reasoning 和 text 内容相同时，应该清空 reasoning（去重）', () {

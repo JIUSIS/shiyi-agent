@@ -862,7 +862,12 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
       behavior: ScrollConfiguration.of(context).copyWith(overscroll: false),
       child: ListView.builder(
         controller: _scroll,
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.fromLTRB(
+          messageListSidePadding,
+          12,
+          messageListSidePadding,
+          12,
+        ),
         itemCount: visible.length,
         itemBuilder: (context, i) {
           final m = visible[i];

@@ -233,7 +233,7 @@ class SettingsScreen extends StatelessWidget {
                             color: _iosTeal,
                             title: '上下文',
                             subtitle:
-                                '${_tokenLabel(s.contextLimit)} · 自动压缩${s.autoCompress ? '开' : '关'}',
+                                '新建默认 ${_tokenLabel(s.contextLimit)} · 自动压缩${s.autoCompress ? '开' : '关'}',
                             onTap: () => _open(
                               context,
                               _ContextSectionPage(shiyi: shiyi),
@@ -422,11 +422,7 @@ String _shortUrl(String url) {
   return trimmed.isEmpty ? '未设置接口' : trimmed;
 }
 
-String _tokenLabel(int n) {
-  if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
-  if (n >= 1000) return '${(n / 1000).toStringAsFixed(0)}K';
-  return '$n';
-}
+String _tokenLabel(int n) => formatContextLimitLabel(n);
 
 String _themeLabel(String mode) {
   switch (mode) {
@@ -1785,8 +1781,8 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                 icon: CupertinoIcons.square_on_square,
                 color: _iosTeal,
               ),
-              title: const Text('上下文上限'),
-              subtitle: const Text('会话上下文最大 token 数（默认 128k，最高 200w）'),
+              title: const Text('新建会话默认上下文'),
+              subtitle: const Text('只作用于之后新建的会话（默认 128k，最高 200w）。已有会话可在聊天页单独改。'),
               trailing: _IosValueField(
                 controller: _contextLimitCtrl,
                 keyboardType: TextInputType.number,
@@ -1794,7 +1790,12 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                 onChanged: (v) {
                   final n = int.tryParse(v);
                   if (n != null && n > 0) {
-                    setState(() => _contextLimit = n.clamp(1000, 2000000));
+                    setState(
+                      () => _contextLimit = n.clamp(
+                        kMinContextLimit,
+                        kMaxContextLimit,
+                      ),
+                    );
                     _save.schedule();
                   }
                 },

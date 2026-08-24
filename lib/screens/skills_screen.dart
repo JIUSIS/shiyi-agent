@@ -310,7 +310,11 @@ class SkillsScreen extends StatelessWidget {
     if (s.content.isNotEmpty) {
       for (final b in splitMarkdownBlocks(s.content)) {
         items.add(
-          MarkdownBlock(b, style: const TextStyle(fontSize: 14, height: 1.5)),
+          MarkdownBlock(
+            b,
+            style: const TextStyle(fontSize: 14, height: 1.5),
+            footnotes: markdownCollectFootnotes(s.content),
+          ),
         );
       }
     }

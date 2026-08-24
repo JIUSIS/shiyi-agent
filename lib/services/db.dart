@@ -40,7 +40,7 @@ class AppDatabase {
           : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 18,
+        version: 19,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -79,7 +79,8 @@ class AppDatabase {
       project_id TEXT,
       workspace_dir TEXT,
       cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
-      cache_input_tokens INTEGER NOT NULL DEFAULT 0
+      cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+      context_limit INTEGER NOT NULL DEFAULT 0
     )
   ''');
     await db.execute('''
@@ -305,6 +306,15 @@ class AppDatabase {
         await db.execute('ALTER TABLE sessions ADD COLUMN api_profile TEXT');
       }
     }
+    // v18 -> v19：sessions 加 context_limit（0 = 跟随全局新建会话默认）。
+    if (oldV < 19) {
+      final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+      if (!cols.any((c) => c['name'] == 'context_limit')) {
+        await db.execute(
+          'ALTER TABLE sessions ADD COLUMN context_limit INTEGER NOT NULL DEFAULT 0',
+        );
+      }
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -338,6 +348,11 @@ class AppDatabase {
     }
     if (!sessionCols.any((c) => c['name'] == 'api_profile')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN api_profile TEXT');
+    }
+    if (!sessionCols.any((c) => c['name'] == 'context_limit')) {
+      await db.execute(
+        'ALTER TABLE sessions ADD COLUMN context_limit INTEGER NOT NULL DEFAULT 0',
+      );
     }
     final cacheCols = await db.rawQuery('PRAGMA table_info(sessions)');
     if (!cacheCols.any((c) => c['name'] == 'cache_hit_tokens')) {
@@ -464,6 +479,7 @@ class AppDatabase {
     String? title,
     String? model,
     String? apiProfile,
+    int? contextLimit,
   }) async {
     final db = await this.db;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -471,6 +487,7 @@ class AppDatabase {
     if (title != null) updates['title'] = title;
     if (model != null) updates['model'] = model;
     if (apiProfile != null) updates['api_profile'] = apiProfile;
+    if (contextLimit != null) updates['context_limit'] = contextLimit;
     await db.update('sessions', updates, where: 'id = ?', whereArgs: [id]);
   }
 

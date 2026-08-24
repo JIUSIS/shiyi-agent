@@ -43,6 +43,13 @@ void main() {
     expect(ReasoningModels.profile(''), isNull);
   });
 
+  test('空模型 ID 不显示思考按钮；非空模型一律有档位表', () {
+    expect(ReasoningModels.effortsFor(''), isNull);
+    expect(LlmClient.reasoningEffortsForModel(''), isNull);
+    expect(ReasoningModels.effortsFor('mimo-v2.5-pro'), isNotNull);
+    expect(ReasoningModels.effortsFor('custom-local-7b'), isNotNull);
+  });
+
   test('拾忆与 DSH 共用同一套档位表', () {
     const ids = [
       'claude-sonnet-4-5',

@@ -74,6 +74,45 @@ void main() {
     expect(barLeft, bubbleLeft);
   });
 
+  test('气泡最大宽度只扣两侧边距，不再预留工具栏空位', () {
+    expect(messageListSidePadding, 12);
+    expect(messageBubbleMaxWidth(390), 366);
+    expect(messageBubbleMaxWidth(390), greaterThan(390 - 24 - 34));
+  });
+
+  testWidgets('长助手气泡贴两边边距，不再额外让出工具栏宽', (tester) async {
+    tester.view.physicalSize = const Size(390, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData(useMaterial3: true, brightness: Brightness.light),
+        home: Scaffold(
+          body: SizedBox(
+            width: 390,
+            child: MessageBubble(
+              message: ChatMessage(
+                id: 'a-wide',
+                sessionId: 's1',
+                role: 'assistant',
+                content: '这是一段足够长的助手回复，用来把气泡撑到接近屏宽。' * 4,
+                createdAt: 0,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final bubbleW = tester
+        .getSize(find.byKey(const ValueKey('assistantBubble')))
+        .width;
+    expect(bubbleW, closeTo(messageBubbleMaxWidth(390), 1));
+    expect(bubbleW, greaterThan(390 - 24 - 34));
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('user bubble 渲染内容且操作条靠右', (tester) async {
     tester.view.physicalSize = const Size(320, 600);
     tester.view.devicePixelRatio = 1;
@@ -479,6 +518,81 @@ void main() {
     await tester.pump(const Duration(milliseconds: 120));
 
     expect(find.textContaining('工具调用前的思考'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('空正文的思考只出现在思考面板，不进正文', (tester) async {
+    await _pump(
+      tester,
+      MessageBubble(
+        message: ChatMessage(
+          id: 'reasoning-only',
+          sessionId: 's1',
+          role: 'assistant',
+          content: '',
+          reasoning: '用户想要一张内容比较多的表格。',
+          createdAt: 0,
+        ),
+      ),
+    );
+
+    expect(find.text('思考过程'), findsOneWidget);
+    expect(find.textContaining('用户想要一张内容比较多的表格。'), findsNothing);
+
+    await tester.tap(find.text('思考过程'));
+    await tester.pump(const Duration(milliseconds: 120));
+
+    expect(find.text('收起思考'), findsOneWidget);
+    expect(find.textContaining('用户想要一张内容比较多的表格。'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('展开思考后流式结束，思考仍在面板不进正文', (tester) async {
+    const bubbleKey = ValueKey('thinking-stays-in-panel');
+
+    Future<void> pumpBubble({
+      required bool streaming,
+      required String content,
+      required String reasoning,
+    }) {
+      return _pump(
+        tester,
+        MessageBubble(
+          key: bubbleKey,
+          message: ChatMessage(
+            id: 'thinking-finish',
+            sessionId: 's1',
+            role: 'assistant',
+            content: streaming ? '' : content,
+            reasoning: streaming ? '' : reasoning,
+            streaming: streaming,
+            createdAt: 0,
+          ),
+          liveContent: streaming ? content : null,
+          liveReasoning: streaming ? reasoning : null,
+        ),
+      );
+    }
+
+    await pumpBubble(
+      streaming: true,
+      content: '',
+      reasoning: '用户想要一张内容比较多的表格。',
+    );
+    await tester.tap(find.text('思考中'));
+    await tester.pump(const Duration(milliseconds: 120));
+    expect(find.textContaining('用户想要一张内容比较多的表格。'), findsOneWidget);
+
+    await pumpBubble(
+      streaming: false,
+      content: '好的，来个信息量足一点的。',
+      reasoning: '用户想要一张内容比较多的表格。',
+    );
+    await tester.pump();
+
+    expect(find.text('收起思考'), findsOneWidget);
+    expect(find.textContaining('用户想要一张内容比较多的表格。'), findsOneWidget);
+    expect(find.textContaining('好的，来个信息量足一点的。'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

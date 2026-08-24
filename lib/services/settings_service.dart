@@ -40,8 +40,7 @@ class SettingsService {
       s.visionApiKey = await _readKey(_visionApiKeyKey);
       s.socks5Password = await _readKey(_socks5PasswordKey);
       s.socks5Servers = await _attachServerPasswords(s.socks5Servers);
-      // 迁移旧默认：此前按“字符”计、默认 100 万；现按 token 计，默认 128k。
-      if (s.contextLimit >= 500000) s.contextLimit = 128000;
+      s.contextLimit = sanitizeLoadedContextLimit(s.contextLimit);
       // 旧版本没有输出上限字段：按已选预设带出建议值，
       // 避免思考型模型继续用偏小的 8192。
       if (!json.containsKey('maxOutputTokens')) {

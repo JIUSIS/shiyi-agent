@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
+import '../core/models.dart';
 import '../services/dsh_api.dart';
+import '../services/dsh_chat_cache.dart';
 import '../services/dsh_model_sync.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
@@ -176,6 +178,12 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
       if (shiyi != null) {
         try {
           await DshModelSync.applyToSession(_api, id, shiyi.settings);
+        } catch (_) {}
+        try {
+          await DshChatCache.writeContextLimit(
+            id,
+            sanitizeLoadedContextLimit(shiyi.settings.contextLimit),
+          );
         } catch (_) {}
       }
       if (!mounted) return;

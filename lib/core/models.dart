@@ -1,5 +1,35 @@
 import 'dart:convert';
 
+/// 设置页允许的会话上下文 token 范围（默认 128k，最高 200 万）。
+const int kDefaultContextLimit = 128000;
+const int kMinContextLimit = 1000;
+const int kMaxContextLimit = 2000000;
+
+/// 读盘后的上下文上限：只纠正非法值，不再把 ≥50 万当成旧「字符」默认写回 128k。
+int sanitizeLoadedContextLimit(int value) {
+  if (value < kMinContextLimit) return kDefaultContextLimit;
+  if (value > kMaxContextLimit) return kMaxContextLimit;
+  return value;
+}
+
+/// 本会话实际生效的上下文上限：>0 用会话自定义，否则用全局新建会话默认。
+int effectiveContextLimit({
+  required int sessionContextLimit,
+  required int globalDefault,
+}) {
+  if (sessionContextLimit > 0) {
+    return sanitizeLoadedContextLimit(sessionContextLimit);
+  }
+  return sanitizeLoadedContextLimit(globalDefault);
+}
+
+/// 设置页 / 会话按钮共用的 token 短标签，如 128K、1.0M。
+String formatContextLimitLabel(int n) {
+  if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
+  if (n >= 1000) return '${(n / 1000).toStringAsFixed(0)}K';
+  return '$n';
+}
+
 /// OpenAI 兼容自定义接口地址规范化：结尾没有版本段时自动补 /v1。
 String normalizeOpenAiBaseUrl(String url) {
   var u = url.trim().replaceAll(RegExp(r'/+$'), '');
@@ -88,6 +118,9 @@ class Session {
   /// 服务端明确返回缓存字段的请求；与 [cacheHitTokens] 同分母）。
   int cacheInputTokens;
 
+  /// 本会话自定义上下文上限（token）。0 = 跟随全局「新建会话默认」。
+  int contextLimit;
+
   Session({
     required this.id,
     required this.title,
@@ -103,6 +136,7 @@ class Session {
     this.workspaceDir = '',
     this.cacheHitTokens = 0,
     this.cacheInputTokens = 0,
+    this.contextLimit = 0,
   });
 
   Map<String, dynamic> toMap() => {
@@ -119,6 +153,7 @@ class Session {
     'workspace_dir': workspaceDir,
     'cache_hit_tokens': cacheHitTokens,
     'cache_input_tokens': cacheInputTokens,
+    'context_limit': contextLimit,
   };
 
   factory Session.fromMap(Map<String, dynamic> m) => Session(
@@ -148,6 +183,9 @@ class Session {
     cacheInputTokens: m['cache_input_tokens'] == null
         ? 0
         : int.tryParse('${m['cache_input_tokens']}') ?? 0,
+    contextLimit: m['context_limit'] == null
+        ? 0
+        : int.tryParse('${m['context_limit']}') ?? 0,
   );
 }
 
@@ -361,27 +399,22 @@ class ChatMessage {
               .toList();
     final rawContent = (m['content'] ?? '').toString();
     final rawReasoning = (m['reasoning'] ?? '').toString();
-    // 部分网关在模型「不思考直接回复」时，会把最终回复同时放进
-    // reasoning_content；正文为空或与思考文本重复时按正文读取，
-    // 避免旧数据一直显示成思考过程。
+    // 正文与思考重复时只保留正文，避免「不思考直接回复」被显示成思考过程。
+    // 空正文 + 非空思考必须保留为思考，禁止再升成正文（用户展开思考面板后
+    // 会把思考当正文带出来）。
     final sameText =
-        rawReasoning.replaceAll(RegExp(r'\s+'), '') ==
-        rawContent.replaceAll(RegExp(r'\s+'), '');
-    final misplacedReply =
-        m['role'] == 'assistant' &&
         rawReasoning.isNotEmpty &&
-        toolCalls.isEmpty &&
-        (rawContent.trim().isEmpty || sameText);
+        rawContent.trim().isNotEmpty &&
+        rawReasoning.replaceAll(RegExp(r'\s+'), '') ==
+            rawContent.replaceAll(RegExp(r'\s+'), '');
     return ChatMessage(
       // 脏数据兜底（迁移/损坏库读出 null 或错误类型时取默认，不抛异常）：
       // 与 Session/MemoryEntry 的 tryParse 风格保持一致。
       id: (m['id'] ?? '').toString(),
       sessionId: (m['session_id'] ?? '').toString(),
       role: (m['role'] ?? 'user').toString(),
-      content: misplacedReply && rawContent.trim().isEmpty
-          ? rawReasoning
-          : rawContent,
-      reasoning: misplacedReply ? '' : rawReasoning,
+      content: rawContent,
+      reasoning: sameText ? '' : rawReasoning,
       subagentResult: (m['subagent_result'] ?? '').toString(),
       toolCalls: toolCalls,
       toolCallId: (m['tool_call_id'] ?? '').toString(),
@@ -555,7 +588,8 @@ class AppSettings {
   double ttsRate;
   String themeMode; // light / dark / system
 
-  /// 会话上下文上限（估算 token，默认 128k）。
+  /// 全局「新建会话默认上下文」（估算 token，默认 128k）。
+  /// 已有会话可单独覆盖，见 [Session.contextLimit]。
   int contextLimit;
 
   /// 单次请求最大输出 token（思考型模型容易把预算花在推理上，默认 8192）。
@@ -636,7 +670,7 @@ class AppSettings {
     this.ttsEnabled = false,
     this.ttsRate = 1.0,
     this.themeMode = 'dark',
-    this.contextLimit = 128000,
+    this.contextLimit = kDefaultContextLimit,
     this.maxOutputTokens = 8192,
     this.compressThresholdPercent = 80,
     this.autoCompress = true,
@@ -798,7 +832,7 @@ class AppSettings {
     ttsEnabled: j['ttsEnabled'] ?? false,
     ttsRate: (j['ttsRate'] as num?)?.toDouble() ?? 1.0,
     themeMode: j['themeMode'] ?? 'dark',
-    contextLimit: (j['contextLimit'] as num?)?.toInt() ?? 128000,
+    contextLimit: (j['contextLimit'] as num?)?.toInt() ?? kDefaultContextLimit,
     maxOutputTokens: (j['maxOutputTokens'] as num?)?.toInt() ?? 8192,
     compressThresholdPercent:
         (j['compressThresholdPercent'] as num?)?.toDouble() ?? 80,

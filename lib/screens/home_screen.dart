@@ -6,6 +6,7 @@ import 'dart:ui' show ImageFilter;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/app_state.dart';
 import '../core/home_tabs.dart';
@@ -32,6 +33,33 @@ import 'terminal_screen.dart';
 const _iosBlue = Color(0xFF0A84FF);
 const _iosRed = Color(0xFFFF3B30);
 const _iosGray = Color(0xFF8E8E93);
+
+const shiyiProjectExpandedPrefsKey = 'shiyi_project_expanded_v1';
+
+/// 拾忆会话卡片左滑：删除保持最右。
+const shiyiSessionSwipeLabels = ['重命名', '项目', '复制 ID', '删除'];
+
+/// 读回项目展开状态；键不存在返回 null（首次启动默认展开未分类）。
+Future<List<String>?> shiyiLoadExpandedProjectIds() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getStringList(shiyiProjectExpandedPrefsKey);
+}
+
+Future<void> shiyiSaveExpandedProjectIds(Iterable<String> ids) async {
+  final prefs = await SharedPreferences.getInstance();
+  final list = ids.toSet().toList()..sort();
+  await prefs.setStringList(shiyiProjectExpandedPrefsKey, list);
+}
+
+/// 首次无偏好只展开未分类；已保存的 id 只保留仍存在的项目和未分类。
+Set<String> shiyiRestoreExpandedProjectIds({
+  required List<String>? saved,
+  required Iterable<String> knownProjectIds,
+}) {
+  if (saved == null) return {''};
+  final known = knownProjectIds.toSet()..add('');
+  return saved.where(known.contains).toSet();
+}
 
 class HomeScreen extends StatefulWidget {
   final ShiyiState shiyi;
@@ -695,6 +723,10 @@ class _SessionsTabState extends State<_SessionsTab> {
   /// 已展开的项目分组 id；空串表示「未分类」，默认展开。
   final Set<String> _expandedGroups = {''};
 
+  /// 上次持久化的展开列表；null 表示还没有写过偏好（首次启动）。
+  List<String>? _savedExpanded;
+  bool _expandedRestored = false;
+
   /// 当前展开的左滑卡片 key；点空白或操作其他卡片时收回。
   final ValueNotifier<String?> _openSwipeKey = ValueNotifier(null);
 
@@ -702,6 +734,39 @@ class _SessionsTabState extends State<_SessionsTab> {
   Rect? _openSwipeRect;
 
   ShiyiState get shiyi => widget.shiyi;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_restoreExpanded());
+  }
+
+  Future<void> _restoreExpanded() async {
+    final saved = await shiyiLoadExpandedProjectIds();
+    if (!mounted) return;
+    setState(() {
+      _savedExpanded = saved;
+      _expandedRestored = true;
+      _applyExpandedPrefs();
+    });
+  }
+
+  void _applyExpandedPrefs() {
+    if (!_expandedRestored) return;
+    _expandedGroups
+      ..clear()
+      ..addAll(
+        shiyiRestoreExpandedProjectIds(
+          saved: _savedExpanded,
+          knownProjectIds: shiyi.projects.map((p) => p.id),
+        ),
+      );
+  }
+
+  Future<void> _saveExpanded() async {
+    _savedExpanded = _expandedGroups.toList();
+    await shiyiSaveExpandedProjectIds(_expandedGroups);
+  }
 
   @override
   void didUpdateWidget(covariant _SessionsTab oldWidget) {
@@ -756,6 +821,7 @@ class _SessionsTabState extends State<_SessionsTab> {
     setState(() {
       if (!_expandedGroups.add(id)) _expandedGroups.remove(id);
     });
+    unawaited(_saveExpanded());
   }
 
   void _onOpenSwipeRectChanged(Rect? rect) {
@@ -872,6 +938,7 @@ class _SessionsTabState extends State<_SessionsTab> {
     final shiyi = widget.shiyi;
     _resetSearch();
     setState(() => _expandedGroups.add(projectId));
+    unawaited(_saveExpanded());
     try {
       await shiyi.newSession(projectId: projectId);
     } catch (e) {
@@ -1348,8 +1415,8 @@ class _SessionTile extends StatelessWidget {
       openNotifier: openSwipeKey,
       onOpenRectChanged: onOpenRectChanged,
       swipeKey: swipeKey,
-      actionWidth: 176,
-      // 左滑拉出拼合胶囊操作（重命名 / 删除）。
+      actionWidth: 232,
+      // 左滑拉出拼合胶囊操作（重命名 / 项目 / 复制 ID / 删除）。
       onTap: () async {
         onBeforeOpen();
         await shiyi.selectSession(s.id);
@@ -1372,7 +1439,7 @@ class _SessionTile extends StatelessWidget {
         // 左缘直角与内容右缘（展开时为直角）拼接，整体呈胶囊。
         _CircularSwipeAction(
           icon: CupertinoIcons.pencil,
-          label: '重命名',
+          label: shiyiSessionSwipeLabels[0],
           backgroundColor: _iosGray,
           foregroundColor: Colors.white,
           onTap: () async {
@@ -1382,7 +1449,7 @@ class _SessionTile extends StatelessWidget {
         ),
         _CircularSwipeAction(
           icon: CupertinoIcons.folder_open,
-          label: '项目',
+          label: shiyiSessionSwipeLabels[1],
           backgroundColor: _iosGray,
           foregroundColor: Colors.white,
           onTap: () async {
@@ -1391,8 +1458,23 @@ class _SessionTile extends StatelessWidget {
           },
         ),
         _CircularSwipeAction(
+          icon: CupertinoIcons.doc_on_doc,
+          label: shiyiSessionSwipeLabels[2],
+          backgroundColor: _iosGray,
+          foregroundColor: Colors.white,
+          onTap: () async {
+            await Clipboard.setData(ClipboardData(text: s.id));
+            if (context.mounted) {
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(const SnackBar(content: Text('已复制会话 ID')));
+            }
+            openSwipeKey?.value = null;
+          },
+        ),
+        _CircularSwipeAction(
           icon: CupertinoIcons.trash,
-          label: '删除',
+          label: shiyiSessionSwipeLabels[3],
           backgroundColor: _iosRed,
           foregroundColor: Colors.white,
           onTap: () async {

@@ -1182,9 +1182,9 @@ class _ChatScreenState extends State<ChatScreen>
                                     reverse: true,
                                     clipBehavior: Clip.none,
                                     padding: EdgeInsets.fromLTRB(
+                                      messageListSidePadding,
                                       12,
-                                      12,
-                                      12,
+                                      messageListSidePadding,
                                       overlayHeight + 12,
                                     ),
                                     itemCount: items.length,
@@ -1520,6 +1520,13 @@ class _ChatScreenState extends State<ChatScreen>
                                         ? null
                                         : _compressContext,
                                     compressBusy: _pageBusy,
+                                    onContextLimit:
+                                        _pageBusy || _pageSessionId == null
+                                        ? null
+                                        : _editContextLimit,
+                                    contextLimitLabel: formatContextLimitLabel(
+                                      sessionSettings.contextLimit,
+                                    ),
                                   );
                                 },
                               ),
@@ -1565,7 +1572,7 @@ class _ChatScreenState extends State<ChatScreen>
     if (sessionId == null) return;
     final tokens = await shiyi.activeContextTokenEstimate(sessionId);
     if (!mounted) return;
-    final limit = shiyi.settings.contextLimit;
+    final limit = shiyi.contextLimitForSession(sessionId);
     final pct = limit <= 0 ? 0.0 : (tokens / limit * 100).clamp(0, 100);
     final occupancy = limit > 0 ? '当前占用约 ${pct.toStringAsFixed(0)}%。' : '';
     final ok = await showIosConfirmDialog(
@@ -1591,6 +1598,18 @@ class _ChatScreenState extends State<ChatScreen>
               '${(result.afterTokens / 10000).toStringAsFixed(1)}w token'
         : '压缩失败（消息太少或 API 未配置）';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _editContextLimit() async {
+    final shiyi = widget.shiyi;
+    final sessionId = _pageSessionId;
+    if (sessionId == null) return;
+    final next = await showSessionContextLimitDialog(
+      context: context,
+      currentLimit: shiyi.contextLimitForSession(sessionId),
+    );
+    if (next == null || !mounted) return;
+    await shiyi.setContextLimitForSession(sessionId, next);
   }
 
   void _saveSkillDialog(String content) {
@@ -1717,7 +1736,7 @@ class _TokenStats extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final round = shiyi.lastRoundTokens;
-    final limit = shiyi.settings.contextLimit;
+    final limit = shiyi.contextLimitForSession(shiyi.currentSessionId);
     final tokens = shiyi.sessionContextTokens;
     final remain = limit <= 0
         ? 100.0

@@ -951,6 +951,49 @@ class _SessionModelMenuRow extends StatelessWidget {
   }
 }
 
+/// 会话页共用的上下文上限入口；只改本会话，不改全局默认。
+class ChatContextLimitButton extends StatelessWidget {
+  final VoidCallback? onPressed;
+  final String label;
+
+  const ChatContextLimitButton({
+    super.key,
+    required this.onPressed,
+    this.label = '',
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final enabled = onPressed != null;
+    final color = enabled
+        ? theme.colorScheme.onSurfaceVariant
+        : theme.disabledColor;
+    return Tooltip(
+      message: '会话上下文',
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 48, height: 32),
+        visualDensity: VisualDensity.compact,
+        onPressed: onPressed,
+        color: color,
+        disabledColor: theme.disabledColor,
+        icon: Text(
+          label.isEmpty ? 'CTX' : label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.labelSmall?.copyWith(
+            color: color,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            letterSpacing: -0.2,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 会话页共用的紧凑压缩入口；压缩实现仍由各引擎自己的回调负责。
 class ChatCompressionButton extends StatelessWidget {
   final VoidCallback? onPressed;
@@ -1006,6 +1049,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final ValueChanged<bool>? onThinkingToggled;
   final VoidCallback? onCompress;
   final bool compressBusy;
+  final VoidCallback? onContextLimit;
+  final String contextLimitLabel;
   final List<SessionModelOption> modelOptions;
   final String modelValue;
   final String modelId;
@@ -1036,6 +1081,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.onThinkingToggled,
     this.onCompress,
     this.compressBusy = false,
+    this.onContextLimit,
+    this.contextLimitLabel = '',
     this.modelOptions = const [],
     this.modelValue = '',
     this.modelId = '',
@@ -1105,7 +1152,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
                 if (modelOptions.isNotEmpty && onModelChanged != null ||
                     thinkingOptions.isNotEmpty && onThinkingChanged != null ||
                     onThinkingToggled != null ||
-                    onCompress != null) ...[
+                    onCompress != null ||
+                    onContextLimit != null) ...[
                   Row(
                     children: [
                       if (modelOptions.isNotEmpty && onModelChanged != null)
@@ -1123,6 +1171,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
                         )
                       else
                         const Spacer(),
+                      if (onContextLimit != null)
+                        ChatContextLimitButton(
+                          onPressed: onContextLimit,
+                          label: contextLimitLabel,
+                        ),
                       if (onCompress != null)
                         ChatCompressionButton(
                           onPressed: onCompress,

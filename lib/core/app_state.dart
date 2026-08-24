@@ -373,6 +373,7 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 拾忆主请求使用的会话级接口配置；未绑定时回退全局设置。
+  /// 上下文上限优先用本会话自定义，0 / 未绑定则用全局「新建会话默认」。
   AppSettings clientSettingsForSession(String? sessionId) {
     Session? sess;
     if (sessionId != null) {
@@ -383,12 +384,20 @@ class ShiyiState extends ChangeNotifier {
         }
       }
     }
+    final limit = effectiveContextLimit(
+      sessionContextLimit: sess?.contextLimit ?? 0,
+      globalDefault: settings.contextLimit,
+    );
     final p = profileForSession(sessionId);
     if (p == null) {
       final sessionModel = sess?.model.trim() ?? '';
-      return sessionModel.isEmpty
-          ? settings
-          : settings.copyWith(model: sessionModel);
+      if (sessionModel.isEmpty && limit == settings.contextLimit) {
+        return settings;
+      }
+      return settings.copyWith(
+        model: sessionModel.isEmpty ? settings.model : sessionModel,
+        contextLimit: limit,
+      );
     }
     final sessionModel = sess?.model.trim() ?? '';
     return settings.copyWith(
@@ -398,7 +407,23 @@ class ShiyiState extends ChangeNotifier {
           ? sessionModel
           : (p.model.isNotEmpty ? p.model : settings.model),
       apiProtocol: p.apiProtocol,
+      contextLimit: limit,
     );
+  }
+
+  /// 当前会话实际生效的上下文上限（token）。
+  int contextLimitForSession(String? sessionId) =>
+      clientSettingsForSession(sessionId).contextLimit;
+
+  /// 绑定本会话自定义上下文上限；[limit] 会夹到设置页允许范围。
+  Future<void> setContextLimitForSession(String? sessionId, int limit) async {
+    if (sessionId == null || sessionId.isEmpty) return;
+    final clamped = sanitizeLoadedContextLimit(limit);
+    await _db.touchSession(sessionId, contextLimit: clamped);
+    for (final s in sessions) {
+      if (s.id == sessionId) s.contextLimit = clamped;
+    }
+    notifyListeners();
   }
 
   /// 绑定会话到一份已保存配置，只改该会话，不改全局设置。
@@ -1040,6 +1065,7 @@ class ShiyiState extends ChangeNotifier {
         createdAt: now,
         updatedAt: now,
         projectId: projectId,
+        contextLimit: sanitizeLoadedContextLimit(settings.contextLimit),
       ),
     );
     currentSessionId = id;
@@ -1386,9 +1412,10 @@ class ShiyiState extends ChangeNotifier {
   /// 按上下文占用生成发送前摘要：60% 压缩旧工具结果，75% 更新滚动任务摘要。
   Future<String> _buildContextSummaries(
     List<ChatMessage> msgs,
-    int fullTokens,
-  ) async {
-    final limit = settings.contextLimit;
+    int fullTokens, {
+    String? sessionId,
+  }) async {
+    final limit = contextLimitForSession(sessionId);
     if (limit <= 0) return '';
     final ratio = fullTokens / limit;
     final parts = <String>[];
@@ -1480,12 +1507,13 @@ class ShiyiState extends ChangeNotifier {
     bool announce = true,
     bool logBudget = false,
     List<Map<String, dynamic>>? tools,
+    String? sessionId,
   }) async {
     if (apiMsgs.length <= 1) return apiMsgs;
     final requestTools = tools ?? activeTools;
     final estimate = estimateRequestTokens(apiMsgs, tools: requestTools);
     final plan = planContextBudget(
-      contextLimit: settings.contextLimit,
+      contextLimit: contextLimitForSession(sessionId),
       maxOutputTokens: settings.maxOutputTokens,
       estimatedInputTokens: estimate.totalEstimatedTokens,
     );
@@ -1989,10 +2017,11 @@ class ShiyiState extends ChangeNotifier {
     final contextSummaries = await _buildContextSummaries(
       sessionMessages,
       fullEstimate,
+      sessionId: sessionId,
     );
+    final sessionLimit = contextLimitForSession(sessionId);
     final compactOldTools =
-        settings.contextLimit > 0 &&
-        fullEstimate / settings.contextLimit >= 0.60;
+        sessionLimit > 0 && fullEstimate / sessionLimit >= 0.60;
 
     // 配了视觉模型 = 声明主模型不看图：带图消息直接走视觉模型描述，不试多模态。
     // 未配视觉模型：先按多模态发，失败自动降级（_knownImageUnsupported）。
@@ -2029,6 +2058,7 @@ class ShiyiState extends ChangeNotifier {
           loopMsgs,
           logBudget: true,
           tools: runTools,
+          sessionId: sessionId,
         );
         // 状态栏、发送前阈值、压缩判断统一走 activeContextTokenEstimate：
         // 有真实 usage 时用「上次真实 total + 新增消息」，没有时才全量估算。
@@ -2309,6 +2339,7 @@ class ShiyiState extends ChangeNotifier {
         logBudget: false,
         announce: false,
         tools: _activeToolsFor(planMode: run.planMode),
+        sessionId: sessionId,
       );
       final result = await _streamRound(run, loopMsgs, asst);
       if (result == null) {
@@ -2483,18 +2514,9 @@ class ShiyiState extends ChangeNotifier {
     ChatMessage asst,
     TurnResult result,
   ) async {
-    final normalized = _normalizeMisplacedReasoning(result);
-    // 最终落库时：如果只有 reasoning 没有正文，把 reasoning 作为正文保存。
-    // 这是给「网关只返回 reasoning_content 的情况」的兜底，但只在最终确认时做，
-    // 不在流式期间做（否则思考内容会在流式时显示在输出区）。
-    final finalText =
-        normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
-        ? normalized.reasoning
-        : normalized.text;
-    final finalReasoning =
-        normalized.text.trim().isEmpty && normalized.reasoning.trim().isNotEmpty
-        ? ''
-        : normalized.reasoning;
+    final normalized = finalizeAssistantTurn(result);
+    final finalText = normalized.text;
+    final finalReasoning = normalized.reasoning;
 
     asst.content = finalText;
     asst.reasoning = finalReasoning;
@@ -2524,10 +2546,9 @@ class ShiyiState extends ChangeNotifier {
     _publishRun(run);
   }
 
-  /// 网关只回 reasoning_content 且没有工具调用时，把它当作最终正文；
-  /// 若思考文本与正文重复，也只保留正文，避免「不思考直接回复」被误显示。
-  /// 另兜底：reasoning 为空但正文带 think 标签时（部分网关把思考写进 content），
-  /// 拆进思考面板，只认明确标签、不做「用户说…」启发式。
+  /// 思考与正文分开保存。空正文不得把思考升成正文。
+  /// 思考与正文重复时只留正文，避免「不思考直接回复」被显示成思考过程。
+  /// reasoning 为空但正文带 think 标签时拆进思考面板，只认明确标签。
   static TurnResult _normalizeMisplacedReasoning(TurnResult result) {
     if (result.toolCalls.isNotEmpty) return result;
     final reasoning = result.reasoning.trim();
@@ -2541,9 +2562,6 @@ class ShiyiState extends ChangeNotifier {
         reasoning: split.reasoning.trim(),
       );
     }
-    // 注释掉：流式期间不要把 reasoning 移到 text，否则思考内容会显示在输出区。
-    // 只在最终落库时（_applyTurn）判断：如果真的没有正文只有思考，那时再转换。
-    // if (text.isEmpty) return TurnResult(text: result.reasoning, reasoning: '');
     if (_sameReplyText(reasoning, text)) {
       return TurnResult(text: result.text, reasoning: '');
     }
@@ -2553,9 +2571,42 @@ class ShiyiState extends ChangeNotifier {
   static bool _sameReplyText(String a, String b) =>
       a.replaceAll(RegExp(r'\s+'), '') == b.replaceAll(RegExp(r'\s+'), '');
 
+  /// 整轮结束落库：思考与正文分开保存。空正文不得把思考升成正文。
+  static TurnResult finalizeAssistantTurn(TurnResult result) {
+    final normalized = _normalizeMisplacedReasoning(result);
+    return TurnResult(
+      text: normalized.text,
+      reasoning: normalized.reasoning,
+      toolCalls: normalized.toolCalls,
+    );
+  }
+
+  /// 思考增量不节流；正文布局 80ms / 200 字节节流。
+  static bool shouldThrottleReasoningStream({
+    required DateTime lastEmit,
+    required DateTime now,
+    required int lastLen,
+    required int totalLen,
+  }) => false;
+
+  static bool shouldThrottleContentStream({
+    required DateTime lastEmit,
+    required DateTime now,
+    required int lastLen,
+    required int totalLen,
+  }) {
+    if (lastLen == 0) return false;
+    return now.difference(lastEmit).inMilliseconds < 80 &&
+        totalLen - lastLen < 200;
+  }
+
   @visibleForTesting
   static TurnResult normalizeMisplacedReasoningForTest(TurnResult result) =>
       _normalizeMisplacedReasoning(result);
+
+  @visibleForTesting
+  static TurnResult finalizeAssistantTurnForTest(TurnResult result) =>
+      finalizeAssistantTurn(result);
 
   /// 收尾一个被中断/无输出的占位消息，防止一直显示「正在思考…」。
   Future<void> _finalizeAbort(_SessionRun run, ChatMessage? m) async {
@@ -2648,17 +2699,23 @@ class ShiyiState extends ChangeNotifier {
               )
               .toList();
         }
-        // 流式刷新节流：80ms 内且增量不大时不重复重建气泡，
-        // 保持视觉连续的同时减少长文逐 token 解析/布局开销。
+        // 思考增量立即推送，避免小片段被 80ms 节流丢掉、面板一直空。
+        // 正文布局仍节流，减少长文逐 token 解析开销。
         final totalLen = live.text.length + live.reasoning.length;
         final now = DateTime.now();
+        run.streamReasoning.value = live.reasoning;
+        if (currentSessionId == sessionId) {
+          streamReasoning.value = live.reasoning;
+        }
         if (lastStreamLen == 0 ||
-            now.difference(lastStreamEmit).inMilliseconds >= 80 ||
-            totalLen - lastStreamLen >= 200) {
-          run.streamReasoning.value = live.reasoning;
+            !shouldThrottleContentStream(
+              lastEmit: lastStreamEmit,
+              now: now,
+              lastLen: lastStreamLen,
+              totalLen: totalLen,
+            )) {
           run.streamText.value = live.text;
           if (currentSessionId == sessionId) {
-            streamReasoning.value = live.reasoning;
             streamText.value = live.text;
           }
           lastStreamEmit = now;
@@ -3282,6 +3339,7 @@ class ShiyiState extends ChangeNotifier {
                   .toList()
             : null;
         final clientSettings = clientSettingsForSession(toolSessionId);
+        final parentLimit = contextLimitForSession(toolSessionId);
         final runner = SubagentRunner(
           baseUrl: clientSettings.baseUrl,
           apiKey: clientSettings.apiKey,
@@ -3291,9 +3349,7 @@ class ShiyiState extends ChangeNotifier {
           maxTokens: settings.maxOutputTokens,
           toolsJson: _toolsJsonFor(def.allowedTools),
           // 子代理上下文预算：主会话 contextLimit 的 75%（留出输出与工具定义空间）。
-          contextBudgetTokens: settings.contextLimit > 0
-              ? (settings.contextLimit * 3) ~/ 4
-              : 0,
+          contextBudgetTokens: parentLimit > 0 ? (parentLimit * 3) ~/ 4 : 0,
           // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
           executeTool: (name, argsJson) async {
             if (!def.allowedTools.contains(name)) {
@@ -3671,7 +3727,7 @@ class ShiyiState extends ChangeNotifier {
     final keep = msgs.where((m) => !m.streaming && !m.archived).toList();
     if (keep.length < 6) return fail;
     final beforeTokens = await activeContextTokenEstimate(sessionId);
-    final keepStart = _compressionKeepStart(keep);
+    final keepStart = _compressionKeepStart(keep, sessionId);
     final toCompress = keep.sublist(0, keepStart);
     if (toCompress.length < 3) return fail;
     final transcript = _buildCompressionTranscript(toCompress);
@@ -3729,8 +3785,11 @@ class ShiyiState extends ChangeNotifier {
 
   /// 选压缩边界：优先按 Token 预算从最新往回保留，至少归档早期 60% 条数。
   /// 工具轮按「assistant tool_calls + 连续 tool 结果」成组归档，不拆散配对。
-  int _compressionKeepStart(List<ChatMessage> keep) {
-    return compressionKeepStart(keep, contextLimit: settings.contextLimit);
+  int _compressionKeepStart(List<ChatMessage> keep, String sessionId) {
+    return compressionKeepStart(
+      keep,
+      contextLimit: contextLimitForSession(sessionId),
+    );
   }
 
   /// 纯函数版压缩边界：供自动/手动压缩与测试共用。
@@ -3863,7 +3922,7 @@ class ShiyiState extends ChangeNotifier {
     if (shouldAutoCompress(
       autoCompress: settings.autoCompress,
       tokens: tokens,
-      contextLimit: settings.contextLimit,
+      contextLimit: contextLimitForSession(sessionId),
       thresholdPercent: settings.compressThresholdPercent,
     )) {
       await compressSession(sessionId);

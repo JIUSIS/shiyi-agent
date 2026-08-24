@@ -4,7 +4,7 @@ import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/services/llm_client.dart';
 
 void main() {
-  test('正文为空且只有 reasoning 时按备份提升为正文', () {
+  test('正文为空且只有 reasoning 时仍作为思考过程，不升成正文', () {
     final msg = ChatMessage.fromMap({
       'id': 'm1',
       'session_id': 's1',
@@ -15,8 +15,8 @@ void main() {
       'tool_call_id': '',
       'created_at': 1,
     });
-    expect(msg.content, '选了「骂一句」——完全理解！');
-    expect(msg.reasoning, isEmpty);
+    expect(msg.content, isEmpty);
+    expect(msg.reasoning, '选了「骂一句」——完全理解！');
   });
 
   test('拾忆 fromMap 不拆正文里的 think 标签', () {

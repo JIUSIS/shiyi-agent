@@ -216,7 +216,9 @@ class LlmClient {
               onDiag?.call('[stream] thinking 参数被网关拒绝，去掉后重试');
               continue;
             }
-            if (reasoningEffort != null && e.contains('reasoning_effort')) {
+            if (reasoningEffort != null &&
+                (e.contains('reasoning_effort') ||
+                    _isVagueInvalidRequest(err))) {
               reasoningEffort = null;
               onDiag?.call('[stream] reasoning_effort 被网关拒绝，去掉后重试');
               continue;
@@ -469,6 +471,15 @@ class LlmClient {
             : const <String, dynamic>{'type': 'object', 'properties': {}},
       };
     }).toList();
+  }
+
+  /// MiMo 等网关拒绝未知字段时只回 `Invalid request parameters`，
+  /// 不点名 `reasoning_effort`。有思考档位时按该字段被拒处理。
+  static bool _isVagueInvalidRequest(String err) {
+    final e = err.toLowerCase();
+    return e.contains('invalid request parameters') ||
+        e.contains('invalid_request_error') ||
+        (e.contains('badrequesterror') && e.contains('invalid request'));
   }
 
   static bool _isUsageParamError(String err) {

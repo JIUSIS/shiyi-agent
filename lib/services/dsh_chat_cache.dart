@@ -61,6 +61,31 @@ class DshChatSnapshot {
 class DshChatCache {
   static const _snapshotPrefix = 'dsh_chat_snapshot_cache_v2_';
   static const _legacyPrefix = 'dsh_chat_history_cache_v1_';
+  static const _contextLimitPrefix = 'dsh_session_context_limit_v1_';
+
+  /// DSH 会话自定义上下文（token）。0 / 缺失 = 跟随全局新建会话默认。
+  static Future<int> readContextLimit(String sessionId) async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt('$_contextLimitPrefix$sessionId') ?? 0;
+  }
+
+  static Future<void> writeContextLimit(String sessionId, int limit) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(
+      '$_contextLimitPrefix$sessionId',
+      sanitizeLoadedContextLimit(limit),
+    );
+  }
+
+  static Future<int> effectiveContextLimitFor(
+    String sessionId,
+    int globalDefault,
+  ) async {
+    return effectiveContextLimit(
+      sessionContextLimit: await readContextLimit(sessionId),
+      globalDefault: globalDefault,
+    );
+  }
 
   static Future<DshChatSnapshot?> read(String sessionId) async {
     final prefs = await SharedPreferences.getInstance();

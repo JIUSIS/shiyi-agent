@@ -11,8 +11,12 @@ import 'markdown_text.dart';
 
 const _iosBlueLight = Color(0xFF007AFF);
 const _iosBlueDark = Color(0xFF0A84FF);
-const _toolbarIconWidth = 34.0;
-const _messageListSidePadding = 12.0;
+
+/// 会话列表左右边距；气泡最大宽度只扣这一圈，不再预留侧栏工具条空位。
+const double messageListSidePadding = 12;
+
+double messageBubbleMaxWidth(double screenWidth) =>
+    (screenWidth - messageListSidePadding * 2).clamp(0.0, double.infinity);
 const _subagentResultMarker = '<子代理返回信息>';
 const _subagentPromptMarker = '<子代理提示词注入>';
 const _subagentSummaryMarker = '<子代理总结>';
@@ -205,10 +209,9 @@ class _MessageBubbleState extends State<MessageBubble> {
         : assistantContent;
     // 用户气泡前景色：深色模式用白、浅色模式用深灰蓝，保证在液态玻璃上的对比度。
     final userFg = dark ? Colors.white : const Color(0xFF14264A);
-    final maxBubbleWidth =
-        MediaQuery.sizeOf(context).width -
-        _messageListSidePadding * 2 -
-        _toolbarIconWidth;
+    final maxBubbleWidth = messageBubbleMaxWidth(
+      MediaQuery.sizeOf(context).width,
+    );
 
     Widget body;
     if (isUser) {
@@ -218,7 +221,7 @@ class _MessageBubbleState extends State<MessageBubble> {
           constraints: BoxConstraints(maxWidth: maxBubbleWidth),
           child: Container(
             key: const ValueKey('userBubble'),
-            margin: const EdgeInsets.only(left: _toolbarIconWidth),
+            margin: EdgeInsets.zero,
             clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
               borderRadius: const BorderRadius.only(
@@ -284,7 +287,7 @@ class _MessageBubbleState extends State<MessageBubble> {
           constraints: BoxConstraints(maxWidth: maxBubbleWidth),
           child: Container(
             key: const ValueKey('assistantBubble'),
-            margin: const EdgeInsets.only(top: 8, right: _toolbarIconWidth),
+            margin: const EdgeInsets.only(top: 8),
             clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
               borderRadius: const BorderRadius.only(

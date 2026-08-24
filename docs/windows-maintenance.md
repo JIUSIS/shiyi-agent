@@ -142,6 +142,22 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
    专用字段 + 正文 `<thinking>` 标签兜底；禁止对正文做启发式拆思考。DSH 会话页
    按钮读同一目录，真正发请求走 `session.selectModel`。OpenRouter 注入必须
    `compat.supportsStore: false`。
+8. **拾忆 / DSH 聊天 Markdown 共用一套渲染器**：会话气泡走
+   `lib/widgets/message_bubble.dart` → `AdaptiveMarkdownText`
+   （`lib/widgets/markdown_text.dart`）。已有能力：标题、加粗/斜体/删除线/
+   行内代码/链接、列表/任务列表、表格（自适应居中）、引用、围栏代码（紧凑分色）。
+   2026-08-24 自研补齐：图片、标准脚注 `[^1]` + 文末 `[^1]:`、内联脚注
+   `[^1](内容)`、定义列表（含缩进/全角冒号）、键盘按键、`==高亮==`、
+   GitHub Alert、LaTeX 可读文本、独立分隔线。改渲染必须两端一起验证，
+   禁止只改拾忆或只改 DSH。测试：`test/markdown_text_test.dart`。
+9. **思考过程不得升成正文**：拾忆落库走 `finalizeAssistantTurn`，DSH 走
+   live / history 原样保留。空正文 + 非空思考必须留在思考面板，禁止再写成
+   `content`。思考增量立即推送，正文布局才 80ms / 200 字节节流。两端共用
+   `MessageBubble` 的折叠面板。测试：`test/reasoning_stream_test.dart`、
+   `test/reasoning_fallback_test.dart`、`test/message_bubble_test.dart`。
+10. **上下文上限是新建会话默认，会话可单独改**：设置页不再把 ≥50 万 token
+    写回 128k。拾忆写入 `sessions.context_limit`，DSH 写入本机偏好；两端共用
+    输入区「会话上下文」按钮。测试：`test/context_limit_test.dart`。
 
 ---
 
@@ -158,7 +174,11 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 | WSL 输出中文乱码 | wsl.exe 管道默认 UTF-16LE | 执行时带 `WSL_UTF8=1` 环境变量 |
 | 模拟点击三键无效（自动化测试时） | 窗口未激活时首次点击被系统用于激活 | 先点击内容区激活窗口，再点三键 |
 | 拾忆思考进正文、折叠面板空 | 网关不带思考参数时不回 `reasoning_content`，思考被灌进 `content` | 命中家族关键字的模型默认带 `thinking`/`reasoning_effort`（拒绝时降级重试），正文 `<thinking>` 标签兜底拆分。见 `docs/fix-log.md` #219 / #222 |
+| 点开思考过程后，思考完把思考当正文带出；部分思考不进面板 | 落库把空正文的思考升成 `content`；历史 `fromMap` 同样提升；拾忆把思考和正文绑在一起 80ms 节流，短 reasoning 增量进不了面板 | 空正文思考保持 `reasoning`；思考增量立即推送，只节流正文。DSH `_publishLive` 已是同一口径。见 `docs/fix-log.md` #231 |
+| 设置里上下文改到 1M 后又变回 128k | `SettingsService.load` 把 ≥50 万当成旧字符默认冲掉 | 只纠正非法值；设置是新建会话默认，聊天页可改本会话。见 `docs/fix-log.md` #233 |
+| mimo 工具续轮 HTTP 400，日志 `thinking=off reasoningEffort=high` | `thinking=off` 不是关开关；MiMo 拒绝 `reasoning_effort` 时只回模糊 BadRequest，旧重试抓不到字段名 | 模糊 400 也去掉 `reasoning_effort` 重试。见 `docs/fix-log.md` #234 |
 | 自定义 Claude/GPT/Grok 会话页没有思考按钮 | 旧逻辑只认少量写死 ID，刷新 Anthropic 模型还会直接报不支持 | 按模型 ID 关键字识别；对不上关键字也显示通用档位。Anthropic 走 `GET /v1/models`。见 `docs/fix-log.md` #222 |
+| 会话 Markdown 图片/脚注/定义列表/公式露原文 | 自研渲染器原先只覆盖标题/列表/表格/代码/引用/强调 | 缺口元素在 `markdown_text.dart` 自研补齐，拾忆与 DSH 共用 `MessageBubble`。见 `docs/fix-log.md` #230 |
 | OpenRouter 在拾忆可用、DSH 返回 400 | pi-ai 给 OpenRouter 发 `store: false`，且 `openai/gpt-4o` 被 `gpt` 当成思考模型误发 `reasoning` | 注入 `compat.supportsStore: false`；gpt-4o/4.1/3.5 不声明思考。见 `docs/fix-log.md` #223 |
 | DSH 0.1.1 启动即崩，修复完整运行环境没用 | `.credentials.yaml` 顶层仍是 `SHIYI_API_KEY:`，解析器只认 `version`/`refs`/`records` | 启动同步写成 `version: 1` + `refs:`，并把顶层密钥收进去。见 `docs/fix-log.md` #224 |
 
@@ -186,7 +206,9 @@ DS Harness 引擎验证点（#114，两端共享）：
 1. 设置 → Agent 引擎切到 DS Harness：侧栏/底部 tab 变为 工作区/功能/文件/终端
 2. 工作区页：红绿灯=添加工作区（选手机文件夹/目录）、分组点击展开/收回、
    左滑三键（新建会话/重命名/删除）；默认工作区删除按钮隐藏，删除
-   方法仍保护性拦截；会话左滑（重命名/归档/复制 ID）；无工作区时
+   方法仍保护性拦截；会话左滑（重命名/归档/复制 ID）。拾忆主页项目
+   分组展开收起写入 `shiyi_project_expanded_v1`，会话左滑含复制 ID；
+   无工作区时
    自动链接默认 agent 目录（Android `/storage/emulated/0/agent`、
    Windows `%TEMP%\agent`）、新建空会话返回后自动归档
 3. 功能页：只显示入口（技能/模型/预设/工作区/文件），不预加载不报错；
@@ -205,6 +227,15 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-08-24 2.5.7**（共享 lib/，详见 `docs/fix-log.md` #230–#234）：
+  Markdown 缺口自研补齐（图片/脚注/定义列表等，拾忆与 DSH 共用）；思考过程不再升成正文；
+  主页项目展开记忆 + 会话左滑复制 ID；设置上下文改为新建会话默认且会话可单独改；
+  MiMo 模糊 400 去掉 `reasoning_effort` 重试。Windows 设置页与聊天输入区同步生效。
+- **2026-08-24**（共享 lib/ 改动，详见 `docs/fix-log.md` #234）：MiMo 模糊 400 去掉
+  `reasoning_effort` 重试；思考开关开着不等于日志 `thinking=on`。
+- **2026-08-24**（共享 lib/ 改动，详见 `docs/fix-log.md` #233）：设置「上下文」改为新建会话默认，
+  不再把 ≥50 万 token 写回 128k；拾忆 / DSH 会话页可单独改本会话上限。Windows 设置页与
+  聊天输入区同步生效。
 - **2026-08-17**（共享 lib/ 改动，详见 `docs/fix-log.md` #193/#194/#195；Windows 未改功能）：
   技能页/会话页先 `session.create(sessionId+cwd)` 挂载会话再调 `skill.list`（DSH
   0.1.0-rc.6 必带 sessionId，不再回退空 payload）；模型数据页重新进入后从当前

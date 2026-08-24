@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import '../core/models.dart';
+
 /// iOS 化页面共用样式：Material Scaffold 不解析 Cupertino 动态颜色，
 /// 这里统一显式取值，避免深色 / 浅色下出现大面积错误底色。
 bool isIosDark(BuildContext context) =>
@@ -101,6 +103,61 @@ Future<bool> showIosConfirmDialog({
     ),
   );
   return result == true;
+}
+
+/// 编辑本会话上下文上限。拾忆写入 sessions.context_limit；DSH 写入本机偏好。
+Future<int?> showSessionContextLimitDialog({
+  required BuildContext context,
+  required int currentLimit,
+}) async {
+  await _unfocusBeforeOverlay();
+  if (!context.mounted) return null;
+  final controller = TextEditingController(text: '$currentLimit');
+  final result = await showIosFadeDialog<int>(
+    context: context,
+    builder: (ctx) => CupertinoTheme(
+      data: iosCupertinoTheme(ctx),
+      child: CupertinoAlertDialog(
+        title: const Text('本会话上下文'),
+        content: Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Column(
+            children: [
+              const Text('只改当前会话，不影响设置里的新建会话默认。单位 token，范围 1000–200 万。'),
+              const SizedBox(height: 10),
+              CupertinoTextField(
+                controller: controller,
+                keyboardType: TextInputType.number,
+                placeholder: '$kDefaultContextLimit',
+                textAlign: TextAlign.center,
+                autofocus: true,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () {
+              final n = int.tryParse(controller.text.trim());
+              if (n == null || n <= 0) {
+                Navigator.pop(ctx);
+                return;
+              }
+              Navigator.pop(ctx, sanitizeLoadedContextLimit(n));
+            },
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    ),
+  );
+  controller.dispose();
+  return result;
 }
 
 /// Apple 风格进度框：短文案 + 系统转圈，任务结束后自动关闭。

@@ -10,7 +10,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
+import '../core/models.dart';
 import '../services/dsh_api.dart';
+import '../services/dsh_chat_cache.dart';
 import '../services/dsh_model_sync.dart';
 import '../services/dsh_service.dart';
 import '../services/file_workspace.dart';
@@ -805,6 +807,12 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       if (!mounted || id.isEmpty) return;
       try {
         await DshModelSync.applyToSession(_api, id, widget.shiyi.settings);
+      } catch (_) {}
+      try {
+        await DshChatCache.writeContextLimit(
+          id,
+          sanitizeLoadedContextLimit(widget.shiyi.settings.contextLimit),
+        );
       } catch (_) {}
       try {
         await _api.insertSessionBefore(w.workspaceId, id);

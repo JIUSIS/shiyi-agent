@@ -445,6 +445,86 @@ void main() {
     }
   });
 
+  test('MiMo 模糊 400 时去掉 reasoning_effort 再试，思考开关仍开着', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final bodies = <Map<String, dynamic>>[];
+    final handled = () async {
+      var first = true;
+      await for (final request in server) {
+        final body =
+            jsonDecode(await utf8.decoder.bind(request).join())
+                as Map<String, dynamic>;
+        bodies.add(body);
+        if (first) {
+          first = false;
+          request.response
+            ..statusCode = HttpStatus.badRequest
+            ..write(
+              '{"error":{"message":"Invalid request parameters","type":"BadRequestError"}}',
+            );
+          await request.response.close();
+          continue;
+        }
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType(
+            'text',
+            'event-stream',
+            charset: 'utf-8',
+          )
+          ..write(
+            'data: {"choices":[{"delta":{"content":"答案"},'
+            '"finish_reason":"stop"}]}\n\n',
+          )
+          ..write('data: [DONE]\n\n');
+        await request.response.close();
+        break;
+      }
+    }();
+
+    try {
+      final client = LlmClient(
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        apiKey: 'test-key',
+        model: 'mimo-v2.5-pro',
+        temperature: 0.2,
+        maxTokens: 8192,
+        tools: const [
+          {
+            'type': 'function',
+            'function': {
+              'name': 'run_terminal',
+              'parameters': {'type': 'object'},
+            },
+          },
+        ],
+        reasoningEffortOverride: 'high',
+      );
+      await client.send([
+        {'role': 'user', 'content': '测试'},
+        {
+          'role': 'assistant',
+          'content': '',
+          'tool_calls': [
+            {
+              'id': 'call_1',
+              'type': 'function',
+              'function': {'name': 'run_terminal', 'arguments': '{}'},
+            },
+          ],
+        },
+        {'role': 'tool', 'tool_call_id': 'call_1', 'content': 'ok'},
+      ]);
+      await handled;
+      expect(bodies, hasLength(2));
+      expect(bodies.first['reasoning_effort'], 'high');
+      expect(bodies.last.containsKey('reasoning_effort'), isFalse);
+      expect(bodies.last.containsKey('thinking'), isFalse);
+    } finally {
+      await server.close(force: true);
+    }
+  });
+
   test('拾忆把 content 当正文，思考只来自 reasoning_content', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final handled = () async {
