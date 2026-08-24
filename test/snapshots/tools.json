@@ -25,9 +25,49 @@
       ]
     }
   },
+  "search_sessions": {
+    "readOnly": true,
+    "description": "搜索本机其他拾忆会话。query 可以是会话 ID（用户左滑会话卡片「复制 ID」后粘贴的那段），也可以是标题或对话内容关键词。找到后用 read_session 阅读正文。这不是联网搜索，也不是长期记忆；用户给了会话 ID 就必须用本工具，不要说看不见。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "会话 ID 或关键词"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  "read_session": {
+    "readOnly": true,
+    "description": "阅读另一个拾忆会话的对话正文。session_id 必须是 search_sessions 返回的 id，或用户粘贴的完整会话 ID。默认从开头取最近若干条用户/助手消息；更长的会话用 offset 继续往后读。不要用来读当前正在进行的这一轮。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "要阅读的拾忆会话 ID"
+        },
+        "offset": {
+          "type": "integer",
+          "description": "从第几条可见消息开始，默认 0"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "本次最多返回多少条，默认 40，最多 80"
+        }
+      },
+      "required": [
+        "session_id"
+      ]
+    }
+  },
   "search_memory": {
     "readOnly": true,
-    "description": "检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。",
+    "description": "检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。查阅其他会话请用 search_sessions / read_session，不要用本工具。",
     "parameters": {
       "type": "object",
       "properties": {

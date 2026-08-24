@@ -12,7 +12,7 @@ import '../widgets/ios_style.dart';
 import '../widgets/terminal_pane.dart';
 import '../widgets/traffic_lights_button.dart';
 
-/// 主页终端 Tab：命令走内嵌 Alpine proot（init-host），Windows 走设置后端。
+/// 主页终端 Tab：Android 走内嵌 Alpine proot；Windows 走本机终端后端。
 class TerminalScreen extends StatefulWidget {
   final ShiyiState shiyi;
   const TerminalScreen({super.key, required this.shiyi});
@@ -39,7 +39,7 @@ class _TerminalScreenState extends State<TerminalScreen>
 
   @override
   void dispose() {
-    // 两端共用 Alpine，页面销毁 / 切引擎都不发 Ctrl+C，只等停止按钮。
+    // 两端共用同一终端会话，页面销毁 / 切引擎都不发 Ctrl+C，只等停止按钮。
     WidgetsBinding.instance.removeObserver(this);
     _input.dispose();
     _scroll.dispose();
@@ -69,7 +69,16 @@ class _TerminalScreenState extends State<TerminalScreen>
       }
       _status = 'Alpine Linux · proot（init-host）';
     } else {
-      _status = 'Windows · ${_session.cwd}';
+      final backend = await TermuxRuntime.resolveWindowsBackend(
+        widget.shiyi.settings.terminalBackend,
+      );
+      final label = switch (backend) {
+        'wsl2' => 'WSL2',
+        'gitbash' => 'Git Bash',
+        'cmd' => 'cmd',
+        _ => 'PowerShell',
+      };
+      _status = 'Windows · $label · ${_session.cwd}';
     }
     _ready = true;
     _session.log.writeln(_banner());
@@ -83,7 +92,8 @@ class _TerminalScreenState extends State<TerminalScreen>
           '宿主工作目录 ${_session.cwd}\n'
           '点画面输入，回车执行。停止按钮注入 Ctrl+C。\n';
     }
-    return '拾忆终端\n工作目录 ${_session.cwd}\n';
+    return '拾忆终端（Windows 本机）\n'
+        '工作目录 ${_session.cwd}\n';
   }
 
   Future<void> _run() async {

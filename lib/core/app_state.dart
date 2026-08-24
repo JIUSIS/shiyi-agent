@@ -23,6 +23,7 @@ import '../services/socks5_config.dart';
 import 'presence_engine.dart';
 import 'prompt_builder.dart';
 import 'prompt_section.dart';
+import 'session_bridge.dart';
 import 'tool_result_pruner.dart';
 
 /// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
@@ -584,7 +585,9 @@ class ShiyiState extends ChangeNotifier {
     tailChars: 2000,
   );
 
-  static List<AgentTool> _buildToolRegistry() => [
+  static List<AgentTool> _buildToolRegistry({bool? windows}) {
+    final isWin = windows ?? Platform.isWindows;
+    return [
     AgentTool(
       name: 'save_memory',
       description:
@@ -610,9 +613,55 @@ class ShiyiState extends ChangeNotifier {
       execute: (self, args) => self._execSaveMemory(args),
     ),
     AgentTool(
+      name: 'search_sessions',
+      description:
+          '搜索本机其他拾忆会话。query 可以是会话 ID（用户左滑会话卡片「复制 ID」后粘贴的那段），'
+          '也可以是标题或对话内容关键词。找到后用 read_session 阅读正文。'
+          '这不是联网搜索，也不是长期记忆；用户给了会话 ID 就必须用本工具，不要说看不见。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'query': {
+            'type': 'string',
+            'description': '会话 ID 或关键词',
+          },
+        },
+        'required': ['query'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execSearchSessions(args),
+    ),
+    AgentTool(
+      name: 'read_session',
+      description:
+          '阅读另一个拾忆会话的对话正文。session_id 必须是 search_sessions 返回的 id，'
+          '或用户粘贴的完整会话 ID。默认从开头取最近若干条用户/助手消息；'
+          '更长的会话用 offset 继续往后读。不要用来读当前正在进行的这一轮。',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'session_id': {
+            'type': 'string',
+            'description': '要阅读的拾忆会话 ID',
+          },
+          'offset': {
+            'type': 'integer',
+            'description': '从第几条可见消息开始，默认 0',
+          },
+          'limit': {
+            'type': 'integer',
+            'description': '本次最多返回多少条，默认 40，最多 80',
+          },
+        },
+        'required': ['session_id'],
+      },
+      readOnly: true,
+      execute: (self, args) => self._execReadSession(args),
+    ),
+    AgentTool(
       name: 'search_memory',
       description:
-          '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。',
+          '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。查阅其他会话请用 search_sessions / read_session，不要用本工具。',
       parameters: {
         'type': 'object',
         'properties': {
@@ -674,8 +723,11 @@ class ShiyiState extends ChangeNotifier {
     ),
     AgentTool(
       name: 'run_terminal',
-      description:
-          '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。app 内置完整 Linux 环境（内嵌 Alpine，可用 apk 安装软件包），首次使用前会自动部署。',
+      description: isWin
+          ? '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。'
+              'Windows 走本机 WSL2 / Git Bash / PowerShell / cmd，默认工作目录是本机「文档\\agent」。'
+          : '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。'
+              'app 内置完整 Linux 环境（内嵌 Alpine，可用 apk 安装软件包），首次使用前会自动部署。',
       parameters: {
         'type': 'object',
         'properties': {
@@ -695,8 +747,9 @@ class ShiyiState extends ChangeNotifier {
         'properties': {
           'path': {
             'type': 'string',
-            'description':
-                '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt',
+            'description': isWin
+                ? '文件路径，如 docs/报告.md 或 文档\\agent\\x.txt'
+                : '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt',
           },
           'content': {'type': 'string', 'description': '要写入的完整内容'},
         },
@@ -863,11 +916,13 @@ class ShiyiState extends ChangeNotifier {
       execute: (self, args) => self._execSpawnAgent(args),
     ),
   ];
+  }
 
   /// 测试专用：与 [_buildToolRegistry] 行为完全一致，仅暴露给快照测试
   /// （改动工具描述/参数/只读标记会触发 test/tool_registry_snapshot_test.dart 的 diff）。
   @visibleForTesting
-  static List<AgentTool> buildToolRegistryForTest() => _buildToolRegistry();
+  static List<AgentTool> buildToolRegistryForTest({bool? windows}) =>
+      _buildToolRegistry(windows: windows);
 
   static String _fmtStamp(DateTime d) {
     final h = d.hour.toString().padLeft(2, '0');
@@ -911,23 +966,35 @@ class ShiyiState extends ChangeNotifier {
           final backend = await TermuxRuntime.resolveWindowsBackend(
             settings.terminalBackend,
           );
-          final probe = backend == 'wsl2'
-              ? await Process.run(
-                  'wsl.exe',
-                  ['-e', 'bash', '-lc', 'uname -r'],
-                  environment: const {'WSL_UTF8': '1'},
-                ).timeout(const Duration(seconds: 20))
-              : backend == 'cmd'
-              ? await Process.run('cmd', [
-                  '/c',
-                  'echo probe-ok',
-                ]).timeout(const Duration(seconds: 20))
-              : await Process.run(shell, [
-                  '-NoProfile',
-                  '-NoLogo',
-                  '-Command',
-                  'echo probe-ok; \$PSVersionTable.PSVersion.ToString()',
-                ]).timeout(const Duration(seconds: 20));
+          ProcessResult probe;
+          if (backend == 'wsl2') {
+            probe = await Process.run(
+              'wsl.exe',
+              ['-e', 'bash', '-lc', 'uname -r'],
+              environment: const {'WSL_UTF8': '1'},
+            ).timeout(const Duration(seconds: 20));
+          } else if (backend == 'gitbash') {
+            final bash =
+                await TermuxRuntime.gitBashPath() ??
+                r'C:\Program Files\Git\bin\bash.exe';
+            probe = await Process.run(bash, [
+              '--login',
+              '-c',
+              'echo probe-ok',
+            ]).timeout(const Duration(seconds: 20));
+          } else if (backend == 'cmd') {
+            probe = await Process.run('cmd', [
+              '/c',
+              'echo probe-ok',
+            ]).timeout(const Duration(seconds: 20));
+          } else {
+            probe = await Process.run(shell, [
+              '-NoProfile',
+              '-NoLogo',
+              '-Command',
+              'echo probe-ok; \$PSVersionTable.PSVersion.ToString()',
+            ]).timeout(const Duration(seconds: 20));
+          }
           await _logError(
             'TermuxProbe',
             'backend=$backend exit=${probe.exitCode} '
@@ -2808,12 +2875,19 @@ class ShiyiState extends ChangeNotifier {
       memories: (t) => _db.recentMemoriesWithTerms(_keywords(t), 8),
       terminalBackend: _actualTerminalBackend,
       presence: () => settings.enablePresence ? presence : null,
+      currentSessionId: () => sessionId ?? currentSessionId,
     );
   }
 
+  /// 测试专用：覆盖 [_actualTerminalBackend]，避免快照随本机 WSL/Git Bash 漂移。
+  @visibleForTesting
+  String? testTerminalBackendOverride;
+
   /// 实际生效的终端后端（供提示词【平台环境】段落使用）：
-  /// Android 恒为 android；Windows 由设置 + WSL2/pwsh 探测决定。
+  /// Android 恒为 android；Windows 由设置 + WSL2 / Git Bash / pwsh 探测决定。
   Future<String> _actualTerminalBackend() async {
+    final override = testTerminalBackendOverride;
+    if (override != null) return override;
     if (!Platform.isWindows) return 'android';
     try {
       return await TermuxRuntime.resolveWindowsBackend(
@@ -2955,6 +3029,42 @@ class ShiyiState extends ChangeNotifier {
     return res.take(5).map((e) => e.content).join('\n');
   }
 
+  Future<String> _execSearchSessions(Map<String, dynamic> args) async {
+    final query = (args['query'] ?? '').toString().trim();
+    if (query.isEmpty) return '搜索失败：query 为空';
+    final current = args['_sessionId']?.toString();
+    final sid = SessionBridge.extractSessionId(query);
+    Session? exact;
+    if (sid != null) {
+      exact = await _db.getSession(sid);
+    }
+    final hits = await _db.searchSessions(sid ?? query);
+    return SessionBridge.formatSearchResults(
+      query: sid ?? query,
+      exact: exact,
+      hits: hits,
+      currentSessionId: current,
+    );
+  }
+
+  Future<String> _execReadSession(Map<String, dynamic> args) async {
+    final raw = (args['session_id'] ?? args['sessionId'] ?? '').toString();
+    final sid = SessionBridge.extractSessionId(raw) ?? raw.trim();
+    if (sid.isEmpty) return '阅读失败：session_id 为空';
+    final session = await _db.getSession(sid);
+    if (session == null) return SessionBridge.missingSession(sid);
+    final messages = await _db.listMessages(sid);
+    final offset = int.tryParse('${args['offset'] ?? 0}') ?? 0;
+    final limit = int.tryParse('${args['limit'] ?? ''}');
+    return SessionBridge.formatTranscript(
+      session: session,
+      messages: messages,
+      currentSessionId: args['_sessionId']?.toString(),
+      offset: offset,
+      limit: limit,
+    );
+  }
+
   Future<String> _execRunSkill(Map<String, dynamic> args) async {
     final name = (args['name'] ?? '').toString().trim();
     final skill = name.isEmpty ? null : await _db.getSkillByName(name);
@@ -3026,8 +3136,8 @@ class ShiyiState extends ChangeNotifier {
       // 平台执行后端：
       // - Android：优先内嵌 Alpine（proot + minirootfs，apk 可用），
       //   其次系统 Termux；都没有则用系统精简 shell；
-      // - Windows：按设置选择 WSL2（Linux 环境）/ pwsh / cmd，
-      //   auto = WSL2 优先 → pwsh → cmd。
+      // - Windows：按设置选择 WSL2 / Git Bash / pwsh / cmd，
+      //   auto = WSL2 → Git Bash → pwsh → cmd。不走 Android proot。
       const systemTermuxShell = '/data/data/com.termux/files/usr/bin/bash';
       final embeddedShell = await TermuxRuntime.shellPath();
       final embedded = !isWin && File(embeddedShell).existsSync();
@@ -3045,9 +3155,11 @@ class ShiyiState extends ChangeNotifier {
             shellArgs = ['-e', 'bash', '-lc', command];
             // WSL_UTF8=1：wsl.exe 管道输出默认 UTF-16LE，强制 UTF-8 防乱码。
             winEnv = const {'WSL_UTF8': '1'};
-            if (want == 'wsl2') {
-              // 显式选了 WSL2：无需告警（探测一致才走到这里）。
-            }
+          case 'gitbash':
+            shell =
+                await TermuxRuntime.gitBashPath() ??
+                r'C:\Program Files\Git\bin\bash.exe';
+            shellArgs = ['--login', '-c', command];
           case 'cmd':
             shell = 'cmd';
             shellArgs = ['/c', command];
@@ -3063,6 +3175,8 @@ class ShiyiState extends ChangeNotifier {
         }
         if (want == 'wsl2' && backend != 'wsl2') {
           backendWarn = '（你选择了 WSL2，但当前不可用，已回退 $backend）';
+        } else if (want == 'gitbash' && backend != 'gitbash') {
+          backendWarn = '（你选择了 Git Bash，但当前不可用，已回退 $backend）';
         } else if (want == 'auto' && backend == 'wsl2') {
           await _logError('Termux', 'run_terminal 使用 WSL2 后端');
         }

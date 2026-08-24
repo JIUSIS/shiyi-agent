@@ -17,7 +17,8 @@ class ShellSpec {
   });
 }
 
-/// 把用户终端接到内嵌 Alpine proot（init-host），Windows 走设置里的后端。
+/// Android 接到内嵌 Alpine proot（init-host）；
+/// Windows 走本机 WSL2 / Git Bash / PowerShell / cmd，不沿用 Android。
 class EmbeddedShell {
   EmbeddedShell._();
 
@@ -40,12 +41,21 @@ class EmbeddedShell {
     );
   }
 
-  static ShellSpec windowsInteractive({required String backend}) {
+  static ShellSpec windowsInteractive({
+    required String backend,
+    String? gitBashPath,
+  }) {
     switch (backend) {
       case 'wsl2':
         return const ShellSpec(
           executable: 'wsl.exe',
           arguments: ['-e', 'bash', '-l'],
+          usesProot: false,
+        );
+      case 'gitbash':
+        return ShellSpec(
+          executable: gitBashPath ?? r'C:\Program Files\Git\bin\bash.exe',
+          arguments: const ['--login', '-i'],
           usesProot: false,
         );
       case 'cmd':
@@ -71,14 +81,21 @@ class EmbeddedShell {
       final backend = await TermuxRuntime.resolveWindowsBackend(
         terminalBackend,
       );
+      final gitBash = await TermuxRuntime.gitBashPath();
       if (command.trim().isEmpty) {
-        return windowsInteractive(backend: backend);
+        return windowsInteractive(backend: backend, gitBashPath: gitBash);
       }
       switch (backend) {
         case 'wsl2':
           return ShellSpec(
             executable: 'wsl.exe',
             arguments: ['-e', 'bash', '-lc', command],
+            usesProot: false,
+          );
+        case 'gitbash':
+          return ShellSpec(
+            executable: gitBash ?? r'C:\Program Files\Git\bin\bash.exe',
+            arguments: ['--login', '-c', command],
             usesProot: false,
           );
         case 'cmd':
@@ -116,7 +133,7 @@ enum TerminalSubmitTarget { command, stdin }
 class TerminalSession {
   TerminalSession();
 
-  /// 拾忆 / DSH 共用同一 Alpine，切引擎不新建、不中断。
+  /// 拾忆 / DSH 共用同一终端会话，切引擎不新建、不中断。
   static final shared = TerminalSession();
 
   final StringBuffer log = StringBuffer();

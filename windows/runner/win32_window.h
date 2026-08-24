@@ -8,8 +8,9 @@
 #include <string>
 
 // macOS style borderless window title bar constants (keep in sync with the
-// Dart side MacTitleBar): the top 44px is the drag region (double-click to
-// maximize); the left 96px is reserved for the traffic lights (HTCLIENT).
+// Dart side MacTitleBar): the top 44px is the drag region (press-move to
+// drag, double-click to maximize; do not report HTCAPTION or Win11 paints
+// a gray caption overlay). The left 96px is reserved for the traffic lights.
 constexpr int kMacTitleBarHeight = 44;
 constexpr int kMacTrafficLightsWidth = 96;
 
@@ -58,6 +59,9 @@ class Win32Window {
   // If true, closing this window will quit the application.
   void SetQuitOnClose(bool quit_on_close);
 
+  // Native title-bar overlay (covers Win11 DWM caption hover).
+  HWND GetTitleBarHandle() const { return title_bar_hwnd_; }
+
   // Return a RECT representing the bounds of the current client area.
   RECT GetClientArea();
 
@@ -76,6 +80,9 @@ class Win32Window {
 
   // Called when Destroy is called.
   virtual void OnDestroy();
+
+  void SetTitleBarColor(COLORREF color);
+  void RaiseTitleBarOverlay();
 
  private:
   friend class WindowClassRegistrar;
@@ -96,10 +103,29 @@ class Win32Window {
   // Update the window frame's theme to match the system theme.
   static void UpdateTheme(HWND const window);
 
+  void CreateTitleBarOverlay();
+  void DestroyTitleBarOverlay();
+  void LayoutTitleBarOverlay();
+  static LRESULT CALLBACK TitleBarProc(HWND window, UINT message,
+                                       WPARAM wparam, LPARAM lparam);
+  void PaintTitleBar(HWND hwnd);
+  void HitTitleBar(HWND hwnd, int x, int y, int* button_out) const;
+  int TitleBarHeightPx() const;
+  int TrafficLightsWidthPx() const;
+
   bool quit_on_close_ = false;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;
+
+  // Native overlay that sits above DWM's caption hover layer.
+  HWND title_bar_hwnd_ = nullptr;
+
+  // Hovered traffic-light index: 0 close, 1 min, 2 max, -1 none.
+  int title_bar_hover_ = -1;
+
+  // Matches Flutter MacTitleBar (light scaffold). Dart may update this.
+  COLORREF title_bar_color_ = RGB(0xF2, 0xF2, 0xF7);
 
   // window handle for hosted content.
   HWND child_content_ = nullptr;

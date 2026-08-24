@@ -8,7 +8,8 @@ import 'package:flutter/material.dart' show Material, MaterialType, Theme;
 import '../services/file_workspace.dart';
 import '../widgets/ios_style.dart';
 
-/// 设置页内「日志」页：实时查看智能体错误日志（默认 /storage/emulated/0/agent/logs/error.log）。
+/// 设置页内「日志」页：实时查看智能体错误日志
+/// （默认工作目录下 logs/error.log）。
 class LogScreen extends StatefulWidget {
   const LogScreen({super.key});
 

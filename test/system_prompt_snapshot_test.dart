@@ -25,6 +25,8 @@ void main() {
       ];
       // 关闭记忆注入，避免测试触碰数据库；记忆段落有独立的行为测试。
       shiyi.settings = shiyi.settings.copyWith(enableMemory: false);
+      // 人设 / 工具规则随终端后端变化；快照固定 Android，Windows 另有行为测试。
+      shiyi.testTerminalBackendOverride = 'android';
       return shiyi;
     }
 

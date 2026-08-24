@@ -2161,7 +2161,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     await _ensureBuiltInSearchPlugin();
     try {
       // 工作目录 = 软件默认 agent 目录：dsh 的 cwd（host.describe）与
-      // 文件入口默认位置都落在 agent 目录（Android: /storage/emulated/0/agent）。
+      // 文件入口默认位置都落在 FileWorkspace.defaultWorkspacePath。
       final agentDir = await FileWorkspace.ensure();
       final webLogFile = File('$agentDir/logs/dsh-web.log');
       await webLogFile.create(recursive: true);

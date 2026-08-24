@@ -43,18 +43,32 @@
   版本标记=`files/termux/.env_version`（alpine-vN，结构变更时递增）。
 - **主页「终端」栏**：底部第四栏，拾忆与 DSH 都有。命令走 `EmbeddedShell` → `/system/bin/sh` + `init-host -c`，与 `run_terminal` 同一套 proot，禁止再拉一套 Termux。无 PTY，交互是一行命令一次 init-host。
 - **终端交互铁律**：没有底部独立输入框，点画面输入；执行中输入仍可用（busy 时回车喂 stdin）。切引擎不发 Ctrl+C。输入法弹出贴底、滑动历史不弹键盘。输入 / 正常输出 / 警告 / 错误分色。独立 `/` 才弹技能。
+- **默认工作目录**：`/storage/emulated/0/agent`。人设 / 工具规则 / `run_terminal` 描述只写 Alpine / apk / 该路径，不出现 Windows 的「文档\agent」或 WSL / Git Bash / PowerShell。
+- **构建隔离**：`flutter build apk` 只编 `android/` + 共享 `lib/`，不会把 `windows/` 的 exe / C++ 标题栏打进 APK。反过来编 Windows 也不会产出 APK。两端各打各的包。
 
 ## Windows 桌面版（exe）
-- 2026-08-14 起项目支持 Windows 桌面完整版：命令后端**用户可选**（设置 → 通用 → 终端）：
-  自动（WSL2 优先 → PowerShell 7 → cmd）/ WSL2 / PowerShell 7 / cmd；
-  数据库走 sqflite_common_ffi，技能 zip 用 archive 包纯 Dart 解压。
+- 2026-08-14 起项目支持 Windows 桌面完整版。**不要和 Android 搞混**：
+  工作目录、终端后端、提示词都按平台隔离。
+- **默认工作目录**：本机「文档\agent」（`%USERPROFILE%\Documents\agent`）。
+  旧 `%TEMP%\agent` 视为未设置，自动改走文档目录。Android 的
+  `/storage/emulated/0/agent` 只给手机用。
+- **命令后端（用户可选，设置 → 通用 → 终端）**：自动 / WSL2 / Git Bash /
+  PowerShell 7 / cmd。自动顺序：WSL2 → Git Bash → PowerShell 7 → cmd。
+  不走 Android Alpine / proot / `apk` / `init-host`。设置页这条入口有
+  `Platform.isWindows` 保护，手机上看不到。
+- 数据库走 `sqflite_common_ffi`，技能 zip 用 archive 包纯 Dart 解压。
 - **UI 已桌面化 + macOS 操作逻辑化**：右键菜单、悬停展开操作、ActionSheet 桌面居中、
   宽窗口侧边导航 + 内容限宽、Ctrl+Enter 快捷键；**无边框窗口 + 红黄绿三键**
-  （拖拽/双击最大化/边缘缩放/贴靠）。
+  （拖拽/双击最大化/边缘缩放/贴靠）。Win11 红绿灯悬停灰条用原生子窗口
+  `SHIYI_TITLEBAR` 盖住。
+- **提示词隔离**：人设 / 工具规则 / `run_terminal` / `file_write` 描述按
+  `Platform.isWindows` 取文案。Windows 只写本机终端与「文档\agent」；
+  Android 只写 Alpine / apk / `/storage/emulated/0/agent`。禁止两端写进同一段。
 - **Windows 端维护文档（独立，勿与手机端混淆）**：`docs/windows-maintenance.md`
   （架构/适配/维护铁律/排错/验证清单）；构建步骤见 `docs/windows-build.md`。
   手机端部署/排错见本文件顶部与 `docs/fix-log.md`。
 - 构建：`flutter build windows --release` → `build\windows\x64\runner\Release\shiyi_agent.exe`。
+  分发必须拷贝整个 Release 目录。
 - 注意：桌面版与 Android 版共享同一套 lib/ 代码，所有平台差异用 `Platform.isWindows`
   分支隔离；改共享代码时不要破坏 Android 侧行为（`flutter test` 全量守护）。
 
@@ -63,6 +77,11 @@
 - 修改任一聊天 UI 时，必须同步检查并更新另一引擎，不能只修拾忆或只修 DSH。
 - 输入框、消息气泡、工具胶囊、状态条、提问面板、附件预览等能共享的部分必须优先抽成共享组件，禁止复制两套后分别维护。
 - 只有协议或引擎能力确实不同的界面允许单独实现，并需在维护文档说明原因。
+
+## 拾忆跨会话查阅
+- 拾忆会话之间必须能互相看见：用户从会话卡片左滑「复制 ID」后，把 ID 发到另一个会话，模型要用 `search_sessions` / `read_session` 找到并阅读，禁止声称搜不到或看不见。
+- `search_sessions` 必须按完整会话 ID 命中（不只搜标题/正文）；`read_session` 读该会话已落库的用户/助手消息。不要走 `search_memory` 或联网搜索。
+- 这是拾忆本地库能力，不是 DSH `session.search`。DSH 会话 ID 对拾忆无效。
 
 ## 拾忆会话并发规则
 - 拾忆会话必须支持多会话同时生成；会话 A 正在思考时，用户可以在会话 B 继续发送，二者互不打断。
@@ -98,3 +117,4 @@
 - 密钥只进 credentials / `.credentials.yaml`，禁止写入 provider settings。
 - DSH 0.1.1 的 `.credentials.yaml` 只认 `version: 1` + `refs` / `records`。禁止把 `SHIYI_API_KEY` 写到顶层；启动同步必须把旧扁平文档和混写文档收进 `refs`。
 - 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML / 凭据文档。YAML 或凭据损坏应靠启动同步自愈，不要误导用户点修复环境。
+  Windows 没有这条「修复完整运行环境」Alpine 流程，桌面终端走本机 WSL / Git Bash / pwsh / cmd。

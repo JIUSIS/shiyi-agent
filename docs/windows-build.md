@@ -2,6 +2,8 @@
 
 > 本文档只写构建步骤；**Windows 端完整维护手册（架构/适配/排错/验证/铁律）见
 > `docs/windows-maintenance.md`**。手机端文档见 `AGENTS.md` 与 `docs/fix-log.md`。
+>
+> 编 Windows 不会产出 APK；编安卓也不会把 exe / `windows/` 打进 APK。两端各打各的包。
 
 ## 构建
 
@@ -20,6 +22,10 @@ flutter build windows --release
 ⚠️ **分发必须整体拷贝 Release 目录**（exe + `flutter_windows.dll` + 各插件 DLL +
 `sqlite3.dll` + `data/`），单拷 exe 会因缺 DLL 无法启动。
 
+桌面图标与 Android 启动图标同一套：`windows/runner/resources/app_icon.ico`
+由 `android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png` 生成
+（16/24/32/48/64/128/256）。换图标时改 Android `ic_launcher` 后重做 ICO。
+
 ## 常见构建报错速查
 
 | 报错 | 原因 | 处理 |
@@ -28,5 +34,6 @@ flutter build windows --release
 | C4996 | `getenv`/`fopen` 不安全 API | 用 `_dupenv_s`/`fopen_s` |
 | C2338 / STL1011 | permission_handler_windows 的 `<experimental/coroutine>` 与新 MSVC 冲突 | `windows/CMakeLists.txt` 已加抑制宏，勿删 |
 | 缺 `KEYSTORE_PASSWORD` | 这是 Android debug 构建的签名要求，与 Windows 构建无关 | Windows 构建不需要 keystore |
+| 想一次编出 APK + exe | 两端构建命令分开 | `flutter build windows --release` 与 `flutter build apk` 互不影响 |
 
 更多排错与维护要点见 `docs/windows-maintenance.md` 第 5~7 节。

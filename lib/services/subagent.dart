@@ -51,6 +51,8 @@ class SubagentDefinition {
   // ---- 只读工具（explore / plan 共用）----
   static const Set<String> _readOnlyTools = {
     'search_memory',
+    'search_sessions',
+    'read_session',
     'run_skill',
     'web_search',
     'web_extract',
@@ -68,6 +70,8 @@ class SubagentDefinition {
     'web_extract',
     'run_skill',
     'search_memory',
+    'search_sessions',
+    'read_session',
   };
 
   static const String _readOnlyBlock = '''

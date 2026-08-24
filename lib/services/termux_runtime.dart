@@ -11,7 +11,7 @@ import 'storage_scope.dart';
 ///   assets 里的 Alpine minirootfs 解压到应用私有目录，proot 以 Android
 ///   系统 linker 加载，命令全部在 proot 内的 Alpine rootfs 中执行；
 ///   apk 包管理（bash / nodejs / 编译工具链），不再依赖 Termux 生态。
-/// - Windows 桌面：PowerShell 7（pwsh，缺失时回退 cmd），无需安装。
+/// - Windows 桌面：WSL2 / Git Bash / PowerShell 7 / cmd，不走 Android proot。
 class TermuxRuntime {
   static const MethodChannel _channel = MethodChannel('shiyi/skillpack');
 
@@ -41,6 +41,9 @@ class TermuxRuntime {
 
   /// Windows shell 探测结果缓存：'pwsh' 或 'cmd'（null = 尚未探测）。
   static String? _windowsShell;
+
+  /// Git Bash 路径缓存：空串 = 已探测且没有；null = 尚未探测。
+  static String? _gitBashPath;
 
   /// WSL 探测结果缓存：'wsl2' / 'wsl1' / 'none'（null = 尚未探测）。
   static Future<String>? _wslProbe;
@@ -72,16 +75,26 @@ class TermuxRuntime {
   }
 
   /// 纯函数：按用户设置与探测结果解析实际后端（便于单测）。
-  /// [setting]：auto / pwsh / cmd / wsl2；[wsl]：wsl2 / wsl1 / none；
+  /// [setting]：auto / pwsh / cmd / wsl2 / gitbash；
+  /// [wsl]：wsl2 / wsl1 / none；
   /// [shell]：已探测的 Windows shell（pwsh / cmd）。
-  /// 返回：wsl2 / pwsh / cmd。
-  static String resolveBackendChoice(String setting, String wsl, String shell) {
+  /// [gitBash]：本机是否装了 Git Bash。
+  /// 返回：wsl2 / gitbash / pwsh / cmd。
+  /// auto：WSL2 → Git Bash → PowerShell → cmd。不走 Android proot。
+  static String resolveBackendChoice(
+    String setting,
+    String wsl,
+    String shell, {
+    bool gitBash = false,
+  }) {
     if (setting == 'pwsh' || setting == 'cmd') return setting;
-    // auto 与显式 wsl2：WSL2 可用即用 WSL2，否则回退 Windows shell。
-    return wsl == 'wsl2' ? 'wsl2' : shell;
+    if (setting == 'gitbash') return gitBash ? 'gitbash' : shell;
+    if (wsl == 'wsl2') return 'wsl2';
+    if (gitBash) return 'gitbash';
+    return shell;
   }
 
-  /// Windows 上解析实际生效的终端后端（wsl2 / pwsh / cmd）。
+  /// Windows 上解析实际生效的终端后端（wsl2 / gitbash / pwsh / cmd）。
   static Future<String> resolveWindowsBackend(String setting) async {
     if (!isWindows) {
       throw UnsupportedError('resolveWindowsBackend 仅支持 Windows 平台');
@@ -90,7 +103,46 @@ class TermuxRuntime {
       setting,
       await wslVariant(),
       await windowsShell(),
+      gitBash: await isGitBashAvailable(),
     );
+  }
+
+  /// 本机 Git for Windows 的 bash.exe；没有则 null。
+  static Future<String?> gitBashPath() async {
+    if (!isWindows) return null;
+    final cached = _gitBashPath;
+    if (cached != null) return cached.isEmpty ? null : cached;
+    final found = _probeGitBashPath();
+    _gitBashPath = found ?? '';
+    return found;
+  }
+
+  static String? _probeGitBashPath() {
+    final extra = <String>[];
+    final local = Platform.environment['LOCALAPPDATA'];
+    if (local != null && local.isNotEmpty) {
+      extra.add('$local\\Programs\\Git\\bin\\bash.exe');
+    }
+    final pf = Platform.environment['ProgramFiles'];
+    if (pf != null && pf.isNotEmpty) {
+      extra.add('$pf\\Git\\bin\\bash.exe');
+    }
+    final pf86 = Platform.environment['ProgramFiles(x86)'];
+    if (pf86 != null && pf86.isNotEmpty) {
+      extra.add('$pf86\\Git\\bin\\bash.exe');
+    }
+    for (final path in [
+      r'C:\Program Files\Git\bin\bash.exe',
+      r'C:\Program Files (x86)\Git\bin\bash.exe',
+      ...extra,
+    ]) {
+      if (File(path).existsSync()) return path;
+    }
+    return null;
+  }
+
+  static Future<bool> isGitBashAvailable() async {
+    return (await gitBashPath()) != null;
   }
 
   /// Windows 桌面 shell：优先 PowerShell 7（pwsh），缺失时回退 cmd。

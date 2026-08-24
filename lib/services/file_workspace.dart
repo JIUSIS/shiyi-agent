@@ -4,15 +4,44 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 智能体工作目录管理：
-/// 默认在 SD 根目录创建 agent 文件夹，所有生成/调用的文件都放这里；
+/// Android 默认在 SD 根目录创建 agent 文件夹；
+/// Windows 默认在本机「文档/agent」，不沿用 Android / 临时目录。
 /// 用户也可以在「文件」页创建其他文件夹并切换为工作目录。
 class FileWorkspace {
   static const String _prefKey = 'agent_workspace_path';
 
-  /// 默认工作目录（SD 根目录下的 agent 文件夹）。
-  static String get defaultWorkspacePath {
-    if (Platform.isAndroid) return '/storage/emulated/0/agent';
-    return '${Directory.systemTemp.path}/agent';
+  /// 默认工作目录。Windows 用「文档\agent」，Android 用存储根下 agent。
+  static String get defaultWorkspacePath => defaultWorkspacePathFrom(
+    android: Platform.isAndroid,
+    documentsDirectory: _windowsDocumentsDir(),
+  );
+
+  /// 纯函数，便于单测。
+  static String defaultWorkspacePathFrom({
+    required bool android,
+    required String documentsDirectory,
+  }) {
+    if (android) return '/storage/emulated/0/agent';
+    return p.join(documentsDirectory, 'agent');
+  }
+
+  static String _windowsDocumentsDir() {
+    final profile = Platform.environment['USERPROFILE'] ?? '';
+    if (profile.isNotEmpty) return p.join(profile, 'Documents');
+    return p.join(Directory.systemTemp.path, 'Documents');
+  }
+
+  /// 旧版 Windows 默认 `%TEMP%\agent`：视为未自定义，改走文档目录。
+  static bool isLegacyTempAgentPath(
+    String path, {
+    required String systemTempPath,
+  }) {
+    final a = p.normalize(path).replaceAll('/', '\\').toLowerCase();
+    final b = p
+        .normalize(p.join(systemTempPath, 'agent'))
+        .replaceAll('/', '\\')
+        .toLowerCase();
+    return a == b;
   }
 
   /// 当前工作目录（用户可自定义，未设置时用默认）。
@@ -20,7 +49,15 @@ class FileWorkspace {
     try {
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getString(_prefKey);
-      if (saved != null && saved.isNotEmpty) return saved;
+      if (saved != null && saved.isNotEmpty) {
+        if (isLegacyTempAgentPath(
+          saved,
+          systemTempPath: Directory.systemTemp.path,
+        )) {
+          return defaultWorkspacePath;
+        }
+        return saved;
+      }
     } catch (_) {}
     return defaultWorkspacePath;
   }

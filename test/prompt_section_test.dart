@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shiyi_agent_app/core/app_state.dart';
 import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/core/presence_engine.dart';
+import 'package:shiyi_agent_app/core/prompt_builder.dart';
 import 'package:shiyi_agent_app/core/prompt_section.dart';
 
 void main() {
@@ -108,6 +109,7 @@ void main() {
         ),
       ];
       shiyi.settings = shiyi.settings.copyWith(enableMemory: false);
+      shiyi.testTerminalBackendOverride = 'android';
       return shiyi;
     }
 
@@ -196,6 +198,13 @@ void main() {
       expect(prompt, contains('用户刚说「你好世界」'));
     });
 
+    test('工作目录段落注入当前拾忆会话 ID', () async {
+      final prompt = await makeState().buildSystemPromptForTest('输入');
+      expect(prompt, contains('当前拾忆会话 ID 是 s'));
+      expect(prompt, contains('search_sessions'));
+      expect(prompt, contains('read_session'));
+    });
+
     test('已加载技能内容支持 {{变量}} 插值', () async {
       final shiyi = makeState();
       shiyi.loadedSkills.add(
@@ -210,6 +219,66 @@ void main() {
       );
       final prompt = await shiyi.buildSystemPromptForTest('输入');
       expect(prompt, contains('技能模板：目录是 /tmp/w'));
+    });
+  });
+
+  group('Windows 提示词不沿用 Android', () {
+    PromptBuilder makeBuilder(String backend) {
+      return PromptBuilder(
+        settings: () => AppSettings(enableMemory: false),
+        skills: () => const [],
+        loadedSkills: () => const [],
+        planMode: () => false,
+        currentWorkspace: () async => backend == 'android'
+            ? '/storage/emulated/0/agent'
+            : r'C:\Users\me\Documents\agent',
+        memories: (_) async => const [],
+        terminalBackend: () async => backend,
+      );
+    }
+
+    test('Android 人设与工具规则仍是 Alpine / apk，不出现 Windows 路径或后端', () async {
+      final prompt = await makeBuilder('android').buildSystemPrompt('hi');
+      expect(prompt, contains('运行在 Android 手机上的个人 AI 工作台'));
+      expect(prompt, contains('apk add python3'));
+      expect(prompt, contains('/storage/emulated/0/agent'));
+      expect(prompt, isNot(contains('文档\\agent')));
+      expect(prompt, isNot(contains('WSL2')));
+      expect(prompt, isNot(contains('Git Bash')));
+      expect(prompt, isNot(contains('PowerShell')));
+      expect(prompt, isNot(contains('Windows 桌面')));
+    });
+
+    test('WSL2 人设是 Windows 桌面，默认文档\\agent，不出现 Android 路径或 apk', () async {
+      final prompt = await makeBuilder('wsl2').buildSystemPrompt('hi');
+      expect(prompt, contains('运行在 Windows 桌面的个人 AI 工作台'));
+      expect(prompt, contains('文档\\agent'));
+      expect(prompt, contains('WSL2'));
+      expect(prompt, isNot(contains('运行在 Android 手机')));
+      expect(prompt, isNot(contains('apk add python3')));
+      expect(prompt, isNot(contains('内嵌 Alpine Linux 的包管理')));
+      expect(prompt, isNot(contains('/storage/emulated/0/agent')));
+      expect(prompt, isNot(contains('proot')));
+    });
+
+    test('Git Bash / PowerShell / cmd 也不出现 Android 路径或 apk', () async {
+      for (final backend in ['gitbash', 'pwsh', 'cmd']) {
+        final prompt = await makeBuilder(backend).buildSystemPrompt('hi');
+        expect(
+          prompt,
+          contains('运行在 Windows 桌面的个人 AI 工作台'),
+          reason: backend,
+        );
+        expect(prompt, contains('文档\\agent'), reason: backend);
+        expect(prompt, isNot(contains('运行在 Android 手机')), reason: backend);
+        expect(prompt, isNot(contains('apk add python3')), reason: backend);
+        expect(
+          prompt,
+          isNot(contains('/storage/emulated/0/agent')),
+          reason: backend,
+        );
+        expect(prompt, isNot(contains('proot')), reason: backend);
+      }
     });
   });
 }

@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/painting.dart';
 
 /// 无边框窗口控制（macOS 风格红黄绿三键）：
 /// 与 windows/runner 的 MethodChannel 'shiyi/window' 通信。
@@ -52,6 +53,16 @@ class WindowControl {
   Future<void> close() async {
     try {
       await _channel.invokeMethod('close');
+    } catch (_) {}
+  }
+
+  /// Native title-bar overlay color (ARGB). Keeps the Win32 strip in
+  /// sync with Flutter's scaffold so it is not the system dark caption.
+  Future<void> setTitleBarColor(Color color) async {
+    try {
+      await _channel.invokeMethod('setTitleBarColor', {
+        'color': color.toARGB32(),
+      });
     } catch (_) {}
   }
 }

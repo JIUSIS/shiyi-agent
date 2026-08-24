@@ -2,6 +2,26 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.5.8] - 2026-08-24
+
+相对 2.5.7：拾忆会话之间可按会话 ID 互相查阅；Windows 工作目录、终端和提示词与 Android 彻底分家。
+
+### 新增
+
+- **拾忆跨会话查阅**：主页左滑「复制 ID」后，把 ID 发到另一个拾忆会话，模型用 `search_sessions` / `read_session` 能找到并阅读该会话，不再声称搜不到。按完整会话 ID 命中本地库，不走 `search_memory` 或联网搜索。DSH 会话 ID 对拾忆无效。
+
+### 优化
+
+- **Windows 默认工作目录**：本机「文档\\agent」。旧 `%TEMP%\\agent` 视为未设置。Android 仍是 `/storage/emulated/0/agent`。
+- **Windows 终端后端**：自动顺序 WSL2 → Git Bash → PowerShell 7 → cmd；不走 Android Alpine / proot / apk。设置页这条入口只在桌面显示。
+- **提示词按平台隔离**：人设 / 工具规则 / `run_terminal` / `file_write` 两端各写各的，禁止「Android …；Windows …」写进同一段。
+- **Win11 红绿灯悬停灰条**：原生子窗口 `SHIYI_TITLEBAR` 盖住系统标题栏悬停层；桌面图标与 Android 启动图标同一套。
+
+### 验证
+
+- `flutter test` 全量通过（含 `session_bridge` / `file_workspace` / `terminal_backend` / `prompt_section` / 工具与提示词快照）。
+- 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
+
 ## [2.5.7] - 2026-08-24
 
 相对 2.5.6：聊天 Markdown 补齐缺口元素；思考过程不再被当成正文；上下文改成新建会话默认并可按会话覆盖；MiMo 工具续轮不再因模糊 400 卡住。

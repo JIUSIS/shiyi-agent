@@ -11,7 +11,7 @@ import 'snapshot_helper.dart';
 /// 模型的行为、请求 token 数和缓存前缀，必须显式确认。
 void main() {
   test('工具目录快照：数量/描述/参数/只读标记', () {
-    final tools = ShiyiState.buildToolRegistryForTest();
+    final tools = ShiyiState.buildToolRegistryForTest(windows: false);
     final json = <String, dynamic>{
       for (final t in tools)
         t.name: {

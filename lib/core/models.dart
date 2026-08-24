@@ -613,9 +613,9 @@ class AppSettings {
   /// 输入框按回车直接发送；关闭时回车换行。
   bool enterToSend;
 
-  /// Windows 桌面终端后端：auto / pwsh / cmd / wsl2
-  /// （Android 恒用内嵌 Alpine Linux，此设置不生效）。auto = WSL2 优先，
-  /// 其次 PowerShell 7（pwsh），再回退 cmd。
+  /// Windows 桌面终端后端：auto / wsl2 / gitbash / pwsh / cmd
+  /// （Android 恒用内嵌 Alpine Linux，此设置不生效）。
+  /// auto = WSL2 → Git Bash → PowerShell 7 → cmd。不走 Android proot。
   String terminalBackend;
 
   /// Agent 引擎：shiyi（拾忆本地引擎）/ dsh（DeepSeek Harness，经 HTTP API）。

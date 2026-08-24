@@ -13,19 +13,24 @@
 
 | 模块 | Android（手机） | Windows（桌面 exe） |
 |---|---|---|
-| 命令执行后端 | 内嵌 Alpine Linux（proot + minirootfs，apk 包管理，2026-08-15 起取代 Termux bootstrap）。主页第四栏「终端」走同一套 `init-host` | **用户可选**（设置 → 通用 → 终端）：自动（WSL2 优先 → PowerShell 7 → cmd）/ WSL2 / PowerShell 7 / cmd。主页第四栏「终端」走该后端 |
-| 数据库 | sqflite 原生（`/storage/emulated/0/...` Documents） | `sqflite_common_ffi`（sqlite3.dll）；库文件 `%APPDATA%\com.shiyi\拾忆 ShiYi\shiyi_agent.db` |
+| 命令执行后端 | 内嵌 Alpine Linux（proot + minirootfs，apk 包管理，2026-08-15 起取代 Termux bootstrap）。主页第四栏「终端」走同一套 `init-host`。手机上看不到 WSL / Git Bash / PowerShell 设置 | **用户可选**（设置 → 通用 → 终端）：自动（WSL2 → Git Bash → PowerShell 7 → cmd）/ WSL2 / Git Bash / PowerShell 7 / cmd。不走 Android Alpine / proot / apk |
+| 数据库 | sqflite 原生（应用 Documents） | `sqflite_common_ffi`（sqlite3.dll）；库文件 `%APPDATA%\com.shiyi\拾忆 ShiYi\shiyi_agent.db` |
 | 技能包 zip | Android 原生 ZipInputStream（MethodChannel `shiyi/skillpack`） | archive 包纯 Dart（channel 抛 MissingPluginException 时回退） |
 | 图片 | 相册/相机 + flutter_image_compress 压缩 | 相册（相机降级相册）、跳过压缩原图保存 |
 | 通知 | flutter_local_notifications Android 通道 | 同插件 WinRT 实现（固定 GUID `c4a7d0e2-9f3b-4a5c-b6d7-8e9f0a1b2c3d`） |
 | 应用更新 | 下载 APK + 签名校验 + 系统安装器 | 跳转 GitHub 发布页手动下载 |
 | 权限 | permission_handler Android 权限 | 非 Android 直接跳过 |
-| 工作目录 | `/storage/emulated/0/agent` | `%TEMP%\agent`（可自定义） |
-| 系统提示词 | 无平台段落 | 注入【平台环境】段落（order 250），按实际生效后端动态描述 |
+| 工作目录 | `/storage/emulated/0/agent` | 本机「文档\\agent」（可自定义）；旧 `%TEMP%\\agent` 视为未设置 |
+| 系统提示词 | 人设 / 工具规则 / `run_terminal` 只写 Alpine / apk / `/storage/emulated/0/agent` | 注入【平台环境】段落（order 250），按实际后端（wsl2 / gitbash / pwsh / cmd）动态描述。人设 / 工具规则 / `run_terminal` 只写本机终端与「文档\\agent」，不出现 Alpine / apk / 安卓路径 |
 | 窗口 | 无（系统全屏） | **无边框 macOS 风格窗口**（红黄绿三键/拖拽/边缘缩放/贴靠） |
 | 交互 | 手机操作逻辑（长按/左滑/底部弹层/底部 Tab） | 桌面逻辑（右键菜单/悬停操作/居中弹层/侧边导航/快捷键） |
 
 **数据是分开的**：Windows 版数据库在 AppData，手机版在手机存储，互不影响。
+
+**构建是分开的**：`flutter build apk` 只编 `android/` + 共享 `lib/`，不会把
+`windows/` 的 exe / C++ 打进 APK。`flutter build windows` 也不会产出 APK。
+共享 `lib/` 里另一侧的字符串会进 Dart 快照（死代码），运行时按
+`Platform.isWindows` 取文案，模型在当前平台拿不到另一侧路径。
 
 ---
 
@@ -40,6 +45,8 @@ flutter build windows --release
 产物：`build\windows\x64\runner\Release\shiyi_agent.exe`
 **分发必须拷贝整个 Release 目录**（依赖同目录的 `flutter_windows.dll`、各插件 DLL、
 `sqlite3.dll`、`data/`），单拷 exe 会启动失败。
+桌面图标与 Android 启动图标同一套：`windows/runner/resources/app_icon.ico`
+来自 `android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png`（16/24/32/48/64/128/256）。
 
 前置条件：Flutter stable（当前 3.44.2）+ Visual Studio（Windows 桌面 C++ 工具链）。
 
@@ -54,13 +61,15 @@ flutter build windows --release
   内核含 `WSL2`/`microsoft-standard` → wsl2；含 `Microsoft`（大写）→ wsl1；
   失败 → none。结果缓存。
 - **后端解析** `resolveWindowsBackend(setting)`（纯函数 `resolveBackendChoice`
-  可单测）：显式 pwsh/cmd 直接生效；auto 与显式 wsl2 在 WSL2 可用时用 WSL2，
-  否则回退已探测的 Windows shell（`windowsShell()`：pwsh 探测 → cmd 回退，缓存）。
+  可单测）：显式 pwsh/cmd/gitbash 直接生效；auto 与显式 wsl2 在 WSL2 可用时用 WSL2，
+  否则 Git Bash（本机 `bash.exe`），再回退 Windows shell（pwsh → cmd）。
+  Windows 不走 Android Alpine / proot / apk / init-host。
 - **执行** `_execRunTerminal`：
   - WSL2：`wsl.exe -e bash -lc <cmd>`，workingDirectory 由 WSL 自动映射为 `/mnt/<盘符>/...`
+  - Git Bash：本机 `Git\\bin\\bash.exe --login -c <cmd>`
   - pwsh：`-NoProfile -NoLogo -NonInteractive -Command <cmd>`
   - cmd：`/c <cmd>`
-  - 显式选 WSL2 但不可用时自动回退并在输出附告警；120s 超时强杀三后端共用。
+  - 显式选 WSL2 / Git Bash 但不可用时自动回退并在输出附告警；120s 超时强杀共用。
 - **启动自检** `_ensureTermux`：Windows 按实际后端探测（日志 `TermuxProbe backend=...`）。
 
 ### 3.2 数据库（`lib/services/db.dart`）
@@ -79,7 +88,13 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 - 更新（`update_service.dart`）：非 Android 直接 `url_launcher` 打开 GitHub 发布页。
 - 通知（`notifier.dart`）：`InitializationSettings` 带
   `windows: WindowsInitializationSettings(appName/appUserModelId/guid)`。
-- 设置（`models.dart`）：`AppSettings.terminalBackend`（auto/pwsh/cmd/wsl2，JSON 持久化）。
+- 设置（`models.dart`）：`AppSettings.terminalBackend`（auto/wsl2/gitbash/pwsh/cmd，JSON 持久化）。
+  Android 恒用 Alpine，此设置不生效，设置页入口也不渲染。
+- **提示词 / 工具描述隔离**（`prompt_builder.dart` + `_buildToolRegistry`）：
+  Windows 只写本机终端与「文档\\agent」；Android 只写 Alpine / apk /
+  `/storage/emulated/0/agent`。禁止两端写进同一段。测试：
+  `test/prompt_section_test.dart`、`test/terminal_backend_test.dart`。
+  工具目录快照 `tools.json` 固定 Android 文案；Windows 文案由行为测试覆盖。
 
 ---
 
@@ -89,9 +104,9 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 
 | 能力 | 实现 |
 |---|---|
-| 无系统标题栏/黑边 | `win32_window.cpp`：`CreateWindowEx` 无 caption 样式 + **创建后强制清除 `WS_CAPTION/WS_BORDER/WS_DLGFRAME/WS_SYSMENU`**（部分 Windows 版本会为 WS_OVERLAPPED 顶层窗口自动补 WS_CAPTION，导致黑边且顶部点击变拖拽）；`WS_EX_DROPSHADOW` 悬浮阴影 + `WS_EX_APPWINDOW` 任务栏按钮 |
+| 无系统标题栏/黑边 | `WS_POPUP \| WS_THICKFRAME`；`WM_NCCALCSIZE` 客户区铺满；`WS_EX_DROPSHADOW` + `WS_EX_APPWINDOW`。Win11 悬停灰层盖不住原生子窗口标题栏 overlay（`SHIYI_TITLEBAR`） |
 | 红黄绿三键 | Dart `MacTitleBar`（44px 全局标题栏，MaterialApp.builder 包裹所有路由）+ `WindowControl`（MethodChannel `shiyi/window`：minimize/toggleMaximize/close/isMaximized）；悬停显示图标；最大化状态由 C++ `WM_SIZE` 推送 `windowStateChanged` 同步，绿键图标随状态切换 |
-| 标题栏拖拽 + 双击最大化 | 顶层窗口 `WM_NCHITTEST`：顶部 44px（三键右侧 x≥96）返回 `HTCAPTION`；**关键**：Flutter 视图（子窗口）覆盖整个客户区导致顶层收不到 hit test，通过 subclass 子窗口（`FlutterChildProc`）对拖拽区与窗口边缘返回 `HTTRANSPARENT` 穿透给顶层 |
+| 标题栏拖拽 + 双击最大化 | 顶层不返回 `HTCAPTION`。子窗口 `SetWindowSubclass`：拖拽区 `HTTRANSPARENT`，红绿灯 `HTCLIENT`。按下超过拖拽阈值再 `WM_NCLBUTTONDOWN HTCAPTION`。Win11 灰条高度 = DWM 认为的标题栏高度；客户区顶边只留 1px 非客户区后，悬停灰条不再盖住红绿灯 |
 | 边缘缩放 + 贴靠 | `WM_NCHITTEST` 6px 边缘返回 `HTLEFT/HTRIGHT/HTTOP/HTBOTTOM/四角`；`WS_MAXIMIZEBOX` 保证 Win+方向键贴靠 |
 
 窗口控制 channel 文件：`flutter_window.cpp`（注册与处理）、`win32_window.cpp`（样式与创建）。
@@ -120,6 +135,8 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 ## 5. 维护铁律（改代码前必读）
 
 1. **平台隔离**：任何平台差异一律 `Platform.isWindows` 分支，禁止影响 Android 路径。
+   工作目录、终端后端、人设、工具规则、`run_terminal` / `file_write` 描述
+   必须两端各写各的，禁止「Android …；Windows …」写进同一段给模型看。
 2. **全量测试守护**：`flutter test` 必须全绿才可交付；快照测试
    （tools.json / system-prompt-*.txt）已平台无关化（normalize 删除平台段落/打码），
    改动工具描述、人设、注入段落后跑测试会触发 diff，属预期变更时用
@@ -158,6 +175,14 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 10. **上下文上限是新建会话默认，会话可单独改**：设置页不再把 ≥50 万 token
     写回 128k。拾忆写入 `sessions.context_limit`，DSH 写入本机偏好；两端共用
     输入区「会话上下文」按钮。测试：`test/context_limit_test.dart`。
+11. **工作目录与终端后端按平台分家**：Windows 默认「文档\\agent」+
+    WSL2 / Git Bash / pwsh / cmd；Android 默认 `/storage/emulated/0/agent` +
+    Alpine / apk / init-host。测试：`test/file_workspace_test.dart`、
+    `test/terminal_backend_test.dart`、`test/prompt_section_test.dart`。
+12. **拾忆跨会话查阅**：用户复制会话 ID 发到另一个拾忆会话时，模型必须用
+    `search_sessions` / `read_session` 找到并阅读，禁止声称搜不到。
+    按完整会话 ID 命中本地库。这不是 DSH `session.search`。
+    测试：`test/session_bridge_test.dart`。
 
 ---
 
@@ -166,6 +191,8 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 | 现象 | 根因 | 解法 |
 |---|---|---|
 | 窗口四周黑边 / 顶部点击变成拖拽 | 系统为 WS_OVERLAPPED 顶层窗口自动补 `WS_CAPTION` | `CreateWindowEx` 后强制 `SetWindowLongPtr` 清除 WS_CAPTION/WS_BORDER/WS_DLGFRAME/WS_SYSMENU + `SetWindowPos(SWP_FRAMECHANGED)` |
+| 鼠标移到顶栏整条变灰 | 拖拽区 `WM_NCHITTEST` 返回 `HTCAPTION`，Win11 DWM 画系统标题栏悬停层 | 顶栏返回 `HTCLIENT`，按下移动再启动系统拖拽；关掉 DWM 非客户区绘制 |
+| 鼠标移到红绿灯顶栏变灰 | Win11 DWM 把系统 caption 叠在 Flutter 表面之上；改命中测试/分层窗口都挡不住。`SetCursorPos` 复现不了 | 原生子窗口 `SHIYI_TITLEBAR` 盖在灰层上面画红绿灯；颜色跟 Flutter scaffold |
 | 三键/拖拽/缩放全部失效 | Flutter 视图子窗口覆盖客户区，顶层收不到 `WM_NCHITTEST` | subclass 子窗口（`FlutterChildProc`）：拖拽区与 6px 边缘返回 `HTTRANSPARENT` 穿透到顶层 |
 | C4819 编译错误 | C++ 注释含中文，MSVC GBK 代码页 | 注释改英文（纯 ASCII） |
 | C4996 编译错误 | `getenv`/`fopen` 不安全 API | `_dupenv_s`/`fopen_s` |
@@ -194,12 +221,15 @@ flutter build windows --release      # 必须成功
 
 启动验证（真实窗口）：
 
-1. 窗口无黑边、标题栏左侧红黄绿三键、悬停显示图标
+1. 窗口无黑边、标题栏左侧红黄绿三键、悬停显示图标；鼠标移到任一红绿灯时顶栏不得变灰
 2. 黄=最小化、绿=最大化/还原（图标随状态切换）、红=关闭
 3. 标题栏拖拽移动窗口、双击最大化/还原
 4. 窗口边缘 6px 缩放、Win+方向键贴靠、Alt+Tab 正常
-5. 启动日志（`%TEMP%\agent\logs\error.log`）`TermuxProbe backend=...` 正常
-6. 数据库自动创建：`%APPDATA%\com.shiyi\拾忆 ShiYi\shiyi_agent.db`
+5. 启动日志（`文档\\agent\\logs\\error.log`）`TermuxProbe backend=...` 正常（wsl2 / gitbash / pwsh / cmd）
+6. 默认工作目录是本机「文档\\agent」（不是 `%TEMP%\\agent`，也不是安卓存储根）
+7. 数据库自动创建：`%APPDATA%\com.shiyi\拾忆 ShiYi\shiyi_agent.db`
+8. 设置 → 通用 → 终端能看到自动 / WSL2 / Git Bash / PowerShell 7 / cmd
+9. 对话人设与 `run_terminal` 描述不出现 Alpine / apk / `/storage/emulated/0/agent`
 
 DS Harness 引擎验证点（#114，两端共享）：
 
@@ -210,7 +240,7 @@ DS Harness 引擎验证点（#114，两端共享）：
    分组展开收起写入 `shiyi_project_expanded_v1`，会话左滑含复制 ID；
    无工作区时
    自动链接默认 agent 目录（Android `/storage/emulated/0/agent`、
-   Windows `%TEMP%\agent`）、新建空会话返回后自动归档
+   Windows `文档\\agent`）、新建空会话返回后自动归档
 3. 功能页：只显示入口（技能/模型/预设/工作区/文件），不预加载不报错；
    技能入口二级页 = DSH skill.list（DSH 0.1.0-rc.6 起必带 sessionId 且会话
    需已挂载；先用 session.create(sessionId+cwd) 挂载会话再短重试，不再回退
@@ -227,6 +257,13 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-08-24 2.5.8**（详见 `docs/fix-log.md` #235/#236）：
+  Windows 默认工作目录改为本机「文档\\agent」（旧 `%TEMP%\\agent` 视为未设置）。
+  终端走 WSL2 / Git Bash / PowerShell / cmd，不走 Android Alpine。人设 / 工具规则 /
+  `run_terminal` 描述按平台隔离。Win11 红绿灯悬停灰条用原生子窗口 `SHIYI_TITLEBAR`
+  盖住；桌面图标换成 Android `ic_launcher`。拾忆跨会话查阅：`search_sessions` /
+  `read_session`，复制 ID 发到另一拾忆会话可看见（仅拾忆本地库，不是 DSH）。
+- **2026-08-24**：鼠标移到顶栏不再变灰。拖拽区不再回报 `HTCAPTION`（Win11 会叠系统标题栏悬停层），改为客户区按下后拖、双击最大化。
 - **2026-08-24 2.5.7**（共享 lib/，详见 `docs/fix-log.md` #230–#234）：
   Markdown 缺口自研补齐（图片/脚注/定义列表等，拾忆与 DSH 共用）；思考过程不再升成正文；
   主页项目展开记忆 + 会话左滑复制 ID；设置上下文改为新建会话默认且会话可单独改；
@@ -267,7 +304,7 @@ DS Harness 引擎验证点（#114，两端共享）：
      无「未分类」（自动链接 agent 目录为默认工作区、新会话自动挂入）、空会话自动归档；
   5. 功能 tab = 拾忆功能页外观，只放 DSH 功能入口（技能/模型/预设/工作区/文件），不预加载；
   6. 文件 tab = 拾忆文件页外观（路径栏/新建文件夹/操作菜单），DSH 主机目录数据，
-     默认浏览 agent 目录；dsh 服务启动 cwd 改为 agent 目录（Windows 为 `%TEMP%\agent`）。
+     默认浏览 agent 目录；dsh 服务启动 cwd 改为 agent 目录（Windows 为「文档\\agent」）。
   - 验证：`flutter analyze` 0 issues；`flutter test` 188 用例全绿；
     debug APK `adb install -r` 真机覆盖安装通过；设备实测 `host.describe` cwd=agent 目录。
 - **2026-08-14**（共享 lib/ 改动，详见 `docs/fix-log.md` #116）：拾忆文件页增加 Android 专用 SD 根/Root 闸门（`StorageScope` + `RootAccess`）。Windows 不走 Root/SD 限制，文件页仍按本机路径直接浏览；改共享 `files_screen.dart` 时勿把 Android 闸门套到桌面。

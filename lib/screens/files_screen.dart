@@ -12,7 +12,8 @@ import '../widgets/ios_style.dart';
 import '../widgets/markdown_text.dart';
 import '../widgets/traffic_lights_button.dart';
 
-/// 文件管理页：浏览智能体工作目录（默认 /storage/emulated/0/agent），
+/// 文件管理页：浏览智能体工作目录
+/// （Android 默认 /storage/emulated/0/agent；Windows 默认本机「文档\\agent」），
 /// 支持新建文件夹、预览文本文件、删除，以及把任意文件夹设为工作目录。
 class FilesScreen extends StatefulWidget {
   final ShiyiState shiyi;

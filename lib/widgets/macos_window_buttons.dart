@@ -14,10 +14,22 @@ class MacTitleBar extends StatefulWidget {
 }
 
 class _MacTitleBarState extends State<MacTitleBar> {
+  Color? _lastBarColor;
+
   @override
   void initState() {
     super.initState();
     WindowControl.instance.init();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bg = Theme.of(context).scaffoldBackgroundColor;
+    if (_lastBarColor != bg) {
+      _lastBarColor = bg;
+      WindowControl.instance.setTitleBarColor(bg);
+    }
   }
 
   @override

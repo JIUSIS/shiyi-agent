@@ -25,7 +25,7 @@ void main() {
       expect(HomeTabs.keepAcrossEngineSwitch, [HomeTabs.terminalIndex]);
     });
 
-    test('拾忆与 DSH 共用同一 Alpine 终端会话', () {
+    test('拾忆与 DSH 共用同一终端会话', () {
       expect(identical(TerminalSession.shared, TerminalSession.shared), isTrue);
     });
   });
@@ -61,6 +61,17 @@ void main() {
         EmbeddedShell.windowsInteractive(backend: 'wsl2').arguments,
         contains('bash'),
       );
+    });
+
+    test('Windows Git Bash 走本机 bash.exe，不走 Android init-host', () {
+      final spec = EmbeddedShell.windowsInteractive(
+        backend: 'gitbash',
+        gitBashPath: r'C:\Program Files\Git\bin\bash.exe',
+      );
+      expect(spec.usesProot, isFalse);
+      expect(spec.executable, r'C:\Program Files\Git\bin\bash.exe');
+      expect(spec.arguments, contains('--login'));
+      expect(spec.executable, isNot(contains('init-host')));
     });
 
     test('停止按钮注入 Ctrl+C：SIGINT + 0x03', () {

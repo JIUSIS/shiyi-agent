@@ -173,7 +173,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   DshApiClient get _api => DshApiClient.instance;
 
-  /// 默认工作区：链接软件默认 agent 目录（Android: /storage/emulated/0/agent）。
+  /// 默认工作区：链接软件默认 agent 目录（FileWorkspace.defaultWorkspacePath）。
   /// 优先按路径匹配，兜底第一个工作区。
   String? get _defaultWorkspaceId {
     if (_workspaces.isEmpty) return null;

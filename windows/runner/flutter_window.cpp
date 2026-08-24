@@ -1,24 +1,31 @@
 #include "flutter_window.h"
 
+#include <commctrl.h>
+#include <cstdint>
 #include <optional>
 #include <windows.h>
 #include <windowsx.h>
 
 #include "flutter/generated_plugin_registrant.h"
 
+#ifndef WM_NCUAHDRAWCAPTION
+#define WM_NCUAHDRAWCAPTION 0x00AE
+#endif
+#ifndef WM_NCUAHDRAWFRAME
+#define WM_NCUAHDRAWFRAME 0x00AF
+#endif
+
 namespace {
 
-// Original window procedure of the Flutter view (child window), saved when
-// subclassing it so hit testing for the borderless title bar works.
-WNDPROC g_original_child_proc = nullptr;
+constexpr UINT_PTR kFlutterChildSubclassId = 1;
 
-// Subclassed child-window procedure: the Flutter view covers the whole
-// client area, so the top-level window never receives WM_NCHITTEST while the
-// cursor is over it. Make the title-bar drag strip and the window edges
-// transparent to hit testing (HTTRANSPARENT) so the system falls through to
-// the top-level window, whose WM_NCHITTEST decides drag / resize / HTCLIENT.
-LRESULT CALLBACK FlutterChildProc(HWND hwnd, UINT message, WPARAM wparam,
-                                  LPARAM lparam) {
+// Flutter's view is a WS_CHILD covering the client area, so the top-level
+// window never sees WM_NCHITTEST over it. Edges and the title-bar drag
+// strip return HTTRANSPARENT so the parent can drag / resize. Traffic
+// lights stay HTCLIENT so Dart receives the clicks.
+LRESULT CALLBACK FlutterChildSubclass(HWND hwnd, UINT message, WPARAM wparam,
+                                      LPARAM lparam, UINT_PTR /*subclass_id*/,
+                                      DWORD_PTR /*ref_data*/) {
   if (message == WM_NCHITTEST) {
     POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     RECT rc;
@@ -28,20 +35,37 @@ LRESULT CALLBACK FlutterChildProc(HWND hwnd, UINT message, WPARAM wparam,
     const int w = rc.right - rc.left;
     const int h = rc.bottom - rc.top;
 
+    UINT dpi = 96;
     HWND parent = GetParent(hwnd);
+    if (parent) {
+      dpi = GetDpiForWindow(parent);
+    }
+    const int title_h = MulDiv(kMacTitleBarHeight, dpi, 96);
+    const int lights_w = MulDiv(kMacTrafficLightsWidth, dpi, 96);
+    const bool in_title = y >= 0 && y < title_h;
+
     if (parent && IsZoomed(parent) == FALSE) {
       constexpr int kEdge = 6;
-      if (x < kEdge || y < kEdge || x >= w - kEdge || y >= h - kEdge) {
+      if (!in_title && (x < kEdge || x >= w - kEdge || y >= h - kEdge)) {
         return HTTRANSPARENT;
       }
     }
-    // Title-bar drag strip (right of the traffic lights): fall through to the
-    // top-level window (HTCAPTION drag / double-click to maximize).
-    if (y >= 0 && y < kMacTitleBarHeight && x >= kMacTrafficLightsWidth) {
+    if (in_title && x < lights_w) {
+      return HTCLIENT;
+    }
+    if (in_title && x >= lights_w) {
       return HTTRANSPARENT;
     }
   }
-  return CallWindowProc(g_original_child_proc, hwnd, message, wparam, lparam);
+  return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void HookFlutterChild(HWND child) {
+  if (!child) {
+    return;
+  }
+  RemoveWindowSubclass(child, FlutterChildSubclass, kFlutterChildSubclassId);
+  SetWindowSubclass(child, FlutterChildSubclass, kFlutterChildSubclassId, 0);
 }
 
 }  // namespace
@@ -69,14 +93,10 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
-  // Subclass the Flutter view so hit testing for the borderless title bar
-  // (drag strip + resize edges) falls through to the top-level window.
+  // Pin hit testing on the Flutter view. Re-hook after the first frame in
+  // case the engine replaces the child WndProc during startup.
   HWND child = flutter_controller_->view()->GetNativeWindow();
-  if (child && !g_original_child_proc) {
-    g_original_child_proc = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtr(child, GWLP_WNDPROC,
-                         reinterpret_cast<LONG_PTR>(FlutterChildProc)));
-  }
+  HookFlutterChild(child);
 
   // macOS style window control channel: called by the Dart traffic lights.
   window_channel_ = std::make_unique<
@@ -90,6 +110,10 @@ bool FlutterWindow::OnCreate() {
   last_maximized_ = IsZoomed(GetHandle()) != FALSE;
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
+    if (this->flutter_controller_ && this->flutter_controller_->view()) {
+      HookFlutterChild(this->flutter_controller_->view()->GetNativeWindow());
+    }
+    this->RaiseTitleBarOverlay();
     this->Show();
   });
 
@@ -126,6 +150,25 @@ void FlutterWindow::HandleWindowMethodCall(
     result->Success();
   } else if (method == "isMaximized") {
     result->Success(flutter::EncodableValue(IsZoomed(hwnd) != FALSE));
+  } else if (method == "setTitleBarColor") {
+    const auto* args =
+        std::get_if<flutter::EncodableMap>(call.arguments());
+    if (args) {
+      auto it = args->find(flutter::EncodableValue("color"));
+      if (it != args->end()) {
+        int64_t argb = 0;
+        if (const auto* v32 = std::get_if<int32_t>(&it->second)) {
+          argb = static_cast<uint32_t>(*v32);
+        } else if (const auto* v64 = std::get_if<int64_t>(&it->second)) {
+          argb = *v64;
+        }
+        if (argb != 0) {
+          SetTitleBarColor(RGB((argb >> 16) & 0xFF, (argb >> 8) & 0xFF,
+                               argb & 0xFF));
+        }
+      }
+    }
+    result->Success();
   } else {
     result->NotImplemented();
   }
@@ -137,12 +180,49 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               LPARAM const lparam) noexcept {
   // Borderless window hit testing (fully custom, no system border):
   // - 6px edges: resize (HTLEFT/HTRIGHT/HTTOP/HTBOTTOM and corners)
-  // - top 44px right of the traffic lights: drag region, double-click to
-  //   maximize (HTCAPTION)
+  // - top 44px right of the traffic lights: HTCLIENT (drag handled below)
   // - left 96px: traffic lights (HTCLIENT, Flutter handles clicks)
   // - everything else: HTCLIENT
+  // Do not return HTCAPTION: Win11 draws a gray caption overlay on hover.
   // Must be handled before the Flutter engine so it is not swallowed by
   // HandleTopLevelWindowProc.
+  if (message == WM_NCCALCSIZE && wparam == TRUE) {
+    auto* sz = reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam);
+    if (IsZoomed(hwnd)) {
+      HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi{};
+      mi.cbSize = sizeof(mi);
+      if (GetMonitorInfo(monitor, &mi)) {
+        sz->rgrc[0] = mi.rcWork;
+      }
+    }
+    return 0;
+  }
+  if (message == WM_GETTITLEBARINFOEX) {
+    auto* info = reinterpret_cast<TITLEBARINFOEX*>(lparam);
+    if (info && info->cbSize >= sizeof(TITLEBARINFOEX)) {
+      // Win11 paints the gray caption overlay over rcTitleBar. An empty
+      // rect is what actually disables it; hiding buttons alone is not
+      // enough, and DefWindowProc pre-fills this before we see it.
+      SetRectEmpty(&info->rcTitleBar);
+      ZeroMemory(info->rgstate, sizeof(info->rgstate));
+      ZeroMemory(info->rgrect, sizeof(info->rgrect));
+      for (int i = 0; i <= CCHILDREN_TITLEBAR; ++i) {
+        info->rgstate[i] = STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE |
+                           STATE_SYSTEM_OFFSCREEN;
+        SetRectEmpty(&info->rgrect[i]);
+      }
+    }
+    return 0;
+  }
+  if (message == WM_NCACTIVATE) {
+    // -1 tells DefWindowProc not to repaint the non-client caption.
+    return DefWindowProc(hwnd, message, wparam, static_cast<LPARAM>(-1));
+  }
+  if (message == WM_NCPAINT || message == WM_NCUAHDRAWCAPTION ||
+      message == WM_NCUAHDRAWFRAME) {
+    return 0;
+  }
   if (message == WM_NCHITTEST) {
     POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     RECT rc;
@@ -151,26 +231,72 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     const int y = pt.y - rc.top;
     const int w = rc.right - rc.left;
     const int h = rc.bottom - rc.top;
+    const UINT dpi = GetDpiForWindow(hwnd);
+    const int title_h = MulDiv(kMacTitleBarHeight, dpi, 96);
+    const bool in_title = y >= 0 && y < title_h;
 
     if (IsZoomed(hwnd) == FALSE) {
       constexpr int kEdge = 6;
       const bool left = x < kEdge;
       const bool right = x >= w - kEdge;
-      const bool top = y < kEdge;
+      const bool top = !in_title && y < kEdge;
       const bool bottom = y >= h - kEdge;
       if (top && left) return HTTOPLEFT;
       if (top && right) return HTTOPRIGHT;
       if (bottom && left) return HTBOTTOMLEFT;
       if (bottom && right) return HTBOTTOMRIGHT;
-      if (left) return HTLEFT;
-      if (right) return HTRIGHT;
+      if (left && !in_title) return HTLEFT;
+      if (right && !in_title) return HTRIGHT;
       if (top) return HTTOP;
       if (bottom) return HTBOTTOM;
     }
-    if (y >= 0 && y < kMacTitleBarHeight && x >= kMacTrafficLightsWidth) {
-      return HTCAPTION;
-    }
     return HTCLIENT;
+  }
+
+  auto in_title_drag_strip = [hwnd](LPARAM lp) -> bool {
+    const int x = GET_X_LPARAM(lp);
+    const int y = GET_Y_LPARAM(lp);
+    const UINT dpi = GetDpiForWindow(hwnd);
+    const int title_h = MulDiv(kMacTitleBarHeight, dpi, 96);
+    const int lights_w = MulDiv(kMacTrafficLightsWidth, dpi, 96);
+    return y >= 0 && y < title_h && x >= lights_w;
+  };
+
+  if (message == WM_LBUTTONDOWN && in_title_drag_strip(lparam)) {
+    title_bar_tracking_ = true;
+    title_bar_press_ = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    SetCapture(hwnd);
+    return 0;
+  }
+  if (message == WM_MOUSEMOVE && title_bar_tracking_ &&
+      (wparam & MK_LBUTTON)) {
+    const int x = GET_X_LPARAM(lparam);
+    const int y = GET_Y_LPARAM(lparam);
+    const int dx = abs(x - title_bar_press_.x);
+    const int dy = abs(y - title_bar_press_.y);
+    if (dx > GetSystemMetrics(SM_CXDRAG) || dy > GetSystemMetrics(SM_CYDRAG)) {
+      title_bar_tracking_ = false;
+      ReleaseCapture();
+      POINT cursor{};
+      GetCursorPos(&cursor);
+      SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION,
+                  MAKELPARAM(cursor.x, cursor.y));
+    }
+    return 0;
+  }
+  if (message == WM_LBUTTONUP && title_bar_tracking_) {
+    title_bar_tracking_ = false;
+    ReleaseCapture();
+    return 0;
+  }
+  if (message == WM_CAPTURECHANGED) {
+    title_bar_tracking_ = false;
+  }
+  if (message == WM_LBUTTONDBLCLK && in_title_drag_strip(lparam)) {
+    title_bar_tracking_ = false;
+    ReleaseCapture();
+    ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+    return 0;
   }
 
   // Give Flutter, including plugins, an opportunity to handle window messages.

@@ -16,6 +16,21 @@ namespace {
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_COLOR_NONE
+#define DWMWA_COLOR_NONE 0xFFFFFFFE
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef WM_NCUAHDRAWCAPTION
+#define WM_NCUAHDRAWCAPTION 0x00AE
+#endif
+#ifndef WM_NCUAHDRAWFRAME
+#define WM_NCUAHDRAWFRAME 0x00AF
+#endif
 
 constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
 
@@ -97,7 +112,7 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     WNDCLASS window_class{};
     window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
     window_class.lpszClassName = kWindowClassName;
-    window_class.style = CS_HREDRAW | CS_VREDRAW;
+    window_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     window_class.cbClsExtra = 0;
     window_class.cbWndExtra = 0;
     window_class.hInstance = GetModuleHandle(nullptr);
@@ -140,25 +155,18 @@ bool Win32Window::Create(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
-  // macOS style: no system title bar and no resize border (traffic lights
-  // drawn in Flutter; edge resizing handled by our own WM_NCHITTEST).
-  // WS_EX_DROPSHADOW gives the floating-window look, WS_EX_APPWINDOW keeps
-  // the taskbar button visible.
+  // Layered + popup: Win11 DWM does not paint the caption hover overlay
+  // on WS_EX_LAYERED windows. Keep THICKFRAME / MINIMIZEBOX / MAXIMIZEBOX
+  // for snap. The Flutter MacTitleBar is the only title chrome.
   HWND window = CreateWindowEx(
       WS_EX_DROPSHADOW | WS_EX_APPWINDOW, window_class, title.c_str(),
-      WS_OVERLAPPED | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+      WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX |
+          WS_CLIPCHILDREN,
       Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
       Scale(size.width, scale_factor), Scale(size.height, scale_factor),
       nullptr, nullptr, GetModuleHandle(nullptr), this);
 
-  // Some Windows versions automatically add WS_CAPTION/WS_BORDER to a
-  // WS_OVERLAPPED top-level window, which draws a system border and makes
-  // the top area act as a title bar (clicks become drags). Force-clear
-  // those bits so the custom WM_NCHITTEST fully controls hit testing.
   if (window) {
-    LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE);
-    style &= ~(WS_CAPTION | WS_BORDER | WS_DLGFRAME | WS_SYSMENU);
-    SetWindowLongPtr(window, GWL_STYLE, style);
     SetWindowPos(window, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
   }
@@ -203,6 +211,7 @@ Win32Window::MessageHandler(HWND hwnd,
                             LPARAM const lparam) noexcept {
   switch (message) {
     case WM_DESTROY:
+      DestroyTitleBarOverlay();
       window_handle_ = nullptr;
       Destroy();
       if (quit_on_close_) {
@@ -221,9 +230,9 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
     }
     case WM_SIZE: {
+      LayoutTitleBarOverlay();
       RECT rect = GetClientArea();
       if (child_content_ != nullptr) {
-        // Size and position the child window.
         MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
                    rect.bottom - rect.top, TRUE);
       }
@@ -231,6 +240,7 @@ Win32Window::MessageHandler(HWND hwnd,
     }
 
     case WM_ACTIVATE:
+      UpdateTheme(hwnd);
       if (child_content_ != nullptr) {
         SetFocus(child_content_);
       }
@@ -239,6 +249,25 @@ Win32Window::MessageHandler(HWND hwnd,
     case WM_DWMCOLORIZATIONCOLORCHANGED:
       UpdateTheme(hwnd);
       return 0;
+
+    case WM_NCUAHDRAWCAPTION:
+    case WM_NCUAHDRAWFRAME:
+      return 0;
+
+    case WM_GETTITLEBARINFOEX: {
+      auto* info = reinterpret_cast<TITLEBARINFOEX*>(lparam);
+      if (info && info->cbSize >= sizeof(TITLEBARINFOEX)) {
+        SetRectEmpty(&info->rcTitleBar);
+        ZeroMemory(info->rgstate, sizeof(info->rgstate));
+        ZeroMemory(info->rgrect, sizeof(info->rgrect));
+        for (int i = 0; i <= CCHILDREN_TITLEBAR; ++i) {
+          info->rgstate[i] = STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE |
+                             STATE_SYSTEM_OFFSCREEN;
+          SetRectEmpty(&info->rgrect[i]);
+        }
+      }
+      return 0;
+    }
   }
 
   return DefWindowProc(window_handle_, message, wparam, lparam);
@@ -246,6 +275,7 @@ Win32Window::MessageHandler(HWND hwnd,
 
 void Win32Window::Destroy() {
   OnDestroy();
+  DestroyTitleBarOverlay();
 
   if (window_handle_) {
     DestroyWindow(window_handle_);
@@ -269,6 +299,10 @@ void Win32Window::SetChildContent(HWND content) {
   MoveWindow(content, frame.left, frame.top, frame.right - frame.left,
              frame.bottom - frame.top, true);
 
+  if (!title_bar_hwnd_) {
+    CreateTitleBarOverlay();
+  }
+  LayoutTitleBarOverlay();
   SetFocus(child_content_);
 }
 
@@ -287,7 +321,7 @@ void Win32Window::SetQuitOnClose(bool quit_on_close) {
 }
 
 bool Win32Window::OnCreate() {
-  // No-op; provided for subclasses.
+  CreateTitleBarOverlay();
   return true;
 }
 
@@ -308,4 +342,235 @@ void Win32Window::UpdateTheme(HWND const window) {
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
                           &enable_dark_mode, sizeof(enable_dark_mode));
   }
+  MARGINS margins = {0, 0, 0, 0};
+  DwmExtendFrameIntoClientArea(window, &margins);
+  if (Win32Window* that = GetThisFromHandle(window)) {
+    if (that->title_bar_hwnd_) {
+      InvalidateRect(that->title_bar_hwnd_, nullptr, TRUE);
+    }
+  }
+}
+
+int Win32Window::TitleBarHeightPx() const {
+  const UINT dpi = GetDpiForWindow(window_handle_);
+  return MulDiv(kMacTitleBarHeight, dpi, 96);
+}
+
+int Win32Window::TrafficLightsWidthPx() const {
+  const UINT dpi = GetDpiForWindow(window_handle_);
+  return MulDiv(kMacTrafficLightsWidth, dpi, 96);
+}
+
+void Win32Window::CreateTitleBarOverlay() {
+  if (!window_handle_ || title_bar_hwnd_) {
+    return;
+  }
+  static bool class_registered = false;
+  if (!class_registered) {
+    WNDCLASS wc{};
+    wc.style = CS_DBLCLKS;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"SHIYI_TITLEBAR";
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpfnWndProc = TitleBarProc;
+    wc.hbrBackground = nullptr;
+    RegisterClass(&wc);
+    class_registered = true;
+  }
+  title_bar_hwnd_ = CreateWindowEx(
+      0, L"SHIYI_TITLEBAR", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
+      0, 0, window_handle_, nullptr, GetModuleHandle(nullptr), this);
+  LayoutTitleBarOverlay();
+}
+
+void Win32Window::DestroyTitleBarOverlay() {
+  if (title_bar_hwnd_) {
+    DestroyWindow(title_bar_hwnd_);
+    title_bar_hwnd_ = nullptr;
+  }
+}
+
+void Win32Window::RaiseTitleBarOverlay() {
+  LayoutTitleBarOverlay();
+}
+
+void Win32Window::SetTitleBarColor(COLORREF color) {
+  title_bar_color_ = color;
+  if (title_bar_hwnd_) {
+    InvalidateRect(title_bar_hwnd_, nullptr, TRUE);
+  }
+}
+
+void Win32Window::LayoutTitleBarOverlay() {
+  if (!window_handle_ || !title_bar_hwnd_) {
+    return;
+  }
+  RECT rc = GetClientArea();
+  const int height = TitleBarHeightPx();
+  SetWindowPos(title_bar_hwnd_, HWND_TOP, rc.left, rc.top,
+               rc.right - rc.left, height,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+}
+
+void Win32Window::HitTitleBar(HWND hwnd, int x, int y, int* button_out) const {
+  *button_out = -1;
+  const UINT dpi = GetDpiForWindow(window_handle_ ? window_handle_ : hwnd);
+  const int pad = MulDiv(14, dpi, 96);
+  const int size = MulDiv(12, dpi, 96);
+  const int gap = MulDiv(8, dpi, 96);
+  const int bar_h = MulDiv(kMacTitleBarHeight, dpi, 96);
+  const int cy = bar_h / 2;
+  const int hit = MulDiv(10, dpi, 96);
+  for (int i = 0; i < 3; ++i) {
+    const int cx = pad + size / 2 + i * (size + gap);
+    if (abs(x - cx) <= hit && abs(y - cy) <= hit) {
+      *button_out = i;
+      return;
+    }
+  }
+}
+
+void Win32Window::PaintTitleBar(HWND hwnd) {
+  PAINTSTRUCT ps;
+  HDC hdc = BeginPaint(hwnd, &ps);
+  RECT rc;
+  GetClientRect(hwnd, &rc);
+
+  HBRUSH bg_brush = CreateSolidBrush(title_bar_color_);
+  FillRect(hdc, &rc, bg_brush);
+  DeleteObject(bg_brush);
+
+  const UINT dpi = GetDpiForWindow(window_handle_ ? window_handle_ : hwnd);
+  const int pad = MulDiv(14, dpi, 96);
+  const int size = MulDiv(12, dpi, 96);
+  const int gap = MulDiv(8, dpi, 96);
+  const int bar_h = rc.bottom - rc.top;
+  const int top = (bar_h - size) / 2;
+  const COLORREF colors[3] = {RGB(0xFF, 0x5F, 0x57), RGB(0xFE, 0xBC, 0x2E),
+                              RGB(0x28, 0xC8, 0x40)};
+
+  for (int i = 0; i < 3; ++i) {
+    const int left = pad + i * (size + gap);
+    HBRUSH brush = CreateSolidBrush(colors[i]);
+    HPEN pen = CreatePen(PS_SOLID, 1, colors[i]);
+    HGDIOBJ old_b = SelectObject(hdc, brush);
+    HGDIOBJ old_p = SelectObject(hdc, pen);
+    Ellipse(hdc, left, top, left + size, top + size);
+    if (title_bar_hover_ == i) {
+      HPEN icon_pen = CreatePen(PS_SOLID, 1, RGB(0x40, 0x40, 0x40));
+      SelectObject(hdc, icon_pen);
+      const int m = MulDiv(3, dpi, 96);
+      const int cx = left + size / 2;
+      const int cy = top + size / 2;
+      if (i == 0) {
+        MoveToEx(hdc, left + m, top + m, nullptr);
+        LineTo(hdc, left + size - m, top + size - m);
+        MoveToEx(hdc, left + size - m, top + m, nullptr);
+        LineTo(hdc, left + m, top + size - m);
+      } else if (i == 1) {
+        MoveToEx(hdc, left + m, cy, nullptr);
+        LineTo(hdc, left + size - m, cy);
+      } else {
+        const bool maximized = IsZoomed(window_handle_);
+        if (maximized) {
+          MoveToEx(hdc, cx - m, cy, nullptr);
+          LineTo(hdc, cx, cy + m);
+          LineTo(hdc, cx + m, cy);
+        } else {
+          MoveToEx(hdc, cx - m, cy, nullptr);
+          LineTo(hdc, cx, cy - m);
+          LineTo(hdc, cx + m, cy);
+        }
+      }
+      SelectObject(hdc, old_p);
+      DeleteObject(icon_pen);
+    }
+    SelectObject(hdc, old_b);
+    SelectObject(hdc, old_p);
+    DeleteObject(brush);
+    DeleteObject(pen);
+  }
+  EndPaint(hwnd, &ps);
+}
+
+LRESULT CALLBACK Win32Window::TitleBarProc(HWND window, UINT message,
+                                           WPARAM wparam, LPARAM lparam) {
+  Win32Window* that = nullptr;
+  if (message == WM_NCCREATE) {
+    auto* cs = reinterpret_cast<CREATESTRUCT*>(lparam);
+    that = static_cast<Win32Window*>(cs->lpCreateParams);
+    SetWindowLongPtr(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(that));
+  } else {
+    that = reinterpret_cast<Win32Window*>(
+        GetWindowLongPtr(window, GWLP_USERDATA));
+  }
+  if (!that) {
+    return DefWindowProc(window, message, wparam, lparam);
+  }
+
+  switch (message) {
+    case WM_PAINT:
+      that->PaintTitleBar(window);
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_MOUSEMOVE: {
+      TRACKMOUSEEVENT tme{};
+      tme.cbSize = sizeof(tme);
+      tme.dwFlags = TME_LEAVE;
+      tme.hwndTrack = window;
+      TrackMouseEvent(&tme);
+      int button = -1;
+      that->HitTitleBar(window, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam),
+                        &button);
+      if (button != that->title_bar_hover_) {
+        that->title_bar_hover_ = button;
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      return 0;
+    }
+    case WM_MOUSELEAVE:
+      if (that->title_bar_hover_ != -1) {
+        that->title_bar_hover_ = -1;
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      return 0;
+    case WM_LBUTTONDOWN: {
+      int button = -1;
+      that->HitTitleBar(window, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam),
+                        &button);
+      if (button < 0 && that->window_handle_) {
+        ReleaseCapture();
+        SendMessage(that->window_handle_, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+      }
+      return 0;
+    }
+    case WM_LBUTTONUP: {
+      int button = -1;
+      that->HitTitleBar(window, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam),
+                        &button);
+      if (button == 0 && that->window_handle_) {
+        PostMessage(that->window_handle_, WM_CLOSE, 0, 0);
+      } else if (button == 1 && that->window_handle_) {
+        ShowWindow(that->window_handle_, SW_MINIMIZE);
+      } else if (button == 2 && that->window_handle_) {
+        ShowWindow(that->window_handle_,
+                   IsZoomed(that->window_handle_) ? SW_RESTORE : SW_MAXIMIZE);
+      }
+      return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+      int button = -1;
+      that->HitTitleBar(window, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam),
+                        &button);
+      if (button < 0 && that->window_handle_) {
+        ShowWindow(that->window_handle_,
+                   IsZoomed(that->window_handle_) ? SW_RESTORE : SW_MAXIMIZE);
+      }
+      return 0;
+    }
+    default:
+      break;
+  }
+  return DefWindowProc(window, message, wparam, lparam);
 }

@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.5.7.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.7/shiyi-agent-v2.5.7.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.5.8.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.8/shiyi-agent-v2.5.8.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -21,7 +21,8 @@
 
 - 双引擎切换：拾忆本地引擎或 DeepSeek Harness，会话数据各自独立
 - 多模型接入：内置 OpenAI / Anthropic / Gemini / DeepSeek 等常见 API 预设，支持自定义接口配置管理、一键获取模型 ID 与测试连接；已保存配置可分别注入 DSH
-- 多轮对话与独立会话管理：搜索 / 重命名 / 删除 / 左滑快捷操作
+- 多轮对话与独立会话管理：搜索 / 重命名 / 删除 / 左滑快捷操作（含复制会话 ID）
+- 拾忆跨会话查阅：把会话 ID 发到另一个拾忆会话，模型可用 `search_sessions` / `read_session` 找到并阅读，不走长期记忆或联网搜索
 - 项目分类管理会话：新建项目时选择文件夹，项目横幅点击展开 / 收起，左滑支持新建会话 / 文件夹 / 重命名 / 删除
 - 项目级工作目录：项目设置一次，项目下会话自动继承；会话也可单独覆盖
 - 文件 / 图片多选附件，支持视觉模型图片理解

@@ -43,6 +43,12 @@ class FlutterWindow : public Win32Window {
 
   // Last known maximize state (dedup WM_SIZE notifications to Dart).
   bool last_maximized_ = false;
+
+  // Custom title-bar drag: do not return HTCAPTION (Win11 paints a gray
+  // caption overlay on hover). Track press, drag after the system threshold,
+  // and double-click to maximize.
+  bool title_bar_tracking_ = false;
+  POINT title_bar_press_{};
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

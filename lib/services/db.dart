@@ -593,7 +593,7 @@ class AppDatabase {
     });
   }
 
-  /// 按标题或消息内容搜索会话，返回每个会话及一段命中内容片段。
+  /// 按标题、消息内容或会话 ID 搜索会话，返回每个会话及一段命中内容片段。
   Future<List<SessionSearchResult>> searchSessions(String query) async {
     final db = await this.db;
     final like = '%$query%';
@@ -603,10 +603,10 @@ class AppDatabase {
              (SELECT COUNT(*) FROM messages m2 WHERE m2.session_id = s.id) AS message_count
       FROM sessions s
       LEFT JOIN messages m ON m.session_id = s.id
-      WHERE s.title LIKE ? OR m.content LIKE ?
+      WHERE s.id = ? OR s.id LIKE ? OR s.title LIKE ? OR m.content LIKE ?
       ORDER BY s.updated_at DESC
     ''',
-      [like, like],
+      [query, like, like, like],
     );
     final out = <SessionSearchResult>[];
     for (final r in rows) {

@@ -449,12 +449,14 @@ String _terminalBackendLabel(String backend) {
   switch (backend) {
     case 'wsl2':
       return 'WSL2（Linux 环境）';
+    case 'gitbash':
+      return 'Git Bash';
     case 'pwsh':
       return 'PowerShell 7';
     case 'cmd':
       return 'cmd';
     default:
-      return '自动（WSL2 → PowerShell）';
+      return '自动（WSL2 → Git Bash → PowerShell）';
   }
 }
 
@@ -2030,7 +2032,7 @@ class _TerminalSectionPageState extends State<_TerminalSectionPage> {
               icon: CupertinoIcons.sparkles,
               color: _iosPurple,
               title: '自动',
-              subtitle: 'WSL2 可用时优先，否则 PowerShell 7，再回退 cmd',
+              subtitle: 'WSL2 → Git Bash → PowerShell 7 → cmd',
               selected: _backend == 'auto',
               onTap: () => _select('auto'),
             ),
@@ -2041,6 +2043,14 @@ class _TerminalSectionPageState extends State<_TerminalSectionPage> {
               subtitle: '完整 Linux 环境（bash/apt/python），需要安装 WSL2',
               selected: _backend == 'wsl2',
               onTap: () => _select('wsl2'),
+            ),
+            _BackendRow(
+              icon: CupertinoIcons.chevron_left_slash_chevron_right,
+              color: _iosOrange,
+              title: 'Git Bash',
+              subtitle: '本机 Git for Windows 的 bash.exe',
+              selected: _backend == 'gitbash',
+              onTap: () => _select('gitbash'),
             ),
             _BackendRow(
               icon: CupertinoIcons.bolt_fill,
@@ -2084,9 +2094,10 @@ class _TerminalSectionPageState extends State<_TerminalSectionPage> {
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
               child: Text(
-                'WSL2 模式下 run_terminal 执行 Linux 命令（bash/apt 等），'
-                'Windows 路径 C:\\... 在 Linux 侧为 /mnt/c/...。'
-                '未安装 WSL2 时建议保持「自动」，会自动回退 PowerShell。',
+                'Windows 终端走本机 WSL2 / Git Bash / PowerShell / cmd。'
+                'WSL2 下 Windows 路径 C:\\... 在 Linux 侧为 /mnt/c/...。'
+                '未安装 WSL2 时「自动」会改用 Git Bash 或 PowerShell。'
+                '默认工作目录是「文档\\agent」。',
                 style: TextStyle(
                   fontSize: 13,
                   height: 1.4,
