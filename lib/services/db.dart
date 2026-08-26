@@ -40,7 +40,7 @@ class AppDatabase {
           : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 19,
+        version: 20,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -80,7 +80,8 @@ class AppDatabase {
       workspace_dir TEXT,
       cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
       cache_input_tokens INTEGER NOT NULL DEFAULT 0,
-      context_limit INTEGER NOT NULL DEFAULT 0
+      context_limit INTEGER NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0
     )
   ''');
     await db.execute('''
@@ -141,7 +142,8 @@ class AppDatabase {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      workspace_dir TEXT
+      workspace_dir TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0
     )
   ''');
   }
@@ -315,6 +317,10 @@ class AppDatabase {
         );
       }
     }
+    // v19 -> v20：项目 / 会话主页长按拖拽排序。
+    if (oldV < 20) {
+      await _ensureSortOrderColumns(db);
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -377,6 +383,22 @@ class AppDatabase {
     if (!projectCols.any((c) => c['name'] == 'workspace_dir')) {
       await db.execute('ALTER TABLE projects ADD COLUMN workspace_dir TEXT');
     }
+    await _ensureSortOrderColumns(db);
+  }
+
+  Future<void> _ensureSortOrderColumns(Database db) async {
+    final sessionCols = await db.rawQuery('PRAGMA table_info(sessions)');
+    if (!sessionCols.any((c) => c['name'] == 'sort_order')) {
+      await db.execute(
+        'ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    final projectCols = await db.rawQuery('PRAGMA table_info(projects)');
+    if (!projectCols.any((c) => c['name'] == 'sort_order')) {
+      await db.execute(
+        'ALTER TABLE projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0',
+      );
+    }
   }
 
   /// 删除把超大内容塞进单行的技能（>800KB），避免 CursorWindow 溢出。
@@ -395,7 +417,8 @@ class AppDatabase {
     final db = await this.db;
     final rows = await db.rawQuery('''
       SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count
-      FROM sessions s ORDER BY s.updated_at DESC
+      FROM sessions s
+      ORDER BY s.sort_order ASC, s.updated_at DESC
     ''');
     return rows.map(Session.fromMap).toList();
   }
@@ -516,14 +539,54 @@ class AppDatabase {
   }
 
   /// 把会话移动到某个项目（projectId 为空 = 未分类）。
-  Future<void> updateSessionProject(String id, String? projectId) async {
+  Future<void> updateSessionProject(
+    String id,
+    String? projectId, {
+    int? sortOrder,
+  }) async {
     final db = await this.db;
+    final updates = <String, dynamic>{
+      'project_id': projectId == null || projectId.isEmpty ? null : projectId,
+    };
+    if (sortOrder != null) updates['sort_order'] = sortOrder;
     await db.update(
       'sessions',
-      {'project_id': projectId == null || projectId.isEmpty ? null : projectId},
+      updates,
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  /// 按给定 id 顺序写入项目 sort_order（下标即顺序）。
+  Future<void> reorderProjects(List<String> ids) async {
+    if (ids.isEmpty) return;
+    final db = await this.db;
+    await db.transaction((txn) async {
+      for (var i = 0; i < ids.length; i++) {
+        await txn.update(
+          'projects',
+          {'sort_order': i + 1},
+          where: 'id = ?',
+          whereArgs: [ids[i]],
+        );
+      }
+    });
+  }
+
+  /// 按给定 id 顺序写入会话 sort_order（下标即顺序）。
+  Future<void> reorderSessions(List<String> ids) async {
+    if (ids.isEmpty) return;
+    final db = await this.db;
+    await db.transaction((txn) async {
+      for (var i = 0; i < ids.length; i++) {
+        await txn.update(
+          'sessions',
+          {'sort_order': i + 1},
+          where: 'id = ?',
+          whereArgs: [ids[i]],
+        );
+      }
+    });
   }
 
   // ---- projects ----
@@ -533,7 +596,7 @@ class AppDatabase {
       SELECT p.*,
              (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id) AS session_count
       FROM projects p
-      ORDER BY p.created_at ASC
+      ORDER BY p.sort_order ASC, p.created_at ASC
     ''');
     return rows.map(Project.fromMap).toList();
   }

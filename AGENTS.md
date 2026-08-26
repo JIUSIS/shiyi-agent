@@ -42,7 +42,8 @@
 - 关键路径：rootfs=`files/termux/local/alpine`、proot/脚本=`local/bin`、库=`local/lib`、
   版本标记=`files/termux/.env_version`（alpine-vN，结构变更时递增）。
 - **主页「终端」栏**：底部第四栏，拾忆与 DSH 都有。命令走 `EmbeddedShell` → `/system/bin/sh` + `init-host -c`，与 `run_terminal` 同一套 proot，禁止再拉一套 Termux。无 PTY，交互是一行命令一次 init-host。
-- **终端交互铁律**：没有底部独立输入框，点画面输入；执行中输入仍可用（busy 时回车喂 stdin）。切引擎不发 Ctrl+C。输入法弹出贴底、滑动历史不弹键盘。输入 / 正常输出 / 警告 / 错误分色。独立 `/` 才弹技能。
+- **终端交互铁律**：没有底部独立输入框，点画面输入；执行中输入仍可用（busy 时回车喂 stdin）。切引擎不发 Ctrl+C。输入法弹出贴底、滑动历史不弹键盘。输入浅蓝 / 正常输出灰绿 / 警告黄 / 错误红；命令行再按 token 分色（命令绿、flag 紫、字符串橙、路径蓝）。独立 `/` 才弹技能。
+- **终端字号与补全**：双指捏合缩放字号，下限 1、上限 28，默认 13；捏合不算点击，不弹键盘。字体必须带中文回退（`NotoSansSC` 等），禁止纯 monospace 导致汉字缺字。输入时按前缀补全内置命令，历史命令优先，未提交部分用浅色幽灵字显示。
 - **默认工作目录**：`/storage/emulated/0/agent`。人设 / 工具规则 / `run_terminal` 描述只写 Alpine / apk / 该路径，不出现 Windows 的「文档\agent」或 WSL / Git Bash / PowerShell。
 - **构建隔离**：`flutter build apk` 只编 `android/` + 共享 `lib/`，不会把 `windows/` 的 exe / C++ 标题栏打进 APK。反过来编 Windows 也不会产出 APK。两端各打各的包。
 
@@ -77,6 +78,25 @@
 - 修改任一聊天 UI 时，必须同步检查并更新另一引擎，不能只修拾忆或只修 DSH。
 - 输入框、消息气泡、工具胶囊、状态条、提问面板、附件预览等能共享的部分必须优先抽成共享组件，禁止复制两套后分别维护。
 - 只有协议或引擎能力确实不同的界面允许单独实现，并需在维护文档说明原因。
+
+## 拾忆主页长按拖拽
+- 项目卡片、会话卡片长按拖起**整张卡片**（头像/标题/背景），不用半透明标题影子。
+- 手势走共享 `HomeLongPressDrag`（350ms `LongPressGestureRecognizer`），禁止再接 `LongPressDraggable` / `DragTarget`。拖影走自建 `HomeDragOverlay`，跟手点是按下位置不是卡片中心。
+- 展开项目长按先 170ms 快速收起，收起的会话必须离开文档流（`outOfFlow` / heightFactor=0）；挤开高度必须用项目头+间距，禁止沿用展开块高度把其它会话挤飞。
+- 拖动时原列表立刻挤开让位；松手从手指位置飞入空隙（缩放 180ms / 飞回 320ms，`easeOutCubic`），远放也要飞回，禁止卸 overlay 后瞬移。
+- 会话拖影高度用 `homeDragCardBodyHeight`（槽位减 8px 间距），禁止把列表间距画进卡面，否则首帧会上下涨一截。
+- 会话拖入另一项目：源列表空占位收起，目标列表先插入 `HomeDragInsertGap` 挤开空隙，再从手指飞入；禁止原地缩小后瞬移。拖回原项目后源占位再打开。跨项目飞入不用回弹曲线，已经出现在目标列表里的新卡片不能再收成 0。
+- 提交后位移立刻贴齐再写库，禁止旧位移套在新顺序上反向弹回（换位后第一下会炸）。飞入结束后等源卡片按最终顺序画完一帧，再卸拖影。
+- 会话拖到另一项目/工作区：未展开停满 1 秒自动展开；已展开停满 1 秒显示「松开以移入」。可释放后占位空隙跟手指在目标列表里移动，松手插到该位置，禁止永远钉在第一格。另一指滚动列表时必须按新坐标重测插入下标，不能冻在拖起那一帧的可见卡片上。测槽位必须用不含 Transform 的布局盒，禁止用动画中的位移去减目标位移。会话写入目标项目/工作区的那一帧必须贴齐位移，且不能再套 foreign translate，否则归位会按卡片高度弹一下。跨组提交完成前源槽必须保持收起，且只收被拖的那张；`keepCollapsed` / `homeDragCardSlotFactor` 不能套到源组其它卡片，否则 BCD 会整组消失再出现。源槽高度不能只看 draggingId。DSH 跨工作区飞入结束后先乐观更新本地 `sessionIds` 和会话 cwd，源名单里没有被拖项之后才能清拖拽态；提交中 `_load` / `_loadSessions` 要静默，禁止先 setState 再整表刷新，否则 BCD 会被撑开再弹回。远放不能直接移入别的项目。拖回原项目必须立刻清掉「松开以移入」，松手归位原项目，禁止沿用上一个目标。
+- 会话在展开列表里拖动时不能被 `SizeTransition` 裁剪命中区；反馈层必须是独立卡片树，不能和列表共用左滑 State。
+- 列表外层必须裁剪：手机 `SafeArea` 内侧 `ClipRect`，搜索栏用不透明 `Material`，`Expanded` 列表再包 `ClipRect`。禁止给会话 ListView 设 `Clip.none` 盖住搜索栏/状态栏。展开列表内部 `unclipped` 只留给长按命中。
+- 顺序写入 `sessions.sort_order` / `projects.sort_order`（缺列由 `_ensureSortOrderColumns` 补，不要误升 DB version 清数据）。
+- 左滑 / 交错展开 / 分组头 / 飞行层抽成共享组件（`lib/widgets/swipe_actions.dart`、`home_drag.dart`、`staggered_sessions.dart`），DSH 工作区页会话级拖拽复用同一套。
+- 左滑必须用 `Listener` 跟手，禁止 `onHorizontalDrag*` 进竞技场；否则会话卡片长按会被抢走。展开列表 `unclipped` 时禁止包 `SizeTransition`。长按计时期间左滑有 300ms 启动窗口，拖中的卡片 `disableSwipe`。
+- DSH 工作区按 `workspace.sessionIds` 显示顺序；重排走 `dshReorderPlanForInsertion` → `workspace.insertSessionBefore`，禁止按 `session.list` 的 `updatedAt` 盖掉服务端顺序。跨工作区提交先乐观更新本地 `sessionIds` 和 cwd，再静默 `_load()`。`insertSessionBefore` 只能动已入账 id；cwd 兜底会话要先 `session.create(workspaceId)` 入账。`session.create` 不能同时带 `workspaceId` 和 `cwd`。
+- DSH 工作区卡片长按排序走 `workspace.insertBefore`（`insertWorkspaceBefore`），和拾忆项目拖拽同一套挤开/飞回。工作区展开状态只在首次进入恢复偏好，之后 `_load` 不得整表盖回旧展开集；长按收起时同步写 `_savedExpanded`。
+- 会话拖到另一个工作区或左滑搬家：官方没有改 `header.cwd` 的 RPC，必须走内置插件 `POST /__shiyi/move-session`（改 zstd/jsonl 头、搬日志目录、registry detach/attach）。插件补丁只写 `$DSH_HOME/cordis.patch.yml`，禁止再写 `profiles/web/cordis.patch.yml`，否则 duplicate id 会让 DSH 起不来。启动最前面若 profile overlay 存在但不是顶层 YAML 数组（空文件/纯注释/对象），写成 `[]`，不要绑在插件部署或 `bin.js` 探测上。插件未加载且 cwd 已一致才允许 attach / `insertSessionBefore` 兜底。归属显示也要 cwd 对得上，不能只看 `sessionIds`。
+- #243「会话长按无拖影」已由 #245 重建关闭。后续视觉/跨项目问题见 `docs/fix-log.md` #246-#273，不要再按 #243 的猜测补丁或重新接系统 Draggable。
 
 ## 拾忆跨会话查阅
 - 拾忆会话之间必须能互相看见：用户从会话卡片左滑「复制 ID」后，把 ID 发到另一个会话，模型要用 `search_sessions` / `read_session` 找到并阅读，禁止声称搜不到或看不见。
@@ -116,5 +136,6 @@
 - 启动同步若发现 `settings.yaml` 已损坏，先备份为 `settings.yaml.corrupt` 再重建干净配置；不要把坏快照再喂给行级 upsert。
 - 密钥只进 credentials / `.credentials.yaml`，禁止写入 provider settings。
 - DSH 0.1.1 的 `.credentials.yaml` 只认 `version: 1` + `refs` / `records`。禁止把 `SHIYI_API_KEY` 写到顶层；启动同步必须把旧扁平文档和混写文档收进 `refs`。
+- `profiles/web/cordis.patch.yml` 必须是顶层 YAML 数组。空文件会让 DSH 退出码 1；启动前由 `_repairDshPatchOverlays` 写成 `[]`。搬家插件不要往这一层 insert。
 - 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML / 凭据文档。YAML 或凭据损坏应靠启动同步自愈，不要误导用户点修复环境。
   Windows 没有这条「修复完整运行环境」Alpine 流程，桌面终端走本机 WSL / Git Bash / pwsh / cmd。

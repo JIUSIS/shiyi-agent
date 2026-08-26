@@ -44,6 +44,69 @@ void main() {
     expect(dshIsDefaultWorkspacePath('/storage/emulated/0/docs', def), isFalse);
   });
 
+  test('展开偏好只在首次恢复，后续刷新不能把收起的工作区再打开', () {
+    expect(
+      dshRestoreExpandedWorkspaceIds(
+        saved: null,
+        knownIds: const ['def', 'docs'],
+        defaultWorkspaceId: 'def',
+      ),
+      {'def'},
+    );
+    expect(
+      dshRestoreExpandedWorkspaceIds(
+        saved: const ['docs'],
+        knownIds: const ['def', 'docs'],
+        defaultWorkspaceId: 'def',
+      ),
+      {'docs'},
+    );
+    expect(
+      dshRestoreExpandedWorkspaceIds(
+        saved: const ['gone', 'docs'],
+        knownIds: const ['def', 'docs'],
+        defaultWorkspaceId: 'def',
+      ),
+      {'docs'},
+    );
+  });
+
+  test('cwd 一致才算已入账，对不上的 sessionIds 不当成该工作区', () {
+    DshWorkspace w(String id, String path, List<String> ids) => DshWorkspace(
+      workspaceId: id,
+      path: path,
+      title: id,
+      sessionIds: ids,
+      createdAt: '',
+      updatedAt: '',
+    );
+    final defW = w('def', def, const ['s-old']);
+    final docs = w('docs', '/storage/emulated/0/docs', const []);
+    expect(
+      dshWorkspaceIdsForSession(
+        sessionId: 's-old',
+        cwd: '/storage/emulated/0/docs',
+        workspaces: [defW, docs],
+        defaultWorkspaceId: 'def',
+      ),
+      ['docs'],
+    );
+    expect(
+      dshSessionMoveCwd(
+        sessionCwd: '/storage/emulated/0/agent',
+        workspacePath: '/storage/emulated/0/docs',
+      ),
+      '/storage/emulated/0/docs',
+    );
+    expect(
+      dshSessionMoveCwd(
+        sessionCwd: '/storage/emulated/0/docs/',
+        workspacePath: '/storage/emulated/0/docs',
+      ),
+      isNull,
+    );
+  });
+
   test('未写入 sessionIds 时按会话 cwd 归到对应工作区', () {
     DshWorkspace w(String id, String path, List<String> ids) => DshWorkspace(
       workspaceId: id,
@@ -72,6 +135,86 @@ void main() {
         defaultWorkspaceId: 'def',
       ),
       ['def'],
+    );
+  });
+
+  test('只改 sessionIds 不改 cwd 时，会话会按路径掉回原工作区', () {
+    DshWorkspace w(String id, String path, List<String> ids) => DshWorkspace(
+      workspaceId: id,
+      path: path,
+      title: id,
+      sessionIds: ids,
+      createdAt: '',
+      updatedAt: '',
+    );
+    final src = w('src', '/ws/src', const ['a', 'b', 'c', 'd']);
+    final dst = w('dst', '/ws/dst', const []);
+    expect(
+      dshWorkspaceIdsForSession(
+        sessionId: 'a',
+        cwd: '/ws/src',
+        workspaces: [
+          src.copyWith(sessionIds: const ['b', 'c', 'd']),
+          dst.copyWith(sessionIds: const ['a']),
+        ],
+        defaultWorkspaceId: 'src',
+      ),
+      ['src'],
+    );
+  });
+
+  test('乐观搬家同时改 sessionIds 和 cwd，源工作区只剩 BCD', () {
+    DshWorkspace w(String id, String path, List<String> ids) => DshWorkspace(
+      workspaceId: id,
+      path: path,
+      title: id,
+      sessionIds: ids,
+      createdAt: '',
+      updatedAt: '',
+    );
+    DshSessionSummary s(String id, String cwd) => DshSessionSummary(
+      sessionId: id,
+      updatedAt: 0,
+      running: false,
+      blank: true,
+      cwd: cwd,
+    );
+    final src = w('src', '/ws/src', const ['a', 'b', 'c', 'd']);
+    final dst = w('dst', '/ws/dst', const ['x']);
+    final moved = dshOptimisticMoveSession(
+      workspaces: [src, dst],
+      sessions: [s('a', '/ws/src'), s('b', '/ws/src'), s('x', '/ws/dst')],
+      sessionId: 'a',
+      toWorkspaceId: 'dst',
+      toIndex: 1,
+    );
+    expect(moved.workspaces[0].sessionIds, ['b', 'c', 'd']);
+    expect(moved.workspaces[1].sessionIds, ['x', 'a']);
+    expect(moved.sessions.firstWhere((e) => e.sessionId == 'a').cwd, '/ws/dst');
+    expect(
+      dshWorkspaceIdsForSession(
+        sessionId: 'a',
+        cwd: moved.sessions.firstWhere((e) => e.sessionId == 'a').cwd,
+        workspaces: moved.workspaces,
+        defaultWorkspaceId: 'src',
+      ),
+      ['dst'],
+    );
+  });
+
+  test('工作区会话按 sessionIds 排，cwd 兜底项接到末尾', () {
+    DshSessionSummary s(String id) => DshSessionSummary(
+      sessionId: id,
+      updatedAt: 0,
+      running: false,
+      blank: true,
+    );
+    expect(
+      dshOrderedWorkspaceSessions(
+        assigned: [s('c'), s('a'), s('b'), s('d')],
+        sessionIds: const ['b', 'a'],
+      ).map((e) => e.sessionId),
+      ['b', 'a', 'c', 'd'],
     );
   });
 

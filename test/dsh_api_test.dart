@@ -1598,6 +1598,111 @@ void main() {
     expect(payload.containsKey('expectedRevision'), isFalse);
   });
 
+  test('moveSessionToWorkspace：POST /__shiyi/move-session', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
+        jsonEncode({'ok': true, 'moved': true, 'sessionId': 'session-1'}),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final result = await clientWith(mock).moveSessionToWorkspace(
+      sessionId: 'session-1',
+      workspaceId: 'ws-2',
+      workspacePath: '/storage/emulated/0/docs',
+    );
+    expect(result['moved'], true);
+    expect(captured.url.toString(), 'http://test.local/__shiyi/move-session');
+    expect(captured.method, 'POST');
+    expect(jsonDecode(captured.body), {
+      'sessionId': 'session-1',
+      'workspaceId': 'ws-2',
+      'workspacePath': '/storage/emulated/0/docs',
+    });
+  });
+
+  test('moveSessionToWorkspace：404 视为插件未加载', () async {
+    final mock = MockClient((req) async => http.Response('not found', 404));
+    try {
+      await clientWith(
+        mock,
+      ).moveSessionToWorkspace(sessionId: 'session-1', workspaceId: 'ws-2');
+      fail('should throw');
+    } on DshApiException catch (e) {
+      expect(e.code, 'plugin-missing');
+    }
+  });
+
+  test('insertWorkspaceBefore：before 为 null 时省略锚点（挪到末尾）', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'workspaceIds': ['ws-2', 'ws-1'],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final ids = await clientWith(mock).insertWorkspaceBefore('ws-1');
+    expect(ids, ['ws-2', 'ws-1']);
+    expect(
+      captured.url.toString(),
+      'http://test.local/api/workspace.insertBefore',
+    );
+    final body = jsonDecode(captured.body) as Map<String, dynamic>;
+    expect(body['method'], 'workspace.insertBefore');
+    expect(body['payload'], {'workspaceId': 'ws-1'});
+  });
+
+  test('insertWorkspaceBefore：带锚点时写入 beforeWorkspaceId', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'workspaceIds': ['ws-1', 'ws-2'],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    await clientWith(
+      mock,
+    ).insertWorkspaceBefore('ws-1', beforeWorkspaceId: 'ws-2');
+    final body = jsonDecode(captured.body) as Map<String, dynamic>;
+    expect(body['payload'], {
+      'workspaceId': 'ws-1',
+      'beforeWorkspaceId': 'ws-2',
+    });
+  });
+
+  test('createSession：带 workspaceId 时不写 cwd', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
+        jsonEncode(okValue({'sessionId': 'sess-ws'})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final id = await clientWith(
+      mock,
+    ).createSession(cwd: '/storage/emulated/0/docs', workspaceId: 'ws-1');
+    expect(id, 'sess-ws');
+    final body = jsonDecode(captured.body) as Map<String, dynamic>;
+    expect(body['method'], 'session.create');
+    expect(body['payload'], {'workspaceId': 'ws-1'});
+  });
+
   test('createSession：带 sessionId 时复用已有会话（唤醒挂载）', () async {
     late http.Request captured;
     final mock = MockClient((req) async {

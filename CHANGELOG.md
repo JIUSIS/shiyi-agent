@@ -2,6 +2,26 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.5.9] - 2026-08-26
+
+相对 2.5.8：主页拖拽抽成共享组件，DSH 工作区会话也能长按排序并持久化到服务端。
+
+### 优化
+
+- **拖拽滚动重测**：按住拖动时另一指滑动列表，占位会跟到新划出来的格子，不再冻在当前屏那几张卡片上。
+- **跨项目插入位置**：会话拖到其他项目/工作区后，占位空隙跟手指走，可插到任意格，不再钉在第一格。
+- **DSH 启动自愈 overlay**：profile 层 `cordis.patch.yml` 若不是 YAML 数组（空文件会退出码 1），启动前写成 `[]`；搬家插件只写 home 层，避免 duplicate id。
+- **共享拖拽组件**：左滑、交错展开、分组头、飞行层 / 让位位移从拾忆主页抽出，DSH 工作区页复用同一套交互。
+- **DSH 工作区会话排序**：组内按 `workspace.sessionIds` 显示，不再被 `session.list` 的 `updatedAt` 盖掉；长按拖拽同组重排或停满 1 秒跨工作区移入。
+- **DSH 顺序持久化**：`dshReorderPlanForInsertion` 以最长公共连续段为锚点，后向前生成 `insertSessionBefore`，尾部移动是插到末尾，不会被前项带偏。
+- **会话卡片长按拖拽**（同版本覆盖）：`HomeLongPressDrag` + 自建 overlay 拖起整张卡片；#243 无拖影已关闭。跨组提交只收被拖项源槽；DSH 先乐观改 `sessionIds` 和 cwd 再静默刷新，源组其它卡片不再被撑开或整组消失。
+
+### 验证
+
+- `flutter test test/home_list_order_test.dart test/dsh_workspace_display_name_test.dart test/home_sessions_tab_test.dart` 通过。
+- `dart analyze` 相关文件无告警。
+- 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
+
 ## [2.5.8] - 2026-08-24
 
 相对 2.5.7：拾忆会话之间可按会话 ID 互相查阅；Windows 工作目录、终端和提示词与 Android 彻底分家。
@@ -16,10 +36,14 @@
 - **Windows 终端后端**：自动顺序 WSL2 → Git Bash → PowerShell 7 → cmd；不走 Android Alpine / proot / apk。设置页这条入口只在桌面显示。
 - **提示词按平台隔离**：人设 / 工具规则 / `run_terminal` / `file_write` 两端各写各的，禁止「Android …；Windows …」写进同一段。
 - **Win11 红绿灯悬停灰条**：原生子窗口 `SHIYI_TITLEBAR` 盖住系统标题栏悬停层；桌面图标与 Android 启动图标同一套。
+- **终端捏合 / 补全 / 分色**（2026-08-25 同版本覆盖）：双指捏合缩放字号（1~28，默认 13），中文回退避免缺字；命令前缀补全（历史优先 + 幽灵字）；命令行按 token 分色。
+- **Markdown 再补缺口**（2026-08-25）：嵌套强调、转义、自动/参考式链接、HTML 片段、表格对齐、有序列表重排、硬换行等，拾忆与 DSH 共用。
+- **主页长按拖拽**（2026-08-25）：项目 / 会话卡片长按拖起整张卡片排序；会话可拖到另一项目（停满 1 秒）；松手飞入空隙，远放不瞬移，提交贴齐不弹回。
 
 ### 验证
 
 - `flutter test` 全量通过（含 `session_bridge` / `file_workspace` / `terminal_backend` / `prompt_section` / 工具与提示词快照）。
+- 2026-08-25 覆盖：`flutter test test/terminal_pane_test.dart test/markdown_text_test.dart test/home_list_order_test.dart test/home_sessions_tab_test.dart` 通过。
 - 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
 
 ## [2.5.7] - 2026-08-24

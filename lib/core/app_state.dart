@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/home_list_order.dart';
 import '../core/model_presets.dart';
 import '../core/models.dart';
 import '../services/db.dart';
@@ -1123,6 +1124,12 @@ class ShiyiState extends ChangeNotifier {
     _clearTrimNotice();
     final now = DateTime.now().millisecondsSinceEpoch;
     final id = 's${now}_${_rand()}';
+    var minOrder = 0;
+    for (final s in sessions) {
+      if (s.projectId == projectId && s.sortOrder < minOrder) {
+        minOrder = s.sortOrder;
+      }
+    }
     await _db.upsertSession(
       Session(
         id: id,
@@ -1133,6 +1140,7 @@ class ShiyiState extends ChangeNotifier {
         updatedAt: now,
         projectId: projectId,
         contextLimit: sanitizeLoadedContextLimit(settings.contextLimit),
+        sortOrder: minOrder - 1,
       ),
     );
     currentSessionId = id;
@@ -1258,11 +1266,16 @@ class ShiyiState extends ChangeNotifier {
     final t = name.trim();
     if (t.isEmpty) throw Exception('项目名不能为空');
     final now = DateTime.now().millisecondsSinceEpoch;
+    var maxOrder = 0;
+    for (final p in projects) {
+      if (p.sortOrder > maxOrder) maxOrder = p.sortOrder;
+    }
     final p = Project(
       id: 'p${now}_${_rand()}',
       name: t,
       createdAt: now,
       workspaceDir: workspaceDir.trim(),
+      sortOrder: maxOrder + 1,
     );
     await _db.upsertProject(p);
     await refreshProjects();
@@ -1284,6 +1297,54 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> moveSessionToProject(String sessionId, String? projectId) async {
     await _db.updateSessionProject(sessionId, projectId);
+    await refreshSessions();
+  }
+
+  /// 主页长按拖拽后按给定 id 顺序重排项目。
+  Future<void> reorderProjects(List<String> ids) async {
+    if (ids.isEmpty) return;
+    await _db.reorderProjects(ids);
+    await refreshProjects();
+  }
+
+  /// 主页长按拖拽后按给定 id 顺序重排会话（可跨项目）。
+  Future<void> reorderSessions(List<String> ids) async {
+    if (ids.isEmpty) return;
+    await _db.reorderSessions(ids);
+    await refreshSessions();
+  }
+
+  /// 把会话拖到另一项目的指定位置（[toIndex] 为该项目内新下标）。
+  Future<void> moveSessionToProjectAt({
+    required String sessionId,
+    required String toProjectId,
+    required int toIndex,
+  }) async {
+    final byProject = <String, List<String>>{};
+    for (final s in sessions) {
+      byProject.putIfAbsent(s.projectId, () => []).add(s.id);
+    }
+    String fromProjectId = '';
+    for (final s in sessions) {
+      if (s.id == sessionId) {
+        fromProjectId = s.projectId;
+        break;
+      }
+    }
+    final next = moveSessionOrder(
+      byProject,
+      sessionId: sessionId,
+      fromProjectId: fromProjectId,
+      toProjectId: toProjectId,
+      toIndex: toIndex,
+    );
+    await _db.updateSessionProject(
+      sessionId,
+      toProjectId.isEmpty ? null : toProjectId,
+      sortOrder: toIndex + 1,
+    );
+    final ordered = <String>[for (final ids in next.values) ...ids];
+    await _db.reorderSessions(ordered);
     await refreshSessions();
   }
 

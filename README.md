@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.5.8.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.8/shiyi-agent-v2.5.8.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.5.9.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.9/shiyi-agent-v2.5.9.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -23,7 +23,7 @@
 - 多模型接入：内置 OpenAI / Anthropic / Gemini / DeepSeek 等常见 API 预设，支持自定义接口配置管理、一键获取模型 ID 与测试连接；已保存配置可分别注入 DSH
 - 多轮对话与独立会话管理：搜索 / 重命名 / 删除 / 左滑快捷操作（含复制会话 ID）
 - 拾忆跨会话查阅：把会话 ID 发到另一个拾忆会话，模型可用 `search_sessions` / `read_session` 找到并阅读，不走长期记忆或联网搜索
-- 项目分类管理会话：新建项目时选择文件夹，项目横幅点击展开 / 收起，左滑支持新建会话 / 文件夹 / 重命名 / 删除
+- 项目分类管理会话：新建项目时选择文件夹，项目横幅点击展开 / 收起，左滑支持新建会话 / 文件夹 / 重命名 / 删除；长按项目 / 会话卡片可拖拽排序，会话可拖到另一项目（停满 1 秒）
 - 项目级工作目录：项目设置一次，项目下会话自动继承；会话也可单独覆盖
 - 文件 / 图片多选附件，支持视觉模型图片理解
 - 流式输出、自动重试、上下文自动压缩与硬窗口保护；手动压缩走输入区常驻按钮
@@ -50,7 +50,7 @@
 
 ### 内置终端
 
-- 底部「终端」栏与 AI 的 `run_terminal` 共用内嵌 Alpine（bash / python3 / apk），**无需安装 Termux、无需 root**；点画面输入，输入 / 输出 / 警告 / 错误分色
+- 底部「终端」栏与 AI 的 `run_terminal` 共用内嵌 Alpine（bash / python3 / apk），**无需安装 Termux、无需 root**；点画面输入，输入 / 输出 / 警告 / 错误分色；双指捏合缩放字号，命令前缀补全，命令行按 token 分色
 - **2026-08-15 起基于 Alpine Linux**（proot + minirootfs，APK 内置约 3.9MB，取代旧 Termux bootstrap 40MB+）：
   - 包管理 `apk`（清华镜像优先 + 官方兜底，网络抖动自动重试），命令全部在 Alpine 沙箱内执行；
   - Node.js 环境（`apk add nodejs npm`）随 DeepSeek Harness 引擎自动安装，无需手动配置；

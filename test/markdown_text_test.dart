@@ -87,7 +87,9 @@ void main() {
     expect(find.text('苹果'), findsOneWidget);
     expect(find.text('水\n果'), findsNothing);
     final fruitW = tester.getSize(find.byKey(const ValueKey('md-col-0'))).width;
-    final originW = tester.getSize(find.byKey(const ValueKey('md-col-1'))).width;
+    final originW = tester
+        .getSize(find.byKey(const ValueKey('md-col-1')))
+        .width;
     final priceW = tester.getSize(find.byKey(const ValueKey('md-col-2'))).width;
     expect(fruitW, greaterThan(40));
     expect(originW, greaterThan(40));
@@ -111,9 +113,13 @@ void main() {
     expect(find.text('需求分析'), findsOneWidget);
     expect(find.text('系统架构设计'), findsOneWidget);
     expect(find.text('需\n求\n分\n析'), findsNothing);
-    final serialW = tester.getSize(find.byKey(const ValueKey('md-col-0'))).width;
+    final serialW = tester
+        .getSize(find.byKey(const ValueKey('md-col-0')))
+        .width;
     final titleW = tester.getSize(find.byKey(const ValueKey('md-col-1'))).width;
-    final statusW = tester.getSize(find.byKey(const ValueKey('md-col-2'))).width;
+    final statusW = tester
+        .getSize(find.byKey(const ValueKey('md-col-2')))
+        .width;
     final bodyW = tester.getSize(find.byKey(const ValueKey('md-col-3'))).width;
     expect(serialW, lessThan(40));
     expect(statusW, lessThan(40));
@@ -228,10 +234,7 @@ void main() {
       language: 'python',
     );
     expect(spans.length, greaterThan(1));
-    final colors = spans
-        .map((s) => s.style?.color)
-        .whereType<Color>()
-        .toSet();
+    final colors = spans.map((s) => s.style?.color).whereType<Color>().toSet();
     expect(colors.length, greaterThanOrEqualTo(3));
     expect(spans.any((s) => s.text == 'def'), isTrue);
     expect(spans.any((s) => s.text == '# note'), isTrue);
@@ -347,18 +350,10 @@ void main() {
   });
 
   test('脚注标记解析：内联内容与百分号解码', () {
+    expect(markdownFootnoteMatch('见这里[^1](第一脚注)。')?.id, '1');
+    expect(markdownFootnoteMatch('见这里[^1](第一脚注)。')?.content, '第一脚注');
     expect(
-      markdownFootnoteMatch('见这里[^1](第一脚注)。')?.id,
-      '1',
-    );
-    expect(
-      markdownFootnoteMatch('见这里[^1](第一脚注)。')?.content,
-      '第一脚注',
-    );
-    expect(
-      markdownFootnoteMatch(
-        'x[^note](%E4%BD%A0%E5%A5%BD)。',
-      )?.content,
+      markdownFootnoteMatch('x[^note](%E4%BD%A0%E5%A5%BD)。')?.content,
       '你好',
     );
     expect(markdownFootnoteMatch('普通[链接](https://example.com)'), isNull);
@@ -441,7 +436,8 @@ void main() {
   });
 
   testWidgets('定义列表缩进冒号也渲染，不露原始冒号行', (tester) async {
-    const md = '术语 A\n    :   术语 A 的定义解释，可以很长很长，会自动换行缩进。\n\n术语 B\n：  术语 B 的定义，支持 **富文本** 格式。';
+    const md =
+        '术语 A\n    :   术语 A 的定义解释，可以很长很长，会自动换行缩进。\n\n术语 B\n：  术语 B 的定义，支持 **富文本** 格式。';
     await tester.pumpWidget(
       const MaterialApp(home: Scaffold(body: AdaptiveMarkdownText(md))),
     );
@@ -635,7 +631,8 @@ $$
   });
 
   testWidgets('已有强调与链接不被新语法打断', (tester) async {
-    const md = '这是**加粗文本**，这是*斜体文本*，这是~~删除线文本~~，这是`行内代码`，这是[超链接](https://example.com)。';
+    const md =
+        '这是**加粗文本**，这是*斜体文本*，这是~~删除线文本~~，这是`行内代码`，这是[超链接](https://example.com)。';
     await tester.pumpWidget(
       const MaterialApp(home: Scaffold(body: AdaptiveMarkdownText(md))),
     );
@@ -645,5 +642,169 @@ $$
     expect(find.textContaining('删除线文本'), findsOneWidget);
     expect(find.textContaining('行内代码'), findsOneWidget);
     expect(find.textContaining('超链接'), findsOneWidget);
+  });
+
+  test('粗体里嵌斜体拆成可渲染片段', () {
+    final parts = markdownEmphasisParts('粗体里再嵌 _斜体_');
+    expect(parts.map((p) => (p.text, p.italic)).toList(), [
+      ('粗体里再嵌 ', false),
+      ('斜体', true),
+    ]);
+  });
+
+  test('转义后的标记保持字面量', () {
+    expect(markdownUnescape(r'\*不是斜体\*'), '*不是斜体*');
+    expect(markdownUnescape(r'\#'), '#');
+    expect(markdownUnescape(r'\\'), r'\');
+    expect(markdownLooksEscaped(r'\*不是斜体\*'), isTrue);
+    expect(markdownLooksEscaped('*斜体*'), isFalse);
+  });
+
+  test('自动链接与参考式链接能解析', () {
+    expect(
+      markdownAutolinkMatch('见 https://example.com 文档')?.url,
+      'https://example.com',
+    );
+    expect(
+      markdownEmailLinkMatch('写给 user@example.com')?.url,
+      'mailto:user@example.com',
+    );
+    const md = '''
+[参考式写法][ref-demo]
+
+[ref-demo]: https://example.com "参考式链接"
+''';
+    expect(
+      markdownReferenceLinkDefs(md)['ref-demo']?.url,
+      'https://example.com',
+    );
+    expect(
+      markdownResolveReferenceLink(
+        '[参考式写法][ref-demo]',
+        markdownReferenceLinkDefs(md),
+      )?.url,
+      'https://example.com',
+    );
+  });
+
+  test('表格对齐行解析左右中', () {
+    expect(markdownTableAlignments([':-----', ':---:', '-----:']), [
+      TextAlign.left,
+      TextAlign.center,
+      TextAlign.right,
+    ]);
+  });
+
+  test('有序列表编号按出现顺序重排，不跟原文数字', () {
+    expect(markdownOrderedListNumber(visibleIndex: 0, raw: '1.'), '1.');
+    expect(markdownOrderedListNumber(visibleIndex: 1, raw: '1.'), '2.');
+    expect(markdownOrderedListNumber(visibleIndex: 2, raw: '7.'), '3.');
+  });
+
+  test('加号无序列表也识别', () {
+    expect(markdownIsListBlock('+ 也可用加号\n'), isTrue);
+  });
+
+  test('行尾两空格转成硬换行，双反引号包住内嵌反引号', () {
+    expect(markdownHardBreaks('同一段里  \n这样硬换行'), '同一段里\n这样硬换行');
+    expect(markdownInlineCodeText('`` 这里有个 ` 符号 ``'), '这里有个 ` 符号');
+  });
+
+  testWidgets('嵌套强调、转义、自动链接、参考式链接、HTML 片段都按效果渲染', (tester) async {
+    const md = r'''
+**粗体里再嵌 _斜体_**
+
+\*不是斜体\*
+
+https://example.com
+
+user@example.com
+
+[参考式写法][ref-demo]
+
+[ref-demo]: https://example.com "参考式链接"
+
+<u>下划线</u>
+<sup>上标</sup> 与 <sub>下标</sub>
+<mark>这段被标出来</mark>
+第一行<br>第二行
+
+<details>
+<summary>折叠块（点我展开）</summary>
+折叠里面还可以再写 Markdown
+</details>
+''';
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(child: AdaptiveMarkdownText(md)),
+        ),
+      ),
+    );
+    expect(tester.takeException(), isNull);
+    expect(find.textContaining('粗体里再嵌'), findsOneWidget);
+    expect(find.textContaining('斜体'), findsWidgets);
+    expect(find.textContaining('*不是斜体*'), findsOneWidget);
+    expect(find.textContaining(r'\*不是斜体\*'), findsNothing);
+    expect(find.textContaining('https://example.com'), findsWidgets);
+    expect(find.textContaining('user@example.com'), findsOneWidget);
+    expect(find.textContaining('参考式写法'), findsOneWidget);
+    expect(find.textContaining('[ref-demo]'), findsNothing);
+    expect(find.textContaining('下划线'), findsOneWidget);
+    expect(find.textContaining('<u>'), findsNothing);
+    expect(find.textContaining('上标'), findsOneWidget);
+    expect(find.textContaining('下标'), findsOneWidget);
+    expect(find.textContaining('这段被标出来'), findsOneWidget);
+    expect(find.textContaining('<mark>'), findsNothing);
+    expect(find.textContaining('第一行'), findsOneWidget);
+    expect(find.textContaining('第二行'), findsOneWidget);
+    expect(find.textContaining('<br>'), findsNothing);
+    expect(find.textContaining('折叠块（点我展开）'), findsOneWidget);
+    expect(find.textContaining('<details>'), findsNothing);
+  });
+
+  testWidgets('引用可嵌套、加号列表、有序编号连续、表格对齐生效', (tester) async {
+    const md = '''
+> 一级引用
+>
+> > 嵌套引用
+
++ 也可用加号
+
+1. 第一项
+1. 还是会变成 2
+7. 还是会变成 3
+
+| 左对齐 | 居中 | 右对齐 |
+| :----- | :---: | -----: |
+| 左 | 中 | 右 |
+''';
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(child: AdaptiveMarkdownText(md)),
+        ),
+      ),
+    );
+    expect(tester.takeException(), isNull);
+    expect(find.textContaining('一级引用'), findsOneWidget);
+    expect(find.textContaining('嵌套引用'), findsOneWidget);
+    expect(find.textContaining('也可用加号'), findsOneWidget);
+    expect(find.text('1.'), findsOneWidget);
+    expect(find.text('2.'), findsOneWidget);
+    expect(find.text('3.'), findsOneWidget);
+    expect(find.text('7.'), findsNothing);
+    final specs = markdownTableColumnSpecs(
+      headers: ['左对齐', '居中', '右对齐'],
+      body: [
+        ['左', '中', '右'],
+      ],
+      alignments: markdownTableAlignments([':-----', ':---:', '-----:']),
+    );
+    expect(specs.map((s) => s.textAlign).toList(), [
+      TextAlign.left,
+      TextAlign.center,
+      TextAlign.right,
+    ]);
   });
 }

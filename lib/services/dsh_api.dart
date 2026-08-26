@@ -145,6 +145,29 @@ class DshSessionSummary {
     );
   }
 
+  DshSessionSummary withCwd(String? cwd) => DshSessionSummary(
+    sessionId: sessionId,
+    title: title,
+    updatedAt: updatedAt,
+    running: running,
+    blank: blank,
+    cwd: cwd,
+    agentPreset: agentPreset,
+    turnCount: turnCount,
+    stepCount: stepCount,
+    isSubagent: isSubagent,
+    llmMs: llmMs,
+    toolMs: toolMs,
+    ttftMs: ttftMs,
+    ttftSteps: ttftSteps,
+    decodeMs: decodeMs,
+    decodeTokens: decodeTokens,
+    uncachedInputTokens: uncachedInputTokens,
+    cacheReadTokens: cacheReadTokens,
+    cacheWriteTokens: cacheWriteTokens,
+    outputTokens: outputTokens,
+  );
+
   /// 还原成 [fromJson] 可读的原始结构，供主页本地缓存使用。
   Map<String, dynamic> toJson() => {
     'sessionId': sessionId,
@@ -288,6 +311,15 @@ class DshWorkspace {
     'createdAt': createdAt,
     'updatedAt': updatedAt,
   };
+
+  DshWorkspace copyWith({List<String>? sessionIds}) => DshWorkspace(
+    workspaceId: workspaceId,
+    path: path,
+    title: title,
+    sessionIds: sessionIds ?? this.sessionIds,
+    createdAt: createdAt,
+    updatedAt: updatedAt,
+  );
 }
 
 /// 子代理条目（subagent.list 行）。
@@ -637,11 +669,24 @@ class DshApiClient {
     return out;
   }
 
-  /// 新建或唤醒会话。传入 [sessionId] 会复用 DSH 已有会话并完成挂载；
-  /// 新会话必须带上工作区路径，否则 DSH 会落在宿主默认目录（agent）。
-  Future<String> createSession({String? cwd, String? sessionId}) async {
+  /// 新建或唤醒会话。传入 [sessionId] 会复用 DSH 已有会话并完成挂载。
+  ///
+  /// [workspaceId] 与 [cwd] 不能同时传（DSH 协议：`session.create accepts
+  /// workspaceId or cwd, not both`）。带 [workspaceId] 时 DSH 用工作区路径
+  /// 作为 cwd，并 `attachSession` 入账；只带 [cwd] 不会写入 `sessionIds`，
+  /// 之后 `insertSessionBefore` 会因未入账失败。
+  Future<String> createSession({
+    String? cwd,
+    String? sessionId,
+    String? workspaceId,
+  }) async {
     final payload = <String, dynamic>{};
-    if (cwd != null && cwd.isNotEmpty) payload['cwd'] = cwd;
+    final workspace = workspaceId?.trim() ?? '';
+    if (workspace.isNotEmpty) {
+      payload['workspaceId'] = workspace;
+    } else if (cwd != null && cwd.isNotEmpty) {
+      payload['cwd'] = cwd;
+    }
     if (sessionId != null && sessionId.trim().isNotEmpty) {
       payload['sessionId'] = sessionId.trim();
     }
@@ -941,12 +986,71 @@ class DshApiClient {
     await _rpc('workspace.delete', {'workspaceId': workspaceId});
   }
 
+  /// 调整工作区显示顺序（workspace.insertBefore）。
+  /// [beforeWorkspaceId] 为 null 表示挪到末尾。
+  Future<List<String>> insertWorkspaceBefore(
+    String workspaceId, {
+    String? beforeWorkspaceId,
+  }) async {
+    final v = await _rpc('workspace.insertBefore', {
+      'workspaceId': workspaceId,
+      'beforeWorkspaceId': ?beforeWorkspaceId,
+    });
+    return ((v['workspaceIds'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList();
+  }
+
   /// 归档会话（workspace.archiveSession）。
   Future<List<String>> archiveSession(String sessionId) async {
     final v = await _rpc('workspace.archiveSession', {'sessionId': sessionId});
     return ((v['archivedSessionIds'] as List?) ?? const [])
         .map((e) => e.toString())
         .toList();
+  }
+
+  /// 把会话搬到另一个工作区目录。
+  ///
+  /// 官方 `insertSessionBefore` 不能改 header.cwd；跨目录必须走拾忆内置
+  /// 插件 `POST /__shiyi/move-session`。插件未加载时抛 `plugin-missing`。
+  Future<Map<String, dynamic>> moveSessionToWorkspace({
+    required String sessionId,
+    required String workspaceId,
+    String? workspacePath,
+  }) async {
+    final http.Response res;
+    final payload = <String, String>{
+      "sessionId": sessionId,
+      "workspaceId": workspaceId,
+    };
+    final path = workspacePath?.trim() ?? "";
+    if (path.isNotEmpty) payload["workspacePath"] = path;
+    try {
+      res = await _client
+          .post(
+            Uri.parse("$_baseUrl/__shiyi/move-session"),
+            headers: const {"content-type": "application/json"},
+            body: jsonEncode(payload),
+          )
+          .timeout(const Duration(seconds: 60));
+    } catch (e) {
+      throw DshApiException("DeepSeek Harness 服务不可达：$e");
+    }
+    if (res.statusCode == 404) {
+      throw DshApiException("跨工作区移动插件未加载", code: "plugin-missing");
+    }
+    Map<String, dynamic> body = const {};
+    try {
+      final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+      if (decoded is Map<String, dynamic>) body = decoded;
+    } catch (_) {}
+    if (res.statusCode != 200 || body["ok"] != true) {
+      throw DshApiException(
+        body["error"]?.toString() ?? "移动失败（HTTP ${res.statusCode}）",
+        code: body["code"]?.toString() ?? "session-move-failed",
+      );
+    }
+    return body;
   }
 
   /// 把会话插入工作区（workspace.insertSessionBefore）。

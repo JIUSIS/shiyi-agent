@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shiyi_agent_app/core/home_list_order.dart';
 import 'package:shiyi_agent_app/screens/home_screen.dart';
 
 void main() {
@@ -55,6 +56,12 @@ void main() {
   group('拾忆会话卡片左滑', () {
     test('左滑操作含复制 ID，删除仍在最右', () {
       expect(shiyiSessionSwipeLabels, ['重命名', '项目', '复制 ID', '删除']);
+    });
+  });
+
+  group('拾忆主页长按拖拽', () {
+    test('会话拖到项目卡片上停顿一秒才展开或可释放', () {
+      expect(kHomeDragHoverDelay, const Duration(seconds: 1));
     });
   });
 }

@@ -121,6 +121,9 @@ class Session {
   /// 本会话自定义上下文上限（token）。0 = 跟随全局「新建会话默认」。
   int contextLimit;
 
+  /// 项目内显示顺序；越小越靠前。未手动排序时为 0，列表按 created_at 兜底。
+  int sortOrder;
+
   Session({
     required this.id,
     required this.title,
@@ -137,6 +140,7 @@ class Session {
     this.cacheHitTokens = 0,
     this.cacheInputTokens = 0,
     this.contextLimit = 0,
+    this.sortOrder = 0,
   });
 
   Map<String, dynamic> toMap() => {
@@ -154,6 +158,7 @@ class Session {
     'cache_hit_tokens': cacheHitTokens,
     'cache_input_tokens': cacheInputTokens,
     'context_limit': contextLimit,
+    'sort_order': sortOrder,
   };
 
   factory Session.fromMap(Map<String, dynamic> m) => Session(
@@ -186,6 +191,9 @@ class Session {
     contextLimit: m['context_limit'] == null
         ? 0
         : int.tryParse('${m['context_limit']}') ?? 0,
+    sortOrder: m['sort_order'] == null
+        ? 0
+        : int.tryParse('${m['sort_order']}') ?? 0,
   );
 }
 
@@ -199,12 +207,16 @@ class Project {
   /// 项目级工作目录：未单独设置目录的会话自动使用它。
   String workspaceDir;
 
+  /// 主页显示顺序；越小越靠前。未手动排序时为 0，列表按 created_at 兜底。
+  int sortOrder;
+
   Project({
     required this.id,
     required this.name,
     required this.createdAt,
     this.sessionCount = 0,
     this.workspaceDir = '',
+    this.sortOrder = 0,
   });
 
   Map<String, dynamic> toMap() => {
@@ -212,6 +224,7 @@ class Project {
     'name': name,
     'created_at': createdAt,
     'workspace_dir': workspaceDir,
+    'sort_order': sortOrder,
   };
 
   factory Project.fromMap(Map<String, dynamic> m) => Project(
@@ -222,6 +235,9 @@ class Project {
         ? 0
         : int.tryParse('${m['session_count']}') ?? 0,
     workspaceDir: m['workspace_dir'] == null ? '' : '${m['workspace_dir']}',
+    sortOrder: m['sort_order'] == null
+        ? 0
+        : int.tryParse('${m['sort_order']}') ?? 0,
   );
 }
 

@@ -1039,7 +1039,7 @@ class DshService {
       // 3. Android 禁止 hard link：给 session persist / fs-local 打 EACCES→rename。
       await _patchAndroidDshHardlinks();
       // 4. 部署拾忆内置免密搜索 provider。
-      await _ensureBuiltInSearchPlugin();
+      await _ensureBuiltInPlugins();
       // 5. 验证 dsh 可执行。
       final probe = await _runCommand([
         'node',
@@ -1232,9 +1232,30 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
     'lib/index.js': 'assets/dsh_plugins/shiyi_free_search/lib/index.js',
   };
 
+  /// DSH 要求 overlay 若存在就必须是顶层 YAML 数组。
+  /// 空文件 / 纯注释会直接拒绝加载；禁用该层只能写 `[]`。
+  static const String _emptyOverlayPatch = '[]\n';
+
+  static const String _movePatchStart = '# ShiYi session move: begin';
+  static const String _movePatchEnd = '# ShiYi session move: end';
+  static const String _movePatchBody = '''
+- insert:
+    - id: shiyi-session-move
+      name: ./plugins/shiyi-session-move/lib/index.js
+''';
+
+  static const Map<String, String> _movePluginAssets = {
+    'package.json': 'assets/dsh_plugins/shiyi_session_move/package.json',
+    'lib/index.js': 'assets/dsh_plugins/shiyi_session_move/lib/index.js',
+  };
+
   @visibleForTesting
   static String builtInSearchPluginDir(String home) =>
       '$home/profiles/web/plugins/shiyi-free-search';
+
+  @visibleForTesting
+  static String builtInSessionMovePluginDir(String home) =>
+      '$home/profiles/web/plugins/shiyi-session-move';
 
   /// 把 sandbox 放行补丁 upsert 进 cordis.patch.yml（幂等）：
   /// 已含标记原样返回；`[]` 空列表模板替换为补丁条目；其余情况末尾追加。
@@ -1274,6 +1295,61 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
     return trimmed.isEmpty ? block : '$trimmed\n$block';
   }
 
+  @visibleForTesting
+  static String stripSessionMovePatchYaml(String existing) {
+    var base = existing;
+    while (true) {
+      final start = base.indexOf(_movePatchStart);
+      if (start < 0) break;
+      final end = base.indexOf(_movePatchEnd, start);
+      base = end >= 0
+          ? '${base.substring(0, start)}${base.substring(end + _movePatchEnd.length)}'
+          : base.substring(0, start);
+    }
+    final trimmed = base.trim();
+    if (trimmed.isEmpty) return _emptyOverlayPatch;
+    return base.trimRight();
+  }
+
+  @visibleForTesting
+  static bool isYamlPatchArray(String text) {
+    var sawList = false;
+    for (final raw in text.split('\n')) {
+      final line = raw.trim();
+      if (line.isEmpty || line.startsWith('#')) continue;
+      if (line == '[]' || line.startsWith('-')) {
+        sawList = true;
+        continue;
+      }
+      return false;
+    }
+    return sawList;
+  }
+
+  @visibleForTesting
+  static String repairProfilePatchYaml(String existing) {
+    final stripped = stripSessionMovePatchYaml(existing);
+    if (isYamlPatchArray(stripped)) return stripped;
+    return _emptyOverlayPatch;
+  }
+
+  @visibleForTesting
+  static String upsertSessionMovePatchYaml(String existing) {
+    final trimmed = stripSessionMovePatchYaml(existing).trimRight();
+    final block = '$_movePatchStart\n$_movePatchBody$_movePatchEnd';
+    if (trimmed.endsWith('[]')) {
+      final head = trimmed.substring(0, trimmed.length - 2).trimRight();
+      return head.isEmpty ? block : '$head\n$block';
+    }
+    return trimmed.isEmpty ? block : '$trimmed\n$block';
+  }
+
+  Future<bool> _ensureBuiltInPlugins() async {
+    final search = await _ensureBuiltInSearchPlugin();
+    final move = await _ensureSessionMovePlugin();
+    return search || move;
+  }
+
   Future<bool> _ensureBuiltInSearchPlugin() async {
     try {
       final dshDir = await _installedDshDir();
@@ -1309,6 +1385,63 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
     } catch (e) {
       debugPrint('DshService built-in search deployment failed: $e');
       return false;
+    }
+  }
+
+  Future<bool> _repairDshPatchOverlays() async {
+    try {
+      final home = await homeDir();
+      final profilePatch = File('$home/profiles/web/cordis.patch.yml');
+      if (!await profilePatch.exists()) return false;
+      final existing = await profilePatch.readAsString();
+      final next = repairProfilePatchYaml(existing);
+      if (next == existing) return false;
+      await profilePatch.writeAsString(next, flush: true);
+      await _appendServiceLog(
+        'repaired profiles/web/cordis.patch.yml (was not a YAML array)',
+      );
+      return true;
+    } catch (e) {
+      debugPrint('DshService overlay repair failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _ensureSessionMovePlugin() async {
+    var changed = await _repairDshPatchOverlays();
+    try {
+      final dshDir = await _installedDshDir();
+      if (dshDir == null || !await File('$dshDir/lib/bin.js').exists()) {
+        return changed;
+      }
+      final home = await homeDir();
+      final pluginDir = Directory(builtInSessionMovePluginDir(home));
+      await pluginDir.create(recursive: true);
+      for (final entry in _movePluginAssets.entries) {
+        final target = File('${pluginDir.path}/${entry.key}');
+        await target.parent.create(recursive: true);
+        final content = await rootBundle.loadString(entry.value);
+        final current = await target.exists()
+            ? await target.readAsString()
+            : '';
+        if (current == content) continue;
+        await target.writeAsString(content);
+        changed = true;
+      }
+      // 只写 home 层。home + profile 两层同时 insert 同一 id
+      // 会让 DSH 启动直接炸：duplicate loader entry id。
+      final patch = File('$home/cordis.patch.yml');
+      await patch.parent.create(recursive: true);
+      final existing = await patch.exists() ? await patch.readAsString() : '';
+      final next = upsertSessionMovePatchYaml(existing);
+      if (next != existing) {
+        await patch.writeAsString(next);
+        changed = true;
+      }
+      return changed;
+    } catch (e) {
+      debugPrint('DshService session-move deployment failed: $e');
+      return changed;
     }
   }
 
@@ -2121,7 +2254,8 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
 
   Future<bool> _start() async {
     if (await isRunning()) {
-      final searchChanged = await _ensureBuiltInSearchPlugin();
+      final repaired = await _repairDshPatchOverlays();
+      final searchChanged = await _ensureBuiltInPlugins() || repaired;
       if (Platform.isAndroid) {
         // 运行中也确保沙箱补丁：DSH 对 home 层 cordis.patch.yml 热重载，
         // 写盘后立即生效，无需重启服务。
@@ -2158,7 +2292,8 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     if (Platform.isAndroid) await _ensureAndroidSandboxPatch();
     progress.value = .12;
     _appendRuntimeOutput('沙箱与权限配置已就绪。\n');
-    await _ensureBuiltInSearchPlugin();
+    await _repairDshPatchOverlays();
+    await _ensureBuiltInPlugins();
     try {
       // 工作目录 = 软件默认 agent 目录：dsh 的 cwd（host.describe）与
       // 文件入口默认位置都落在 FileWorkspace.defaultWorkspacePath。

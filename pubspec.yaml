@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.5.8+22
+version: 2.5.9+23
 
 environment:
   sdk: ^3.12.2
@@ -86,6 +86,8 @@ flutter:
     - assets/avatar.png
     - assets/dsh_plugins/shiyi_free_search/package.json
     - assets/dsh_plugins/shiyi_free_search/lib/index.js
+    - assets/dsh_plugins/shiyi_session_move/package.json
+    - assets/dsh_plugins/shiyi_session_move/lib/index.js
     # 内嵌 Alpine 运行时：minirootfs + proot 家族（目录声明，含全部资产）。
     - assets/termux/
   # 不使用内置字体（2026-08-15 移除苹方：版权风险 + 33MB 体积），

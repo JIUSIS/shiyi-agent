@@ -9,14 +9,18 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/app_state.dart';
+import '../core/home_list_order.dart';
 import '../core/home_tabs.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_service.dart';
 import '../services/update_service.dart';
-import '../widgets/context_menu.dart';
+import '../widgets/home_drag.dart';
+import '../widgets/home_group_header.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
+import '../widgets/staggered_sessions.dart';
+import '../widgets/swipe_actions.dart';
 import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
 import 'chat_screen.dart';
@@ -284,7 +288,8 @@ class _HomeScreenState extends State<HomeScreen>
             ],
           ),
         );
-        if (!desktopNav) return SafeArea(child: stack);
+        // 裁剪在 SafeArea 内侧，会话卡片挤开位移不能画进状态栏。
+        if (!desktopNav) return SafeArea(child: ClipRect(child: stack));
         return SafeArea(
           child: Center(
             child: ConstrainedBox(
@@ -733,6 +738,43 @@ class _SessionsTabState extends State<_SessionsTab> {
   /// 当前展开左滑卡片的屏幕区域，用于精确识别「空白点击」。
   Rect? _openSwipeRect;
 
+  /// 长按拖拽：会话拖到项目卡片上停顿 1 秒展开 / 显示可释放。
+  final HomeDragHoverController _hover = HomeDragHoverController();
+  Timer? _hoverTimer;
+  String? _hoveringProjectId;
+  String? _dropReadyProjectId;
+  String? _draggingSessionId;
+  String? _draggingProjectId;
+  int? _projectPreviewFrom;
+  int? _projectPreviewTo;
+  String? _sessionPreviewProjectId;
+  int? _sessionPreviewFrom;
+  int? _sessionPreviewTo;
+  bool _dropCommitted = false;
+  bool _flying = false;
+  bool _snapShift = false;
+  bool _crossDropCommitting = false;
+  Offset? _flyStartTopLeft;
+  OverlayEntry? _flyEntry;
+  final HomeDragOverlay _dragOverlay = HomeDragOverlay();
+  List<String>? _projectOrderOverride;
+  String? _sessionOrderOverrideProject;
+  List<String>? _sessionOrderOverride;
+  final Map<String, GlobalKey> _projectBlockKeys = {};
+  final Map<String, GlobalKey> _projectHeaderKeys = {};
+  final Map<String, GlobalKey> _insertGapKeys = {};
+  final Map<String, GlobalKey> _sessionCardKeys = {};
+  final GlobalKey _uncategorizedHeaderKey = GlobalKey();
+  final List<double> _projectHeights = [];
+  final List<double> _projectCenters = [];
+  final List<double> _sessionHeights = [];
+  final List<double> _sessionCenters = [];
+  final List<double> _crossHeights = [];
+  final List<double> _crossCenters = [];
+  String? _crossGeometryId;
+  int _crossInsertIndex = 0;
+  Offset? _lastDragGlobal;
+
   ShiyiState get shiyi => widget.shiyi;
 
   @override
@@ -781,6 +823,9 @@ class _SessionsTabState extends State<_SessionsTab> {
   @override
   void dispose() {
     _searchDebounce?.cancel();
+    _hoverTimer?.cancel();
+    _dragOverlay.remove();
+    _removeFlyEntry();
     _openSwipeKey.dispose();
     _searchFocus.dispose();
     _searchCtrl.dispose();
@@ -822,6 +867,791 @@ class _SessionsTabState extends State<_SessionsTab> {
       if (!_expandedGroups.add(id)) _expandedGroups.remove(id);
     });
     unawaited(_saveExpanded());
+  }
+
+  void _expandProject(String id) {
+    if (_expandedGroups.contains(id)) return;
+    setState(() => _expandedGroups.add(id));
+    unawaited(_saveExpanded());
+  }
+
+  void _cancelHover() {
+    _hoverTimer?.cancel();
+    _hoverTimer = null;
+    final hadHover = _hoveringProjectId != null || _dropReadyProjectId != null;
+    _hoveringProjectId = null;
+    _hover.onLeave();
+    _dropReadyProjectId = null;
+    _crossGeometryId = null;
+    _crossInsertIndex = 0;
+    _crossHeights.clear();
+    _crossCenters.clear();
+    if (hadHover && mounted) setState(() {});
+  }
+
+  GlobalKey _keyFor(Map<String, GlobalKey> map, String id) {
+    return map.putIfAbsent(id, GlobalKey.new);
+  }
+
+  void _onSessionDragStarted(
+    String sessionId,
+    String projectId,
+    int index,
+    Offset pointerGlobal,
+  ) {
+    if (_flying) return;
+    _closeSwipe();
+    _dropCommitted = false;
+    _snapShift = false;
+    _flying = false;
+    _flyStartTopLeft = null;
+    final list = [
+      for (final s in shiyi.sessions)
+        if (s.projectId == projectId) s.id,
+    ];
+    homeDragReadSlotGeometry(
+      [for (final id in list) _keyFor(_sessionCardKeys, id)],
+      _sessionHeights,
+      _sessionCenters,
+    );
+    Session? session;
+    for (final s in shiyi.sessions) {
+      if (s.id == sessionId) {
+        session = s;
+        break;
+      }
+    }
+    // 先读取已布局的原槽并插入拖影，再让列表进入拖拽状态，
+    // 避免 setState 重建后 GlobalKey 暂时拿到零尺寸。
+    if (session != null) {
+      final slot = homeDragOriginSlot(_keyFor(_sessionCardKeys, sessionId));
+      final feedbackHeight = homeDragCardBodyHeight(slot.$2.height);
+      _showDragOverlay(
+        originKey: _keyFor(_sessionCardKeys, sessionId),
+        pointerGlobal: pointerGlobal,
+        visualHeight: feedbackHeight,
+        card: homeDragFeedbackClone(
+          context,
+          width: slot.$2.width,
+          height: feedbackHeight,
+          child: KeyedSubtree(
+            key: ValueKey('lift_session_$sessionId'),
+            child: _SessionTile(
+              shiyi: shiyi,
+              session: session,
+              onBeforeOpen: () {},
+              onReturn: () {},
+              visualOnly: true,
+            ),
+          ),
+        ),
+      );
+    }
+    setState(() {
+      _draggingSessionId = sessionId;
+      _draggingProjectId = null;
+      _sessionPreviewProjectId = projectId;
+      _sessionPreviewFrom = index;
+      _sessionPreviewTo = index;
+      _projectPreviewFrom = null;
+      _projectPreviewTo = null;
+      _projectOrderOverride = null;
+      _sessionOrderOverride = null;
+      _sessionOrderOverrideProject = null;
+    });
+  }
+
+  Future<void> _onProjectDragStarted(
+    String projectId,
+    int index,
+    Offset pointerGlobal,
+  ) async {
+    if (_flying) return;
+    _closeSwipe();
+    _cancelHover();
+    _dropCommitted = false;
+    _snapShift = false;
+    _flying = false;
+    _flyStartTopLeft = null;
+    homeDragReadSlotGeometry(
+      [for (final p in shiyi.projects) _keyFor(_projectBlockKeys, p.id)],
+      _projectHeights,
+      _projectCenters,
+    );
+    Project? project;
+    for (final p in shiyi.projects) {
+      if (p.id == projectId) {
+        project = p;
+        break;
+      }
+    }
+    final count = [
+      for (final s in shiyi.sessions)
+        if (s.projectId == projectId) s,
+    ].length;
+    final headerKey = _keyFor(_projectHeaderKeys, projectId);
+    final headerSlot = homeDragOriginSlot(headerKey);
+    final wasExpanded = _expandedGroups.contains(projectId);
+    // 先按项目头的真实尺寸插入拖影；展开项目在这一帧收起，
+    // 避免把下面整串会话一起当成项目卡片拖走。
+    _showDragOverlay(
+      originKey: headerKey,
+      pointerGlobal: pointerGlobal,
+      card: homeDragFeedbackClone(
+        context,
+        width: headerSlot.$2.width,
+        height: headerSlot.$2.height,
+        child: KeyedSubtree(
+          key: ValueKey('lift_project_$projectId'),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: iosSectionBackground(context),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: HomeGroupHeader(
+              name: project?.name ?? '',
+              count: count,
+              expanded: false,
+              onTap: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    setState(() {
+      if (wasExpanded) _expandedGroups.remove(projectId);
+      _draggingSessionId = null;
+      _draggingProjectId = projectId;
+      _projectPreviewFrom = index;
+      _projectPreviewTo = index;
+      _sessionPreviewProjectId = null;
+      _sessionPreviewFrom = null;
+      _sessionPreviewTo = null;
+      _projectOrderOverride = null;
+      _sessionOrderOverride = null;
+      _sessionOrderOverrideProject = null;
+    });
+    if (wasExpanded) {
+      homeDragCollapseSlot(
+        heights: _projectHeights,
+        centers: _projectCenters,
+        index: index,
+        collapsedHeight: homeDragCollapsedProjectSlotHeight(
+          headerSlot.$2.height,
+        ),
+      );
+      unawaited(_saveExpanded());
+    }
+  }
+
+  void _prepareCrossDropCommit() {
+    _crossDropCommitting = true;
+    _snapShift = true;
+    _hoverTimer?.cancel();
+    _hoverTimer = null;
+    _hoveringProjectId = null;
+    _hover.onLeave();
+    _dropReadyProjectId = null;
+    _crossGeometryId = null;
+    _crossInsertIndex = 0;
+    _crossHeights.clear();
+    _crossCenters.clear();
+  }
+
+  void _clearDragPreview() {
+    _hoverTimer?.cancel();
+    _hoverTimer = null;
+    _hoveringProjectId = null;
+    _hover.onLeave();
+    _dropReadyProjectId = null;
+    _crossGeometryId = null;
+    _crossInsertIndex = 0;
+    _crossHeights.clear();
+    _crossCenters.clear();
+    _draggingSessionId = null;
+    _draggingProjectId = null;
+    _projectPreviewFrom = null;
+    _projectPreviewTo = null;
+    _sessionPreviewProjectId = null;
+    _sessionPreviewFrom = null;
+    _sessionPreviewTo = null;
+    _dropCommitted = false;
+    _flying = false;
+    _crossDropCommitting = false;
+    _flyStartTopLeft = null;
+  }
+
+  void _clearOrderOverride() {
+    _projectOrderOverride = null;
+    _sessionOrderOverride = null;
+    _sessionOrderOverrideProject = null;
+    // 提交后保持贴齐，避免下一次触碰把旧位移再弹回去。
+  }
+
+  void _removeFlyEntry() {
+    _flyEntry?.remove();
+    _flyEntry = null;
+  }
+
+  void _removeDragVisuals() {
+    _dragOverlay.remove();
+    _removeFlyEntry();
+  }
+
+  void _showDragOverlay({
+    required GlobalKey originKey,
+    required Widget card,
+    Offset? pointerGlobal,
+    double? visualHeight,
+    Alignment scaleAlignment = Alignment.center,
+  }) {
+    if (!kHomeDragOwnedOverlay) return;
+    final overlay = Overlay.maybeOf(context, rootOverlay: true);
+    if (overlay == null) return;
+    final (originTopLeft, size) = homeDragOriginSlot(originKey);
+    if (size == Size.zero) return;
+    _dragOverlay.show(
+      overlay,
+      topLeft: originTopLeft,
+      size: size,
+      visualHeight: visualHeight,
+      pointerGlobal: pointerGlobal,
+      scaleAlignment: scaleAlignment,
+      child: card,
+    );
+    _flyStartTopLeft = originTopLeft;
+  }
+
+  void _followDragOverlay(Offset global, {required double height}) {
+    if (!kHomeDragOwnedOverlay || !_dragOverlay.isShowing) return;
+    _dragOverlay.followGlobal(global);
+    _flyStartTopLeft = Offset(_dragOverlay.left, _dragOverlay.top);
+  }
+
+  double get _draggedProjectHeight {
+    final from = _projectPreviewFrom;
+    if (from == null || from >= _projectHeights.length) return 56;
+    return _projectHeights[from];
+  }
+
+  double get _draggedSessionHeight {
+    final from = _sessionPreviewFrom;
+    if (from == null || from >= _sessionHeights.length) return 68;
+    return _sessionHeights[from];
+  }
+
+  Rect? _globalRect(GlobalKey key) {
+    final box = key.currentContext?.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return null;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
+
+  String? _projectAtGlobal(Offset global) {
+    for (final project in _visibleProjects) {
+      final rect = _globalRect(_keyFor(_projectBlockKeys, project.id));
+      if (rect?.contains(global) == true) return project.id;
+    }
+    if (_globalRect(_uncategorizedHeaderKey)?.contains(global) == true) {
+      return '';
+    }
+    for (final session in shiyi.sessions) {
+      if (session.projectId != '') continue;
+      if (_globalRect(
+            _keyFor(_sessionCardKeys, session.id),
+          )?.contains(global) ==
+          true) {
+        return '';
+      }
+    }
+    return null;
+  }
+
+  void _updateProjectPreviewFromGlobal(Offset global) {
+    if (_flying || _dropCommitted) return;
+    _lastDragGlobal = global;
+    _followDragOverlay(global, height: _draggedProjectHeight);
+    _refreshProjectGeometry();
+    final from = _projectPreviewFrom;
+    if (from == null || _projectCenters.isEmpty) return;
+    final dest = homeDragIndexFromCenters(
+      y: global.dy,
+      centers: _projectCenters,
+      from: from,
+    );
+    if (_projectPreviewTo == dest) return;
+    setState(() => _projectPreviewTo = dest);
+  }
+
+  void _updateSessionPreviewFromGlobal(Offset global) {
+    if (_flying || _dropCommitted) return;
+    _lastDragGlobal = global;
+    _followDragOverlay(global, height: _draggedSessionHeight);
+    final currentProject = _sessionPreviewProjectId;
+    final hoverProject = _projectAtGlobal(global);
+    final crossProject = homeDragIsCrossProjectHover(
+      currentId: currentProject,
+      hoverId: hoverProject,
+    );
+    if (!crossProject && _hoveringProjectId != null) {
+      _cancelHover();
+    }
+    if (crossProject) {
+      final target = hoverProject;
+      if (target == null) return;
+      _onHoverProject(target, expanded: _expandedGroups.contains(target));
+      _updateCrossInsertFromGlobal(target, global);
+      return;
+    }
+    _refreshSessionGeometry();
+    final from = _sessionPreviewFrom;
+    if (from == null || _sessionCenters.isEmpty) return;
+    final dest = homeDragIndexFromCenters(
+      y: global.dy,
+      centers: _sessionCenters,
+      from: from,
+    );
+    if (_sessionPreviewTo == dest) return;
+    setState(() => _sessionPreviewTo = dest);
+  }
+
+  Future<void> _flyThen({
+    required double destDy,
+    required GlobalKey originKey,
+    required Widget card,
+    required VoidCallback applyOverride,
+    required Future<void> Function() persist,
+    Alignment scaleAlignment = Alignment.center,
+  }) async {
+    final (originTopLeft, originSize) = homeDragOriginSlot(originKey);
+    final start = _flyStartTopLeft ?? originTopLeft;
+    final destTop = originTopLeft.dy + destDy;
+    final destination = Offset(originTopLeft.dx, destTop);
+    setState(() => _flying = true);
+    if (kHomeDragOwnedOverlay && _dragOverlay.isShowing) {
+      await _dragOverlay.flyTo(destination);
+    } else {
+      final overlay = Overlay.maybeOf(context, rootOverlay: true);
+      if (overlay != null && originSize != Size.zero) {
+        _removeFlyEntry();
+        _flyEntry = OverlayEntry(
+          builder: (_) => IgnorePointer(
+            child: HomeDragFlyLayer(
+              top: start.dy,
+              destTop: destTop,
+              left: start.dx,
+              destLeft: destination.dx,
+              width: originSize.width,
+              flying: true,
+              scaleAlignment: scaleAlignment,
+              child: card,
+            ),
+          ),
+        );
+        overlay.insert(_flyEntry!);
+        await Future<void>.delayed(kHomeDragFlyDuration);
+      }
+    }
+    if (!mounted) {
+      _removeDragVisuals();
+      _flying = false;
+      return;
+    }
+    if (kHomeDragSnapOnCommit) {
+      _snapShift = true;
+      applyOverride();
+      _clearDragPreview();
+      setState(() {});
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      await persist();
+      if (!mounted) return;
+      setState(_clearOrderOverride);
+      await WidgetsBinding.instance.endOfFrame;
+      return;
+    }
+    applyOverride();
+    _clearDragPreview();
+    setState(() {});
+    await WidgetsBinding.instance.endOfFrame;
+    await persist();
+    if (!mounted) return;
+    setState(_clearOrderOverride);
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  Future<void> _commitProjectDrag() async {
+    if (_dropCommitted) return;
+    _dropCommitted = true;
+    final from = _projectPreviewFrom;
+    final to = _projectPreviewTo;
+    _hoverTimer?.cancel();
+    if (homeDragShouldFly(from: from, to: to)) {
+      final destDy = homeDragSlotDestDy(
+        from: from!,
+        to: to!,
+        heights: _projectHeights,
+      );
+      final ids = shiyi.projects.map((p) => p.id).toList();
+      final changed = from != to;
+      final next = changed ? moveIdToIndex(ids, ids[from], to) : ids;
+      final id = ids[from];
+      Project? project;
+      for (final p in shiyi.projects) {
+        if (p.id == id) {
+          project = p;
+          break;
+        }
+      }
+      final count = [
+        for (final s in shiyi.sessions)
+          if (s.projectId == id) s,
+      ].length;
+      await _flyThen(
+        destDy: destDy,
+        originKey: _keyFor(_projectHeaderKeys, id),
+        card: homeDragFeedbackClone(
+          context,
+          width: homeDragOriginSlot(_keyFor(_projectHeaderKeys, id)).$2.width,
+          child: KeyedSubtree(
+            key: ValueKey('fly_project_$id'),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: iosSectionBackground(context),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: HomeGroupHeader(
+                name: project?.name ?? '',
+                count: count,
+                expanded: _expandedGroups.contains(id),
+                onTap: () {},
+              ),
+            ),
+          ),
+        ),
+        applyOverride: () {
+          if (changed) _projectOrderOverride = next;
+        },
+        persist: () => changed ? shiyi.reorderProjects(next) : Future.value(),
+      );
+      return;
+    }
+    if (!mounted) return;
+    await _dragOverlay.land();
+    setState(_clearDragPreview);
+  }
+
+  Future<void> _commitSessionDrag([Offset? global]) async {
+    if (_dropCommitted) return;
+    if (global != null) {
+      _updateSessionPreviewFromGlobal(global);
+    }
+    _dropCommitted = true;
+    final from = _sessionPreviewFrom;
+    final to = _sessionPreviewTo;
+    final projectId = _sessionPreviewProjectId;
+    final sessionId = _draggingSessionId;
+    final dropReady = _dropReadyProjectId;
+    _hoverTimer?.cancel();
+    if (kHomeDragCrossProjectNeedsDropReady &&
+        sessionId != null &&
+        dropReady != null &&
+        dropReady != projectId) {
+      await _flyCrossProjectThenDrop(
+        sessionId: sessionId,
+        toProjectId: dropReady,
+        toIndex: _crossInsertIndex,
+      );
+      return;
+    }
+    if (projectId != null && homeDragShouldFly(from: from, to: to)) {
+      final destDy = homeDragSlotDestDy(
+        from: from!,
+        to: to!,
+        heights: _sessionHeights,
+      );
+      final list = [
+        for (final s in shiyi.sessions)
+          if (s.projectId == projectId) s.id,
+      ];
+      final changed = from != to;
+      final next = changed ? moveIdToIndex(list, list[from], to) : list;
+      final flyingId = list[from];
+      Session? session;
+      for (final s in shiyi.sessions) {
+        if (s.id == flyingId) {
+          session = s;
+          break;
+        }
+      }
+      final flySlot = homeDragOriginSlot(_keyFor(_sessionCardKeys, flyingId));
+      final flyHeight = homeDragCardBodyHeight(flySlot.$2.height);
+      await _flyThen(
+        destDy: destDy,
+        originKey: _keyFor(_sessionCardKeys, flyingId),
+        card: homeDragFeedbackClone(
+          context,
+          width: flySlot.$2.width,
+          height: flyHeight,
+          child: KeyedSubtree(
+            key: ValueKey('fly_session_$flyingId'),
+            child: session == null
+                ? const SizedBox.shrink()
+                : _SessionTile(
+                    shiyi: shiyi,
+                    session: session,
+                    onBeforeOpen: () {},
+                    onReturn: () {},
+                    visualOnly: true,
+                  ),
+          ),
+        ),
+        applyOverride: () {
+          if (!changed) return;
+          _sessionOrderOverrideProject = projectId;
+          _sessionOrderOverride = next;
+        },
+        persist: () =>
+            changed ? _persistSessionOrder(projectId, next) : Future.value(),
+      );
+      return;
+    }
+    if (!mounted) return;
+    await _dragOverlay.land();
+    setState(_clearDragPreview);
+  }
+
+  void _scheduleHoverTick(String projectId, {required bool expanded}) {
+    _hoverTimer?.cancel();
+    void fire() {
+      if (!mounted || _draggingSessionId == null) return;
+      final tick = _hover.tick(DateTime.now(), expanded: expanded);
+      if (!expanded && tick.autoExpand) {
+        _expandProject(projectId);
+        _hover.onExpanded(projectId, DateTime.now());
+        _scheduleHoverTick(projectId, expanded: true);
+        return;
+      }
+      if (expanded && tick.dropReady) {
+        if (_dropReadyProjectId != projectId) {
+          _ensureCrossGeometry(projectId);
+          final last = _lastDragGlobal;
+          if (last != null && _crossGeometryId == projectId) {
+            _crossInsertIndex = homeDragInsertIndexFromCenters(
+              y: last.dy,
+              centers: _crossCenters,
+            );
+          }
+          setState(() => _dropReadyProjectId = projectId);
+        }
+        return;
+      }
+      _hoverTimer = Timer(const Duration(milliseconds: 80), fire);
+    }
+
+    _hoverTimer = Timer(kHomeDragHoverDelay, fire);
+  }
+
+  void _onHoverProject(String projectId, {required bool expanded}) {
+    if (_draggingSessionId == null) return;
+    if (_hoveringProjectId == projectId) return;
+    _hoveringProjectId = projectId;
+    _hover.onEnter(projectId, DateTime.now());
+    _sessionPreviewTo = _sessionPreviewFrom;
+    _crossGeometryId = null;
+    _crossInsertIndex = 0;
+    _crossHeights.clear();
+    _crossCenters.clear();
+    setState(() {
+      if (_dropReadyProjectId != null && _dropReadyProjectId != projectId) {
+        _dropReadyProjectId = null;
+      }
+    });
+    _scheduleHoverTick(projectId, expanded: expanded);
+  }
+
+  List<String> _sessionIdsInProject(String projectId) {
+    return [
+      for (final s in _sessionsForProject(projectId, [
+        for (final s in shiyi.sessions)
+          if (s.projectId == projectId) s,
+      ]))
+        s.id,
+    ];
+  }
+
+  void _refreshProjectGeometry() {
+    homeDragReadSlotGeometry(
+      [for (final p in _visibleProjects) _keyFor(_projectBlockKeys, p.id)],
+      _projectHeights,
+      _projectCenters,
+    );
+  }
+
+  void _refreshSessionGeometry() {
+    final projectId = _sessionPreviewProjectId;
+    if (projectId == null) return;
+    final ids = _sessionIdsInProject(projectId);
+    homeDragReadSlotGeometry(
+      [for (final id in ids) _keyFor(_sessionCardKeys, id)],
+      _sessionHeights,
+      _sessionCenters,
+    );
+  }
+
+  void _ensureCrossGeometry(String projectId) {
+    final ids = _sessionIdsInProject(projectId);
+    if (ids.isEmpty) {
+      _crossGeometryId = projectId;
+      _crossHeights.clear();
+      _crossCenters.clear();
+      return;
+    }
+    if (homeDragReadSlotGeometry(
+      [for (final id in ids) _keyFor(_sessionCardKeys, id)],
+      _crossHeights,
+      _crossCenters,
+    )) {
+      _crossGeometryId = projectId;
+    }
+  }
+
+  void _updateCrossInsertFromGlobal(String projectId, Offset global) {
+    if (!_expandedGroups.contains(projectId)) return;
+    _ensureCrossGeometry(projectId);
+    if (_crossGeometryId != projectId) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _hoveringProjectId != projectId) return;
+        _ensureCrossGeometry(projectId);
+        if (_crossGeometryId != projectId) return;
+        _updateCrossInsertFromGlobal(projectId, global);
+      });
+      return;
+    }
+    final dest = homeDragInsertIndexFromCenters(
+      y: global.dy,
+      centers: _crossCenters,
+    );
+    if (_crossInsertIndex == dest) return;
+    setState(() => _crossInsertIndex = dest);
+  }
+
+  Future<void> _persistSessionOrder(String projectId, List<String> next) async {
+    final others = [
+      for (final s in shiyi.sessions)
+        if (s.projectId != projectId) s.id,
+    ];
+    await shiyi.reorderSessions([...next, ...others]);
+  }
+
+  double _insertGapHeight(String projectId) {
+    final dragging = _draggingSessionId;
+    final alreadyInTarget =
+        dragging != null &&
+        shiyi.sessions.any((s) => s.id == dragging && s.projectId == projectId);
+    return homeDragInsertGapHeight(
+      dropReadyId: _dropReadyProjectId,
+      groupId: projectId,
+      sessionAlreadyInTarget: alreadyInTarget,
+      draggedHeight: _draggedSessionHeight,
+    );
+  }
+
+  Offset? _crossProjectLanding(String toProjectId, int toIndex) {
+    final ids = _sessionIdsInProject(toProjectId);
+    Offset? destSlot;
+    if (toIndex < ids.length) {
+      final slot = homeDragOriginSlot(_keyFor(_sessionCardKeys, ids[toIndex]));
+      if (slot.$2 != Size.zero) destSlot = slot.$1;
+    }
+    final gap = homeDragOriginSlot(_keyFor(_insertGapKeys, toProjectId));
+    final headerKey = toProjectId.isEmpty
+        ? _uncategorizedHeaderKey
+        : _keyFor(_projectHeaderKeys, toProjectId);
+    final header = homeDragOriginSlot(headerKey);
+    if (header.$2 == Size.zero && gap.$2 == Size.zero && destSlot == null) {
+      return null;
+    }
+    return homeDragCrossInsertLanding(
+      headerTopLeft: header.$1,
+      headerSize: header.$2,
+      gapTopLeft: gap.$2.height > 0 ? gap.$1 : null,
+      destSlotTopLeft: destSlot,
+    );
+  }
+
+  Future<void> _flyCrossProjectThenDrop({
+    required String sessionId,
+    required String toProjectId,
+    required int toIndex,
+  }) async {
+    setState(() {
+      _flying = true;
+      _crossDropCommitting = true;
+    });
+    final landing = _crossProjectLanding(toProjectId, toIndex);
+    if (kHomeDragCrossProjectFliesToSlot &&
+        kHomeDragOwnedOverlay &&
+        _dragOverlay.isShowing &&
+        landing != null) {
+      await _dragOverlay.flyTo(landing, curve: Curves.easeOutCubic);
+    } else if (_dragOverlay.isShowing) {
+      await _dragOverlay.land();
+    }
+    if (!mounted) {
+      _removeDragVisuals();
+      _flying = false;
+      return;
+    }
+    _prepareCrossDropCommit();
+    await _dropSessionOnProject(sessionId, toProjectId, toIndex: toIndex);
+    if (!mounted) return;
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    setState(_clearDragPreview);
+  }
+
+  Future<void> _dropSessionOnProject(
+    String sessionId,
+    String projectId, {
+    int toIndex = 0,
+  }) async {
+    Session? session;
+    for (final s in shiyi.sessions) {
+      if (s.id == sessionId) {
+        session = s;
+        break;
+      }
+    }
+    if (session == null) return;
+    if (session.projectId == projectId) return;
+    await shiyi.moveSessionToProjectAt(
+      sessionId: sessionId,
+      toProjectId: projectId,
+      toIndex: toIndex,
+    );
+    _expandProject(projectId);
+  }
+
+  List<Project> get _visibleProjects {
+    final override = _projectOrderOverride;
+    if (override == null) return shiyi.projects;
+    final byId = {for (final p in shiyi.projects) p.id: p};
+    return [
+      for (final id in override)
+        if (byId[id] != null) byId[id]!,
+    ];
+  }
+
+  List<Session> _sessionsForProject(String projectId, List<Session> raw) {
+    if (_sessionOrderOverrideProject != projectId ||
+        _sessionOrderOverride == null) {
+      return raw;
+    }
+    final byId = {for (final s in raw) s.id: s};
+    return [
+      for (final id in _sessionOrderOverride!)
+        if (byId[id] != null) byId[id]!,
+    ];
   }
 
   void _onOpenSwipeRectChanged(Rect? rect) {
@@ -885,21 +1715,24 @@ class _SessionsTabState extends State<_SessionsTab> {
             ),
             body: Column(
               children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                  child: CupertinoSearchTextField(
-                    controller: _searchCtrl,
-                    focusNode: _searchFocus,
-                    onChanged: _onSearchChanged,
-                    onSubmitted: (_) => _dismissSearch(),
-                    placeholder: '搜索会话或消息内容',
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
+                Material(
+                  color: Theme.of(context).scaffoldBackgroundColor,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                    child: CupertinoSearchTextField(
+                      controller: _searchCtrl,
+                      focusNode: _searchFocus,
+                      onChanged: _onSearchChanged,
+                      onSubmitted: (_) => _dismissSearch(),
+                      placeholder: '搜索会话或消息内容',
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
                     ),
                   ),
                 ),
-                Expanded(child: _buildBody(context)),
+                Expanded(child: ClipRect(child: _buildBody(context))),
               ],
             ),
           ),
@@ -959,9 +1792,25 @@ class _SessionsTabState extends State<_SessionsTab> {
   Widget _centeredList(Widget list) => Center(
     child: ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 640),
-      child: list,
+      child: NotificationListener<ScrollNotification>(
+        onNotification: (n) {
+          if (n is ScrollUpdateNotification) _onDragListScroll();
+          return false;
+        },
+        child: list,
+      ),
     ),
   );
+
+  void _onDragListScroll() {
+    final last = _lastDragGlobal;
+    if (last == null || _flying || _dropCommitted) return;
+    if (_draggingSessionId != null) {
+      _updateSessionPreviewFromGlobal(last);
+    } else if (_draggingProjectId != null) {
+      _updateProjectPreviewFromGlobal(last);
+    }
+  }
 
   Widget _buildBody(BuildContext context) {
     final q = _query.trim();
@@ -974,141 +1823,68 @@ class _SessionsTabState extends State<_SessionsTab> {
         byProject.putIfAbsent(s.projectId, () => []).add(s);
       }
       final children = <Widget>[];
-      for (final p in shiyi.projects) {
-        final list = byProject[p.id] ?? const <Session>[];
+      final projects = _visibleProjects;
+      final projectCount = projects.length;
+      for (var projectIndex = 0; projectIndex < projectCount; projectIndex++) {
+        final p = projects[projectIndex];
+        final list = _sessionsForProject(
+          p.id,
+          byProject[p.id] ?? const <Session>[],
+        );
         final expanded = _expandedGroups.contains(p.id);
         children.add(
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: _SwipeActions(
-              key: ValueKey('project_${p.id}'),
-              openNotifier: _openSwipeKey,
-              onOpenRectChanged: _onOpenSwipeRectChanged,
-              swipeKey: 'project_${p.id}',
-              actionWidth: 232,
-              actions: [
-                _CircularSwipeAction(
-                  icon: CupertinoIcons.plus,
-                  label: '新建会话',
-                  backgroundColor: _iosBlue,
-                  foregroundColor: Colors.white,
-                  onTap: () async {
-                    await _openNewSessionInProject(p.id);
-                    _openSwipeKey.value = null;
-                  },
+          _shiftedSlot(
+            key: _keyFor(_projectBlockKeys, p.id),
+            dy: _projectPreviewFrom == null || _projectPreviewTo == null
+                ? 0
+                : homeDragTranslateY(
+                    index: projectIndex,
+                    from: _projectPreviewFrom!,
+                    to: _projectPreviewTo!,
+                    heights: _projectHeights,
+                  ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _dragProjectCard(
+                  project: p,
+                  projectIndex: projectIndex,
+                  sessionCount: list.length,
+                  expanded: expanded,
                 ),
-                _CircularSwipeAction(
-                  icon: CupertinoIcons.folder_open,
-                  label: '项目文件夹',
-                  backgroundColor: _iosGray,
-                  foregroundColor: Colors.white,
-                  onTap: () async {
-                    await showProjectFolderSheet(context, shiyi, p);
-                    _openSwipeKey.value = null;
-                  },
+                StaggeredSessions(
+                  expanded: expanded,
+                  unclipped: kHomeDragSessionHitTestUnclipped && expanded,
+                  fastCollapse: _draggingProjectId == p.id,
+                  outOfFlow: _draggingProjectId == p.id,
+                  children: _sessionCardsWithGap(list: list, projectId: p.id),
                 ),
-                _CircularSwipeAction(
-                  icon: CupertinoIcons.pencil,
-                  label: '重命名',
-                  backgroundColor: _iosGray,
-                  foregroundColor: Colors.white,
-                  onTap: () async {
-                    await renameProjectDialog(context, shiyi, p);
-                    _openSwipeKey.value = null;
-                  },
-                ),
-                _CircularSwipeAction(
-                  icon: CupertinoIcons.trash,
-                  label: '删除',
-                  backgroundColor: _iosRed,
-                  foregroundColor: Colors.white,
-                  onTap: () async {
-                    await deleteProjectDialog(context, shiyi, p);
-                    _openSwipeKey.value = null;
-                  },
+                HomeDragInsertGap(
+                  key: _keyFor(_insertGapKeys, p.id),
+                  height: _insertGapHeight(p.id),
+                  snap: _dropCommitted,
                 ),
               ],
-              child: _ProjectHeader(
-                name: p.name,
-                count: list.length,
-                expanded: expanded,
-                onTap: () => _toggleProject(p.id),
-              ),
             ),
-          ),
-        );
-        children.add(
-          _StaggeredProjectSessions(
-            expanded: expanded,
-            children: [
-              for (final s in list)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: _SessionTile(
-                    shiyi: shiyi,
-                    session: s,
-                    openSwipeKey: _openSwipeKey,
-                    onOpenRectChanged: _onOpenSwipeRectChanged,
-                    swipeKey: 'session_${s.id}',
-                    onBeforeOpen: _dismissSearch,
-                    onReturn: _resetSearch,
-                  ),
-                ),
-            ],
           ),
         );
       }
-      final uncat = byProject[''] ?? const <Session>[];
+      final uncat = _sessionsForProject('', byProject[''] ?? const <Session>[]);
       if (uncat.isNotEmpty) {
         final expanded = _expandedGroups.contains('');
+        children.add(_uncategorizedHeader(uncat.length, expanded));
         children.add(
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: _SwipeActions(
-              key: const ValueKey('project_uncat'),
-              openNotifier: _openSwipeKey,
-              onOpenRectChanged: _onOpenSwipeRectChanged,
-              swipeKey: 'project_uncat',
-              actionWidth: 64,
-              actions: [
-                _CircularSwipeAction(
-                  icon: CupertinoIcons.plus,
-                  label: '新建会话',
-                  backgroundColor: _iosBlue,
-                  foregroundColor: Colors.white,
-                  onTap: () async {
-                    await _openNewSessionInProject('');
-                    _openSwipeKey.value = null;
-                  },
-                ),
-              ],
-              child: _ProjectHeader(
-                name: '未分类',
-                count: uncat.length,
-                expanded: expanded,
-                onTap: () => _toggleProject(''),
-              ),
-            ),
+          StaggeredSessions(
+            expanded: expanded,
+            unclipped: kHomeDragSessionHitTestUnclipped && expanded,
+            children: _sessionCardsWithGap(list: uncat, projectId: ''),
           ),
         );
         children.add(
-          _StaggeredProjectSessions(
-            expanded: expanded,
-            children: [
-              for (final s in uncat)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: _SessionTile(
-                    shiyi: shiyi,
-                    session: s,
-                    openSwipeKey: _openSwipeKey,
-                    onOpenRectChanged: _onOpenSwipeRectChanged,
-                    swipeKey: 'session_${s.id}',
-                    onBeforeOpen: _dismissSearch,
-                    onReturn: _resetSearch,
-                  ),
-                ),
-            ],
+          HomeDragInsertGap(
+            key: _keyFor(_insertGapKeys, ''),
+            height: _insertGapHeight(''),
+            snap: _dropCommitted,
           ),
         );
       }
@@ -1154,149 +1930,251 @@ class _SessionsTabState extends State<_SessionsTab> {
       },
     );
   }
-}
 
-/// 项目会话列表的展开/收起动画容器：会话卡片逐条出现/收回，
-/// 避免整体高度擦除式过渡。
-class _StaggeredProjectSessions extends StatefulWidget {
-  final bool expanded;
-  final List<Widget> children;
-  const _StaggeredProjectSessions({
-    required this.expanded,
-    required this.children,
-  });
-
-  @override
-  State<_StaggeredProjectSessions> createState() =>
-      _StaggeredProjectSessionsState();
-}
-
-class _StaggeredProjectSessionsState extends State<_StaggeredProjectSessions>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 420),
-  )..value = widget.expanded ? 1 : 0;
-
-  @override
-  void didUpdateWidget(covariant _StaggeredProjectSessions oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.expanded != widget.expanded) {
-      if (widget.expanded) {
-        _controller.forward();
-      } else {
-        _controller.reverse();
-      }
-    }
+  List<Widget> _sessionCardsWithGap({
+    required List<Session> list,
+    required String projectId,
+  }) {
+    final draggingHere =
+        _draggingSessionId != null && _sessionPreviewProjectId == projectId;
+    final from = draggingHere ? _sessionPreviewFrom : null;
+    final to = draggingHere ? _sessionPreviewTo : null;
+    final alreadyHere =
+        _draggingSessionId != null &&
+        list.any((s) => s.id == _draggingSessionId);
+    final crossHere = homeDragAppliesForeignShift(
+      dropReadyHere: _dropReadyProjectId == projectId,
+      originGroup: _sessionPreviewProjectId == projectId,
+      draggedAlreadyHere: alreadyHere,
+    );
+    return [
+      for (var i = 0; i < list.length; i++)
+        _shiftedSlot(
+          key: _keyFor(_sessionCardKeys, list[i].id),
+          dy: crossHere
+              ? homeDragForeignTranslateY(
+                  index: i,
+                  insertAt: _crossInsertIndex,
+                  draggedHeight: _draggedSessionHeight,
+                )
+              : from == null || to == null
+              ? 0
+              : homeDragTranslateY(
+                  index: i,
+                  from: from,
+                  to: to,
+                  heights: _sessionHeights,
+                ),
+          child: _dragSessionCard(
+            session: list[i],
+            indexInProject: i,
+            projectId: projectId,
+          ),
+        ),
+    ];
   }
 
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final n = widget.children.length;
-    return AnimatedBuilder(
-      animation: _controller,
-      builder: (context, _) {
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [for (var i = 0; i < n; i++) _buildItem(i, n)],
-        );
-      },
+  Widget _shiftedSlot({Key? key, required double dy, required Widget child}) {
+    return HomeDragShift(
+      key: key,
+      dy: dy,
+      snap: _snapShift,
+      duration: kHomeDragSqueezeDuration,
+      child: child,
     );
   }
 
-  Widget _buildItem(int index, int total) {
-    final start = index / total;
-    final end = (index + 1) / total;
-    final curved = CurvedAnimation(
-      parent: _controller,
-      curve: Interval(start, end, curve: Curves.easeOutCubic),
-      reverseCurve: Interval(start, end, curve: Curves.easeInCubic),
-    );
-    return SizeTransition(
-      sizeFactor: curved,
-      alignment: Alignment.topCenter,
-      child: FadeTransition(
-        opacity: curved,
-        child: SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(0, 0.08),
-            end: Offset.zero,
-          ).animate(curved),
-          child: widget.children[index],
+  Widget _dragProjectCard({
+    required Project project,
+    required int projectIndex,
+    required int sessionCount,
+    required bool expanded,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: HomeLongPressDrag(
+        key: ValueKey('drag_project_${project.id}'),
+        enabled:
+            (_draggingProjectId == null && _draggingSessionId == null) ||
+            _draggingProjectId == project.id,
+        onDragStart: (details) => _onProjectDragStarted(
+          project.id,
+          projectIndex,
+          details.globalPosition,
+        ),
+        onDragUpdate: (details) =>
+            _updateProjectPreviewFromGlobal(details.globalPosition),
+        onDragEnd: (_) => _commitProjectDrag(),
+        onDragCancel: _commitProjectDrag,
+        onDragSettled: _removeDragVisuals,
+        child: _projectSwipeActions(
+          project: project,
+          sessionCount: sessionCount,
+          expanded: expanded,
+          disableSwipe: _draggingProjectId == project.id,
         ),
       ),
     );
   }
-}
 
-class _ProjectHeader extends StatelessWidget {
-  final String name;
-  final int count;
-  final bool expanded;
-  final VoidCallback onTap;
-  const _ProjectHeader({
-    required this.name,
-    required this.count,
-    required this.expanded,
-    required this.onTap,
-  });
+  Widget _projectSwipeActions({
+    required Project project,
+    required int sessionCount,
+    required bool expanded,
+    bool disableSwipe = false,
+  }) {
+    return SwipeActions(
+      key: ValueKey('project_${project.id}'),
+      openNotifier: _openSwipeKey,
+      onOpenRectChanged: _onOpenSwipeRectChanged,
+      swipeKey: 'project_${project.id}',
+      disableSwipe: disableSwipe,
+      actionWidth: 232,
+      actions: [
+        CircularSwipeAction(
+          icon: CupertinoIcons.plus,
+          label: '新建会话',
+          backgroundColor: _iosBlue,
+          foregroundColor: Colors.white,
+          onTap: () async {
+            await _openNewSessionInProject(project.id);
+            _openSwipeKey.value = null;
+          },
+        ),
+        CircularSwipeAction(
+          icon: CupertinoIcons.folder_open,
+          label: '项目文件夹',
+          backgroundColor: _iosGray,
+          foregroundColor: Colors.white,
+          onTap: () async {
+            await showProjectFolderSheet(context, shiyi, project);
+            _openSwipeKey.value = null;
+          },
+        ),
+        CircularSwipeAction(
+          icon: CupertinoIcons.pencil,
+          label: '重命名',
+          backgroundColor: _iosGray,
+          foregroundColor: Colors.white,
+          onTap: () async {
+            await renameProjectDialog(context, shiyi, project);
+            _openSwipeKey.value = null;
+          },
+        ),
+        CircularSwipeAction(
+          icon: CupertinoIcons.trash,
+          label: '删除',
+          backgroundColor: _iosRed,
+          foregroundColor: Colors.white,
+          onTap: () async {
+            await deleteProjectDialog(context, shiyi, project);
+            _openSwipeKey.value = null;
+          },
+        ),
+      ],
+      child: HomeGroupHeader(
+        key: _keyFor(_projectHeaderKeys, project.id),
+        name: project.name,
+        count: sessionCount,
+        expanded: expanded,
+        dropReady: _dropReadyProjectId == project.id,
+        onTap: () => _toggleProject(project.id),
+      ),
+    );
+  }
 
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+  Widget _uncategorizedHeader(int count, bool expanded) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 6, 4, 4),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-            child: Row(
-              children: [
-                Icon(
-                  expanded ? CupertinoIcons.folder_open : CupertinoIcons.folder,
-                  size: 18,
-                  color: _iosBlue,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-                Text(
-                  '$count 个会话',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(width: 4),
-                AnimatedRotation(
-                  turns: expanded ? 0.5 : 0.0,
-                  duration: const Duration(milliseconds: 220),
-                  curve: Curves.easeInOutCubic,
-                  child: const Icon(
-                    CupertinoIcons.chevron_down,
-                    size: 18,
-                    color: CupertinoColors.systemGrey,
-                  ),
-                ),
-              ],
-            ),
+      padding: const EdgeInsets.only(bottom: 8),
+      child: SwipeActions(
+        key: _uncategorizedHeaderKey,
+        openNotifier: _openSwipeKey,
+        onOpenRectChanged: _onOpenSwipeRectChanged,
+        swipeKey: 'project_uncat',
+        actionWidth: 64,
+        actions: [
+          CircularSwipeAction(
+            icon: CupertinoIcons.plus,
+            label: '新建会话',
+            backgroundColor: _iosBlue,
+            foregroundColor: Colors.white,
+            onTap: () async {
+              await _openNewSessionInProject('');
+              _openSwipeKey.value = null;
+            },
           ),
+        ],
+        child: HomeGroupHeader(
+          name: '未分类',
+          count: count,
+          expanded: expanded,
+          dropReady: _dropReadyProjectId == '',
+          onTap: () => _toggleProject(''),
+        ),
+      ),
+    );
+  }
+
+  Widget _dragSessionCard({
+    required Session session,
+    required int indexInProject,
+    required String projectId,
+  }) {
+    Widget sessionCard({bool visualOnly = false}) => Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: _SessionTile(
+        shiyi: shiyi,
+        session: session,
+        openSwipeKey: visualOnly ? null : _openSwipeKey,
+        onOpenRectChanged: visualOnly ? null : _onOpenSwipeRectChanged,
+        swipeKey: visualOnly ? null : 'session_${session.id}',
+        onBeforeOpen: visualOnly ? () {} : _dismissSearch,
+        onReturn: visualOnly ? () {} : _resetSearch,
+        disableSwipe: visualOnly || _draggingSessionId == session.id,
+        visualOnly: visualOnly,
+      ),
+    );
+    return HomeLongPressDrag(
+      key: ValueKey('drag_session_${session.id}'),
+      enabled:
+          _draggingProjectId == null &&
+          (_draggingSessionId == null || _draggingSessionId == session.id),
+      onDragStart: (details) => _onSessionDragStarted(
+        session.id,
+        projectId,
+        indexInProject,
+        details.globalPosition,
+      ),
+      onDragUpdate: (details) =>
+          _updateSessionPreviewFromGlobal(details.globalPosition),
+      onDragEnd: (details) => _commitSessionDrag(details.globalPosition),
+      onDragCancel: _commitSessionDrag,
+      onDragSettled: _removeDragVisuals,
+      child: HomeDragHeightFactor(
+        factor: homeDragCardSlotFactor(
+          isDragged: _draggingSessionId == session.id,
+          keepCollapsed: homeDragSourceSlotKeepCollapsed(
+            committing: _crossDropCommitting,
+            originId: _sessionPreviewProjectId,
+            cardGroupId: projectId,
+          ),
+          originId: _sessionPreviewProjectId,
+          hoverId: _hoveringProjectId ?? _dropReadyProjectId,
+          cardGroupId: projectId,
+        ),
+        snap:
+            homeDragSourceSlotKeepCollapsed(
+              committing: _crossDropCommitting,
+              originId: _sessionPreviewProjectId,
+              cardGroupId: projectId,
+            ) ||
+            homeDragSourceSlotSnaps(
+              originId: _sessionPreviewProjectId,
+              cardGroupId: projectId,
+            ),
+        child: Opacity(
+          opacity: _draggingSessionId == session.id ? 0 : 1,
+          child: sessionCard(),
         ),
       ),
     );
@@ -1312,6 +2190,8 @@ class _SessionTile extends StatelessWidget {
   final ValueNotifier<String?>? openSwipeKey;
   final ValueChanged<Rect?>? onOpenRectChanged;
   final String? swipeKey;
+  final bool disableSwipe;
+  final bool visualOnly;
   const _SessionTile({
     required this.shiyi,
     required this.session,
@@ -1321,6 +2201,8 @@ class _SessionTile extends StatelessWidget {
     this.openSwipeKey,
     this.onOpenRectChanged,
     this.swipeKey,
+    this.disableSwipe = false,
+    this.visualOnly = false,
   });
 
   @override
@@ -1410,11 +2292,24 @@ class _SessionTile extends StatelessWidget {
         ],
       ),
     );
-    return _SwipeActions(
+    if (visualOnly) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(14),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: iosSectionBackground(context),
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: tile,
+        ),
+      );
+    }
+    return SwipeActions(
       key: ValueKey(s.id),
       openNotifier: openSwipeKey,
       onOpenRectChanged: onOpenRectChanged,
       swipeKey: swipeKey,
+      disableSwipe: disableSwipe,
       actionWidth: 232,
       // 左滑拉出拼合胶囊操作（重命名 / 项目 / 复制 ID / 删除）。
       onTap: () async {
@@ -1437,7 +2332,7 @@ class _SessionTile extends StatelessWidget {
       actions: [
         // 左滑拉出的操作按钮：圆角交给外层 ClipRRect 裁剪，
         // 左缘直角与内容右缘（展开时为直角）拼接，整体呈胶囊。
-        _CircularSwipeAction(
+        CircularSwipeAction(
           icon: CupertinoIcons.pencil,
           label: shiyiSessionSwipeLabels[0],
           backgroundColor: _iosGray,
@@ -1447,7 +2342,7 @@ class _SessionTile extends StatelessWidget {
             openSwipeKey?.value = null;
           },
         ),
-        _CircularSwipeAction(
+        CircularSwipeAction(
           icon: CupertinoIcons.folder_open,
           label: shiyiSessionSwipeLabels[1],
           backgroundColor: _iosGray,
@@ -1457,7 +2352,7 @@ class _SessionTile extends StatelessWidget {
             openSwipeKey?.value = null;
           },
         ),
-        _CircularSwipeAction(
+        CircularSwipeAction(
           icon: CupertinoIcons.doc_on_doc,
           label: shiyiSessionSwipeLabels[2],
           backgroundColor: _iosGray,
@@ -1472,7 +2367,7 @@ class _SessionTile extends StatelessWidget {
             openSwipeKey?.value = null;
           },
         ),
-        _CircularSwipeAction(
+        CircularSwipeAction(
           icon: CupertinoIcons.trash,
           label: shiyiSessionSwipeLabels[3],
           backgroundColor: _iosRed,
@@ -1505,356 +2400,6 @@ class _SessionTile extends StatelessWidget {
         ),
       ],
       child: tile,
-    );
-  }
-}
-
-/// 自实现左滑操作容器：内容跟随手指左移，露出右侧固定宽度的操作胶囊；
-/// 已滑开时点击内容先收回，再点才触发 onTap。
-class _SwipeActions extends StatefulWidget {
-  final Widget child;
-  final List<Widget> actions;
-  final VoidCallback? onTap;
-  final double actionWidth;
-  final ValueNotifier<String?>? openNotifier;
-  final ValueChanged<Rect?>? onOpenRectChanged;
-  final String? swipeKey;
-
-  const _SwipeActions({
-    super.key,
-    required this.child,
-    required this.actions,
-    this.onTap,
-    this.actionWidth = 132,
-    this.openNotifier,
-    this.onOpenRectChanged,
-    this.swipeKey,
-  });
-
-  @override
-  State<_SwipeActions> createState() => _SwipeActionsState();
-}
-
-class _SwipeActionsState extends State<_SwipeActions>
-    with SingleTickerProviderStateMixin {
-  double get actionWidth => widget.actionWidth;
-
-  late final AnimationController _controller = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 200),
-  )..addStatusListener(_onAnimationStatus);
-
-  double _offset = 0;
-  bool _animating = false;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.openNotifier?.addListener(_onOpenChanged);
-  }
-
-  @override
-  void dispose() {
-    widget.openNotifier?.removeListener(_onOpenChanged);
-    widget.onOpenRectChanged?.call(null);
-    _controller.dispose();
-    super.dispose();
-  }
-
-  void _onAnimationStatus(AnimationStatus status) {
-    if (status != AnimationStatus.completed &&
-        status != AnimationStatus.dismissed) {
-      return;
-    }
-    _offset = -actionWidth * _controller.value;
-    _animating = false;
-    if (status == AnimationStatus.dismissed) {
-      widget.onOpenRectChanged?.call(null);
-    }
-    if (mounted) setState(() {});
-  }
-
-  /// 计算松手后的目标偏移。
-  /// 规则：左滑过 35% 或快速左滑 → 展开；已完全展开时快速右滑收回，原地松手保持展开。
-  double _target(double velocity) {
-    final fullyOpen = _offset <= -actionWidth + 2;
-    if (fullyOpen) {
-      if (velocity > 200) return 0;
-      return -actionWidth;
-    }
-    if (velocity > 250) return 0;
-    if (_offset < -actionWidth * 0.35 || velocity < -200) {
-      return -actionWidth;
-    }
-    return 0;
-  }
-
-  void _drag(double dx) {
-    final n = widget.openNotifier;
-    final k = widget.swipeKey;
-    if (n != null && k != null && n.value != null && n.value != k) {
-      n.value = null;
-    }
-    if (_animating) {
-      _controller.stop();
-      _animating = false;
-    }
-    setState(() {
-      _offset = (_offset + dx).clamp(-actionWidth, 0.0);
-    });
-  }
-
-  /// 从当前位移平滑吸附到目标位置。
-  void _settle(double target) {
-    _controller.value = (_offset / -actionWidth).clamp(0.0, 1.0);
-    _animating = true;
-    _controller.animateTo(target / -actionWidth, curve: Curves.easeOutCubic);
-  }
-
-  void _end(double velocity) {
-    final t = _target(velocity);
-    if (t == _offset) {
-      if (_animating) {
-        _controller.stop();
-        _animating = false;
-      }
-      // 拖满上限时位移已到目标值，也要把展开/收回状态同步出去，
-      // 否则点空白时找不到当前展开卡片。
-      _syncOpenState(t);
-      return;
-    }
-    _settle(t);
-    _syncOpenState(t);
-  }
-
-  void _handleTap() {
-    if (_offset < 0) {
-      widget.onOpenRectChanged?.call(null);
-      _settle(0);
-      _syncOpenState(0);
-      return;
-    }
-    widget.onTap?.call();
-  }
-
-  /// Windows 桌面：鼠标悬停展开操作区（代替左滑），离开收回。
-  void _setHovered(bool hovered) {
-    if (!Platform.isWindows) return;
-    if (_animating) {
-      _controller.stop();
-      _animating = false;
-    }
-    if (hovered) {
-      if (_offset >= 0) {
-        _controller.forward();
-        _syncOpenState(-actionWidth);
-      }
-    } else if (_offset < 0) {
-      widget.onOpenRectChanged?.call(null);
-      _settle(0);
-      _syncOpenState(0);
-    }
-    if (mounted) setState(() {});
-  }
-
-  /// Windows 桌面：右键弹出与左滑操作相同的菜单（悬停展开之外的第二入口）。
-  void _openContextMenu(BuildContext context, Offset globalPosition) {
-    final entries = <DesktopMenuItem>[];
-    for (final a in widget.actions) {
-      if (a is _CircularSwipeAction) {
-        entries.add(
-          DesktopMenuItem(
-            label: a.label,
-            icon: a.icon,
-            iconColor: a.backgroundColor,
-            onTap: a.onTap,
-          ),
-        );
-      }
-    }
-    if (entries.isEmpty) return;
-    // 若已展开先收回，避免菜单出现时列表项还露着操作区。
-    if (_offset < 0) {
-      widget.onOpenRectChanged?.call(null);
-      _settle(0);
-      _syncOpenState(0);
-    }
-    showDesktopMenu(context, globalPosition: globalPosition, items: entries);
-  }
-
-  void _syncOpenState(double target) {
-    final n = widget.openNotifier;
-    final k = widget.swipeKey;
-    if (n == null || k == null) return;
-    if (target < 0) {
-      n.value = k;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        final box = context.findRenderObject();
-        if (box is RenderBox && box.hasSize) {
-          widget.onOpenRectChanged?.call(
-            box.localToGlobal(Offset.zero) & box.size,
-          );
-        }
-      });
-    } else if (n.value == k) {
-      n.value = null;
-      widget.onOpenRectChanged?.call(null);
-    }
-  }
-
-  void _onOpenChanged() {
-    final n = widget.openNotifier;
-    final k = widget.swipeKey;
-    if (n == null || k == null || n.value == k) return;
-    if (_animating) {
-      _controller.stop();
-      _animating = false;
-      _offset = -actionWidth * _controller.value;
-    }
-    if (_offset < 0) {
-      widget.onOpenRectChanged?.call(null);
-      _settle(0);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final displayOffset = _animating
-        ? -actionWidth * _controller.value
-        : _offset;
-    final desktop = Platform.isWindows;
-    // Windows 桌面：鼠标悬停展开操作区（代替左滑手势），右键弹菜单；
-    // 手机端保持左滑 + 点击逻辑不变。
-    return MouseRegion(
-      onEnter: desktop ? (_) => _setHovered(true) : null,
-      onExit: desktop ? (_) => _setHovered(false) : null,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(14),
-        child: Stack(
-          children: [
-            // 底层：右侧固定宽度操作区（仅滑动展开时显示，静止时完全不可见）。
-            Positioned.fill(
-              child: AnimatedOpacity(
-                opacity: displayOffset < 0 ? 1 : 0,
-                duration: const Duration(milliseconds: 100),
-                child: GestureDetector(
-                  // 露出的操作区背景也视为空白：点圆形按钮触发操作，
-                  // 点按钮之间的空隙则收回左滑。
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _handleTap,
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: SizedBox(
-                      width: actionWidth,
-                      height: double.infinity,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [for (final a in widget.actions) a],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            // 上层：内容。手势放在 transform 内部，命中区域随左移，
-            // 右侧露出的操作区才能被点中；内容带不透明背景遮挡底层。
-            AnimatedBuilder(
-              animation: _controller,
-              builder: (context, _) {
-                final off = _animating
-                    ? -actionWidth * _controller.value
-                    : _offset;
-                return Container(
-                  transform: Matrix4.translationValues(off, 0, 0),
-                  decoration: BoxDecoration(
-                    color: iosSectionBackground(context),
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onHorizontalDragUpdate: desktop
-                        ? null
-                        : (d) => _drag(d.delta.dx),
-                    onHorizontalDragEnd: desktop
-                        ? null
-                        : (d) => _end(d.primaryVelocity ?? 0),
-                    onHorizontalDragCancel: desktop ? null : () => _end(0),
-                    onSecondaryTapDown: desktop
-                        ? (d) => _openContextMenu(context, d.globalPosition)
-                        : null,
-                    onTap: _handleTap,
-                    child: widget.child,
-                  ),
-                );
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// 左滑操作中的圆形图标按钮：圆形底 + 图标，下方配小字标签。
-class _CircularSwipeAction extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color backgroundColor;
-  final Color foregroundColor;
-  final VoidCallback onTap;
-
-  const _CircularSwipeAction({
-    required this.icon,
-    required this.label,
-    required this.backgroundColor,
-    required this.foregroundColor,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Tooltip(
-      message: label,
-      child: SizedBox(
-        width: 56,
-        child: FittedBox(
-          fit: BoxFit.scaleDown,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Material(
-                color: backgroundColor,
-                shape: const CircleBorder(),
-                elevation: 1.5,
-                shadowColor: Colors.black.withValues(alpha: .25),
-                child: InkWell(
-                  onTap: onTap,
-                  customBorder: const CircleBorder(),
-                  child: SizedBox(
-                    width: 40,
-                    height: 40,
-                    child: Icon(icon, color: foregroundColor, size: 18),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontSize: 9.5,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     );
   }
 }

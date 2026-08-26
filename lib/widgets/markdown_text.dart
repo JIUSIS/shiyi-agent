@@ -15,13 +15,19 @@ class MarkdownText extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final footnotes = markdownCollectFootnotes(data);
+    final refs = markdownReferenceLinkDefs(data);
     final blocks = splitMarkdownBlocks(data);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         for (final block in blocks)
           if (block.trim().isNotEmpty)
-            MarkdownBlock(block, style: style, footnotes: footnotes),
+            MarkdownBlock(
+              block,
+              style: style,
+              footnotes: footnotes,
+              refs: refs,
+            ),
       ],
     );
   }
@@ -98,6 +104,14 @@ List<String> splitMarkdownBlocks(String md) {
       _flushQuote(out, quoteBuf);
       quoteBuf = null;
       out.add('${line.trim()}\n');
+      continue;
+    }
+    if (markdownIsReferenceDefinition(line)) {
+      _flushBuf(out, buf);
+      _flushTable(out, tableBuf);
+      tableBuf = null;
+      _flushQuote(out, quoteBuf);
+      quoteBuf = null;
       continue;
     }
     // 独立分隔线单独成块，避免和前后段落糊成一段原文。
@@ -207,8 +221,10 @@ bool isAtomicMarkdownBlock(String block) {
   return t.startsWith('```') || t.startsWith(r'$$') || _isTableBlock(t);
 }
 
-bool _isListBlock(String b) =>
-    b.split('\n').any((l) => RegExp(r'^(\s*[-*•]|\d+[.)、\.])\s').hasMatch(l));
+bool markdownIsListBlock(String b) =>
+    b.split('\n').any((l) => RegExp(r'^(\s*[-*+•]|\d+[.)、\.])\s').hasMatch(l));
+
+bool _isListBlock(String b) => markdownIsListBlock(b);
 
 bool _isRuleLine(String line) =>
     RegExp(r'^(-{3,}|\*{3,}|_{3,})$').hasMatch(line.trim());
@@ -235,7 +251,40 @@ bool _isDefListBlock(String b) {
   return false;
 }
 
-final _imagePattern = RegExp(r'!\[([^\]]*)\]\(([^)\s]+)\)');
+final _imagePattern = RegExp(r'!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)');
+final _linkedImagePattern = RegExp(
+  r'\[!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)\]\(([^)\s]+)\)',
+);
+final _refDefPattern = RegExp(r'^\[([^\]]+)\]:\s+(\S+)(?:\s+"([^"]*)")?\s*$');
+final _refLinkPattern = RegExp(r'^\[([^\]]+)\]\[([^\]]*)\]$');
+final _autolinkPattern = RegExp(r'https?://[^\s<>\]]+');
+final _emailPattern = RegExp(
+  r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
+);
+final _htmlCommentPattern = RegExp(r'<!--.*?-->', dotAll: true);
+final _escapePattern = RegExp(r'\\([\\`*_{}\[\]()#+.!>-])');
+final _uPattern = RegExp(r'<u>(.*?)</u>', caseSensitive: false, dotAll: true);
+final _supPattern = RegExp(
+  r'<sup>(.*?)</sup>',
+  caseSensitive: false,
+  dotAll: true,
+);
+final _subPattern = RegExp(
+  r'<sub>(.*?)</sub>',
+  caseSensitive: false,
+  dotAll: true,
+);
+final _markPattern = RegExp(
+  r'<mark>(.*?)</mark>',
+  caseSensitive: false,
+  dotAll: true,
+);
+final _brPattern = RegExp(r'<br\s*/?>', caseSensitive: false);
+final _detailsPattern = RegExp(
+  r'<details>\s*<summary>(.*?)</summary>(.*?)</details>',
+  caseSensitive: false,
+  dotAll: true,
+);
 final _footnotePattern = RegExp(r'\[\^([^\]]+)\]\(([^)]+)\)');
 final _footnoteRefPattern = RegExp(r'\[\^([^\]]+)\]');
 final _footnoteDefPattern = RegExp(r'^\[\^([^\]]+)\]:\s*(.*)$');
@@ -323,6 +372,114 @@ bool _isOnlyFootnoteDefinitions(String block) {
   return lines.isNotEmpty && lines.every(markdownIsFootnoteDefinition);
 }
 
+class MarkdownEmphasisPart {
+  final String text;
+  final bool italic;
+  const MarkdownEmphasisPart(this.text, {this.italic = false});
+}
+
+List<MarkdownEmphasisPart> markdownEmphasisParts(String text) {
+  final parts = <MarkdownEmphasisPart>[];
+  final re = RegExp(r'_([^_]+)_|\*([^*]+)\*');
+  var pos = 0;
+  for (final m in re.allMatches(text)) {
+    if (m.start > pos) {
+      parts.add(MarkdownEmphasisPart(text.substring(pos, m.start)));
+    }
+    parts.add(MarkdownEmphasisPart(m.group(1) ?? m.group(2)!, italic: true));
+    pos = m.end;
+  }
+  if (pos < text.length) parts.add(MarkdownEmphasisPart(text.substring(pos)));
+  if (parts.isEmpty) parts.add(MarkdownEmphasisPart(text));
+  return parts;
+}
+
+String markdownUnescape(String text) =>
+    text.replaceAllMapped(_escapePattern, (m) => m.group(1)!);
+
+bool markdownLooksEscaped(String text) => _escapePattern.hasMatch(text);
+
+class MarkdownLinkMatch {
+  final String text;
+  final String url;
+  const MarkdownLinkMatch({required this.text, required this.url});
+}
+
+MarkdownLinkMatch? markdownAutolinkMatch(String text) {
+  final m = _autolinkPattern.firstMatch(text);
+  if (m == null) return null;
+  return MarkdownLinkMatch(text: m.group(0)!, url: m.group(0)!);
+}
+
+MarkdownLinkMatch? markdownEmailLinkMatch(String text) {
+  final m = _emailPattern.firstMatch(text);
+  if (m == null) return null;
+  return MarkdownLinkMatch(text: m.group(0)!, url: 'mailto:${m.group(0)!}');
+}
+
+class MarkdownReferenceDef {
+  final String url;
+  final String? title;
+  const MarkdownReferenceDef({required this.url, this.title});
+}
+
+bool markdownIsReferenceDefinition(String line) =>
+    _refDefPattern.hasMatch(line.trim());
+
+Map<String, MarkdownReferenceDef> markdownReferenceLinkDefs(String md) {
+  final out = <String, MarkdownReferenceDef>{};
+  for (final line in md.split('\n')) {
+    final m = _refDefPattern.firstMatch(line.trim());
+    if (m == null) continue;
+    out[m.group(1)!.toLowerCase()] = MarkdownReferenceDef(
+      url: m.group(2)!,
+      title: m.group(3),
+    );
+  }
+  return out;
+}
+
+MarkdownLinkMatch? markdownResolveReferenceLink(
+  String text,
+  Map<String, MarkdownReferenceDef> defs,
+) {
+  final m = _refLinkPattern.firstMatch(text.trim());
+  if (m == null) return null;
+  final label = m.group(1)!;
+  final id = (m.group(2)!.isEmpty ? label : m.group(2)!).toLowerCase();
+  final def = defs[id];
+  if (def == null) return null;
+  return MarkdownLinkMatch(text: label, url: def.url);
+}
+
+List<TextAlign> markdownTableAlignments(List<String> cells) {
+  return [
+    for (final raw in cells)
+      switch (raw.trim()) {
+        final t when t.startsWith(':') && t.endsWith(':') => TextAlign.center,
+        final t when t.endsWith(':') => TextAlign.right,
+        _ => TextAlign.left,
+      },
+  ];
+}
+
+String markdownOrderedListNumber({
+  required int visibleIndex,
+  required String raw,
+}) => '${visibleIndex + 1}.';
+
+String markdownHardBreaks(String text) =>
+    text.replaceAll(RegExp(r'  \n'), '\n');
+
+String? markdownInlineCodeText(String group) {
+  final doubled = RegExp(r'^``\s*(.*?)\s*``$', dotAll: true).firstMatch(group);
+  if (doubled != null) return doubled.group(1);
+  if (group.startsWith('`') && group.endsWith('`') && group.length >= 2) {
+    return group.substring(1, group.length - 1);
+  }
+  return null;
+}
+
 const _latexCommands = <String, String>{
   r'\int': '∫',
   r'\sum': '∑',
@@ -360,18 +517,22 @@ String markdownLatexPlain(String latex) {
   if (s.startsWith(r'$') && s.endsWith(r'$') && s.length >= 2) {
     s = s.substring(1, s.length - 1).trim();
   }
-  s = s.replaceAllMapped(RegExp(r'\\begin\{bmatrix\}([\s\S]*?)\\end\{bmatrix\}'), (
-    m,
-  ) {
-    return markdownLatexMatrix(m.group(1)!)
-        .map((row) => row.join('  '))
-        .join('\n');
-  });
+  s = s.replaceAllMapped(
+    RegExp(r'\\begin\{bmatrix\}([\s\S]*?)\\end\{bmatrix\}'),
+    (m) {
+      return markdownLatexMatrix(
+        m.group(1)!,
+      ).map((row) => row.join('  ')).join('\n');
+    },
+  );
   s = s.replaceAllMapped(RegExp(r'\\sqrt\{([^}]*)\}'), (m) {
     final inner = m.group(1) ?? '';
     return inner.isEmpty ? '√' : '√$inner';
   });
-  s = s.replaceAllMapped(_latexCommandPattern, (m) => _latexCommands[m.group(0)!]!);
+  s = s.replaceAllMapped(
+    _latexCommandPattern,
+    (m) => _latexCommands[m.group(0)!]!,
+  );
   s = s.replaceAllMapped(RegExp(r'\^\{([^}]*)\}'), (m) => '^${m.group(1)}');
   s = s.replaceAllMapped(RegExp(r'_\{([^}]*)\}'), (m) => '_${m.group(1)}');
   s = s.replaceAll(r'\\', '\n');
@@ -402,11 +563,13 @@ class MarkdownBlock extends StatelessWidget {
   final String block;
   final TextStyle? style;
   final Map<String, String> footnotes;
+  final Map<String, MarkdownReferenceDef> refs;
   const MarkdownBlock(
     this.block, {
     super.key,
     this.style,
     this.footnotes = const {},
+    this.refs = const {},
   });
 
   @override
@@ -441,6 +604,7 @@ class MarkdownBlock extends StatelessWidget {
         base: base,
         accent: accent,
         footnotes: footnotes,
+        refs: refs,
       );
     }
     if (trimmed.startsWith('>')) {
@@ -449,6 +613,7 @@ class MarkdownBlock extends StatelessWidget {
         base: base,
         accent: accent,
         footnotes: footnotes,
+        refs: refs,
       );
     }
     if (_isMathBlock(trimmed)) {
@@ -460,6 +625,7 @@ class MarkdownBlock extends StatelessWidget {
         base: base,
         accent: accent,
         footnotes: footnotes,
+        refs: refs,
       );
     }
     if (_isListBlock(trimmed)) {
@@ -468,6 +634,7 @@ class MarkdownBlock extends StatelessWidget {
         base: base,
         accent: accent,
         footnotes: footnotes,
+        refs: refs,
       );
     }
     if (trimmed.startsWith('#')) {
@@ -476,6 +643,7 @@ class MarkdownBlock extends StatelessWidget {
         base: base,
         accent: accent,
         footnotes: footnotes,
+        refs: refs,
       );
     }
     if (_isRule(trimmed)) {
@@ -495,7 +663,13 @@ class MarkdownBlock extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Text.rich(
         TextSpan(
-          children: _renderInline(trimmed, base, accent, footnotes: footnotes),
+          children: _renderInline(
+            trimmed,
+            base,
+            accent,
+            footnotes: footnotes,
+            refs: refs,
+          ),
         ),
         style: base,
       ),
@@ -541,6 +715,7 @@ class AdaptiveMarkdownText extends StatelessWidget {
       return Text(data, style: style);
     }
     final footnotes = markdownCollectFootnotes(data);
+    final refs = markdownReferenceLinkDefs(data);
     if (data.length > lazyThreshold) {
       final blocks = splitMarkdownBlocks(data);
       return ConstrainedBox(
@@ -552,6 +727,7 @@ class AdaptiveMarkdownText extends StatelessWidget {
             blocks[i],
             style: style,
             footnotes: footnotes,
+            refs: refs,
           ),
         ),
       );
@@ -589,6 +765,7 @@ class MarkdownInlineText extends StatelessWidget {
           base,
           accent,
           footnotes: markdownCollectFootnotes(data),
+          refs: markdownReferenceLinkDefs(data),
         ),
       ),
       style: base,
@@ -603,35 +780,63 @@ List<InlineSpan> _renderInline(
   TextStyle base,
   Color accent, {
   Map<String, String> footnotes = const {},
+  Map<String, MarkdownReferenceDef> refs = const {},
 }) {
   final spans = <InlineSpan>[];
+  var work = markdownHardBreaks(text.replaceAll(_htmlCommentPattern, ''));
+  work = work.replaceAllMapped(_brPattern, (_) => '\n');
+  work = work.replaceAllMapped(_detailsPattern, (m) {
+    final summary = (m.group(1) ?? '').trim();
+    final body = (m.group(2) ?? '').trim();
+    return body.isEmpty ? summary : '$summary\n$body';
+  });
   final regex = RegExp(
-    r'(`[^`]+`'
-    r'|\*\*[^*]+\*\*'
-    r'|__[^_]+__'
+    r'(``.+?``'
+    r'|`[^`]+`'
+    r'|\\[\\`*_{}\[\]()#+.!>-]'
+    r'|\*\*\*[^*]+\*\*\*'
+    r'|___[^_]+___'
+    r'|\*\*[^*]+?\*\*'
+    r'|__[^_]+?__'
     r'|~~[^~]+~~'
     r'|==[^=]+=='
-    r'|!\[[^\]]*\]\([^)\s]+\)'
+    r'|\[!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\)\]\([^)\s]+\)'
+    r'|!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\)'
     r'|\[\^[^\]]+\](?:\([^)]+\))?'
-    r'|\[[^\]]+\]\([^)\s]+\)'
+    r'|\[[^\]]+\]\([^)\s]+(?:\s+"[^"]*")?\)'
+    r'|\[[^\]]+\]\[[^\]]*\]'
     r'|<kbd>[^<]+</kbd>'
+    r'|<u>.*?</u>'
+    r'|<sup>.*?</sup>'
+    r'|<sub>.*?</sub>'
+    r'|<mark>.*?</mark>'
     r'|\$[^$\n]+\$'
     r'|\*[^*]+\*'
     r'|_[^_]+_'
+    r'|https?://[^\s<>\]]+'
+    r'|\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'
     r'|\b(?:Ctrl|Control|Cmd|Command|Alt|Option|Shift|Win|Meta)\s*\+\s*(?:Enter|Return|Tab|Esc|Escape|Space|Delete|Backspace|Home|End|[A-Za-z0-9])\b'
     r')',
     caseSensitive: false,
+    dotAll: true,
   );
   var pos = 0;
-  for (final m in regex.allMatches(text)) {
+  for (final m in regex.allMatches(work)) {
     if (m.start > pos) {
-      spans.add(TextSpan(text: text.substring(pos, m.start), style: base));
-    }
-    final group = m.group(0)!;
-    if (group.startsWith('`')) {
       spans.add(
         TextSpan(
-          text: group.substring(1, group.length - 1),
+          text: markdownUnescape(work.substring(pos, m.start)),
+          style: base,
+        ),
+      );
+    }
+    final group = m.group(0)!;
+    if (group.startsWith(r'\') && group.length == 2) {
+      spans.add(TextSpan(text: group.substring(1), style: base));
+    } else if (group.startsWith('`')) {
+      spans.add(
+        TextSpan(
+          text: markdownInlineCodeText(group) ?? group,
           style: base.copyWith(
             fontFamily: 'monospace',
             fontSize: (base.fontSize ?? 14) - 1.5,
@@ -640,13 +845,29 @@ List<InlineSpan> _renderInline(
           ),
         ),
       );
-    } else if (group.startsWith('**') || group.startsWith('__')) {
+    } else if (group.startsWith('***') || group.startsWith('___')) {
       spans.add(
         TextSpan(
-          text: group.substring(2, group.length - 2),
-          style: base.copyWith(fontWeight: FontWeight.bold),
+          text: group.substring(3, group.length - 3),
+          style: base.copyWith(
+            fontWeight: FontWeight.bold,
+            fontStyle: FontStyle.italic,
+          ),
         ),
       );
+    } else if (group.startsWith('**') || group.startsWith('__')) {
+      final inner = group.substring(2, group.length - 2);
+      final bold = base.copyWith(fontWeight: FontWeight.bold);
+      for (final part in markdownEmphasisParts(inner)) {
+        spans.add(
+          TextSpan(
+            text: part.text,
+            style: part.italic
+                ? bold.copyWith(fontStyle: FontStyle.italic)
+                : bold,
+          ),
+        );
+      }
     } else if (group.startsWith('~~')) {
       spans.add(
         TextSpan(
@@ -663,6 +884,27 @@ List<InlineSpan> _renderInline(
           ),
         ),
       );
+    } else if (group.startsWith('[![')) {
+      final img = _linkedImagePattern.firstMatch(group);
+      if (img != null) {
+        final url = img.group(4)!;
+        spans.add(
+          WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: GestureDetector(
+              onTap: () => _openUrl(url),
+              child: _MarkdownImage(
+                alt: img.group(1) ?? '',
+                url: img.group(2)!,
+                base: base,
+                compact: true,
+              ),
+            ),
+          ),
+        );
+      } else {
+        spans.add(TextSpan(text: group, style: base));
+      }
     } else if (group.startsWith('![')) {
       final img = _imagePattern.firstMatch(group);
       if (img != null) {
@@ -705,12 +947,16 @@ List<InlineSpan> _renderInline(
         spans.add(TextSpan(text: group, style: base));
       }
     } else if (group.startsWith('[')) {
-      final m2 = RegExp(r'^\[([^\]]+)\]\(([^)\s]+)\)$').firstMatch(group);
-      if (m2 != null) {
-        final url = m2.group(2)!;
+      final m2 = RegExp(
+        r'^\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)$',
+      ).firstMatch(group);
+      final ref = markdownResolveReferenceLink(group, refs);
+      final label = m2?.group(1) ?? ref?.text;
+      final url = m2?.group(2) ?? ref?.url;
+      if (label != null && url != null) {
         spans.add(
           TextSpan(
-            text: m2.group(1),
+            text: label,
             style: base.copyWith(
               color: accent,
               decoration: TextDecoration.underline,
@@ -728,6 +974,55 @@ List<InlineSpan> _renderInline(
         WidgetSpan(
           alignment: PlaceholderAlignment.middle,
           child: _KbdChip(label: (kbd?.group(1) ?? group).trim(), base: base),
+        ),
+      );
+    } else if (group.toLowerCase().startsWith('<u>')) {
+      final inner = _uPattern.firstMatch(group)?.group(1) ?? group;
+      spans.add(
+        TextSpan(
+          text: inner,
+          style: base.copyWith(decoration: TextDecoration.underline),
+        ),
+      );
+    } else if (group.toLowerCase().startsWith('<sup>')) {
+      final inner = _supPattern.firstMatch(group)?.group(1) ?? group;
+      spans.add(
+        WidgetSpan(
+          alignment: PlaceholderAlignment.top,
+          child: Transform.translate(
+            offset: const Offset(0, -4),
+            child: Text(
+              inner,
+              style: base.copyWith(
+                fontSize: ((base.fontSize ?? 15) * 0.72).clamp(10.0, 12.0),
+                height: 1,
+              ),
+            ),
+          ),
+        ),
+      );
+    } else if (group.toLowerCase().startsWith('<sub>')) {
+      final inner = _subPattern.firstMatch(group)?.group(1) ?? group;
+      spans.add(
+        WidgetSpan(
+          alignment: PlaceholderAlignment.bottom,
+          child: Text(
+            inner,
+            style: base.copyWith(
+              fontSize: ((base.fontSize ?? 15) * 0.72).clamp(10.0, 12.0),
+              height: 1,
+            ),
+          ),
+        ),
+      );
+    } else if (group.toLowerCase().startsWith('<mark>')) {
+      final inner = _markPattern.firstMatch(group)?.group(1) ?? group;
+      spans.add(
+        TextSpan(
+          text: inner,
+          style: base.copyWith(
+            backgroundColor: const Color(0xFFFFF59D).withValues(alpha: .85),
+          ),
         ),
       );
     } else if (group.startsWith(r'$')) {
@@ -749,6 +1044,31 @@ List<InlineSpan> _renderInline(
           style: base.copyWith(fontStyle: FontStyle.italic),
         ),
       );
+    } else if (group.startsWith('http://') || group.startsWith('https://')) {
+      spans.add(
+        TextSpan(
+          text: group,
+          style: base.copyWith(
+            color: accent,
+            decoration: TextDecoration.underline,
+            decorationColor: accent,
+          ),
+          recognizer: TapGestureRecognizer()..onTap = () => _openUrl(group),
+        ),
+      );
+    } else if (_emailPattern.hasMatch(group) && group.contains('@')) {
+      spans.add(
+        TextSpan(
+          text: group,
+          style: base.copyWith(
+            color: accent,
+            decoration: TextDecoration.underline,
+            decorationColor: accent,
+          ),
+          recognizer: TapGestureRecognizer()
+            ..onTap = () => _openUrl('mailto:$group'),
+        ),
+      );
     } else {
       final chord = _chordPattern.firstMatch(group);
       if (chord != null) {
@@ -766,13 +1086,15 @@ List<InlineSpan> _renderInline(
           ),
         );
       } else {
-        spans.add(TextSpan(text: group, style: base));
+        spans.add(TextSpan(text: markdownUnescape(group), style: base));
       }
     }
     pos = m.end;
   }
-  if (pos < text.length) {
-    spans.add(TextSpan(text: text.substring(pos), style: base));
+  if (pos < work.length) {
+    spans.add(
+      TextSpan(text: markdownUnescape(work.substring(pos)), style: base),
+    );
   }
   return spans;
 }
@@ -781,7 +1103,12 @@ Future<void> _openUrl(String url) async {
   final uri = Uri.tryParse(url);
   // 只放行 http/https：javascript:/file:/intent: 等 scheme 不进入系统 Intent
   //（防 LLM 生成的链接唤起系统文件/内容组件）。
-  if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;
+  if (uri == null ||
+      (uri.scheme != 'http' &&
+          uri.scheme != 'https' &&
+          uri.scheme != 'mailto')) {
+    return;
+  }
   try {
     await launchUrl(uri, mode: LaunchMode.externalApplication);
   } catch (_) {
@@ -880,6 +1207,7 @@ List<MarkdownTableColumnSpec> markdownTableColumnSpecs({
   required List<String> headers,
   required List<List<String>> body,
   double baseFontSize = 15,
+  List<TextAlign>? alignments,
 }) {
   final dense = markdownTableIsDense(headers: headers, body: body);
   final colCount = headers.length;
@@ -907,13 +1235,16 @@ List<MarkdownTableColumnSpec> markdownTableColumnSpecs({
         : dense && kind == MarkdownTableColumnKind.body
         ? (baseFontSize - 3).clamp(12.0, 13.0)
         : (baseFontSize - 3).clamp(12.0, 14.0);
+    final align = (alignments != null && i < alignments.length)
+        ? alignments[i]
+        : TextAlign.center;
     specs.add(
       MarkdownTableColumnSpec(
         kind: kind,
         flex: flex,
         fontSize: fontSize,
         vertical: vertical,
-        textAlign: TextAlign.center,
+        textAlign: align,
       ),
     );
   }
@@ -926,11 +1257,13 @@ class _TableBlock extends StatelessWidget {
   final TextStyle base;
   final Color accent;
   final Map<String, String> footnotes;
+  final Map<String, MarkdownReferenceDef> refs;
   const _TableBlock({
     required this.block,
     required this.base,
     required this.accent,
     this.footnotes = const {},
+    this.refs = const {},
   });
 
   List<List<String>> _parseRows() {
@@ -961,6 +1294,7 @@ class _TableBlock extends StatelessWidget {
     }
     final header = sep > 0 ? rows[0] : rows.first;
     final body = sep >= 0 ? rows.sublist(sep + 1) : rows.sublist(1);
+    final alignments = sep >= 0 ? markdownTableAlignments(rows[sep]) : null;
     final colCount = rows.fold<int>(0, (m, r) => r.length > m ? r.length : m);
     if (colCount < 2) {
       // 退化（如 `| a |`）：按普通段落渲染，避免出现奇怪的单列表格
@@ -983,6 +1317,7 @@ class _TableBlock extends StatelessWidget {
       headers: paddedHeader,
       body: paddedBody,
       baseFontSize: base.fontSize ?? 15,
+      alignments: alignments,
     );
     return Container(
       width: double.infinity,
@@ -1036,11 +1371,8 @@ class _TableBlock extends StatelessWidget {
     Key? key,
     required bool padRight,
   }) {
-    final style =
-        (isHeader ? base.copyWith(fontWeight: FontWeight.bold) : base).copyWith(
-          fontSize: spec.fontSize,
-          height: spec.vertical ? 1.15 : 1.35,
-        );
+    final style = (isHeader ? base.copyWith(fontWeight: FontWeight.bold) : base)
+        .copyWith(fontSize: spec.fontSize, height: spec.vertical ? 1.15 : 1.35);
     final Widget child;
     if (spec.vertical) {
       child = Text(
@@ -1051,7 +1383,13 @@ class _TableBlock extends StatelessWidget {
     } else {
       child = Text.rich(
         TextSpan(
-          children: _renderInline(text, style, accent, footnotes: footnotes),
+          children: _renderInline(
+            text,
+            style,
+            accent,
+            footnotes: footnotes,
+            refs: refs,
+          ),
         ),
         style: style,
         textAlign: spec.textAlign,
@@ -1097,28 +1435,38 @@ class _QuoteBlock extends StatelessWidget {
   final TextStyle base;
   final Color accent;
   final Map<String, String> footnotes;
+  final Map<String, MarkdownReferenceDef> refs;
   const _QuoteBlock({
     required this.block,
     required this.base,
     required this.accent,
     this.footnotes = const {},
+    this.refs = const {},
   });
 
   @override
   Widget build(BuildContext context) {
-    final lines = block
-        .split('\n')
-        .map((l) => l.replaceFirst(RegExp(r'^>\s?'), ''))
-        .where((l) => l.trim().isNotEmpty)
-        .toList();
-    if (lines.isEmpty) return const SizedBox.shrink();
+    final raw = block.split('\n').where((l) => l.trim().isNotEmpty).toList();
+    if (raw.isEmpty) return const SizedBox.shrink();
+    final stripped = [
+      for (final l in raw) l.replaceFirst(RegExp(r'^>\s?'), ''),
+    ];
     String? alert;
-    final first = _alertPattern.firstMatch(lines.first.trim());
+    final first = _alertPattern.firstMatch(stripped.first.trim());
     if (first != null) {
       alert = first.group(1)!.toUpperCase();
-      lines.removeAt(0);
+      stripped.removeAt(0);
     }
     final color = alert == null ? accent : _alertColor(alert, accent);
+    final nested = <String>[];
+    final top = <String>[];
+    for (final l in stripped) {
+      if (l.trimLeft().startsWith('>')) {
+        nested.add(l);
+      } else {
+        top.add(l);
+      }
+    }
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.symmetric(vertical: 4),
@@ -1145,7 +1493,7 @@ class _QuoteBlock extends StatelessWidget {
                 ),
               ),
             ),
-          for (final l in lines)
+          for (final l in top)
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 1),
               child: Text.rich(
@@ -1155,10 +1503,19 @@ class _QuoteBlock extends StatelessWidget {
                     base,
                     color,
                     footnotes: footnotes,
+                    refs: refs,
                   ),
                 ),
                 style: base,
               ),
+            ),
+          if (nested.isNotEmpty)
+            _QuoteBlock(
+              block: nested.join('\n'),
+              base: base,
+              accent: color,
+              footnotes: footnotes,
+              refs: refs,
             ),
         ],
       ),
@@ -1180,9 +1537,7 @@ class _KbdChip extends StatelessWidget {
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .7),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: theme.colorScheme.outlineVariant,
-        ),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
       ),
       child: Text(
         label,
@@ -1301,11 +1656,13 @@ class _DefListBlock extends StatelessWidget {
   final TextStyle base;
   final Color accent;
   final Map<String, String> footnotes;
+  final Map<String, MarkdownReferenceDef> refs;
   const _DefListBlock({
     required this.block,
     required this.base,
     required this.accent,
     this.footnotes = const {},
+    this.refs = const {},
   });
 
   @override
@@ -1326,6 +1683,7 @@ class _DefListBlock extends StatelessWidget {
                   base,
                   accent,
                   footnotes: footnotes,
+                  refs: refs,
                 ),
               ),
               style: base,
@@ -1343,6 +1701,7 @@ class _DefListBlock extends StatelessWidget {
                   base.copyWith(fontWeight: FontWeight.w700),
                   accent,
                   footnotes: footnotes,
+                  refs: refs,
                 ),
               ),
             ),
@@ -1359,6 +1718,7 @@ class _DefListBlock extends StatelessWidget {
                     base,
                     accent,
                     footnotes: footnotes,
+                    refs: refs,
                   ),
                 ),
                 style: base,
@@ -1473,10 +1833,7 @@ class _MathBlock extends StatelessWidget {
   }
 }
 
-TextStyle markdownCodeBlockStyle({
-  required double baseFontSize,
-  Color? color,
-}) {
+TextStyle markdownCodeBlockStyle({required double baseFontSize, Color? color}) {
   return TextStyle(
     fontFamily: 'monospace',
     fontSize: (baseFontSize - 4).clamp(11.0, 12.5),
@@ -1592,18 +1949,10 @@ List<TextSpan> markdownHighlightSpans(
   TextStyle? base,
 }) {
   final dark = brightness == Brightness.dark;
-  final keywordColor = dark
-      ? const Color(0xFF79C0FF)
-      : const Color(0xFF0550AE);
-  final stringColor = dark
-      ? const Color(0xFF7EE787)
-      : const Color(0xFF0A7A3E);
-  final commentColor = dark
-      ? const Color(0xFF8B949E)
-      : const Color(0xFF6E7781);
-  final numberColor = dark
-      ? const Color(0xFFFFA657)
-      : const Color(0xFFB35900);
+  final keywordColor = dark ? const Color(0xFF79C0FF) : const Color(0xFF0550AE);
+  final stringColor = dark ? const Color(0xFF7EE787) : const Color(0xFF0A7A3E);
+  final commentColor = dark ? const Color(0xFF8B949E) : const Color(0xFF6E7781);
+  final numberColor = dark ? const Color(0xFFFFA657) : const Color(0xFFB35900);
   final comment = _codeCommentPattern(language);
   final hasComment = comment.isNotEmpty;
   final pattern = [
@@ -1745,19 +2094,22 @@ class _ListBlock extends StatelessWidget {
   final TextStyle base;
   final Color accent;
   final Map<String, String> footnotes;
+  final Map<String, MarkdownReferenceDef> refs;
   const _ListBlock({
     required this.block,
     required this.base,
     required this.accent,
     this.footnotes = const {},
+    this.refs = const {},
   });
 
   @override
   Widget build(BuildContext context) {
     final children = <Widget>[];
+    final orderedAtIndent = <int, int>{};
     for (final line in block.split('\n')) {
       if (markdownIsFootnoteDefinition(line)) continue;
-      final m = RegExp(r'^(\s*)([-*•]|\d+[.)、\.])\s+(.*)$').firstMatch(line);
+      final m = RegExp(r'^(\s*)([-*+•]|\d+[.)、\.])\s+(.*)$').firstMatch(line);
       if (m == null) {
         // 混合块中非列表行不能丢，按普通段落保留，避免内容缺失
         if (line.trim().isNotEmpty) {
@@ -1771,6 +2123,7 @@ class _ListBlock extends StatelessWidget {
                     base,
                     accent,
                     footnotes: footnotes,
+                    refs: refs,
                   ),
                 ),
                 style: base,
@@ -1780,7 +2133,8 @@ class _ListBlock extends StatelessWidget {
         }
         continue;
       }
-      final indentPx = (m.group(1) ?? '').replaceAll('\t', '    ').length * 5.0;
+      final indentChars = (m.group(1) ?? '').replaceAll('\t', '    ').length;
+      final indentPx = indentChars * 5.0;
       final prefix = m.group(2)!;
       final isNumbered = RegExp(r'^\d').hasMatch(prefix);
       final content = m.group(3)!;
@@ -1811,6 +2165,7 @@ class _ListBlock extends StatelessWidget {
                         base,
                         accent,
                         footnotes: footnotes,
+                        refs: refs,
                       ),
                     ),
                   ),
@@ -1821,9 +2176,12 @@ class _ListBlock extends StatelessWidget {
         );
         continue;
       }
-      final bullet = isNumbered
-          ? '${prefix.replaceAll(RegExp(r'[.)、。）]'), '')}.'
-          : prefix;
+      String bullet = prefix;
+      if (isNumbered) {
+        final n = orderedAtIndent[indentChars] ?? 0;
+        bullet = markdownOrderedListNumber(visibleIndex: n, raw: prefix);
+        orderedAtIndent[indentChars] = n + 1;
+      }
       children.add(
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 1),
@@ -1849,6 +2207,7 @@ class _ListBlock extends StatelessWidget {
                       base,
                       accent,
                       footnotes: footnotes,
+                      refs: refs,
                     ),
                   ),
                 ),
@@ -1870,11 +2229,13 @@ class _Heading extends StatelessWidget {
   final TextStyle base;
   final Color accent;
   final Map<String, String> footnotes;
+  final Map<String, MarkdownReferenceDef> refs;
   const _Heading({
     required this.text,
     required this.base,
     required this.accent,
     this.footnotes = const {},
+    this.refs = const {},
   });
 
   @override
@@ -1904,6 +2265,7 @@ class _Heading extends StatelessWidget {
                   base.copyWith(fontSize: size, fontWeight: FontWeight.bold),
                   accent,
                   footnotes: footnotes,
+                  refs: refs,
                 ),
               ),
             ),

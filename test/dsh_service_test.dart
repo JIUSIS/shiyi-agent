@@ -396,6 +396,97 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
     });
   });
 
+  group('DSH built-in session move patch', () {
+    test('插件资源已打包且只有搬家入口', () async {
+      final package = await rootBundle.loadString(
+        'assets/dsh_plugins/shiyi_session_move/package.json',
+      );
+      final source = await rootBundle.loadString(
+        'assets/dsh_plugins/shiyi_session_move/lib/index.js',
+      );
+      expect(package, contains('"name": "shiyi-session-move"'));
+      expect(source, contains('POST /__shiyi/move-session'));
+      expect(source, contains('parseHeaderRecord'));
+      expect(source, contains('workspacePath'));
+      expect(source, isNot(contains('/__sessionmove/delete')));
+      expect(source, isNot(contains('workbench_session_delete')));
+    });
+
+    test('插件部署在 web profile 的相对路径根目录', () {
+      expect(
+        DshService.builtInSessionMovePluginDir('/root/.dsh'),
+        '/root/.dsh/profiles/web/plugins/shiyi-session-move',
+      );
+    });
+
+    test('空文件写入 insert 条目', () {
+      final out = DshService.upsertSessionMovePatchYaml('');
+      expect(out, contains('name: ./plugins/shiyi-session-move/lib/index.js'));
+      expect(out, contains('id: shiyi-session-move'));
+    });
+
+    test('重复 upsert 替换自有块且保留用户条目', () {
+      const existing = '- id: telemetry\n  disabled: true\n';
+      final once = DshService.upsertSessionMovePatchYaml(existing);
+      final twice = DshService.upsertSessionMovePatchYaml(once);
+      expect(twice, once);
+      expect(twice, startsWith('- id: telemetry'));
+      expect('id: shiyi-session-move'.allMatches(twice), hasLength(1));
+    });
+
+    test('profile 层旧补丁要剥掉，避免和 home 层重复 id', () {
+      final home = DshService.upsertSessionMovePatchYaml('- id: telemetry\n');
+      final profile = DshService.upsertSessionMovePatchYaml('- id: web\n');
+      expect('id: shiyi-session-move'.allMatches(home), hasLength(1));
+      expect('id: shiyi-session-move'.allMatches(profile), hasLength(1));
+      final stripped = DshService.stripSessionMovePatchYaml(profile);
+      expect(stripped, contains('- id: web'));
+      expect(stripped, isNot(contains('shiyi-session-move')));
+      expect(stripped, isNot(contains('ShiYi session move')));
+    });
+
+    test('剥掉后若文件空了要写成合法空列表 []', () {
+      final onlyMove = DshService.upsertSessionMovePatchYaml('');
+      final stripped = DshService.stripSessionMovePatchYaml(onlyMove);
+      expect(stripped, contains('[]'));
+      expect(DshService.isYamlPatchArray(stripped), isTrue);
+      expect(
+        DshService.isYamlPatchArray(
+          DshService.stripSessionMovePatchYaml('   \n'),
+        ),
+        isTrue,
+      );
+    });
+
+    test('profile overlay 空文件/纯注释/对象都修成 YAML 数组', () {
+      expect(
+        DshService.isYamlPatchArray(DshService.repairProfilePatchYaml('')),
+        isTrue,
+      );
+      expect(DshService.repairProfilePatchYaml(''), contains('[]'));
+      expect(
+        DshService.isYamlPatchArray(
+          DshService.repairProfilePatchYaml('# just comments\n'),
+        ),
+        isTrue,
+      );
+      expect(
+        DshService.repairProfilePatchYaml('- id: web\n'),
+        contains('- id: web'),
+      );
+      expect(
+        DshService.isYamlPatchArray(
+          DshService.repairProfilePatchYaml('- id: web\n'),
+        ),
+        isTrue,
+      );
+      final mapping = DshService.repairProfilePatchYaml('foo: bar\n');
+      expect(mapping, contains('[]'));
+      expect(mapping, isNot(contains('foo:')));
+      expect(DshService.isYamlPatchArray(mapping), isTrue);
+    });
+  });
+
   group('missingAndroidBuildTools', () {
     test('探测成功且无输出视为工具链齐全', () {
       expect(DshService.missingAndroidBuildTools(''), isEmpty);

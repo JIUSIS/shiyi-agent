@@ -165,8 +165,11 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
    行内代码/链接、列表/任务列表、表格（自适应居中）、引用、围栏代码（紧凑分色）。
    2026-08-24 自研补齐：图片、标准脚注 `[^1]` + 文末 `[^1]:`、内联脚注
    `[^1](内容)`、定义列表（含缩进/全角冒号）、键盘按键、`==高亮==`、
-   GitHub Alert、LaTeX 可读文本、独立分隔线。改渲染必须两端一起验证，
-   禁止只改拾忆或只改 DSH。测试：`test/markdown_text_test.dart`。
+   GitHub Alert、LaTeX 可读文本、独立分隔线。
+   2026-08-25 再补：嵌套强调、转义字面量、自动/邮箱/参考式链接、
+   `<u>` / `<sup>` / `<sub>` / `<mark>`、表格左右中对齐、有序列表按出现顺序重排、
+   加号无序列表、行尾两空格硬换行、双反引号包内嵌反引号。
+   改渲染必须两端一起验证，禁止只改拾忆或只改 DSH。测试：`test/markdown_text_test.dart`。
 9. **思考过程不得升成正文**：拾忆落库走 `finalizeAssistantTurn`，DSH 走
    live / history 原样保留。空正文 + 非空思考必须留在思考面板，禁止再写成
    `content`。思考增量立即推送，正文布局才 80ms / 200 字节节流。两端共用
@@ -183,6 +186,15 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
     `search_sessions` / `read_session` 找到并阅读，禁止声称搜不到。
     按完整会话 ID 命中本地库。这不是 DSH `session.search`。
     测试：`test/session_bridge_test.dart`。
+13. **终端捏合 / 补全 / 命令分色**：`TerminalPane` 双指捏合缩放字号（1~28，默认 13），
+    捏合不弹键盘；中文回退字体；前缀补全（历史优先 + 幽灵字）；命令行 token 分色。
+    测试：`test/terminal_pane_test.dart`。
+14. **拾忆主页长按拖拽**：`HomeLongPressDrag` + 自建 overlay 拖起整张卡片；
+    松手飞入空隙，远放不瞬移；提交贴齐禁止反向弹回。跨项目须停满 1 秒，
+    拖回原项目立刻取消「松开以移入」。列表外层必须裁剪，不能让挤开位移盖住搜索栏/状态栏。
+    顺序写 `sort_order`，缺列补列不清库。跨组提交只收被拖项源槽，禁止把同组其它卡片收成 0。
+    DSH 跨工作区先乐观改本地 `sessionIds` 和 cwd，再静默 `_load()`。详见 `docs/fix-log.md` #241-#273。
+    测试：`test/home_list_order_test.dart`、`test/home_sessions_tab_test.dart`、`test/staggered_sessions_test.dart`、`test/dsh_workspace_display_name_test.dart`。
 
 ---
 
@@ -206,6 +218,8 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 | mimo 工具续轮 HTTP 400，日志 `thinking=off reasoningEffort=high` | `thinking=off` 不是关开关；MiMo 拒绝 `reasoning_effort` 时只回模糊 BadRequest，旧重试抓不到字段名 | 模糊 400 也去掉 `reasoning_effort` 重试。见 `docs/fix-log.md` #234 |
 | 自定义 Claude/GPT/Grok 会话页没有思考按钮 | 旧逻辑只认少量写死 ID，刷新 Anthropic 模型还会直接报不支持 | 按模型 ID 关键字识别；对不上关键字也显示通用档位。Anthropic 走 `GET /v1/models`。见 `docs/fix-log.md` #222 |
 | 会话 Markdown 图片/脚注/定义列表/公式露原文 | 自研渲染器原先只覆盖标题/列表/表格/代码/引用/强调 | 缺口元素在 `markdown_text.dart` 自研补齐，拾忆与 DSH 共用 `MessageBubble`。见 `docs/fix-log.md` #230 |
+| 粗体嵌斜体、转义、自动链接、参考式链接、HTML 片段仍露原文 | 2.5.7 只补了图片/脚注/定义列表等，嵌套强调与参考式链接还没拆 | 继续自研补齐。见 `docs/fix-log.md` #239 |
+| 主页会话拖动卡住 / 远放瞬移 / 换位后第一下炸 / 搜索栏被挡 | 旧 `LongPressDraggable` 拆树；`SizeTransition` 裁剪命中；ListView `Clip.none` 盖住搜索 | `HomeLongPressDrag` + 自建 overlay；展开内部 unclipped；外层 SafeArea/列表 ClipRect。见 `docs/fix-log.md` #240-#259 |
 | OpenRouter 在拾忆可用、DSH 返回 400 | pi-ai 给 OpenRouter 发 `store: false`，且 `openai/gpt-4o` 被 `gpt` 当成思考模型误发 `reasoning` | 注入 `compat.supportsStore: false`；gpt-4o/4.1/3.5 不声明思考。见 `docs/fix-log.md` #223 |
 | DSH 0.1.1 启动即崩，修复完整运行环境没用 | `.credentials.yaml` 顶层仍是 `SHIYI_API_KEY:`，解析器只认 `version`/`refs`/`records` | 启动同步写成 `version: 1` + `refs:`，并把顶层密钥收进去。见 `docs/fix-log.md` #224 |
 
@@ -230,6 +244,8 @@ flutter build windows --release      # 必须成功
 7. 数据库自动创建：`%APPDATA%\com.shiyi\拾忆 ShiYi\shiyi_agent.db`
 8. 设置 → 通用 → 终端能看到自动 / WSL2 / Git Bash / PowerShell 7 / cmd
 9. 对话人设与 `run_terminal` 描述不出现 Alpine / apk / `/storage/emulated/0/agent`
+10. 终端双指捏合缩放字号、命令补全幽灵字、命令行 token 分色仍可用（与 Android 同一套 `TerminalPane`）
+11. 拾忆主页长按项目 / 会话卡片可拖拽排序；会话拖到另一项目须停满 1 秒；松手飞入空隙，换位后点一下不炸；上滑时搜索栏和状态栏不被卡片盖住
 
 DS Harness 引擎验证点（#114，两端共享）：
 
@@ -257,6 +273,22 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-08-26**（共享 `lib/`；详见 `docs/fix-log.md` #267-#273）：
+  跨项目/工作区可插到任意位置；滚动后重测插入格；测槽位用不含 Transform 的布局盒。
+  DSH 跨工作区飞入后先乐观更新 `sessionIds` 和 cwd，再静默 `_load()`，避免源组 BCD 被撑开弹回。
+  `keepCollapsed` 只收被拖的那张，不能把同组其它卡片收成 0。Windows 拾忆主页共用源槽口径。
+- **2026-08-26**（共享 `lib/`；详见 `docs/fix-log.md` #243-#259）：
+  #243 会话长按无拖影已由 #245 重建关闭（`HomeLongPressDrag` + 自建 overlay，不再用 `LongPressDraggable`）。
+  后续补齐跨项目状态、抓取点、收起动画、挤开高度、源空槽、飞入曲线和搜索栏层级。
+  真机 `af3700b1` 正式包 `adb install -r` Success，未卸载未清数据。
+- **2026-08-26 2.5.9**（共享 `lib/` 改动；Windows 无新增平台分支；详见 `docs/fix-log.md` #241）：
+  左滑 / 交错展开 / 分组头 / 飞行层抽成共享组件。DSH 工作区会话长按拖拽按 `sessionIds` 排序，
+  `dshReorderPlanForInsertion` 生成 `insertSessionBefore`。Windows 拾忆主页同一套拖拽。
+- **2026-08-25**（共享 `lib/` 改动；Windows 无新增平台分支；详见 `docs/fix-log.md` #238/#239/#240）：
+  1. 终端双指捏合缩放字号（1~28）、中文回退、命令前缀补全与幽灵字、命令行 token 分色；
+  2. Markdown 再补嵌套强调 / 转义 / 自动与参考式链接 / HTML 片段 / 表格对齐 / 有序列表重排；
+  3. 拾忆主页长按拖拽项目与会话排序，会话可拖到另一项目（停满 1 秒）；松手飞入空隙，提交贴齐。
+  共享验证：`flutter test test/terminal_pane_test.dart test/markdown_text_test.dart test/home_list_order_test.dart test/home_sessions_tab_test.dart`。
 - **2026-08-24 2.5.8**（详见 `docs/fix-log.md` #235/#236）：
   Windows 默认工作目录改为本机「文档\\agent」（旧 `%TEMP%\\agent` 视为未设置）。
   终端走 WSL2 / Git Bash / PowerShell / cmd，不走 Android Alpine。人设 / 工具规则 /
