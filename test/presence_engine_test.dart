@@ -3,108 +3,72 @@ import 'package:shiyi_agent_app/core/presence_engine.dart';
 
 void main() {
   group('PresenceEngine', () {
-    test('新会话默认偏向联结，不先走能力感', () {
+    test('未接皮层时不注入 PSI 段，也不声称已接通', () {
       final e = PresenceEngine();
-      expect(e.needs['relatedness']!, greaterThan(e.needs['competence']!));
-      expect(e.cognitiveCycle, 0);
-      expect(e.interactionCount, 0);
-      expect(e.dominantNeed, 'relatedness');
+      expect(e.cortexConnected, isFalse);
+      expect(e.promptSection(), isEmpty);
+      expect(e.promptSection(), isNot(contains('LAAP 已接通')));
+      expect(e.promptSection(), isNot(contains('本机皮层')));
     });
 
-    test('新会话在场段含本轮内心话，模型只负责翻译', () {
+    test('空 applyRemote 不算接通', () {
       final e = PresenceEngine();
-      final p = e.promptSection();
-      expect(p, contains('【在场】'));
-      expect(p, contains('本轮内心'));
-      expect(p, contains('刚又见面'));
-      expect(p, contains('翻译成一句自然的话'));
-      expect(p, contains('不要改核心意图'));
-      expect(p, contains('不要工作汇报腔'));
-      expect(p, contains('不要第一句给结论'));
-      expect(p, isNot(contains('展示专业能力')));
-      expect(p, isNot(contains('PSI')));
+      expect(e.applyRemote(), isFalse);
+      expect(e.cortexConnected, isFalse);
+      expect(e.promptSection(), isEmpty);
     });
 
-    test('隔了很久再会，内心话带上离开的时长', () {
-      final e = PresenceEngine(
-        lastSeenMs: DateTime.now()
-            .subtract(const Duration(hours: 8))
-            .millisecondsSinceEpoch,
-        interactionCount: 12,
-        bondLevel: 40,
+    test('官方 preamble / cot_hint 原样进动尾', () {
+      final e = PresenceEngine();
+      final applied = e.applyRemote(
+        needs: {
+          'competence': 0.4,
+          'autonomy': 0.4,
+          'relatedness': 0.35,
+          'certainty': 0.86,
+          'growth': 0.4,
+        },
+        valence: -0.2,
+        energy: 7,
+        attentionFocus: 'explore',
+        cognitiveCycle: 12,
+        preamble:
+            '[PSI State — Cycle 12]\nNeeds: certainty=0.86\nDominant need: certainty (explore mode)',
+        cotHint: '[认知状态] 最高需求: certainty — 提供确切的、可验证的信息 | 注意力: explore',
       );
-      e.onUserMessage('我回来了');
-      final inner = e.innerLine();
-      expect(inner, contains('8'));
-      expect(inner, contains('小时'));
-      expect(e.promptSection(), contains(inner));
+      expect(applied, isTrue);
+      expect(e.cortexConnected, isTrue);
+      expect(e.dominantNeed, 'certainty');
+      final prompt = e.promptSection();
+      expect(prompt, contains('## PSI Cognitive State (Live)'));
+      expect(prompt, contains('[PSI State — Cycle 12]'));
+      expect(prompt, contains('当前最高需求 (certainty)'));
+      expect(prompt, contains('提供确切的、可验证的信息'));
+      expect(prompt, contains('[认知状态] 最高需求: certainty'));
+      expect(prompt, isNot(contains('本机皮层')));
+      expect(prompt, isNot(contains('LAAP 已接通')));
+      expect(prompt, isNot(contains('本轮内心')));
+      expect(prompt, isNot(contains('【在场】')));
     });
 
-    test('闲聊你好时内心话是接话，不是办事', () {
+    test('只有 needs 时按官方格式补 preamble', () {
       final e = PresenceEngine();
-      e.onUserMessage('你好');
-      expect(e.innerLine(), contains('打了个招呼'));
-      expect(e.innerLine(), isNot(contains('先给结论')));
-    });
-
-    test('闲聊你好仍保持联结主导', () {
-      final e = PresenceEngine();
-      e.onUserMessage('你好');
+      e.applyRemote(
+        needs: {
+          'competence': 0.3,
+          'autonomy': 0.3,
+          'relatedness': 0.8,
+          'certainty': 0.3,
+          'growth': 0.3,
+        },
+        attentionFocus: 'social',
+      );
       expect(e.dominantNeed, 'relatedness');
-    });
-
-    test('用户说陪伴/一起会抬高联结需求', () {
-      final e = PresenceEngine();
-      e.onUserMessage('今晚一起吃饭，有你陪伴真好');
-      expect(e.needs['relatedness']!, greaterThan(0.5));
-      expect(e.cognitiveCycle, 1);
-      expect(e.dominantNeed, 'relatedness');
-    });
-
-    test('用户问为什么/不确定会抬高确定性需求', () {
-      final e = PresenceEngine();
-      e.onUserMessage('为什么会这样？我不太确定');
-      expect(e.needs['certainty']!, greaterThan(0.5));
-    });
-
-    test('长回复抬高能力感，暖词抬高联结', () {
-      final e = PresenceEngine();
-      e.onAssistantReply('理解你的处境。${'详细说明。' * 40}');
-      expect(e.needs['competence']!, greaterThan(0.5));
-      expect(e.needs['relatedness']!, greaterThan(0.5));
-    });
-
-    test('需求会向 0.5 缓慢回落', () {
-      final e = PresenceEngine();
-      e.needs['growth'] = 0.9;
-      e.onUserMessage('嗯');
-      expect(e.needs['growth']!, lessThan(0.9));
-      expect(e.needs['growth']!, greaterThan(0.5));
-    });
-
-    test('提示词含本轮内心话，且禁止念出数值', () {
-      final e = PresenceEngine();
-      e.onUserMessage('我们一起把这个做完');
-      final p = e.promptSection();
-      expect(p, contains('【在场】'));
-      expect(p, contains('本轮内心'));
-      expect(p, contains(e.innerLine()));
-      expect(p, contains('不要直接说出来'));
-      expect(p, contains('不要每轮自我介绍'));
-      expect(p, contains('覆盖上方沟通规范里的工作台腔'));
-      expect(p, isNot(contains('PSI')));
-    });
-
-    test('JSON 往返保留需求、轮次和上次见面', () {
-      final e = PresenceEngine();
-      e.onUserMessage('想学点新的，一起探索');
-      final restored = PresenceEngine.fromJson(e.toJson());
-      expect(restored.cognitiveCycle, e.cognitiveCycle);
-      expect(restored.needs['growth'], e.needs['growth']);
-      expect(restored.needs['relatedness'], e.needs['relatedness']);
-      expect(restored.interactionCount, e.interactionCount);
-      expect(restored.lastSeenMs, e.lastSeenMs);
-      expect(restored.bondLevel, e.bondLevel);
+      final prompt = e.promptSection();
+      expect(prompt, contains('## PSI Cognitive State (Live)'));
+      expect(prompt, contains('[PSI State —'));
+      expect(prompt, contains('relatedness'));
+      expect(prompt, contains('优先建立情感连接，表达温暖和理解'));
     });
   });
 }

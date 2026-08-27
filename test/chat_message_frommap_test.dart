@@ -71,4 +71,20 @@ void main() {
     expect(restored.subagentResult, '子代理报告');
     expect(restored.toApiMap().containsKey('subagent_result'), isFalse);
   });
+
+  test('加密思考可落库往返，Responses 回放、Chat 也能带到 toApiMap', () {
+    final original = ChatMessage(
+      id: 'm4',
+      sessionId: 's1',
+      role: 'assistant',
+      content: '正文',
+      reasoning: '思考',
+      reasoningEncrypted: 'enc-abc',
+      createdAt: 0,
+    );
+    final restored = ChatMessage.fromMap(original.toMap());
+    expect(restored.reasoningEncrypted, 'enc-abc');
+    expect(restored.toApiMap()['reasoning_encrypted'], 'enc-abc');
+    expect(restored.toApiMap()['reasoning_content'], '思考');
+  });
 }

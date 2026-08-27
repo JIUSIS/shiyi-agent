@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:shiyi_agent_app/core/app_state.dart';
@@ -21,8 +23,10 @@ void main() {
 
     test('预算不足时裁剪较早历史并保留最新', () {
       final out = ShiyiState.trimApiMessagesForBudget(msgs(), 200);
-      expect(out.length, 2);
-      expect(out.first['content'], contains('较早对话因上下文限制未包含'));
+      expect(out.length, 3);
+      expect(out.first['content'], 'sys');
+      expect(out[1]['role'], 'user');
+      expect(out[1]['content'], contains('较早对话因上下文限制未包含'));
       expect(out.last['content'], 'latest');
     });
 
@@ -48,8 +52,9 @@ void main() {
         {'role': 'user', 'content': 'latest'},
       ];
       final out = ShiyiState.trimApiMessagesForBudget(m, 300);
-      expect(out.length, 2);
+      expect(out.first['content'], 's');
       expect(out.last['content'], 'latest');
+      expect(out.any((e) => (e['content'] ?? '').toString().contains('较早对话')), isTrue);
     });
 
     test('裁剪时保留完整工具轮，不拆散 tool_calls 与 tool 结果', () {
@@ -74,14 +79,17 @@ void main() {
         {'role': 'user', 'content': 'latest'},
       ];
       final out = ShiyiState.trimApiMessagesForBudget(m, 300);
+      expect(out.first['role'], 'system');
+      expect(out.first['content'], 'sys');
       expect(out.map((e) => e['role']).toList(), [
         'system',
+        'user',
         'assistant',
         'tool',
         'user',
       ]);
-      expect(out[1]['tool_calls'], isNotEmpty);
-      expect(out[2]['tool_call_id'], 'c1');
+      expect(out[2]['tool_calls'], isNotEmpty);
+      expect(out[3]['tool_call_id'], 'c1');
     });
 
     test('预算不足时整组裁掉工具轮，不留下孤儿 tool 结果', () {
@@ -105,7 +113,9 @@ void main() {
         {'role': 'user', 'content': 'latest'},
       ];
       final out = ShiyiState.trimApiMessagesForBudget(m, 300);
-      expect(out.map((e) => e['role']).toList(), ['system', 'user']);
+      expect(out.first['content'], 'sys');
+      expect(out.map((e) => e['role']).toList(), ['system', 'user', 'user']);
+      expect(out[1]['content'], contains('较早对话因上下文限制未包含'));
     });
 
     test('工具定义占用预算，裁剪后总请求 Token 不超过总预算', () {
@@ -132,6 +142,22 @@ void main() {
       ).totalEstimatedTokens;
       expect(total, lessThanOrEqualTo(budget));
       expect(out.last['content'], '最新问题');
+      expect(out.first['content'], '系统提示');
+    });
+
+    test('动尾 system 不改字节，裁剪说明插在冻头之后', () {
+      final m = [
+        {'role': 'system', 'content': 'frozen-prefix'},
+        {'role': 'user', 'content': 'old' * 2000},
+        {'role': 'assistant', 'content': 'old-ans' * 200},
+        {'role': 'user', 'content': 'latest'},
+        {'role': 'system', 'content': 'tail-time'},
+      ];
+      final out = ShiyiState.trimApiMessagesForBudget(m, 250);
+      expect(out.first['content'], 'frozen-prefix');
+      expect(out.last['content'], 'tail-time');
+      expect(out[1]['content'], contains('较早对话因上下文限制未包含'));
+      expect(out[out.length - 2]['content'], 'latest');
     });
   });
 
@@ -469,6 +495,147 @@ void main() {
       final start = ShiyiState.compressionKeepStart(msgs, contextLimit: 300);
       expect(start, 1, reason: '工具单元必须整组保留（asst1+tool1）');
       expect(msgs[start].role, 'assistant');
+    });
+  });
+
+  group('compactOldTools 原地截断', () {
+    var seq = 0;
+    ChatMessage asst(String callId, String content) => ChatMessage(
+      id: 'a${seq++}',
+      sessionId: 's1',
+      role: 'assistant',
+      content: content,
+      toolCalls: [ToolCall(id: callId, name: 'run_terminal', arguments: '{}')],
+      createdAt: seq,
+    );
+    ChatMessage tool(String callId, String output) => ChatMessage(
+      id: 't$seq${seq++}',
+      sessionId: 's1',
+      role: 'tool',
+      content: output,
+      toolCallId: callId,
+      createdAt: seq,
+    );
+
+    test('超过 3 个完整工具轮时保留全部成对，只截断较早输出', () {
+      final long = 'x' * 4000;
+      final msgs = <ChatMessage>[
+        ChatMessage(
+          id: 'u0',
+          sessionId: 's1',
+          role: 'user',
+          content: '开始',
+          createdAt: 0,
+        ),
+        for (var i = 1; i <= 5; i++) ...[
+          asst('c$i', 'ok$i'),
+          tool('c$i', long),
+        ],
+      ];
+      final out = ShiyiState.historyToApiForTest(
+        msgs,
+        compactOldTools: true,
+      );
+      final tools = out.where((m) => m['role'] == 'tool').toList();
+      expect(tools.length, 5);
+      expect(out.where((m) => m['role'] == 'assistant').length, 5);
+      expect((tools[0]['content'] as String).length, lessThan(long.length));
+      expect((tools[0]['content'] as String), contains('已裁剪中间内容'));
+      expect(tools[4]['content'], long);
+    });
+
+    test('压缩请求冻头不变，压缩指令在动尾，不是摘要助手', () {
+      final msgs = ShiyiState.buildCompactRequestMessages(
+        frozen: 'FROZEN_PREFIX',
+        history: [
+          {'role': 'user', 'content': 'hello'},
+          {'role': 'assistant', 'content': 'hi'},
+        ],
+      );
+      expect(msgs.first['role'], 'system');
+      expect(msgs.first['content'], 'FROZEN_PREFIX');
+      expect(msgs.last['role'], 'system');
+      expect(msgs.last['content'], ShiyiState.compactInstruction);
+      expect(jsonEncode(msgs), isNot(contains('对话摘要助手')));
+    });
+  });
+
+  group('主请求冻头/归档/动尾', () {
+    test('滚动任务摘要进动尾，不插在历史前面', () {
+      final msgs = ShiyiState.buildMainRequestMessages(
+        frozen: 'FROZEN_PREFIX',
+        history: [
+          {'role': 'user', 'content': 'hello'},
+          {'role': 'assistant', 'content': 'hi'},
+        ],
+        tail: 'TAIL_TIME',
+        rollingSummary: '早先做了登录',
+        contextSummaries: '【滚动任务摘要】\n目标：改缓存',
+      );
+      expect(msgs.first['content'], 'FROZEN_PREFIX');
+      expect(msgs[1]['role'], 'user');
+      expect(msgs[1]['content'], contains('【历史任务摘要】'));
+      expect(msgs[1]['content'], contains('早先做了登录'));
+      expect(msgs[1]['content'], isNot(contains('【滚动任务摘要】')));
+      expect(msgs[2]['role'], 'assistant');
+      expect(msgs[3]['content'], 'hello');
+      expect(msgs[4]['content'], 'hi');
+      expect(msgs.last['role'], 'system');
+      expect(msgs.last['content'], contains('TAIL_TIME'));
+      expect(msgs.last['content'], contains('【滚动任务摘要】'));
+      expect(msgs.last['content'], contains('目标：改缓存'));
+    });
+
+    test('没有压缩归档时历史紧跟冻头', () {
+      final msgs = ShiyiState.buildMainRequestMessages(
+        frozen: 'FROZEN_PREFIX',
+        history: [
+          {'role': 'user', 'content': 'hello'},
+        ],
+        tail: 'TAIL_TIME',
+      );
+      expect(msgs.map((m) => m['role']).toList(), ['system', 'user', 'system']);
+      expect(msgs[1]['content'], 'hello');
+    });
+  });
+
+  group('内嵌终端探活', () {
+    test('已经探活成功就不再跑 true 自检', () {
+      expect(
+        ShiyiState.shouldProbeEmbeddedTerminal(alreadyReady: true),
+        isFalse,
+      );
+      expect(
+        ShiyiState.shouldProbeEmbeddedTerminal(alreadyReady: false),
+        isTrue,
+      );
+    });
+  });
+
+  group('tools 表缓存前缀', () {
+    test('顺序固定，计划模式与普通模式 JSON 完全相同', () {
+      final names = ShiyiState.toolRegistry.map((t) => t.name).toList();
+      expect(names, [
+        'save_memory',
+        'search_sessions',
+        'read_session',
+        'search_memory',
+        'run_skill',
+        'web_search',
+        'web_extract',
+        'run_terminal',
+        'file_write',
+        'file_read',
+        'question',
+        'create_skill',
+        'enter_plan_mode',
+        'exit_plan_mode',
+        'spawn_agent',
+      ]);
+      expect(
+        jsonEncode(ShiyiState.toolsJsonForRequest(planMode: true)),
+        jsonEncode(ShiyiState.toolsJsonForRequest(planMode: false)),
+      );
     });
   });
 }

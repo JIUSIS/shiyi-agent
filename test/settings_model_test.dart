@@ -40,6 +40,18 @@ void main() {
     );
     expect(ApiProfile.fromJson(profile.toJson()).apiProtocol, 'anthropic');
     expect(ApiProfile.fromJson({}).apiProtocol, 'openai');
+
+    final responses = AppSettings(apiProtocol: 'responses').toJson();
+    expect(AppSettings.fromJson(responses).apiProtocol, 'responses');
+    final responsesProfile = ApiProfile(
+      name: 'Responses',
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiProtocol: 'responses',
+    );
+    expect(
+      ApiProfile.fromJson(responsesProfile.toJson()).apiProtocol,
+      'responses',
+    );
   });
 
   test('dshStopOnExit 默认开启，并随设置 JSON 往返持久化', () {
@@ -120,6 +132,27 @@ void main() {
     expect(
       LlmClient.normalizeAnthropicBaseUrl('https://host/api/v1'),
       'https://host/api',
+    );
+  });
+
+  test('normalizeResponsesBaseUrl：DeepSeek 官方去掉 /v1，其它网关保留', () {
+    expect(
+      LlmClient.normalizeResponsesBaseUrl('https://api.deepseek.com/v1'),
+      'https://api.deepseek.com',
+    );
+    expect(
+      LlmClient.normalizeResponsesBaseUrl('https://api.deepseek.com/'),
+      'https://api.deepseek.com',
+    );
+    expect(
+      LlmClient.normalizeResponsesBaseUrl('https://openrouter.ai/api/v1'),
+      'https://openrouter.ai/api/v1',
+    );
+    expect(
+      LlmClient.normalizeResponsesBaseUrl(
+        'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      ),
+      'https://dashscope.aliyuncs.com/compatible-mode/v1',
     );
   });
 }

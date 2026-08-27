@@ -10,9 +10,13 @@ class PromptSection {
   final String name;
 
   /// 组装顺序：升序拼接。约定：
-  /// 0 人设 / 50 在场（可选活人感）/ 100 工具规则 / 200 工作目录 / 300 动态注入（记忆/技能）/
-  /// 400 模式注入（计划模式）/ 900 历史归档 / 1000 当前时间。
+  /// 冻头 0 人设 / 100 工具规则 / 200 工作目录 / 250 平台 / 310 技能目录 /
+  /// 320 已加载技能；
+  /// 动尾 850 记忆 / 860 在场 / 870 计划模式 / 1000 当前时间。
   final int order;
+
+  /// 缓存分层：冻头必须跨请求字节级稳定；动尾可以每轮变化。
+  final PromptCacheTier cacheTier;
 
   /// 静态文本；非空时直接使用，不调用 [builder]。
   final String text;
@@ -23,6 +27,7 @@ class PromptSection {
   const PromptSection({
     required this.name,
     required this.order,
+    this.cacheTier = PromptCacheTier.frozen,
     this.text = '',
     this.builder,
   }) : assert(text != '' || builder != null, '段落 $name 必须提供 text 或 builder');
@@ -36,12 +41,36 @@ class PromptSection {
   }
 }
 
+/// 提示词缓存分层。冻头走 instructions / Claude cache_control；动尾放请求尾部。
+enum PromptCacheTier { frozen, tail }
+
+/// 按缓存分层组装后的提示词。
+class AssembledPrompt {
+  final String frozen;
+  final String tail;
+
+  const AssembledPrompt({required this.frozen, required this.tail});
+
+  bool get isEmpty => frozen.trim().isEmpty && tail.trim().isEmpty;
+
+  /// 冻头在前、动尾在后的完整文本（Chat Completions 单条 system 用）。
+  String get full {
+    if (frozen.trim().isEmpty) return tail;
+    if (tail.trim().isEmpty) return frozen;
+    return '$frozen\n\n$tail';
+  }
+}
+
+/// 人设 / 技能模板里一旦出现这些变量，整段都不能进冻头。
+bool promptTemplateHasVolatileVars(String text) =>
+    text.contains('{{now}}') || text.contains('{{user_text}}');
+
 /// 按 [PromptSection.order] 升序组装段落：
-/// 求值 → 跳过空段落 → 用空行（\n\n）拼接。
+/// 求值 → 跳过空段落 → 用空行（\n\n）拼接，并按冻头 / 动尾分层。
 ///
 /// - 段落名重复会抛 [StateError]（DSH 同款约束：同一层内重复注册是配置错误）。
 /// - order 相同时按注册顺序保持稳定（不依赖排序算法稳定性）。
-Future<String> assemblePromptSections(List<PromptSection> sections) async {
+Future<AssembledPrompt> assemblePromptParts(List<PromptSection> sections) async {
   final names = <String>{};
   for (final s in sections) {
     if (!names.add(s.name)) {
@@ -53,12 +82,23 @@ Future<String> assemblePromptSections(List<PromptSection> sections) async {
       final c = a.value.order.compareTo(b.value.order);
       return c != 0 ? c : a.key.compareTo(b.key);
     });
-  final parts = <String>[];
+  final frozen = <String>[];
+  final tail = <String>[];
   for (final e in indexed) {
     final text = await e.value.build();
-    if (text.trim().isNotEmpty) parts.add(text);
+    if (text.trim().isEmpty) continue;
+    if (e.value.cacheTier == PromptCacheTier.tail) {
+      tail.add(text);
+    } else {
+      frozen.add(text);
+    }
   }
-  return parts.join('\n\n');
+  return AssembledPrompt(frozen: frozen.join('\n\n'), tail: tail.join('\n\n'));
+}
+
+/// 兼容旧调用：冻头 + 动尾拼成一条完整 system。
+Future<String> assemblePromptSections(List<PromptSection> sections) async {
+  return (await assemblePromptParts(sections)).full;
 }
 
 /// 提示词变量插值：把 `{{name}}` 替换为注册变量的值。

@@ -2,6 +2,35 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.5.10] - 2026-08-27
+
+相对 2.5.9：拾忆直连补上 OpenAI Responses；冻头/动尾对齐 Codex 口径稳住缓存；活人感改接本机 LAAP 皮层，按官方 preamble 注入。
+
+### 新增
+
+- **第三条协议 Responses**：设置页 Chat Completions / Claude 之外增加 OpenAI Responses。冻头走 `instructions`，其余走 `input`，默认 `store: false`。禁止 `previous_response_id` / `prompt_cache_key`。
+- **LAAP 认知皮层**：引擎页按 DSH 同款方式本机部署 `laap-MAX`（Android Alpine Python / Windows 本机 Python，端口 11546）。只给活人感供内心状态，不是第三套聊天引擎。
+- **活人感开关搬到引擎页**：对话设置里不再放活人感。打开且皮层就绪才注入；皮层挂了就不注入，没有本地关键字替身。
+
+### 优化
+
+- **冻头/动尾稳缓存**：Chat Completions 冻头第一条 system、动尾放历史之后；Claude 冻头 system 与最后一个 tool 打 `cache_control`。滚动摘要、记忆、活人感、当前时间不进冻头。
+- **压缩与工具轮 cache-safe**：压缩与主请求同一冻头和 tools；长会话旧工具轮原地截断；计划模式不换 tools 表；Responses 可回放加密思考 item。
+- **75% 任务摘要改走历史归档**：不再插在冻头和历史中间挡前缀。
+- **大工具输出 spill**：超长结果落到工作目录 `.shiyi/tool-outputs/`，模型只看头尾预览；只读 `tool_calls` 主循环可并行。
+- **状态栏本轮缓存**：会话页显示本轮命中 / 未缓存，命中率按会话累计。
+
+### 修复
+
+- **Responses 发图 HTTP 502**：图片改为 `{type:input_image, image_url:"..."}` 字符串，不再把 Chat 的 `image_url` 对象原样塞进 Responses。
+- **小米小窗空白卡死**：HyperOS 自由窗口把状态栏 padding 报成窗口高度时，钳制 MediaQuery，主页/会话能画出来。Activity 声明 `resizeableActivity`。
+- **活人感官方接法**：去掉提示词里的「本机皮层已接通」。按 `psi_hermes_adapter.py` 注入 `## PSI Cognitive State (Live)` + preamble + 需求风格 + cot_hint。未改 Alpine 里的 laap-MAX 源码。
+
+### 验证
+
+- `flutter test test/laap_api_test.dart test/presence_engine_test.dart test/prompt_section_test.dart test/llm_protocol_cache_test.dart test/media_query_fix_test.dart test/tool_output_spill_test.dart test/context_budget_test.dart test/settings_model_test.dart` 通过。
+- 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
+
 ## [2.5.9] - 2026-08-26
 
 相对 2.5.8：主页拖拽抽成共享组件，DSH 工作区会话也能长按排序并持久化到服务端。

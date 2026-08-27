@@ -1742,10 +1742,14 @@ class _TokenStats extends StatelessWidget {
         ? 100.0
         : ((limit - tokens) / limit * 100).clamp(0, 100);
     final remainInt = remain.round();
-    // 缓存命中率 = 会话累计口径（Σ缓存token ÷ Σ输入token，同 DSH），切会话清零。
+    // 会话累计命中率（越高越便宜）+ 本轮真实命中/未缓存，便于判断前缀有没有稳住。
     final cacheText = !shiyi.sessionCacheKnown || shiyi.sessionInputTokens <= 0
         ? '缓存 --'
         : '缓存 ${(shiyi.sessionCachedTokens / shiyi.sessionInputTokens * 100).round()}%';
+    final roundCacheText = !shiyi.lastRoundCacheKnown ||
+            shiyi.lastRoundPromptTokens <= 0
+        ? '本轮命中 --'
+        : '本轮命中 ${_fmt(shiyi.lastRoundCachedTokens)}/未缓存 ${_fmt((shiyi.lastRoundPromptTokens - shiyi.lastRoundCachedTokens).clamp(0, shiyi.lastRoundPromptTokens))}';
     final color = remainInt <= 20
         ? theme.colorScheme.error
         : remainInt <= 50
@@ -1758,7 +1762,7 @@ class _TokenStats extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
           child: Text(
-            '本轮 ${_fmt(round)} · 上下文剩 $remainInt% · $cacheText',
+            '本轮 ${_fmt(round)} · 上下文剩 $remainInt% · $cacheText · $roundCacheText',
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,

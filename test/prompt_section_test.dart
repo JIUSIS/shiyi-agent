@@ -8,6 +8,21 @@ import 'package:shiyi_agent_app/core/prompt_section.dart';
 
 void main() {
   group('assemblePromptSections', () {
+    test('assemblePromptParts 冻头在前、动尾在后', () async {
+      final out = await assemblePromptParts([
+        const PromptSection(
+          name: 'tail',
+          order: 10,
+          cacheTier: PromptCacheTier.tail,
+          text: 'TAIL',
+        ),
+        const PromptSection(name: 'frozen', order: 0, text: 'FROZEN'),
+      ]);
+      expect(out.frozen, 'FROZEN');
+      expect(out.tail, 'TAIL');
+      expect(out.full, 'FROZEN\n\nTAIL');
+    });
+
     test('按 order 升序组装（乱序输入）', () async {
       final out = await assemblePromptSections([
         const PromptSection(name: 'b', order: 200, text: 'B'),
@@ -68,10 +83,7 @@ void main() {
     });
 
     test('宽容模式：未注册变量原样保留', () {
-      expect(
-        renderPromptVariables('未知 {{foo}} 保留', vars),
-        '未知 {{foo}} 保留',
-      );
+      expect(renderPromptVariables('未知 {{foo}} 保留', vars), '未知 {{foo}} 保留');
     });
 
     test('严格模式：未注册变量抛 StateError', () {
@@ -124,31 +136,61 @@ void main() {
       expect(sections.any((s) => s.name == 'presence'), isFalse);
     });
 
-    test('活人感开启时注入 presence，且排在人设之后、工具规则之前', () async {
+    test('活人感开启但皮层未接通时不写入 PSI 段', () async {
       final shiyi = makeState();
       shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
-      shiyi.presence.onUserMessage('我们一起把这个做完');
+      final prompt = await shiyi.buildSystemPromptForTest('输入');
+      expect(prompt, isNot(contains('PSI Cognitive State')));
+      expect(prompt, isNot(contains('【在场】')));
+      expect(prompt, contains('你是「拾忆」'));
+    });
+
+    test('活人感开启时注入 presence，排在工具规则之后、时间之前，并标为动尾', () async {
+      final shiyi = makeState();
+      shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
+      shiyi.presence.applyRemote(
+        needs: {
+          'competence': 0.7,
+          'autonomy': 0.4,
+          'relatedness': 0.4,
+          'certainty': 0.4,
+          'growth': 0.4,
+        },
+        attentionFocus: 'task',
+      );
       final sections = shiyi.buildPromptSectionsForTest('输入');
       final presence = sections.singleWhere((s) => s.name == 'presence');
       final persona = sections.singleWhere((s) => s.name == 'persona');
       final toolRules = sections.singleWhere((s) => s.name == 'tool-rules');
+      final time = sections.singleWhere((s) => s.name == 'current-time');
       expect(presence.order, greaterThan(persona.order));
-      expect(presence.order, lessThan(toolRules.order));
+      expect(presence.order, greaterThan(toolRules.order));
+      expect(presence.order, lessThan(time.order));
+      expect(presence.cacheTier, PromptCacheTier.tail);
+      expect(toolRules.cacheTier, PromptCacheTier.frozen);
 
       final text = await presence.build();
-      expect(text, contains('【在场】'));
-      expect(text, contains('本轮内心'));
-      expect(text, contains('不要直接说出来'));
-      expect(text, contains('不要工作汇报腔'));
-      expect(text, isNot(contains('PSI')));
+      expect(text, contains('## PSI Cognitive State (Live)'));
+      expect(text, contains('[PSI State —'));
+      expect(text, contains('当前最高需求 (competence)'));
+      expect(text, isNot(contains('本机皮层')));
+      expect(text, isNot(contains('【在场】')));
     });
 
-    test('活人感开启时完整提示词含在场段，默认人设仍在', () async {
+    test('活人感开启时完整提示词含 PSI 段，默认人设仍在', () async {
       final shiyi = makeState();
       shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
-      shiyi.presence.onUserMessage('输入');
+      shiyi.presence.applyRemote(
+        needs: {
+          'competence': 0.7,
+          'autonomy': 0.4,
+          'relatedness': 0.4,
+          'certainty': 0.4,
+          'growth': 0.4,
+        },
+      );
       final prompt = await shiyi.buildSystemPromptForTest('输入');
-      expect(prompt, contains('【在场】'));
+      expect(prompt, contains('## PSI Cognitive State (Live)'));
       expect(prompt, contains('你是「拾忆」'));
       expect(prompt, contains('【工具使用规则】'));
     });
@@ -157,19 +199,42 @@ void main() {
       final shiyi = makeState();
       shiyi.settings = shiyi.settings.copyWith(enablePresence: true);
       shiyi.presence = PresenceEngine();
-      shiyi.presence.onUserMessage('今晚一起吃饭，有你陪伴真好');
+      shiyi.presence.applyRemote(
+        needs: {
+          'competence': 0.3,
+          'autonomy': 0.3,
+          'relatedness': 0.8,
+          'certainty': 0.3,
+          'growth': 0.3,
+        },
+        attentionFocus: 'social',
+      );
       final prompt = await shiyi.buildSystemPromptForTest('今晚一起吃饭，有你陪伴真好');
-      expect(prompt, contains('联结'));
       expect(prompt, contains('relatedness'));
+      expect(prompt, contains('优先建立情感连接，表达温暖和理解'));
     });
 
     test('时间段落 order 最大（永远排最后，缓存前缀稳定）', () {
       final sections = makeState().buildPromptSectionsForTest('输入');
       final time = sections.singleWhere((s) => s.name == 'current-time');
       for (final s in sections) {
-        expect(s.order <= time.order, isTrue,
-            reason: '${s.name} (${s.order}) 不应排在时间段落之后');
+        expect(
+          s.order <= time.order,
+          isTrue,
+          reason: '${s.name} (${s.order}) 不应排在时间段落之后',
+        );
       }
+    });
+
+    test('计划模式进动尾，不改冻头', () async {
+      final shiyi = makeState();
+      shiyi.planMode = true;
+      final assembled = await assemblePromptParts(
+        shiyi.buildPromptSectionsForTest('输入'),
+      );
+      expect(assembled.frozen, isNot(contains('【计划模式】')));
+      expect(assembled.tail, contains('【计划模式】'));
+      expect(assembled.tail, contains('【当前时间】'));
     });
 
     test('静态段落求值不依赖实例状态', () async {
@@ -237,6 +302,14 @@ void main() {
       );
     }
 
+    test('默认人设进冻头，当前时间进动尾', () async {
+      final assembled = await makeBuilder('android').buildAssembledPrompt('hi');
+      expect(assembled.frozen, contains('你是「拾忆」'));
+      expect(assembled.frozen, contains('【工具使用规则】'));
+      expect(assembled.frozen, isNot(contains('【当前时间】')));
+      expect(assembled.tail, contains('【当前时间】'));
+    });
+
     test('Android 人设与工具规则仍是 Alpine / apk，不出现 Windows 路径或后端', () async {
       final prompt = await makeBuilder('android').buildSystemPrompt('hi');
       expect(prompt, contains('运行在 Android 手机上的个人 AI 工作台'));
@@ -264,11 +337,7 @@ void main() {
     test('Git Bash / PowerShell / cmd 也不出现 Android 路径或 apk', () async {
       for (final backend in ['gitbash', 'pwsh', 'cmd']) {
         final prompt = await makeBuilder(backend).buildSystemPrompt('hi');
-        expect(
-          prompt,
-          contains('运行在 Windows 桌面的个人 AI 工作台'),
-          reason: backend,
-        );
+        expect(prompt, contains('运行在 Windows 桌面的个人 AI 工作台'), reason: backend);
         expect(prompt, contains('文档\\agent'), reason: backend);
         expect(prompt, isNot(contains('运行在 Android 手机')), reason: backend);
         expect(prompt, isNot(contains('apk add python3')), reason: backend);

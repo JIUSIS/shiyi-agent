@@ -87,6 +87,7 @@ llm-pi-ai:
     test('openai -> openai-completions，anthropic -> anthropic-messages', () {
       expect(DshModelSync.dshApiFor('openai'), 'openai-completions');
       expect(DshModelSync.dshApiFor('anthropic'), 'anthropic-messages');
+      expect(DshModelSync.dshApiFor('responses'), 'openai-responses');
     });
 
     test('mimo 与 deepseek 一样声明思考档位，对不上家族关键字的也有通用档位', () {

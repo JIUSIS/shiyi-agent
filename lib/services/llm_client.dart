@@ -23,9 +23,11 @@ class TurnResult {
   final String text;
   final List<Map<String, String>> toolCalls; // [{id,name,arguments}]
   final String reasoning; // 模型思考内容（reasoning_content）
+  final String reasoningEncrypted; // Responses encrypted_content，原样回放
   TurnResult({
     this.text = '',
     this.reasoning = '',
+    this.reasoningEncrypted = '',
     List<Map<String, String>>? toolCalls,
   }) : toolCalls = toolCalls ?? [];
 }
@@ -35,7 +37,7 @@ class LlmClient {
   final String baseUrl;
   final String apiKey;
   final String model;
-  final String protocol; // openai | anthropic
+  final String protocol; // openai | anthropic | responses
   final double temperature;
   final int maxTokens;
   final List<Map<String, dynamic>> tools;
@@ -79,6 +81,9 @@ class LlmClient {
   /// 把 reasoning_content 一起回传，否则 HTTP 400）。
   String _lastRoundReasoning = '';
 
+  /// Responses 加密思考，续写/工具轮必须原样回放。
+  String _lastRoundReasoningEncrypted = '';
+
   LlmClient({
     required this.baseUrl,
     required this.apiKey,
@@ -94,13 +99,16 @@ class LlmClient {
     this.onDiag,
   });
 
+  bool get _isResponses => protocol == 'responses';
+
   String get _endpoint {
-    final root = protocol == 'anthropic'
-        ? normalizeAnthropicBaseUrl(baseUrl)
-        : baseUrl.replaceAll(RegExp(r'/*$'), '');
-    return protocol == 'anthropic'
-        ? '$root/v1/messages'
-        : '$root/chat/completions';
+    if (protocol == 'anthropic') {
+      return '${normalizeAnthropicBaseUrl(baseUrl)}/v1/messages';
+    }
+    if (_isResponses) {
+      return '${normalizeResponsesBaseUrl(baseUrl)}/responses';
+    }
+    return '${baseUrl.replaceAll(RegExp(r'/*$'), '')}/chat/completions';
   }
 
   /// Anthropic 自定义网关兼容：去掉结尾的 /v1，避免拼成 /v1/v1/messages。
@@ -110,13 +118,28 @@ class LlmClient {
         .replaceFirst(RegExp(r'/v1$', caseSensitive: false), '');
   }
 
+  /// Responses 路径：一般是 {base}/responses。DeepSeek 官方文档是
+  /// POST https://api.deepseek.com/responses，不是 /v1/responses。
+  static String normalizeResponsesBaseUrl(String url) {
+    final root = url.replaceAll(RegExp(r'/*$'), '');
+    final uri = Uri.tryParse(root);
+    if (uri != null &&
+        (uri.host == 'api.deepseek.com' || uri.host == 'api.deepseek.ai')) {
+      final scheme = uri.scheme.isEmpty ? 'https' : uri.scheme;
+      return '$scheme://${uri.host}';
+    }
+    return root;
+  }
+
   Map<String, String> _headers({required bool streaming}) => <String, String>{
     'Content-Type': 'application/json',
     if (streaming) 'Accept': 'text/event-stream',
-    if (apiKey.isNotEmpty && protocol == 'openai')
+    if (apiKey.isNotEmpty && protocol != 'anthropic')
       'Authorization': 'Bearer $apiKey',
     if (apiKey.isNotEmpty && protocol == 'anthropic') 'x-api-key': apiKey,
     if (protocol == 'anthropic') 'anthropic-version': '2023-06-01',
+    if (protocol == 'anthropic')
+      'anthropic-beta': 'prompt-caching-2024-07-31',
   };
 
   /// 续写指令：上一轮只输出了计划且没有实际工具调用时，改用“工具唤醒”提示，
@@ -143,6 +166,7 @@ class LlmClient {
     lastInputTokens = null;
     lastCachedTokens = null;
     _lastRoundReasoning = '';
+    _lastRoundReasoningEncrypted = '';
     final client = await Socks5Proxy.client();
     try {
       var includeUsage = true;
@@ -168,10 +192,13 @@ class LlmClient {
                   profile?.usesAnthropicThinking == true));
       // 网关拒绝 max_completion_tokens 时回退 max_tokens（旧网关兼容）。
       var useMaxCompletion = _useMaxCompletionTokens;
+      var sendStore = _isResponses;
+      var sendParallel = tools.isNotEmpty;
+      var sendInclude = _isResponses;
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
-      for (var round = 0; round < 3; round++) {
+      for (var round = 0; round < 8; round++) {
         final body = _buildRequestBody(
           messages: [...messages, ...continuation],
           stream: true,
@@ -180,6 +207,9 @@ class LlmClient {
           thinkingEnabled: thinkingEnabled,
           reasoningEffort: reasoningEffort,
           useMaxCompletionTokens: useMaxCompletion,
+          sendStore: sendStore,
+          sendParallel: sendParallel,
+          sendInclude: sendInclude,
         );
         final request = http.Request('POST', Uri.parse(_endpoint))
           ..headers.addAll(_headers(streaming: true))
@@ -190,11 +220,15 @@ class LlmClient {
           'reasoningEffort=${reasoningEffort ?? 'off'} '
           'tokenField=${useMaxCompletion ? 'max_completion_tokens' : 'max_tokens'}',
         );
-        // 完整请求体诊断（无密钥；截断防爆日志）。
+        // 请求体诊断：先写体积和内容类型（才能看见图片块），再截断正文。
         {
           final bodyPreview = jsonEncode(body);
           onDiag?.call(
-            '[reqbody] ${bodyPreview.length <= 2000 ? bodyPreview : '${bodyPreview.substring(0, 2000)}…'}',
+            '[reqmeta] protocol=$protocol '
+            'bytes=${utf8.encode(bodyPreview).length} ${_contentMeta(body)}',
+          );
+          onDiag?.call(
+            '[reqbody] ${_previewRequestBody(bodyPreview)}',
           );
         }
         try {
@@ -223,6 +257,23 @@ class LlmClient {
               onDiag?.call('[stream] reasoning_effort 被网关拒绝，去掉后重试');
               continue;
             }
+            if (sendStore &&
+                (e.contains('store') || e.contains('previous_response_id'))) {
+              sendStore = false;
+              onDiag?.call('[stream] store/previous_response_id 被拒绝，去掉后重试');
+              continue;
+            }
+            if (sendParallel && e.contains('parallel_tool_calls')) {
+              sendParallel = false;
+              onDiag?.call('[stream] parallel_tool_calls 被拒绝，去掉后重试');
+              continue;
+            }
+            if (sendInclude &&
+                (e.contains('include') || e.contains('encrypted_content'))) {
+              sendInclude = false;
+              onDiag?.call('[stream] include/encrypted_content 被拒绝，去掉后重试');
+              continue;
+            }
             // 部分网关/中转不支持 stream_options：去掉后重试一次（只少 token 统计，不影响内容）。
             if (includeUsage && _isUsageParamError(err)) {
               includeUsage = false;
@@ -238,6 +289,8 @@ class LlmClient {
           }
           final needContinue = protocol == 'anthropic'
               ? await _parseAnthropicSse(response.stream)
+              : _isResponses
+              ? await _parseResponsesSse(response.stream)
               : await _parseOpenAiSse(response.stream);
           if (!needContinue) return;
           // 纯文本截断：追加已输出 + 继续指令，发起续写请求。
@@ -256,6 +309,8 @@ class LlmClient {
               // 必须原样回传，否则上游 HTTP 400 拒绝续写请求。
               if (_lastRoundReasoning.isNotEmpty)
                 'reasoning_content': _lastRoundReasoning,
+              if (_lastRoundReasoningEncrypted.isNotEmpty)
+                'reasoning_encrypted': _lastRoundReasoningEncrypted,
             },
             {
               'role': 'user',
@@ -295,7 +350,7 @@ class LlmClient {
     }
   }
 
-  /// 判断 HTTP 400 是否由 stream_options/include_usage 参数不被支持引起。
+  /// 按协议组装 Chat Completions / Anthropic Messages / Responses 请求体。
   Map<String, dynamic> _buildRequestBody({
     required List<Map<String, dynamic>> messages,
     required bool stream,
@@ -304,60 +359,67 @@ class LlmClient {
     bool thinkingEnabled = false,
     String? reasoningEffort,
     bool? useMaxCompletionTokens,
+    bool sendStore = false,
+    bool sendParallel = false,
+    bool sendInclude = false,
   }) {
     if (protocol == 'anthropic') {
-      final systemParts = <String>[];
-      final apiMessages = <Map<String, dynamic>>[];
-      for (final m in messages) {
-        if (m['role'] == 'system') {
-          final c = (m['content'] ?? '').toString().trim();
-          if (c.isNotEmpty) systemParts.add(c);
-        } else {
-          apiMessages.add(m);
-        }
-      }
-      final effort = reasoningEffort;
-      final thinkingOn =
-          thinkingEnabled &&
-          effort != null &&
-          effort.isNotEmpty &&
-          effort != 'off';
-      return <String, dynamic>{
-        'model': model,
-        if (systemParts.isNotEmpty) 'system': systemParts.join('\n\n'),
-        'messages': _toAnthropicMessages(apiMessages),
-        'max_tokens': maxTokens,
-        'stream': stream,
-        // extended thinking 开启时 Anthropic 要求不传 temperature。
-        if (!thinkingOn) 'temperature': temperature,
-        if (thinkingOn)
-          'thinking': {
-            'type': 'enabled',
-            'budget_tokens': ReasoningModels.anthropicBudget(effort, maxTokens),
-          },
-        if (tools.isNotEmpty) 'tools': _toAnthropicTools(tools),
-        if (tools.isNotEmpty)
-          'tool_choice': {'type': 'auto', 'disable_parallel_tool_use': false},
-      };
+      return _buildAnthropicBody(
+        messages: messages,
+        stream: stream,
+        maxTokens: maxTokens,
+        thinkingEnabled: thinkingEnabled,
+        reasoningEffort: reasoningEffort,
+      );
     }
+    if (_isResponses) {
+      return _buildResponsesBody(
+        messages: messages,
+        stream: stream,
+        maxTokens: maxTokens,
+        thinkingEnabled: thinkingEnabled,
+        reasoningEffort: reasoningEffort,
+        sendStore: sendStore,
+        sendParallel: sendParallel,
+        sendInclude: sendInclude,
+      );
+    }
+    return _buildChatCompletionsBody(
+      messages: messages,
+      stream: stream,
+      includeUsage: includeUsage,
+      maxTokens: maxTokens,
+      thinkingEnabled: thinkingEnabled,
+      reasoningEffort: reasoningEffort,
+      useMaxCompletionTokens: useMaxCompletionTokens,
+      sendParallel: sendParallel,
+    );
+  }
+
+  Map<String, dynamic> _buildChatCompletionsBody({
+    required List<Map<String, dynamic>> messages,
+    required bool stream,
+    required bool includeUsage,
+    required int maxTokens,
+    required bool thinkingEnabled,
+    String? reasoningEffort,
+    bool? useMaxCompletionTokens,
+    bool sendParallel = false,
+  }) {
+    final split = _splitSystems(messages);
     final effortField = _openAiReasoningEffort(reasoningEffort);
     return <String, dynamic>{
       'model': model,
-      'messages': messages,
+      'messages': [
+        if (split.frozen.trim().isNotEmpty)
+          {'role': 'system', 'content': split.frozen},
+        ...split.messages.map(_withoutResponsesOnlyFields),
+        if (split.tail.trim().isNotEmpty)
+          {'role': 'system', 'content': split.tail},
+      ],
       'stream': stream,
       if (includeUsage) 'stream_options': {'include_usage': true},
-      // 思考模式（reasoning_effort）下不发送 temperature 与 tool_choice：
-      // 与 DSH 引擎走通该网关的请求（llm-pi-ai/pi-ai）逐字段对齐——
-      // pi-ai 仅在调用方显式传值时才带这两个字段，而 DSH agent 请求
-      // 从不带；真机对照：带 temperature=0.2 + tool_choice=auto 时网关把
-      // 思考链折叠进 content（reasoning_content 恒 null），DSH 引擎不带
-      // 时 reasoning_content 正常下发。
-      if (effortField == null || effortField.isEmpty)
-        'temperature': temperature,
-      // opencode.ai 等 OpenAI 风格网关用 max_completion_tokens 区分新旧
-      // 请求路径（与 DSH 内置 pi-ai 的 detectCompat 一致）；发 max_tokens
-      // 时网关会把思考链折叠进 content（真机原始 SSE 帧实证：
-      // delta.content=思考链, delta.reasoning_content=null）。
+      if (effortField == null || effortField.isEmpty) 'temperature': temperature,
       if (useMaxCompletionTokens ?? _useMaxCompletionTokens)
         'max_completion_tokens': maxTokens
       else
@@ -366,8 +428,346 @@ class LlmClient {
       if (effortField != null && effortField.isNotEmpty)
         'reasoning_effort': effortField,
       if (tools.isNotEmpty) 'tools': tools,
-      // tool_choice 与 pi-ai 对齐：不显式发送（OpenAI 默认 auto）。
+      if (tools.isNotEmpty) 'tool_choice': 'auto',
+      if (tools.isNotEmpty && sendParallel) 'parallel_tool_calls': true,
     };
+  }
+
+  Map<String, dynamic> _buildAnthropicBody({
+    required List<Map<String, dynamic>> messages,
+    required bool stream,
+    required int maxTokens,
+    required bool thinkingEnabled,
+    String? reasoningEffort,
+  }) {
+    final split = _splitSystems(messages);
+    final effort = reasoningEffort;
+    final thinkingOn =
+        thinkingEnabled &&
+        effort != null &&
+        effort.isNotEmpty &&
+        effort != 'off';
+    final systemBlocks = <Map<String, dynamic>>[];
+    if (split.frozen.trim().isNotEmpty) {
+      systemBlocks.add({
+        'type': 'text',
+        'text': split.frozen,
+        'cache_control': {'type': 'ephemeral'},
+      });
+    }
+    if (split.tail.trim().isNotEmpty) {
+      systemBlocks.add({'type': 'text', 'text': split.tail});
+    }
+    final anthTools = _toAnthropicTools(tools);
+    if (anthTools.isNotEmpty) {
+      anthTools[anthTools.length - 1] = {
+        ...anthTools.last,
+        'cache_control': {'type': 'ephemeral'},
+      };
+    }
+    return <String, dynamic>{
+      'model': model,
+      if (systemBlocks.isNotEmpty) 'system': systemBlocks,
+      'messages': _toAnthropicMessages(split.messages),
+      'max_tokens': maxTokens,
+      'stream': stream,
+      if (!thinkingOn) 'temperature': temperature,
+      if (thinkingOn)
+        'thinking': {
+          'type': 'enabled',
+          'budget_tokens': ReasoningModels.anthropicBudget(effort, maxTokens),
+        },
+      if (anthTools.isNotEmpty) 'tools': anthTools,
+      if (anthTools.isNotEmpty)
+        'tool_choice': {'type': 'auto', 'disable_parallel_tool_use': false},
+    };
+  }
+
+  Map<String, dynamic> _buildResponsesBody({
+    required List<Map<String, dynamic>> messages,
+    required bool stream,
+    required int maxTokens,
+    required bool thinkingEnabled,
+    String? reasoningEffort,
+    required bool sendStore,
+    bool sendParallel = false,
+    bool sendInclude = false,
+  }) {
+    final split = _splitSystems(messages);
+    final effortField = _openAiReasoningEffort(reasoningEffort);
+    final input = _toResponsesInput(split.messages);
+    if (split.tail.trim().isNotEmpty) {
+      input.add({
+        'type': 'message',
+        'role': 'system',
+        'content': split.tail,
+      });
+    }
+    return <String, dynamic>{
+      'model': model,
+      if (split.frozen.trim().isNotEmpty) 'instructions': split.frozen,
+      'input': input,
+      'stream': stream,
+      'max_output_tokens': maxTokens,
+      if (sendStore) 'store': false,
+      if (effortField == null || effortField.isEmpty) 'temperature': temperature,
+      if (thinkingEnabled && baseUrl.contains('deepseek.com'))
+        'thinking': {'type': 'enabled'},
+      if (effortField != null && effortField.isNotEmpty)
+        'reasoning': {'effort': effortField},
+      if (tools.isNotEmpty) 'tools': _toResponsesTools(tools),
+      if (tools.isNotEmpty) 'tool_choice': 'auto',
+      if (tools.isNotEmpty && sendParallel) 'parallel_tool_calls': true,
+      if (sendInclude) 'include': const ['reasoning.encrypted_content'],
+    };
+  }
+
+  ({String frozen, String tail, List<Map<String, dynamic>> messages})
+  _splitSystems(List<Map<String, dynamic>> messages) {
+    var frozen = '';
+    final tailParts = <String>[];
+    final rest = <Map<String, dynamic>>[];
+    var seenFrozen = false;
+    for (final m in messages) {
+      if (m['role'] == 'system') {
+        final c = (m['content'] ?? '').toString().trim();
+        if (c.isEmpty) continue;
+        if (!seenFrozen) {
+          frozen = c;
+          seenFrozen = true;
+        } else {
+          tailParts.add(c);
+        }
+      } else {
+        rest.add(m);
+      }
+    }
+    return (
+      frozen: frozen,
+      tail: tailParts.join('\n\n'),
+      messages: rest,
+    );
+  }
+
+  List<Map<String, dynamic>> _toResponsesInput(
+    List<Map<String, dynamic>> messages,
+  ) {
+    final input = <Map<String, dynamic>>[];
+    var assistantSeq = 0;
+    for (final m in messages) {
+      final role = (m['role'] ?? '').toString();
+      if (role == 'tool') {
+        input.add({
+          'type': 'function_call_output',
+          'call_id': (m['tool_call_id'] ?? '').toString(),
+          'output': (m['content'] ?? '').toString(),
+        });
+        continue;
+      }
+      final toolCalls = m['tool_calls'];
+      if (role == 'assistant' && toolCalls is List && toolCalls.isNotEmpty) {
+        _addResponsesReasoning(input, m);
+        final text = (m['content'] ?? '').toString();
+        if (text.trim().isNotEmpty) {
+          assistantSeq++;
+          input.add({
+            'type': 'message',
+            'role': 'assistant',
+            'status': 'completed',
+            'id': 'msg_asst_$assistantSeq',
+            'content': text,
+          });
+        }
+        for (final raw in toolCalls) {
+          final tc = raw is Map<String, dynamic> ? raw : <String, dynamic>{};
+          final fn = tc['function'] is Map<String, dynamic>
+              ? tc['function'] as Map<String, dynamic>
+              : <String, dynamic>{};
+          input.add({
+            'type': 'function_call',
+            'call_id': (tc['id'] ?? '').toString(),
+            'name': (fn['name'] ?? '').toString(),
+            'arguments': (fn['arguments'] ?? '').toString(),
+          });
+        }
+        continue;
+      }
+      if (role == 'assistant') {
+        _addResponsesReasoning(input, m);
+        assistantSeq++;
+      }
+      final resolvedRole = role.isEmpty ? 'user' : role;
+      final item = <String, dynamic>{
+        'type': 'message',
+        'role': resolvedRole,
+        'content': _toResponsesContent(m['content'], role: resolvedRole),
+      };
+      if (role == 'assistant') {
+        item['status'] = 'completed';
+        item['id'] = 'msg_asst_$assistantSeq';
+      }
+      input.add(item);
+    }
+    return input;
+  }
+
+  static void _addResponsesReasoning(
+    List<Map<String, dynamic>> input,
+    Map<String, dynamic> message,
+  ) {
+    final enc = (message['reasoning_encrypted'] ?? '').toString().trim();
+    if (enc.isEmpty) return;
+    input.add({
+      'type': 'reasoning',
+      'encrypted_content': enc,
+    });
+  }
+
+  static Map<String, dynamic> _withoutResponsesOnlyFields(
+    Map<String, dynamic> message,
+  ) {
+    if (!message.containsKey('reasoning_encrypted')) return message;
+    final copy = Map<String, dynamic>.from(message);
+    copy.remove('reasoning_encrypted');
+    return copy;
+  }
+
+  /// Chat Completions 多模态是 `{type:image_url, image_url:{url}}`；
+  /// Responses 原生要 `{type:input_image, image_url:"..."}`。
+  /// 原样透传会让中转/上游崩成 Cloudflare 502。
+  Object _toResponsesContent(Object? raw, {String role = 'user'}) {
+    if (raw is! List) return (raw ?? '').toString();
+    final parts = <Map<String, dynamic>>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final m = Map<String, dynamic>.from(item);
+      final type = (m['type'] ?? '').toString();
+      if (type == 'input_text' ||
+          type == 'output_text' ||
+          type == 'input_image' ||
+          type == 'input_file') {
+        if (type == 'input_image') {
+          final url = _responsesImageUrl(m);
+          if (url == null) continue;
+          parts.add({'type': 'input_image', 'image_url': url});
+          continue;
+        }
+        parts.add(m);
+        continue;
+      }
+      if (type == 'text' || (type.isEmpty && m['text'] != null)) {
+        parts.add({
+          'type': role == 'assistant' ? 'output_text' : 'input_text',
+          'text': (m['text'] ?? '').toString(),
+        });
+        continue;
+      }
+      if (type == 'image_url') {
+        final url = _responsesImageUrl(m);
+        if (url == null) continue;
+        parts.add({'type': 'input_image', 'image_url': url});
+      }
+    }
+    if (parts.isEmpty) return '';
+    return parts;
+  }
+
+  static String? _responsesImageUrl(Map<dynamic, dynamic> part) {
+    final direct = part['image_url'];
+    if (direct is String) {
+      final url = direct.trim();
+      if (url.isEmpty || url.startsWith('file:')) return null;
+      return url;
+    }
+    if (direct is Map) {
+      final url = (direct['url'] ?? '').toString().trim();
+      if (url.isEmpty || url.startsWith('file:')) return null;
+      return url;
+    }
+    return null;
+  }
+
+  static String _previewRequestBody(String encoded) {
+    final redacted = encoded.replaceAll(
+      RegExp(r'data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+'),
+      'data:image/*;base64,<omitted>',
+    );
+    return redacted.length <= 2000
+        ? redacted
+        : '${redacted.substring(0, 2000)}…';
+  }
+
+  static String _contentMeta(Map<String, dynamic> body) {
+    final root = body['input'] ?? body['messages'];
+    if (root is! List) return 'images=0 parts=0';
+    var images = 0;
+    var parts = 0;
+    final types = <String>[];
+    for (final item in root) {
+      if (item is! Map) continue;
+      final content = item['content'];
+      if (content is List) {
+        for (final part in content) {
+          parts++;
+          if (part is! Map) {
+            types.add('unknown');
+            continue;
+          }
+          final type = (part['type'] ?? '').toString();
+          types.add(type.isEmpty ? 'unknown' : type);
+          if (type == 'image_url' || type == 'input_image') images++;
+        }
+      } else {
+        parts++;
+        types.add('string');
+      }
+    }
+    final shown = types.length <= 12
+        ? types.join(',')
+        : '${types.take(12).join(',')}…';
+    final toolNames = _toolNames(body['tools']);
+    return 'images=$images parts=$parts types=$shown '
+        'tools=${toolNames.length} fingerprint=${toolNames.join(',')} '
+        'parallel=${body['parallel_tool_calls'] == true} '
+        'include=${body['include'] is List ? (body['include'] as List).join(',') : ''}';
+  }
+
+  static List<String> _toolNames(Object? tools) {
+    if (tools is! List) return const [];
+    final names = <String>[];
+    for (final raw in tools) {
+      if (raw is! Map) continue;
+      final direct = (raw['name'] ?? '').toString();
+      if (direct.isNotEmpty) {
+        names.add(direct);
+        continue;
+      }
+      final fn = raw['function'];
+      if (fn is Map) {
+        final name = (fn['name'] ?? '').toString();
+        if (name.isNotEmpty) names.add(name);
+      }
+    }
+    return names;
+  }
+
+
+  List<Map<String, dynamic>> _toResponsesTools(
+    List<Map<String, dynamic>> tools,
+  ) {
+    return tools.map((t) {
+      final fn = t['function'] is Map<String, dynamic>
+          ? t['function'] as Map<String, dynamic>
+          : t;
+      return <String, dynamic>{
+        'type': 'function',
+        'name': (fn['name'] ?? '').toString(),
+        'description': (fn['description'] ?? '').toString(),
+        'parameters': fn['parameters'] is Map<String, dynamic>
+            ? fn['parameters']
+            : const <String, dynamic>{'type': 'object', 'properties': {}},
+      };
+    }).toList();
   }
 
   /// GPT-5 关闭思考发 `none`；其余模型沿用 `off` / 档位原值。
@@ -528,6 +928,9 @@ class LlmClient {
       stream: false,
       includeUsage: false,
       maxTokens: maxTokens ?? this.maxTokens,
+      sendStore: _isResponses,
+      sendParallel: tools.isNotEmpty,
+      sendInclude: _isResponses,
     );
     final request = http.Request('POST', Uri.parse(_endpoint))
       ..headers.addAll(_headers(streaming: false))
@@ -554,6 +957,9 @@ class LlmClient {
           }
         }
         return parts.join('\n');
+      }
+      if (_isResponses) {
+        return _textFromResponsesObject(json);
       }
       final choices = json['choices'] as List<dynamic>? ?? [];
       if (choices.isEmpty) return '';
@@ -664,6 +1070,373 @@ class LlmClient {
       client.close();
     }
   }
+
+  String _textFromResponsesObject(Map<String, dynamic> json) {
+    final direct = json['output_text'];
+    if (direct is String && direct.trim().isNotEmpty) return direct.trim();
+    final output = json['output'] as List<dynamic>? ?? [];
+    final parts = <String>[];
+    for (final raw in output) {
+      if (raw is! Map) continue;
+      final item = Map<String, dynamic>.from(raw);
+      if (item['type'] != 'message') continue;
+      final content = item['content'];
+      if (content is String && content.trim().isNotEmpty) {
+        parts.add(content.trim());
+        continue;
+      }
+      if (content is List) {
+        for (final block in content) {
+          if (block is! Map) continue;
+          final type = (block['type'] ?? '').toString();
+          if (type == 'output_text' || type == 'text') {
+            final text = (block['text'] ?? '').toString().trim();
+            if (text.isNotEmpty) parts.add(text);
+          }
+        }
+      }
+    }
+    return parts.join('\n');
+  }
+
+  /// OpenAI / DeepSeek / 百炼 / OpenRouter Responses SSE。
+  /// DeepSeek 在 response.completed 结束，没有 data: [DONE]。
+  Future<bool> _parseResponsesSse(Stream<List<int>> raw) async {
+    final lineBuffer = StringBuffer();
+    String text = '';
+    String reasoning = '';
+    String reasoningEncrypted = '';
+    final toolBuf = <int, Map<String, String>>{};
+    var doneReceived = false;
+    var stoppedByUser = false;
+    var rawFramesLeft = 25;
+    String? finishReason;
+    final completer = Completer<bool>();
+
+    void emitPartial() {
+      if (text.isNotEmpty || reasoning.isNotEmpty) {
+        onTurn?.call(
+          TurnResult(
+            text: text,
+            reasoning: reasoning,
+            reasoningEncrypted: reasoningEncrypted,
+            toolCalls: _snapshotTools(toolBuf),
+          ),
+        );
+      }
+    }
+
+    bool decideContinue() {
+      if (completer.isCompleted) return false;
+      final toolsComplete =
+          toolBuf.isNotEmpty &&
+          toolBuf.values.every((t) {
+            final a = t['arguments'] ?? '';
+            return a.trim().isNotEmpty && _tryDecode(a) != null;
+          });
+      final t = text.trim();
+      final halfCut =
+          reasoning.isNotEmpty &&
+          t.isNotEmpty &&
+          toolBuf.isEmpty &&
+          (t.endsWith('：') ||
+              t.endsWith(':') ||
+              t.endsWith('，') ||
+              t.endsWith(','));
+      final truncated = finishReason == 'length' || halfCut;
+      if (!truncated) return false;
+      if (toolsComplete) return false;
+      if (toolBuf.isNotEmpty) {
+        completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
+        return false;
+      }
+      if (finishReason == 'length' && t.isEmpty) {
+        completer.completeError(
+          LlmInterruptedException('回复中断：模型输出被截断且没有正文，交上层整轮重试'),
+        );
+        return false;
+      }
+      return true;
+    }
+
+    void handleFunctionItem(Map<String, dynamic> item, int outputIndex) {
+      if ((item['type'] ?? '').toString() != 'function_call') return;
+      final cur = toolBuf.putIfAbsent(
+        outputIndex,
+        () => {'id': '', 'name': '', 'arguments': ''},
+      );
+      final callId = (item['call_id'] ?? item['id'] ?? '').toString();
+      if (callId.isNotEmpty) cur['id'] = callId;
+      final name = (item['name'] ?? '').toString();
+      if (name.isNotEmpty) cur['name'] = name;
+      final args = item['arguments'];
+      if (args is String && args.isNotEmpty) {
+        cur['arguments'] = args;
+      }
+    }
+
+    void handleReasoningItem(Map<String, dynamic> item) {
+      if ((item['type'] ?? '').toString() != 'reasoning') return;
+      final enc = (item['encrypted_content'] ?? '').toString();
+      if (enc.trim().isNotEmpty) reasoningEncrypted = enc;
+      if (reasoning.isNotEmpty) return;
+      final summary = item['summary'];
+      if (summary is List) {
+        final parts = <String>[];
+        for (final block in summary) {
+          if (block is! Map) continue;
+          final piece = (block['text'] ?? '').toString().trim();
+          if (piece.isNotEmpty) parts.add(piece);
+        }
+        if (parts.isNotEmpty) reasoning = parts.join('\n');
+      }
+    }
+
+    void handleJson(Map<String, dynamic> json) {
+      final usage = json['usage'] as Map<String, dynamic>?;
+      if (usage != null) applyUsage(usage);
+      final type = (json['type'] ?? '').toString();
+      if (type.startsWith('response.reasoning') ||
+          type.startsWith('response.thinking') ||
+          type == 'response.reasoning_summary_text.delta' ||
+          type == 'response.reasoning_text.delta') {
+        final rc =
+            extractReasoningValue(json['delta']) ??
+            extractReasoningValue(json['text']);
+        if (rc != null) {
+          reasoning += rc;
+          emitPartial();
+        }
+        return;
+      }
+      if (type == 'response.output_text.delta' ||
+          type == 'response.content_part.delta') {
+        final delta =
+            extractReasoningValue(json['delta']) ??
+            extractReasoningValue(json['text']);
+        if (delta != null && delta.isNotEmpty) {
+          text += delta;
+          emitPartial();
+        }
+        return;
+      }
+      if (type == 'response.output_item.added' ||
+          type == 'response.output_item.done') {
+        final item = json['item'];
+        final outputIndex = (json['output_index'] as num?)?.toInt() ??
+            (toolBuf.isEmpty ? 0 : (toolBuf.keys.reduce((a, b) => a > b ? a : b) + 1));
+        if (item is Map<String, dynamic>) {
+          handleFunctionItem(item, outputIndex);
+          handleReasoningItem(item);
+          if ((item['type'] ?? '').toString() == 'message' &&
+              type == 'response.output_item.done' &&
+              text.isEmpty) {
+            final content = item['content'];
+            if (content is List) {
+              for (final block in content) {
+                if (block is Map &&
+                    ((block['type'] ?? '') == 'output_text' ||
+                        (block['type'] ?? '') == 'text')) {
+                  final piece = (block['text'] ?? '').toString();
+                  if (piece.isNotEmpty) text += piece;
+                }
+              }
+              if (text.isNotEmpty) emitPartial();
+            }
+          }
+        }
+        return;
+      }
+      if (type == 'response.function_call_arguments.delta') {
+        final outputIndex = (json['output_index'] as num?)?.toInt() ?? 0;
+        final cur = toolBuf.putIfAbsent(
+          outputIndex,
+          () => {'id': '', 'name': '', 'arguments': ''},
+        );
+        final delta = json['delta'];
+        if (delta is String && delta.isNotEmpty) {
+          cur['arguments'] = '${cur['arguments']}$delta';
+        }
+        return;
+      }
+      if (type == 'response.completed' ||
+          type == 'response.incomplete' ||
+          type == 'response.failed') {
+        doneReceived = true;
+        final response = json['response'];
+        if (response is Map<String, dynamic>) {
+          final ru = response['usage'];
+          if (ru is Map<String, dynamic>) applyUsage(ru);
+          if (text.isEmpty) {
+            final extracted = _textFromResponsesObject(response);
+            if (extracted.isNotEmpty) text = extracted;
+          }
+          final output = response['output'];
+          if (output is List) {
+            for (final rawItem in output) {
+              if (rawItem is Map<String, dynamic>) {
+                handleReasoningItem(rawItem);
+              } else if (rawItem is Map) {
+                handleReasoningItem(Map<String, dynamic>.from(rawItem));
+              }
+            }
+          }
+          if (type == 'response.incomplete') {
+            final details = response['incomplete_details'];
+            final reason = details is Map
+                ? (details['reason'] ?? '').toString()
+                : '';
+            if (reason.contains('max') || reason.contains('token')) {
+              finishReason = 'length';
+            }
+          }
+          if (type == 'response.failed') {
+            final err = response['error'];
+            final msg = err is Map
+                ? (err['message'] ?? 'Responses 请求失败').toString()
+                : 'Responses 请求失败';
+            if (!completer.isCompleted) {
+              completer.completeError(LlmException(msg));
+            }
+          }
+        } else if (type == 'response.incomplete') {
+          finishReason = 'length';
+        }
+        return;
+      }
+      if (type == 'error') {
+        final msg = (json['message'] ?? json['error'] ?? 'Responses 流错误')
+            .toString();
+        if (!completer.isCompleted) {
+          completer.completeError(LlmException(msg));
+        }
+      }
+    }
+
+    void handleLine(String line) {
+      if (line.isEmpty) return;
+      if (!line.startsWith('data:')) return;
+      final data = line.substring(5).trim();
+      if (rawFramesLeft > 0) {
+        rawFramesLeft--;
+        final preview = data.length <= 500 ? data : '${data.substring(0, 500)}…';
+        onDiag?.call('[sse] $preview');
+      }
+      if (data == '[DONE]') {
+        doneReceived = true;
+        return;
+      }
+      final json = _tryDecode(data);
+      if (json == null) return;
+      handleJson(json);
+    }
+
+    StreamSubscription<String>? sub;
+    Timer? idleTimer;
+    void resetIdleTimer() {
+      idleTimer?.cancel();
+      idleTimer = Timer(const Duration(seconds: 180), () {
+        idleTimer = null;
+        sub?.cancel();
+        onDiag?.call('[stream] idle 超时断开');
+        if (!completer.isCompleted) {
+          completer.completeError(LlmInterruptedException('回复中断：连接长时间无数据，请重试'));
+        }
+      });
+    }
+
+    sub = raw
+        .transform(utf8.decoder)
+        .listen(
+          (chunk) {
+            if (shouldStop?.call() ?? false) {
+              stoppedByUser = true;
+              idleTimer?.cancel();
+              sub?.cancel();
+              if (!completer.isCompleted) completer.complete(false);
+              return;
+            }
+            resetIdleTimer();
+            lineBuffer.write(chunk);
+            if (lineBuffer.length > _maxLineBufferChars) {
+              handleLine(lineBuffer.toString());
+              lineBuffer.clear();
+              return;
+            }
+            var s = lineBuffer.toString();
+            int idx;
+            while ((idx = s.indexOf('\n')) != -1) {
+              final line = s.substring(0, idx).trimRight();
+              s = s.substring(idx + 1);
+              handleLine(line);
+            }
+            lineBuffer.clear();
+            lineBuffer.write(s);
+          },
+          onError: (Object e) {
+            idleTimer?.cancel();
+            onDiag?.call('[stream] onError: $e');
+            if (!completer.isCompleted) {
+              completer.completeError(LlmInterruptedException('回复中断（连接断开）：$e'));
+            }
+          },
+          onDone: () {
+            idleTimer?.cancel();
+            if (lineBuffer.isNotEmpty) {
+              final rest = lineBuffer.toString();
+              if (rest.trim().isNotEmpty) {
+                for (final line in rest.split('\n')) {
+                  handleLine(line);
+                }
+              }
+              lineBuffer.clear();
+            }
+            final tail = text.length <= 40
+                ? text
+                : '…${text.substring(text.length - 40)}';
+            onDiag?.call(
+              '[stream] end model=$model max=$maxTokens '
+              'fr=$finishReason done=$doneReceived '
+              'textLen=${text.length} tools=${toolBuf.length} '
+              'reasoningLen=${reasoning.length} tail=${tail.trim()}',
+            );
+            if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
+              onTurn?.call(
+                TurnResult(
+                  text: text.trim(),
+                  reasoning: reasoning,
+                  reasoningEncrypted: reasoningEncrypted,
+                  toolCalls: _snapshotTools(toolBuf),
+                ),
+              );
+            }
+            final needContinue = decideContinue();
+            _lastRoundText = text.trim();
+            _lastRoundReasoning = reasoning;
+            _lastRoundReasoningEncrypted = reasoningEncrypted;
+            onDiag?.call(
+              '[stream] needContinue=$needContinue model=$model '
+              'max=$maxTokens fr=$finishReason '
+              'done=$doneReceived tools=${toolBuf.length}',
+            );
+            if (!completer.isCompleted) {
+              if (!doneReceived &&
+                  !stoppedByUser &&
+                  text.isEmpty &&
+                  toolBuf.isEmpty) {
+                completer.completeError(
+                  LlmInterruptedException('回复不完整：连接提前断开，请重试'),
+                );
+              } else {
+                completer.complete(needContinue);
+              }
+            }
+          },
+          cancelOnError: true,
+        );
+    return completer.future;
+  }
+
 
   Future<bool> _parseOpenAiSse(Stream<List<int>> raw) async {
     final lineBuffer = StringBuffer(); // 行缓冲

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/app_state.dart';
+import 'core/media_query_fix.dart';
 import 'services/permission_service.dart';
 import 'core/app_theme.dart';
 import 'services/dsh_service.dart';
@@ -71,9 +72,7 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
     final ok = await DshService.instance.ensureAvailableOnLaunch();
     if (ok) return;
     _messengerKey.currentState?.showSnackBar(
-      const SnackBar(
-        content: Text('DeepSeek Harness 未安装，请到 Agent 引擎页安装'),
-      ),
+      const SnackBar(content: Text('DeepSeek Harness 未安装，请到 Agent 引擎页安装')),
     );
   }
 
@@ -136,16 +135,21 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
       darkTheme: MacTheme.dark(),
       themeMode: themeMode,
       // Windows 无边框窗口：全局顶部挂 macOS 风格标题栏（红黄绿三键），
-      // 所有路由页面都在标题栏下方；Android 保持原样。
+      // 所有路由页面都在标题栏下方。Android 小窗先修正异常 MediaQuery padding。
       builder: (context, child) {
-        if (!Platform.isWindows) {
-          return child ?? const SizedBox.shrink();
+        Widget content = child ?? const SizedBox.shrink();
+        if (Platform.isWindows) {
+          content = Column(
+            children: [
+              const MacTitleBar(),
+              Expanded(child: content),
+            ],
+          );
         }
-        return Column(
-          children: [
-            const MacTitleBar(),
-            Expanded(child: child ?? const SizedBox.shrink()),
-          ],
+        // 小米 HyperOS 小窗会把 viewPadding.top 报成窗口高度，SafeArea 把界面挤没。
+        return MediaQuery(
+          data: sanitizeMediaQuery(MediaQuery.of(context)),
+          child: content,
         );
       },
       home: WelcomeScreen(shiyi: shiyi),

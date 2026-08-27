@@ -111,8 +111,11 @@ class DshModelSync {
   }
 
   /// 拾忆协议 -> DSH 手写路由协议。
-  static String dshApiFor(String protocol) =>
-      protocol == 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+  static String dshApiFor(String protocol) => protocol == 'anthropic'
+      ? 'anthropic-messages'
+      : protocol == 'responses'
+      ? 'openai-responses'
+      : 'openai-completions';
 
   /// pi-ai 按 URL 识别 OpenRouter；手写 `shiyi_*` 路由也必须走同一套判断。
   static bool isOpenRouterBase(String baseUrl) =>

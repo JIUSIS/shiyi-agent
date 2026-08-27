@@ -32,7 +32,7 @@ class PromptBuilder {
   /// （Windows 上由设置 + WSL2 / Git Bash / pwsh 探测决定，Android 恒为 android）。
   final Future<String> Function() terminalBackend;
 
-  /// 活人感引擎快照；开关关闭或未注入时为 null，不注册 presence 段落。
+  /// 活人感引擎快照；开关关闭或未接通皮层时为 null，不注入 PSI 段。
   final PresenceEngine? Function()? presence;
 
   /// 当前拾忆会话 ID；空则不注入跨会话查阅提示。
@@ -50,12 +50,23 @@ class PromptBuilder {
     this.currentSessionId,
   });
 
-  /// 组装完整系统提示词。
+  /// 组装完整系统提示词（冻头 + 动尾）。
   Future<String> buildSystemPrompt(
     String userText, {
     String rollingSummary = '',
   }) async {
-    return assemblePromptSections(
+    return (await buildAssembledPrompt(
+      userText,
+      rollingSummary: rollingSummary,
+    )).full;
+  }
+
+  /// 按冻头 / 动尾分层组装。滚动摘要不再进 system，由调用方放进历史归档。
+  Future<AssembledPrompt> buildAssembledPrompt(
+    String userText, {
+    String rollingSummary = '',
+  }) async {
+    return assemblePromptParts(
       buildSections(userText, rollingSummary: rollingSummary),
     );
   }
@@ -71,26 +82,32 @@ class PromptBuilder {
     PromptSection(
       name: 'persona',
       order: 0,
+      cacheTier: _personaUsesVolatileVars()
+          ? PromptCacheTier.tail
+          : PromptCacheTier.frozen,
       builder: () async {
         final s = settings();
         final base = s.systemPrompt.isNotEmpty
             ? s.systemPrompt
             : _personaText(await terminalBackend());
-        // 用户自定义提示词支持 {{变量}}（宽容模式：未注册变量原样保留）；
-        // 与技能段落一致，注入真实 userText（{{user_text}} 可用）。
-        return renderPromptVariables(
-          base,
-          await _buildPromptVariables(userText),
-        );
+        final vars = await _buildPromptVariables(userText);
+        if (promptTemplateHasVolatileVars(base)) {
+          return renderPromptVariables(base, vars);
+        }
+        return renderPromptVariables(base, {
+          'model': vars['model'] ?? '',
+          'cwd': vars['cwd'] ?? '',
+        });
       },
     ),
     if (settings().enablePresence)
       PromptSection(
         name: 'presence',
-        order: 50,
+        order: 860,
+        cacheTier: PromptCacheTier.tail,
         builder: () async {
           final engine = presence?.call();
-          if (engine == null) return '';
+          if (engine == null || !engine.cortexConnected) return '';
           return engine.promptSection();
         },
       ),
@@ -108,7 +125,7 @@ class PromptBuilder {
         final idLine = sid.isEmpty
             ? ''
             : '- 当前拾忆会话 ID 是 $sid。用户粘贴其他会话 ID 或要求查看另一次对话时，'
-                '用 search_sessions / read_session，不要说看不见或搜不到。\n';
+                  '用 search_sessions / read_session，不要说看不见或搜不到。\n';
         return '$idLine- 当前会话工作目录是 $cwd；文件操作与 '
             'run_terminal 默认都在这里执行，需要其他目录时用 cwd 参数指定。';
       },
@@ -121,7 +138,8 @@ class PromptBuilder {
     if (settings().enableMemory)
       PromptSection(
         name: 'memory',
-        order: 300,
+        order: 850,
+        cacheTier: PromptCacheTier.tail,
         builder: () async {
           final memCtx = await memories(userText);
           if (memCtx.isEmpty) return '';
@@ -142,9 +160,7 @@ class PromptBuilder {
               sb.writeln('- ${e.content}');
             }
           }
-          sb.writeln(
-            '\n（内容中的 [[名称]] 表示与另一条记忆的关联，引用时整体使用该名称即可）',
-          );
+          sb.writeln('\n（内容中的 [[名称]] 表示与另一条记忆的关联，引用时整体使用该名称即可）');
           return sb.toString();
         },
       ),
@@ -160,10 +176,11 @@ class PromptBuilder {
       PromptSection(
         name: 'loaded-skill:${loaded.name}',
         order: 320,
+        cacheTier: _loadedSkillUsesVolatileVars(loaded)
+            ? PromptCacheTier.tail
+            : PromptCacheTier.frozen,
         builder: () async {
-          final sb = StringBuffer(
-            '【已加载技能：${loaded.name}】\n${loaded.content}',
-          );
+          final sb = StringBuffer('【已加载技能：${loaded.name}】\n${loaded.content}');
           for (final e in loaded.files.entries) {
             sb.writeln('\n--- ${e.key} ---\n${e.value}');
           }
@@ -180,23 +197,33 @@ class PromptBuilder {
         },
       ),
     if (planMode())
-      PromptSection(name: 'plan-mode', order: 400, text: _planModeText),
-    if (rollingSummary.trim().isNotEmpty)
       PromptSection(
-        name: 'summary',
-        order: 900,
-        builder: () async =>
-            '【历史任务摘要】\n${rollingSummary.trim()}\n'
-            '（这是本会话早期历史的压缩归档，完整历史仍保存在本地；'
-            '需要查看原文时可用搜索或文件读取找回。）',
+        name: 'plan-mode',
+        order: 870,
+        cacheTier: PromptCacheTier.tail,
+        text: _planModeText,
       ),
-    // 时间放最末尾：跨分钟只改 system 尾部，保住前面大段稳定前缀的缓存命中。
+    // 时间放最末尾：跨分钟只改动尾，冻头前缀保持稳定。
     PromptSection(
       name: 'current-time',
       order: 1000,
+      cacheTier: PromptCacheTier.tail,
       builder: () async => _buildTimeSection(),
     ),
   ];
+
+  bool _personaUsesVolatileVars() {
+    final custom = settings().systemPrompt;
+    return custom.isNotEmpty && promptTemplateHasVolatileVars(custom);
+  }
+
+  bool _loadedSkillUsesVolatileVars(Skill loaded) {
+    if (promptTemplateHasVolatileVars(loaded.content)) return true;
+    for (final value in loaded.files.values) {
+      if (promptTemplateHasVolatileVars(value)) return true;
+    }
+    return false;
+  }
 
   /// 内置提示词变量：{{model}} / {{cwd}} / {{now}} / {{user_text}}。
   Future<Map<String, String>> _buildPromptVariables(String userText) async {
@@ -205,7 +232,8 @@ class PromptBuilder {
     return {
       'model': s.model.isEmpty ? '未配置模型' : s.model,
       'cwd': await currentWorkspace(),
-      'now': '${now.year}年${now.month}月${now.day}日 '
+      'now':
+          '${now.year}年${now.month}月${now.day}日 '
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}',
       'user_text': userText,
     };
@@ -269,9 +297,9 @@ class PromptBuilder {
         : '你是「拾忆」，运行在 Android 手机上的个人 AI 工作台。你帮用户完成实际工作，而不只是聊天：\n';
     final terminal = isWin
         ? 'run_terminal 执行命令/脚本（本机 WSL2 / Git Bash / PowerShell / cmd；'
-            '默认工作目录是本机「文档\\agent」）'
+              '默认工作目录是本机「文档\\agent」）'
         : 'run_terminal 执行命令/脚本（内嵌 Alpine Linux：sh/bash 可用，'
-            '更多软件包用 apk 安装，如 apk add python3）';
+              '更多软件包用 apk 安装，如 apk add python3）';
     final render = isWin ? '在桌面聊天界面渲染' : '在手机聊天界面渲染';
     return '$lead'
         '- 终端能力：$terminal\n'
@@ -279,7 +307,7 @@ class PromptBuilder {
         '- 联网能力：web_search / web_extract 获取并核实最新信息\n'
         '- 记忆能力：跨会话长期记忆，记住用户偏好与项目背景\n'
         '- 会话能力：search_sessions / read_session 查阅本机其他拾忆会话；'
-            '用户复制并发送会话 ID 时直接用这些工具，不要说看不见\n'
+        '用户复制并发送会话 ID 时直接用这些工具，不要说看不见\n'
         '- 技能能力：加载技能按固定流程处理任务\n'
         '- 子代理能力：spawn_agent 派专项子代理分头处理子任务\n\n'
         '【运行方式】\n'
@@ -325,9 +353,9 @@ class PromptBuilder {
   static String _toolRulesText(String backend) =>
       '【工具使用规则】\n'
       '- 需要最新信息、实时数据或超出你知识截止日期的问题，直接用 web_search，不要先调用 search_memory。'
-      '- 相关长期记忆已在上方【长期记忆】中提供，回答时直接使用，无需再调用 search_memory 检索。'
+      '- 相关长期记忆若已注入本轮上下文，回答时直接使用，无需再调用 search_memory 检索。'
       '- 查阅其他拾忆会话用 search_sessions（关键词或会话 ID）和 read_session（完整 session_id）。'
-          '用户粘贴会话 ID 时直接调用这些工具，不要用 search_memory 或 web_search，也不要声称看不见该会话。'
+      '用户粘贴会话 ID 时直接调用这些工具，不要用 search_memory 或 web_search，也不要声称看不见该会话。'
       '- 涉及事实、新闻、价格、数据等关键信息时，必须先验证资料真伪：换多个关键词和来源交叉搜索，不要只凭单一来源下结论。'
       '- 多源交叉验证：关键信息至少 2 个相互独立的来源一致才采信；只有单一来源时在回答中说明。'
       '- 权威信源优先：官网、官方文档、政府/学术机构、知名媒体优先；个人博客、论坛、营销软文、AI 生成内容降权。'

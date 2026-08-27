@@ -40,7 +40,7 @@ class AppDatabase {
           : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 20,
+        version: 21,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -91,6 +91,7 @@ class AppDatabase {
       role TEXT NOT NULL,
       content TEXT,
       reasoning TEXT,
+      reasoning_encrypted TEXT,
       subagent_result TEXT,
       tool_calls TEXT,
       tool_call_id TEXT,
@@ -321,6 +322,10 @@ class AppDatabase {
     if (oldV < 20) {
       await _ensureSortOrderColumns(db);
     }
+    // v20 -> v21：Responses 加密思考 item，store:false 时原样回放。
+    if (oldV < 21) {
+      await _ensureReasoningEncryptedColumn(db);
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -346,6 +351,7 @@ class AppDatabase {
     if (!messageCols.any((c) => c['name'] == 'subagent_result')) {
       await db.execute('ALTER TABLE messages ADD COLUMN subagent_result TEXT');
     }
+    await _ensureReasoningEncryptedColumn(db);
     if (!sessionCols.any((c) => c['name'] == 'rolling_summary')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN rolling_summary TEXT');
     }
@@ -384,6 +390,15 @@ class AppDatabase {
       await db.execute('ALTER TABLE projects ADD COLUMN workspace_dir TEXT');
     }
     await _ensureSortOrderColumns(db);
+  }
+
+  Future<void> _ensureReasoningEncryptedColumn(Database db) async {
+    final cols = await db.rawQuery('PRAGMA table_info(messages)');
+    if (!cols.any((c) => c['name'] == 'reasoning_encrypted')) {
+      await db.execute(
+        'ALTER TABLE messages ADD COLUMN reasoning_encrypted TEXT',
+      );
+    }
   }
 
   Future<void> _ensureSortOrderColumns(Database db) async {
@@ -730,6 +745,7 @@ class AppDatabase {
     String id,
     String content, {
     String? reasoning,
+    String? reasoningEncrypted,
     String? subagentResult,
     List<ToolCall>? toolCalls,
   }) async {
@@ -737,6 +753,9 @@ class AppDatabase {
     final upd = <String, dynamic>{'content': content};
     if (reasoning != null) {
       upd['reasoning'] = reasoning;
+    }
+    if (reasoningEncrypted != null) {
+      upd['reasoning_encrypted'] = reasoningEncrypted;
     }
     if (subagentResult != null) {
       upd['subagent_result'] = subagentResult;

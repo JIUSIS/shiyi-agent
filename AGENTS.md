@@ -112,10 +112,22 @@
 ## 思考档位规则
 - 会话页思考开关 / 档位按模型 ID 关键字识别，不绑死版本号：`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认 `deepseek`。拾忆直连与 DSH 注入共用 `lib/core/reasoning_models.dart`。
 - `gpt-4o` / `gpt-4.1` / `gpt-3.5` 没有 reasoning 参数，不能跟 `gpt-5` / Codex 一起被裸关键字 `gpt` 命中（OpenRouter 的 `openai/gpt-4o` 同理）。
-- 命中家族关键字时有默认档位（多为 `high`）并按协议组包：OpenAI 兼容发 `reasoning_effort`，GPT 关闭发 `none`；DeepSeek 官方额外发 `thinking: {type: enabled}`；Anthropic Messages 发 `thinking.budget_tokens` 且不发 `temperature`。
+- 命中家族关键字时有默认档位（多为 `high`）并按协议组包：OpenAI 兼容发 `reasoning_effort`，GPT 关闭发 `none`；Responses 发 `reasoning: {effort}`；DeepSeek 官方额外发 `thinking: {type: enabled}`；Anthropic Messages 发 `thinking.budget_tokens` 且不发 `temperature`。
 - 对不上关键字的非空模型 ID 仍显示通用档位（off/low/medium/high/max），但默认不自动往请求或 DSH provider 里塞 thinking。空模型 ID 不显示按钮。
 - DSH 会话页按钮读同一套目录；真正发请求走 `session.selectModel` 的 `reasoningEffort`，不要把拾忆请求体误写成 DSH 文件协议。
 - OpenRouter 手写注入必须 `compat.supportsStore: false`（pi-ai 会把 `store: false` 转发给 OpenRouter 导致 400）；Anthropic 协议不要写 `supportsStore`。
+
+## 拾忆 API 协议
+- 三条并列：`openai`（Chat Completions）/ `responses`（OpenAI Responses）/ `anthropic`（Messages）。设置页与 `ApiProfile.apiProtocol` 同步持久化。
+- Responses 可移植子集：冻头 → `instructions`，其余 → `input`，默认 `store: false`。**禁止** `previous_response_id` / `prompt_cache_key`。网关拒 `store` 时去掉再试。DeepSeek 官方路径去掉 `/v1`（`POST https://api.deepseek.com/responses`）。
+- 压缩必须 cache-safe fork：同一冻头 + 同一 tools，压缩指令放动尾。长会话旧工具轮原地截断，不从中间抽轮。计划模式不换 tools 表，只读约束走动尾提示词 + 执行层拦截。
+- Responses 可发 `include: ["reasoning.encrypted_content"]` 并原样回放 `type=reasoning`；网关拒 `include` / `parallel_tool_calls` 时去掉再试。Chat 补 `tool_choice: auto` 与 `parallel_tool_calls: true`。禁止 `prompt_cache_retention`。
+- 图片：Chat 走 `{type:image_url, image_url:{url}}`；Responses 必须转成 `{type:input_image, image_url:"..."}`，`image_url` 是字符串。禁止把 Chat 块原样塞进 Responses。
+- 冻头必须跨请求字节级稳定。滚动摘要、记忆、活人感、当前时间、裁剪说明、重试指令都进动尾或历史归档，不要改冻头。人设 / 技能出现 `{{now}}` / `{{user_text}}` 时整段改走动尾。
+- Chat Completions：冻头第一条 system，动尾放到历史之后，禁止合并。Claude：冻头 system 与最后一个 tool 打 `cache_control: ephemeral`。
+- 不要内嵌 Codex harness，不要把核心改成 Rust，不要和 DSH 混协议。拾忆 `responses` 同步 DSH 时映射 `openai-responses`。
+- 缓存命中率：会话累计 + 本轮命中/未缓存。命中率高=便宜，低=爆炸。75% 滚动任务摘要只进动尾，禁止插在冻头和历史中间。
+- 大工具输出 spill 到会话工作目录 `.shiyi/tool-outputs/`，模型只看头尾预览 + 路径；`file_read` 超长按头尾裁，不改 tools schema（禁止加 offset 参数）。只读 `tool_calls` 主循环并行，`run_terminal` / 写入 / `question` 仍串行。工具循环超预算先原地截断旧输出，再 trim。详见 `docs/fix-log.md` #274/#275/#276/#277/#278。
 
 ## SOCKS5 代理通道
 - 设置 → 通用 → SOCKS5 代理：`off` / `auto` / `custom`。`auto` 扫本机 Clash mixed/socks、V2RayN、SS 常见端口并做 SOCKS5 握手；`custom` 用已保存服务器或临时主机端口。
@@ -124,7 +136,8 @@
 - 手机连电脑 Clash：Clash 开允许局域网，自定义里填电脑局域网 IP，不要填 `127.0.0.1`。
 
 ## 活人感
-- `enablePresence` 默认关。打开后 `PresenceEngine` 每轮生成本轮内心话，经 `PromptSection` 注入；模型只翻译内心，不改工具工作台管线。不要把它改回静态 soul 段落。
+ - `enablePresence` 默认关，开关在 Agent 引擎页的 LAAP 卡上，不在对话设置里。打开且皮层就绪后，才把官方 PSI preamble 走动尾（order 860）。对照 `psi_hermes_adapter.py`：注入 `## PSI Cognitive State (Live)` + preamble + 需求风格 + cot_hint。没有本地关键字/需求演化替身，也不要写「本机皮层已接通」。皮层挂了就不注入。不要写进冻头，不要改回静态 soul。
+ - LAAP 是皮层不是第三套聊天引擎：引擎页单独安装/启停 `LaapService`（127.0.0.1:11546）。`PYTHONPATH` 必须带 `aris_brain`，Android 要有 numpy。启动时 `/health` 不够，还得 `/v1/cognitive_state` 真能返回 preamble/needs。回合结束 `/v1/reflect`。禁止把拾忆 `baseUrl` 改到 LAAP。
 
 ## 会话压缩入口
 - 输入区常驻 `ChatCompressionButton` 是唯一手动压缩入口。禁止再在达到阈值时弹出右下角「压缩上下文」胶囊。

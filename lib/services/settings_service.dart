@@ -53,7 +53,8 @@ class SettingsService {
       }
       // 自定义 OpenAI 兼容接口缺 /v1 时自动补上，避免请求打到错误路径。
       final isPreset = modelPresets.any((p) => p.baseUrl == s.baseUrl.trim());
-      if (s.apiProtocol == 'openai' && !isPreset) {
+      if ((s.apiProtocol == 'openai' || s.apiProtocol == 'responses') &&
+          !isPreset) {
         final normalized = normalizeOpenAiBaseUrl(s.baseUrl);
         if (normalized != s.baseUrl.trim()) {
           s.baseUrl = normalized;
@@ -96,7 +97,8 @@ class SettingsService {
         final j = (e as Map<String, dynamic>);
         final p = ApiProfile.fromJson(j);
         final isPreset = modelPresets.any((m) => m.name == p.name);
-        final baseUrl = isPreset || p.apiProtocol != 'openai'
+        final baseUrl = isPreset ||
+                (p.apiProtocol != 'openai' && p.apiProtocol != 'responses')
             ? p.baseUrl
             : normalizeOpenAiBaseUrl(p.baseUrl);
         if (baseUrl != p.baseUrl) {

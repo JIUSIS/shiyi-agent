@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 
 import 'llm_client.dart';
 import '../core/tool_result_pruner.dart';
+import '../core/tool_output_spill.dart';
 
 /// 子代理定义：一个可派发的专项代理（类型 + 提示词模板 + 工具白名单）。
 /// 设计为数据驱动：新增代理类型 = 加一个定义条目，执行器无需改动，
@@ -94,7 +95,8 @@ run_terminal 只允许只读命令：ls、find、grep、cat、head、tail、wc�
     allowedTools: _readOnlyTools,
     maxTurns: 15,
     readOnlyTerminal: true,
-    systemPrompt: '''
+    systemPrompt:
+        '''
 你是拾忆的「探索子代理」，专职在项目里定位文件、代码与信息。你只负责查找与分析，绝不修改任何东西。
 $_readOnlyBlock
 
@@ -117,7 +119,8 @@ $_returnProtocol''',
     allowedTools: _readOnlyTools,
     maxTurns: 15,
     readOnlyTerminal: true,
-    systemPrompt: '''
+    systemPrompt:
+        '''
 你是拾忆的「规划子代理」，负责探索现有资料并设计实施方案。
 $_readOnlyBlock
 
@@ -167,8 +170,7 @@ $_returnProtocol''',
 
   static final generalPurpose = SubagentDefinition(
     name: 'general-purpose',
-    whenToUse:
-        '通用兜底子代理：任务不适合上面三类时使用，可搜索、分析并执行多步骤任务。',
+    whenToUse: '通用兜底子代理：任务不适合上面三类时使用，可搜索、分析并执行多步骤任务。',
     allowedTools: _execTools,
     maxTurns: 25,
     systemPrompt: '''
@@ -218,28 +220,28 @@ class SubagentResult {
   final int totalTokens;
 
   SubagentResult.success(this.report, {this.totalTokens = 0})
-      : status = SubagentStatus.success,
-        error = null;
+    : status = SubagentStatus.success,
+      error = null;
 
   SubagentResult.stopped({this.totalTokens = 0})
-      : status = SubagentStatus.stopped,
-        report = '',
-        error = null;
+    : status = SubagentStatus.stopped,
+      report = '',
+      error = null;
 
   SubagentResult.turnLimit(int maxTurns, {this.totalTokens = 0})
-      : status = SubagentStatus.turnLimit,
-        report = '',
-        error = '达到轮数上限 $maxTurns';
+    : status = SubagentStatus.turnLimit,
+      report = '',
+      error = '达到轮数上限 $maxTurns';
 
   SubagentResult.generationFailed({this.totalTokens = 0})
-      : status = SubagentStatus.generationFailed,
-        report = '',
-        error = '单轮生成失败';
+    : status = SubagentStatus.generationFailed,
+      report = '',
+      error = '单轮生成失败';
 
   SubagentResult.requestFailed(String message, {this.totalTokens = 0})
-      : status = SubagentStatus.requestFailed,
-        report = '',
-        error = message;
+    : status = SubagentStatus.requestFailed,
+      report = '',
+      error = message;
 
   bool get isSuccess => status == SubagentStatus.success;
 
@@ -326,8 +328,11 @@ class SubagentRunner {
 
   /// 运行子代理，返回类型化结果。
   /// [maxTurnsOverride] 可动态覆盖定义里的轮数上限（动态预算，默认用定义值）。
-  Future<SubagentResult> run(SubagentDefinition def, String prompt,
-      {int? maxTurnsOverride}) async {
+  Future<SubagentResult> run(
+    SubagentDefinition def,
+    String prompt, {
+    int? maxTurnsOverride,
+  }) async {
     final budget = (maxTurnsOverride ?? def.maxTurns).clamp(1, 80);
     final msgs = <Map<String, dynamic>>[
       {
@@ -352,10 +357,7 @@ class SubagentRunner {
       } on LlmException catch (e) {
         // 请求失败必须如实返回失败状态，不能伪装成成功报告。
         // 注意：_round 已带「子代理请求失败: 」前缀，这里不再重复拼接。
-        return SubagentResult.requestFailed(
-          '$e',
-          totalTokens: totalTokens,
-        );
+        return SubagentResult.requestFailed('$e', totalTokens: totalTokens);
       }
       if (result == null) {
         return SubagentResult.generationFailed(totalTokens: totalTokens);
@@ -384,26 +386,42 @@ class SubagentRunner {
             },
         ],
       });
-      for (var i = 0; i < result.toolCalls.length; i++) {
-        final tc = result.toolCalls[i];
+      final names = [
+        for (final tc in result.toolCalls) (tc['name'] ?? '').toString(),
+      ];
+      final calls = result.toolCalls;
+      final parallel = ToolCallScheduler.runInParallel(names);
+      Future<String> execAt(int i) async {
+        final tc = calls[i];
         final name = (tc['name'] ?? '').toString();
         final args = (tc['arguments'] ?? '').toString();
         onProgress?.call(round, budget, name);
-        String output;
         if (!def.allowedTools.contains(name)) {
-          output = '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
-        } else {
-          try {
-            final raw = await executeTool(name, args);
-            // 掐头去尾裁剪，保护子代理上下文预算（结尾的报错/摘要不丢）。
-            output = _subagentPruner.prune(raw);
-          } catch (e) {
-            output = '工具执行异常: $e';
-          }
+          return '工具 $name 不在本子代理白名单，已跳过；改用允许的工具。';
         }
+        try {
+          final raw = await executeTool(name, args);
+          return _subagentPruner.prune(raw);
+        } catch (e) {
+          return '工具执行异常: $e';
+        }
+      }
+
+      final outputs = <String>[];
+      if (parallel) {
+        outputs.addAll(
+          await Future.wait([for (var i = 0; i < calls.length; i++) execAt(i)]),
+        );
+      } else {
+        for (var i = 0; i < calls.length; i++) {
+          outputs.add(await execAt(i));
+        }
+      }
+      for (var i = 0; i < calls.length; i++) {
+        final tc = calls[i];
         msgs.add({
           'role': 'tool',
-          'content': output,
+          'content': outputs[i],
           'tool_call_id': (tc['id'] ?? '').isEmpty
               ? 'call_sub_${round}_$i'
               : (tc['id'] ?? ''),
@@ -423,7 +441,8 @@ class SubagentRunner {
   void _enforceContextBudget(List<Map<String, dynamic>> msgs) {
     if (contextBudgetTokens <= 0) return;
     var guard = 0;
-    while (_estimateMessagesTokens(msgs) > contextBudgetTokens && guard++ < 20) {
+    while (_estimateMessagesTokens(msgs) > contextBudgetTokens &&
+        guard++ < 20) {
       // 找出所有 assistant 工具轮的起点。
       final groupStarts = <int>[];
       for (var i = 1; i < msgs.length; i++) {

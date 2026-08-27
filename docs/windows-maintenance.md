@@ -152,7 +152,7 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
    不绑死版本号（`gpt-5.6` 认 `gpt`，`deepseek-v4-flash` 认 `deepseek`）。
    `gpt-4o` / `gpt-4.1` / `gpt-3.5` 没有 reasoning，不能跟 `gpt-5` / Codex 一起
    被裸关键字 `gpt` 命中。命中家族时默认 `high`：OpenAI 兼容发 `reasoning_effort`
-   （GPT 关闭发 `none`），DeepSeek 官方额外发 `thinking: {type: enabled}`，
+   （GPT 关闭发 `none`），Responses 发 `reasoning: {effort}`，DeepSeek 官方额外发 `thinking: {type: enabled}`，
    Anthropic Messages 发 `thinking.budget_tokens` 且不发 `temperature`。
    对不上关键字的非空 ID 仍显示通用档位，但不自动塞 thinking。网关拒绝思考参数时
    分别去掉不兼容字段重试。拾忆解析 `reasoning_content` / `reasoning` / `thinking`
@@ -195,6 +195,15 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
     顺序写 `sort_order`，缺列补列不清库。跨组提交只收被拖项源槽，禁止把同组其它卡片收成 0。
     DSH 跨工作区先乐观改本地 `sessionIds` 和 cwd，再静默 `_load()`。详见 `docs/fix-log.md` #241-#273。
     测试：`test/home_list_order_test.dart`、`test/home_sessions_tab_test.dart`、`test/staggered_sessions_test.dart`、`test/dsh_workspace_display_name_test.dart`。
+15. **拾忆 API 三条协议 + 冻头/动尾**：`openai` / `responses` / `anthropic` 并列。
+    Responses 可移植子集：冻头 → `instructions`，其余 → `input`，`store: false`。
+    禁止 `previous_response_id` / `prompt_cache_key`。图片 Chat 走 `image_url` 对象，
+    Responses 必须转 `input_image` + 字符串 URL。冻头跨请求字节稳定；记忆 / 活人感 /
+    当前时间 / 滚动摘要不进冻头。不要内嵌 Codex harness，不要和 DSH 混协议。LAAP 是活人感皮层不是第三套聊天：Windows 用本机 Python 启 127.0.0.1:11546（PYTHONPATH 带 aris_brain，缺 numpy 就 pip install），不要把拾忆 baseUrl 指过去，也不要写 Alpine 路径。活人感开关在引擎页；按 Hermes 官方接法把 preamble 注入动尾，不要写「本机皮层已接通」，没有本地替身。
+    测试：`test/llm_protocol_cache_test.dart`、`test/context_budget_test.dart`。详见 `docs/fix-log.md` #274/#275/#276。
+    压缩与主请求同一冻头/tools；旧工具轮原地截断；Responses 回放加密思考 item；
+    计划模式不换 tools 表。75% 滚动任务摘要只进动尾。超预算优先压缩，不要靠从中间抽历史来稳缓存。详见 `docs/fix-log.md` #276/#277。
+    大工具输出 spill 到工作目录 `.shiyi/tool-outputs/`；只读 tool_calls 并行。详见 `docs/fix-log.md` #278。
 
 ---
 
@@ -221,6 +230,8 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
 | 粗体嵌斜体、转义、自动链接、参考式链接、HTML 片段仍露原文 | 2.5.7 只补了图片/脚注/定义列表等，嵌套强调与参考式链接还没拆 | 继续自研补齐。见 `docs/fix-log.md` #239 |
 | 主页会话拖动卡住 / 远放瞬移 / 换位后第一下炸 / 搜索栏被挡 | 旧 `LongPressDraggable` 拆树；`SizeTransition` 裁剪命中；ListView `Clip.none` 盖住搜索 | `HomeLongPressDrag` + 自建 overlay；展开内部 unclipped；外层 SafeArea/列表 ClipRect。见 `docs/fix-log.md` #240-#259 |
 | OpenRouter 在拾忆可用、DSH 返回 400 | pi-ai 给 OpenRouter 发 `store: false`，且 `openai/gpt-4o` 被 `gpt` 当成思考模型误发 `reasoning` | 注入 `compat.supportsStore: false`；gpt-4o/4.1/3.5 不声明思考。见 `docs/fix-log.md` #223 |
+| Responses 纯文本正常、发图 Cloudflare 502 | Chat `image_url` 对象被原样塞进 Responses `input` | 转成 `input_image` + 字符串 URL。见 `docs/fix-log.md` #275 |
+| 缓存命中爆炸、每轮都像冷启动 | 时间/记忆/摘要写进冻头 system，前缀对不齐 | 冻头/动尾分层；滚动摘要改历史归档。见 `docs/fix-log.md` #274 |
 | DSH 0.1.1 启动即崩，修复完整运行环境没用 | `.credentials.yaml` 顶层仍是 `SHIYI_API_KEY:`，解析器只认 `version`/`refs`/`records` | 启动同步写成 `version: 1` + `refs:`，并把顶层密钥收进去。见 `docs/fix-log.md` #224 |
 
 ---
@@ -273,6 +284,15 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-08-27 2.5.10**（共享 `lib/`；详见 `docs/fix-log.md` #274-#282）：
+  拾忆直连第三条协议 Responses；冻头/动尾稳缓存；Responses 发图转 `input_image`。
+  小米小窗 MediaQuery 钳制。LAAP 皮层本机部署，活人感按 Hermes 官方 preamble 注入动尾，
+  开关在引擎页，不要写「本机皮层已接通」。Windows 用本机 Python 启 11546，不写 Alpine 路径。
+- **2026-08-27**（共享 `lib/`；详见 `docs/fix-log.md` #274/#275）：
+  拾忆直连第三条协议 OpenAI Responses（冻头 `instructions` / `input` / `store: false`）。
+  Chat Completions 与 Claude 按冻头/动尾拆开，稳住前缀缓存。Responses 发图必须转
+  `input_image` 字符串，禁止把 Chat `image_url` 对象原样塞进去。状态栏加本轮命中/未缓存。
+  Windows 无新增平台分支。
 - **2026-08-26**（共享 `lib/`；详见 `docs/fix-log.md` #267-#273）：
   跨项目/工作区可插到任意位置；滚动后重测插入格；测槽位用不含 Transform 的布局盒。
   DSH 跨工作区飞入后先乐观更新 `sessionIds` 和 cwd，再静默 `_load()`，避免源组 BCD 被撑开弹回。

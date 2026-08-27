@@ -5,7 +5,7 @@ class ModelPreset {
   final String name;
   final String baseUrl;
   final String model;
-  final String apiProtocol; // openai | anthropic
+  final String apiProtocol; // openai | anthropic | responses
   final String keyHint; // API Key 格式提示
   final int suggestedMaxTokens; // 该模型推荐的单次输出上限
   const ModelPreset({

@@ -359,6 +359,8 @@ class ChatMessage {
   String role; // user | assistant | system | tool
   String content;
   String reasoning; // 模型思考内容（reasoning_content，如 DeepSeek R1）
+  /// Responses `store:false` 时回放的加密思考 item；Chat 路径不发这个字段。
+  String reasoningEncrypted;
   List<ToolCall> toolCalls;
   String toolCallId; // for tool results
   int createdAt;
@@ -381,6 +383,7 @@ class ChatMessage {
     required this.role,
     this.content = '',
     this.reasoning = '',
+    this.reasoningEncrypted = '',
     List<ToolCall>? toolCalls,
     this.toolCallId = '',
     required this.createdAt,
@@ -400,6 +403,7 @@ class ChatMessage {
     'role': role,
     'content': content,
     'reasoning': reasoning,
+    'reasoning_encrypted': reasoningEncrypted,
     'subagent_result': subagentResult,
     'tool_calls': jsonEncode(toolCalls.map((t) => t.toJson()).toList()),
     'tool_call_id': toolCallId,
@@ -431,6 +435,7 @@ class ChatMessage {
       role: (m['role'] ?? 'user').toString(),
       content: rawContent,
       reasoning: sameText ? '' : rawReasoning,
+      reasoningEncrypted: (m['reasoning_encrypted'] ?? '').toString(),
       subagentResult: (m['subagent_result'] ?? '').toString(),
       toolCalls: toolCalls,
       toolCallId: (m['tool_call_id'] ?? '').toString(),
@@ -455,6 +460,8 @@ class ChatMessage {
         'role': 'assistant',
         'content': content,
         if (reasoning.isNotEmpty) 'reasoning_content': reasoning,
+        if (reasoningEncrypted.isNotEmpty)
+          'reasoning_encrypted': reasoningEncrypted,
         'tool_calls': toolCalls
             .map(
               (t) => {
@@ -471,6 +478,8 @@ class ChatMessage {
       'content': content,
       if (role == 'assistant' && reasoning.isNotEmpty)
         'reasoning_content': reasoning,
+      if (role == 'assistant' && reasoningEncrypted.isNotEmpty)
+        'reasoning_encrypted': reasoningEncrypted,
     };
   }
 }
@@ -589,7 +598,7 @@ class AppSettings {
   String apiKey;
   String model;
 
-  /// API 协议：openai（Chat Completions）或 anthropic（Messages API）。
+  /// API 协议：openai（Chat Completions）/ responses（OpenAI Responses）/ anthropic（Messages）。
   String apiProtocol;
   String systemPrompt;
   double temperature;
@@ -597,8 +606,7 @@ class AppSettings {
   bool enableMemory;
   bool enableAutoLearn;
 
-  /// 活人感（在场）：打开后按对话更新内部需求状态，并在人设后注入本轮内心。
-  /// 不接外部进程。默认关，不影响工作台腔与工具调用。
+  /// 活人感：打开后按 LAAP 官方接法把 PSI preamble 注入动尾。没有本地替身。开关在 Agent 引擎页。默认关。
   bool enablePresence;
   bool ttsEnabled;
   double ttsRate;

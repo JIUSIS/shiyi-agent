@@ -39,7 +39,7 @@ void main() {
       );
     });
 
-    test('自定义人设 + 计划模式 + 滚动摘要渲染', () async {
+    test('自定义人设 + 计划模式渲染（滚动摘要不再进 system）', () async {
       final shiyi = makeState();
       shiyi.settings = shiyi.settings.copyWith(
         systemPrompt: '你是测试人设。\n- 规则一\n- 规则二',

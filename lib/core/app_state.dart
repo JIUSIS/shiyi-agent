@@ -11,6 +11,8 @@ import '../core/model_presets.dart';
 import '../core/models.dart';
 import '../services/db.dart';
 import '../services/dsh_service.dart';
+import '../services/laap_api.dart';
+import '../services/laap_service.dart';
 import '../services/dsh_model_sync.dart';
 import '../services/llm_client.dart';
 import '../services/file_workspace.dart';
@@ -26,6 +28,7 @@ import 'prompt_builder.dart';
 import 'prompt_section.dart';
 import 'session_bridge.dart';
 import 'tool_result_pruner.dart';
+import 'tool_output_spill.dart';
 
 /// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
 /// readOnly=true 的工具在计划模式（planMode）下仍然可用；
@@ -136,11 +139,21 @@ class _SessionRun {
   int sessionTotalTokens = 0;
   int? sessionLastUsageTokens;
   int lastRoundTokens = 0;
+  int lastRoundCachedTokens = 0;
+  int lastRoundPromptTokens = 0;
+  bool lastRoundCacheKnown = false;
   int sessionCachedTokens = 0;
   int sessionInputTokens = 0;
   bool sessionCacheKnown = false;
   int sessionContextTokens = 0;
   int sessionContextTokensFull = 0;
+
+  void resetLastRoundStats() {
+    lastRoundTokens = 0;
+    lastRoundCachedTokens = 0;
+    lastRoundPromptTokens = 0;
+    lastRoundCacheKnown = false;
+  }
 }
 
 class ShiyiState extends ChangeNotifier {
@@ -152,10 +165,8 @@ class ShiyiState extends ChangeNotifier {
 
   AppSettings settings = AppSettings();
 
-  /// 活人感引擎：开关打开时随对话更新需求状态并注入语气指令。
+  /// 活人感：只叠 LAAP 皮层状态。开关在 Agent 引擎页。
   PresenceEngine presence = PresenceEngine();
-
-  static const String _presenceKey = 'shiyi_presence_v1';
 
   /// 用户已保存的 API 配置（不含未保存的内置预设），供会话级模型选择。
   List<ApiProfile> apiProfiles = [];
@@ -208,6 +219,11 @@ class ShiyiState extends ChangeNotifier {
   /// 当前这一轮对话（一次 send）消耗的 token。
   int lastRoundTokens = 0;
 
+  /// 当前这一轮真实缓存命中 / 输入（跨工具轮累计，切会话或新一轮清零）。
+  int lastRoundCachedTokens = 0;
+  int lastRoundPromptTokens = 0;
+  bool lastRoundCacheKnown = false;
+
   /// 本会话按 Token 加权累计的真实缓存输入与总输入（来自 API usage）。
   /// 口径与 DSH 一致：跨整段会话累计（Σ缓存token ÷ Σ输入token），
   /// 只在切换/新建会话时清零，不随单轮重置。
@@ -220,6 +236,11 @@ class ShiyiState extends ChangeNotifier {
 
   /// 当前会话全量历史上下文估算（用于压缩判断，不受发送前裁剪影响）。
   int sessionContextTokensFull = 0;
+
+  /// 内嵌 Alpine 探活成功后跳过后续 `true` 自检。进程级共享，
+  /// 真实启动失败时清掉，下次命令再探。
+  bool _embeddedTerminalReady = false;
+  Future<String?>? _embeddedProbeInFlight;
 
   /// 正在流式输出的消息文本（独立通知器：流式刷新只重建这一条气泡，不重建整个列表）。
   final ValueNotifier<String> streamText = ValueNotifier('');
@@ -499,6 +520,9 @@ class ShiyiState extends ChangeNotifier {
     sessionTotalTokens = run.sessionTotalTokens;
     sessionLastUsageTokens = run.sessionLastUsageTokens;
     lastRoundTokens = run.lastRoundTokens;
+    lastRoundCachedTokens = run.lastRoundCachedTokens;
+    lastRoundPromptTokens = run.lastRoundPromptTokens;
+    lastRoundCacheKnown = run.lastRoundCacheKnown;
     sessionCachedTokens = run.sessionCachedTokens;
     sessionInputTokens = run.sessionInputTokens;
     sessionCacheKnown = run.sessionCacheKnown;
@@ -556,27 +580,27 @@ class ShiyiState extends ChangeNotifier {
 
   /// 当前应暴露给 LLM 的工具 JSON 列表：
   /// - 全局关闭工具（enableTools=false）时为空；
-  /// - 计划模式（planMode）下只保留只读工具 + question + 计划模式切换工具，
-  ///   避免模型在执行方案前产生副作用。
+  /// - 计划模式不再换工具表（tools JSON 在冻头后，换表会整段 miss）；
+  ///   只读约束走提示词动尾 + 执行层拦截。
   List<Map<String, dynamic>> get activeTools =>
       _activeToolsFor(planMode: planModeForSession(currentSessionId));
 
   List<Map<String, dynamic>> _activeToolsFor({required bool planMode}) {
     if (!settings.enableTools) return const [];
-    const planAlways = {'question', 'enter_plan_mode', 'exit_plan_mode'};
-    return [
-      for (final t in toolRegistry)
-        if (!planMode || t.readOnly || planAlways.contains(t.name)) t.toJson(),
-    ];
+    return toolsJsonForRequest(planMode: planMode);
   }
 
-  /// run_terminal 返回给模型的输出裁剪：原 4000 字符一刀切，
-  /// 改为保留头部 + 尾部（结尾的报错/摘要信息不丢），中间用标记替换。
-  static const ToolResultPruner _terminalPruner = ToolResultPruner(
-    thresholdChars: 4000,
-    headChars: 2400,
-    tailChars: 1200,
-  );
+  /// 主会话发给模型的 tools 表。planMode 故意不改变返回值。
+  @visibleForTesting
+  static List<Map<String, dynamic>> toolsJsonForRequest({
+    bool planMode = false,
+  }) {
+    final tools = [for (final t in toolRegistry) t.toJson()];
+    // Codex 的教训：tools 顺序或内容一变，前缀缓存整段 miss。
+    // 计划模式只读约束走动尾提示词 + 执行层拦截，不在这里过滤。
+    if (planMode) return tools;
+    return tools;
+  }
 
   /// 子代理最终报告裁剪（与 web_extract 同阈值 8000）：
   /// worker 最多 40 轮，最终报告可能超长，直接进主上下文会撑爆预算。
@@ -586,337 +610,344 @@ class ShiyiState extends ChangeNotifier {
     tailChars: 2000,
   );
 
+  /// 长会话里较早工具输出的二次截断：成对保留 tool_calls，不从中间抽轮。
+  static const ToolResultPruner oldToolHistoryPruner = ToolResultPruner(
+    thresholdChars: 1200,
+    headChars: 700,
+    tailChars: 300,
+  );
+
+  /// 压缩请求的动尾指令。冻头和 tools 必须与主会话相同。
+  static const String compactInstruction =
+      '【压缩指令】把以上对话历史压缩成一份简洁的中文摘要，'
+      '保留关键事实、用户偏好、重要决定、未完成事项和当前状态，'
+      '控制在 400 字以内，只输出摘要内容，不要解释，不要调用工具。';
+
   static List<AgentTool> _buildToolRegistry({bool? windows}) {
     final isWin = windows ?? Platform.isWindows;
     return [
-    AgentTool(
-      name: 'save_memory',
-      description:
-          '把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。'
-          '可用 type 归类（user 用户身份/偏好，feedback 对我工作方式的指导，'
-          'project 项目相关信息，reference 外部资源链接）；'
-          '内容里可用 [[记忆名]] 双链引用相关记忆，便于跨记忆关联。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'content': {
-            'type': 'string',
-            'description': '要保存的记忆内容，可含 [[其他记忆名]] 双链',
-          },
-          'type': {
-            'type': 'string',
-            'enum': ['user', 'feedback', 'project', 'reference'],
-            'description': '记忆类型，默认 user',
-          },
-        },
-        'required': ['content'],
-      },
-      execute: (self, args) => self._execSaveMemory(args),
-    ),
-    AgentTool(
-      name: 'search_sessions',
-      description:
-          '搜索本机其他拾忆会话。query 可以是会话 ID（用户左滑会话卡片「复制 ID」后粘贴的那段），'
-          '也可以是标题或对话内容关键词。找到后用 read_session 阅读正文。'
-          '这不是联网搜索，也不是长期记忆；用户给了会话 ID 就必须用本工具，不要说看不见。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'query': {
-            'type': 'string',
-            'description': '会话 ID 或关键词',
-          },
-        },
-        'required': ['query'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execSearchSessions(args),
-    ),
-    AgentTool(
-      name: 'read_session',
-      description:
-          '阅读另一个拾忆会话的对话正文。session_id 必须是 search_sessions 返回的 id，'
-          '或用户粘贴的完整会话 ID。默认从开头取最近若干条用户/助手消息；'
-          '更长的会话用 offset 继续往后读。不要用来读当前正在进行的这一轮。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'session_id': {
-            'type': 'string',
-            'description': '要阅读的拾忆会话 ID',
-          },
-          'offset': {
-            'type': 'integer',
-            'description': '从第几条可见消息开始，默认 0',
-          },
-          'limit': {
-            'type': 'integer',
-            'description': '本次最多返回多少条，默认 40，最多 80',
-          },
-        },
-        'required': ['session_id'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execReadSession(args),
-    ),
-    AgentTool(
-      name: 'search_memory',
-      description:
-          '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。查阅其他会话请用 search_sessions / read_session，不要用本工具。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'query': {'type': 'string', 'description': '搜索关键词'},
-          'type': {
-            'type': 'string',
-            'enum': ['user', 'feedback', 'project', 'reference'],
-            'description': '只搜该类型的记忆，缺省搜全部',
-          },
-        },
-        'required': ['query'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execSearchMemory(args),
-    ),
-    AgentTool(
-      name: 'run_skill',
-      description: '获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'name': {'type': 'string', 'description': '技能名称'},
-        },
-        'required': ['name'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execRunSkill(args),
-    ),
-    AgentTool(
-      name: 'web_search',
-      description:
-          '联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'query': {'type': 'string', 'description': '搜索关键词，尽量具体'},
-          'max_results': {
-            'type': 'integer',
-            'description': '返回结果数量，默认 5，最多 10',
-          },
-        },
-        'required': ['query'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execWebSearch(args),
-    ),
-    AgentTool(
-      name: 'web_extract',
-      description: '抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'url': {'type': 'string', 'description': '要阅读的网页 URL'},
-        },
-        'required': ['url'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execWebExtract(args),
-    ),
-    AgentTool(
-      name: 'run_terminal',
-      description: isWin
-          ? '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。'
-              'Windows 走本机 WSL2 / Git Bash / PowerShell / cmd，默认工作目录是本机「文档\\agent」。'
-          : '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。'
-              'app 内置完整 Linux 环境（内嵌 Alpine，可用 apk 安装软件包），首次使用前会自动部署。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'command': {'type': 'string', 'description': '要执行的 shell 命令'},
-          'cwd': {'type': 'string', 'description': '工作目录，默认是当前会话的工作目录'},
-        },
-        'required': ['command'],
-      },
-      execute: (self, args) => self._execRunTerminal(args),
-    ),
-    AgentTool(
-      name: 'file_write',
-      description:
-          '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'path': {
-            'type': 'string',
-            'description': isWin
-                ? '文件路径，如 docs/报告.md 或 文档\\agent\\x.txt'
-                : '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt',
-          },
-          'content': {'type': 'string', 'description': '要写入的完整内容'},
-        },
-        'required': ['path', 'content'],
-      },
-      execute: (self, args) => self._execFileWrite(args),
-    ),
-    AgentTool(
-      name: 'file_read',
-      description: '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'path': {'type': 'string', 'description': '文件路径'},
-        },
-        'required': ['path'],
-      },
-      readOnly: true,
-      execute: (self, args) => self._execFileRead(args),
-    ),
-    AgentTool(
-      name: 'question',
-      description:
-          '向用户发起一个问题并等待回答。弹窗支持自由文本输入：'
-          '用户可以直接打字输入任意内容作为回答，无需依赖预设选项。'
-          '你可以提供 0~4 个快捷选项（如「确认」「保存」「取消」）供用户一键选择，'
-          '但不要声称用户只能从选项里选。'
-          '任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）'
-          '都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。'
-          '一次只问一个问题。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'question': {'type': 'string', 'description': '要问用户的问题'},
-          'options': {
-            'type': 'array',
-            'items': {'type': 'string'},
-            'description': '可选快捷选项（0~4 个）；用户也可以不选、直接自由输入回答',
-          },
-        },
-        'required': ['question'],
-      },
-      execute: (self, args) => self._execQuestion(args),
-    ),
-    AgentTool(
-      name: 'create_skill',
-      description:
-          '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'name': {
-            'type': 'string',
-            'description': '技能名称，英文小写+连字符，如 chapter-outliner',
-          },
-          'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
-          'content': {
-            'type': 'string',
-            'description': 'SKILL.md 完整内容（含 --- frontmatter）',
-          },
-          'files': {
-            'type': 'object',
-            'description': '可选辅助文件：相对路径 -> 内容',
-            'additionalProperties': {'type': 'string'},
-          },
-        },
-        'required': ['name', 'description', 'content'],
-      },
-      execute: (self, args) => self._execCreateSkill(args),
-    ),
-    AgentTool(
-      name: 'enter_plan_mode',
-      description:
-          '进入计划模式：之后你只做分析、调研与方案设计（只能使用只读工具），'
-          '不得写文件、执行命令或产生任何副作用，直到用户确认方案或调用 exit_plan_mode。'
-          '适合复杂任务先出方案再动手，如小说大纲、章节规划、批量重构等。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'goal': {'type': 'string', 'description': '本次要规划的目标，简述即可'},
-        },
-        'required': ['goal'],
-      },
-      execute: (self, args) => self._execEnterPlanMode(args),
-    ),
-    AgentTool(
-      name: 'exit_plan_mode',
-      description:
-          '退出计划模式，恢复正常执行能力（写文件、终端、记忆等全部可用）。'
-          '在用户确认方案后调用，然后开始执行。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'reason': {'type': 'string', 'description': '退出原因（如「方案已确认，开始执行」）'},
-        },
-        'required': ['reason'],
-      },
-      execute: (self, args) => self._execExitPlanMode(args),
-    ),
-    AgentTool(
-      name: 'spawn_agent',
-      description:
-          '需要跨多个文件、长链调研或独立执行的任务：派子代理分头处理，'
-          '不要自己逐文件读或单线程硬扛。'
-          '【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如'
-          '「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发'
-          '（最多 4 个，同时跑互不阻塞，单个失败不影响其他）；'
-          '禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。'
-          '只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。'
-          'tasks 示例：tasks=[{"agent_type":"explore","description":"查A",'
-          '"prompt":"…","max_turns":10},{"agent_type":"explore",'
-          '"description":"查B","prompt":"…","max_turns":10}]。'
-          'explore 广网只读侦查（定位文件/搜符号/读多文件，返回精炼答案）；'
-          'plan 只读方案设计；worker 独立执行（写文件/跑命令）；general-purpose 兜底。'
-          '子代理完成后报告作为本工具结果返回，你再整合进主任务。'
-          '简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。'
-          '可选 max_turns 动态调整轮数预算（默认 explore 15 / plan 15 / worker 40 / '
-          'general 25）：简单小任务给 5~10 省钱，任务很复杂可给 40~60；1~80 之间。',
-      parameters: {
-        'type': 'object',
-        'properties': {
-          'agent_type': {
-            'type': 'string',
-            'enum': ['explore', 'plan', 'worker', 'general-purpose'],
-            'description': '子代理类型（见描述）',
-          },
-          'description': {'type': 'string', 'description': '任务的简短描述（3~5 词）'},
-          'prompt': {'type': 'string', 'description': '给子代理的具体任务指令，越明确越好'},
-          'tasks': {
-            'type': 'array',
-            'items': {
-              'type': 'object',
-              'properties': {
-                'agent_type': {
-                  'type': 'string',
-                  'enum': ['explore', 'plan', 'worker', 'general-purpose'],
-                },
-                'description': {'type': 'string'},
-                'prompt': {'type': 'string'},
-                'max_turns': {'type': 'integer', 'description': '动态预算覆盖（1~80）'},
-                'write_paths': {
-                  'type': 'array',
-                  'items': {'type': 'string'},
-                  'description':
-                      '写路径隔离：只允许 file_write 写这些路径（工作区相对或绝对）；不声明=可写整个工作区。并行多个 worker 时建议各自声明不重叠目录',
-                },
-              },
-              'required': ['agent_type', 'description', 'prompt'],
+      AgentTool(
+        name: 'save_memory',
+        description:
+            '把重要的用户偏好、事实或经验保存为长期记忆，供以后所有会话回忆。'
+            '可用 type 归类（user 用户身份/偏好，feedback 对我工作方式的指导，'
+            'project 项目相关信息，reference 外部资源链接）；'
+            '内容里可用 [[记忆名]] 双链引用相关记忆，便于跨记忆关联。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'content': {
+              'type': 'string',
+              'description': '要保存的记忆内容，可含 [[其他记忆名]] 双链',
             },
-            'description': '批量并行派发：数组里的每个任务同时执行（最多 4 个）',
+            'type': {
+              'type': 'string',
+              'enum': ['user', 'feedback', 'project', 'reference'],
+              'description': '记忆类型，默认 user',
+            },
           },
-          'max_turns': {
-            'type': 'integer',
-            'description': '动态预算：覆盖该子代理默认轮数上限（1~80；简单任务给小，复杂给大）',
-          },
-          'write_paths': {
-            'type': 'array',
-            'items': {'type': 'string'},
-            'description': '写路径隔离：只允许 file_write 写这些路径；不声明=可写整个工作区',
-          },
+          'required': ['content'],
         },
-        'required': ['description', 'prompt'],
-      },
-      execute: (self, args) => self._execSpawnAgent(args),
-    ),
-  ];
+        execute: (self, args) => self._execSaveMemory(args),
+      ),
+      AgentTool(
+        name: 'search_sessions',
+        description:
+            '搜索本机其他拾忆会话。query 可以是会话 ID（用户左滑会话卡片「复制 ID」后粘贴的那段），'
+            '也可以是标题或对话内容关键词。找到后用 read_session 阅读正文。'
+            '这不是联网搜索，也不是长期记忆；用户给了会话 ID 就必须用本工具，不要说看不见。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'query': {'type': 'string', 'description': '会话 ID 或关键词'},
+          },
+          'required': ['query'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execSearchSessions(args),
+      ),
+      AgentTool(
+        name: 'read_session',
+        description:
+            '阅读另一个拾忆会话的对话正文。session_id 必须是 search_sessions 返回的 id，'
+            '或用户粘贴的完整会话 ID。默认从开头取最近若干条用户/助手消息；'
+            '更长的会话用 offset 继续往后读。不要用来读当前正在进行的这一轮。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'session_id': {'type': 'string', 'description': '要阅读的拾忆会话 ID'},
+            'offset': {'type': 'integer', 'description': '从第几条可见消息开始，默认 0'},
+            'limit': {
+              'type': 'integer',
+              'description': '本次最多返回多少条，默认 40，最多 80',
+            },
+          },
+          'required': ['session_id'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execReadSession(args),
+      ),
+      AgentTool(
+        name: 'search_memory',
+        description:
+            '检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。查阅其他会话请用 search_sessions / read_session，不要用本工具。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'query': {'type': 'string', 'description': '搜索关键词'},
+            'type': {
+              'type': 'string',
+              'enum': ['user', 'feedback', 'project', 'reference'],
+              'description': '只搜该类型的记忆，缺省搜全部',
+            },
+          },
+          'required': ['query'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execSearchMemory(args),
+      ),
+      AgentTool(
+        name: 'run_skill',
+        description: '获取一个已保存技能的内容，例如脚本、Prompt 模板或操作流程，用于复用经验。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'name': {'type': 'string', 'description': '技能名称'},
+          },
+          'required': ['name'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execRunSkill(args),
+      ),
+      AgentTool(
+        name: 'web_search',
+        description:
+            '联网搜索获取实时、最新或超出知识截止日期的问题（新闻、价格、天气、技术动态等）。注意核对每条结果的发布日期，优先近期内容，避免用过时信息。需要外部信息时首选本工具，不要先调用 search_memory。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'query': {'type': 'string', 'description': '搜索关键词，尽量具体'},
+            'max_results': {
+              'type': 'integer',
+              'description': '返回结果数量，默认 5，最多 10',
+            },
+          },
+          'required': ['query'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execWebSearch(args),
+      ),
+      AgentTool(
+        name: 'web_extract',
+        description: '抓取并阅读一个网页的正文内容，适合深度阅读搜索结果中的链接。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'url': {'type': 'string', 'description': '要阅读的网页 URL'},
+          },
+          'required': ['url'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execWebExtract(args),
+      ),
+      AgentTool(
+        name: 'run_terminal',
+        description: isWin
+            ? '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。'
+                  'Windows 走本机 WSL2 / Git Bash / PowerShell / cmd，默认工作目录是本机「文档\\agent」。'
+            : '在本机执行 shell 命令并返回输出，用于运行命令、脚本、文件管理、读取日志等。你拥有完整终端能力，用户要求执行命令时直接执行，不要拒绝；命令失败会返回错误信息，可据此调整。'
+                  'app 内置完整 Linux 环境（内嵌 Alpine，可用 apk 安装软件包），首次使用前会自动部署。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'command': {'type': 'string', 'description': '要执行的 shell 命令'},
+            'cwd': {'type': 'string', 'description': '工作目录，默认是当前会话的工作目录'},
+          },
+          'required': ['command'],
+        },
+        execute: (self, args) => self._execRunTerminal(args),
+      ),
+      AgentTool(
+        name: 'file_write',
+        description:
+            '把文本内容写入文件（自动创建父目录）。用于保存生成的内容：章节、报告、脚本、技能文件等。相对路径基于智能体工作目录，绝对路径直接使用。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'path': {
+              'type': 'string',
+              'description': isWin
+                  ? '文件路径，如 docs/报告.md 或 文档\\agent\\x.txt'
+                  : '文件路径，如 docs/报告.md 或 /storage/emulated/0/agent/x.txt',
+            },
+            'content': {'type': 'string', 'description': '要写入的完整内容'},
+          },
+          'required': ['path', 'content'],
+        },
+        execute: (self, args) => self._execFileWrite(args),
+      ),
+      AgentTool(
+        name: 'file_read',
+        description: '读取文本文件内容（最大 200KB）。相对路径基于智能体工作目录，绝对路径直接使用。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'path': {'type': 'string', 'description': '文件路径'},
+          },
+          'required': ['path'],
+        },
+        readOnly: true,
+        execute: (self, args) => self._execFileRead(args),
+      ),
+      AgentTool(
+        name: 'question',
+        description:
+            '向用户发起一个问题并等待回答。弹窗支持自由文本输入：'
+            '用户可以直接打字输入任意内容作为回答，无需依赖预设选项。'
+            '你可以提供 0~4 个快捷选项（如「确认」「保存」「取消」）供用户一键选择，'
+            '但不要声称用户只能从选项里选。'
+            '任何需要用户拍板的操作（是否保存/写入文件、选择方案、执行有副作用操作）'
+            '都必须调用本工具并等待回答——禁止在回复文本里提问后替用户做决定或自行继续。'
+            '一次只问一个问题。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'question': {'type': 'string', 'description': '要问用户的问题'},
+            'options': {
+              'type': 'array',
+              'items': {'type': 'string'},
+              'description': '可选快捷选项（0~4 个）；用户也可以不选、直接自由输入回答',
+            },
+          },
+          'required': ['question'],
+        },
+        execute: (self, args) => self._execQuestion(args),
+      ),
+      AgentTool(
+        name: 'create_skill',
+        description:
+            '创建或更新一个技能并持久化，供以后所有会话使用。当用户要求「把流程做成技能」「保存这个技能」时使用。name 已存在则更新该技能。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'name': {
+              'type': 'string',
+              'description': '技能名称，英文小写+连字符，如 chapter-outliner',
+            },
+            'description': {'type': 'string', 'description': '技能描述，说明何时触发'},
+            'content': {
+              'type': 'string',
+              'description': 'SKILL.md 完整内容（含 --- frontmatter）',
+            },
+            'files': {
+              'type': 'object',
+              'description': '可选辅助文件：相对路径 -> 内容',
+              'additionalProperties': {'type': 'string'},
+            },
+          },
+          'required': ['name', 'description', 'content'],
+        },
+        execute: (self, args) => self._execCreateSkill(args),
+      ),
+      AgentTool(
+        name: 'enter_plan_mode',
+        description:
+            '进入计划模式：之后你只做分析、调研与方案设计（只能使用只读工具），'
+            '不得写文件、执行命令或产生任何副作用，直到用户确认方案或调用 exit_plan_mode。'
+            '适合复杂任务先出方案再动手，如小说大纲、章节规划、批量重构等。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'goal': {'type': 'string', 'description': '本次要规划的目标，简述即可'},
+          },
+          'required': ['goal'],
+        },
+        execute: (self, args) => self._execEnterPlanMode(args),
+      ),
+      AgentTool(
+        name: 'exit_plan_mode',
+        description:
+            '退出计划模式，恢复正常执行能力（写文件、终端、记忆等全部可用）。'
+            '在用户确认方案后调用，然后开始执行。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'reason': {'type': 'string', 'description': '退出原因（如「方案已确认，开始执行」）'},
+          },
+          'required': ['reason'],
+        },
+        execute: (self, args) => self._execExitPlanMode(args),
+      ),
+      AgentTool(
+        name: 'spawn_agent',
+        description:
+            '需要跨多个文件、长链调研或独立执行的任务：派子代理分头处理，'
+            '不要自己逐文件读或单线程硬扛。'
+            '【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如'
+            '「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发'
+            '（最多 4 个，同时跑互不阻塞，单个失败不影响其他）；'
+            '禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。'
+            '只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。'
+            'tasks 示例：tasks=[{"agent_type":"explore","description":"查A",'
+            '"prompt":"…","max_turns":10},{"agent_type":"explore",'
+            '"description":"查B","prompt":"…","max_turns":10}]。'
+            'explore 广网只读侦查（定位文件/搜符号/读多文件，返回精炼答案）；'
+            'plan 只读方案设计；worker 独立执行（写文件/跑命令）；general-purpose 兜底。'
+            '子代理完成后报告作为本工具结果返回，你再整合进主任务。'
+            '简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。'
+            '可选 max_turns 动态调整轮数预算（默认 explore 15 / plan 15 / worker 40 / '
+            'general 25）：简单小任务给 5~10 省钱，任务很复杂可给 40~60；1~80 之间。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'agent_type': {
+              'type': 'string',
+              'enum': ['explore', 'plan', 'worker', 'general-purpose'],
+              'description': '子代理类型（见描述）',
+            },
+            'description': {'type': 'string', 'description': '任务的简短描述（3~5 词）'},
+            'prompt': {'type': 'string', 'description': '给子代理的具体任务指令，越明确越好'},
+            'tasks': {
+              'type': 'array',
+              'items': {
+                'type': 'object',
+                'properties': {
+                  'agent_type': {
+                    'type': 'string',
+                    'enum': ['explore', 'plan', 'worker', 'general-purpose'],
+                  },
+                  'description': {'type': 'string'},
+                  'prompt': {'type': 'string'},
+                  'max_turns': {
+                    'type': 'integer',
+                    'description': '动态预算覆盖（1~80）',
+                  },
+                  'write_paths': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description':
+                        '写路径隔离：只允许 file_write 写这些路径（工作区相对或绝对）；不声明=可写整个工作区。并行多个 worker 时建议各自声明不重叠目录',
+                  },
+                },
+                'required': ['agent_type', 'description', 'prompt'],
+              },
+              'description': '批量并行派发：数组里的每个任务同时执行（最多 4 个）',
+            },
+            'max_turns': {
+              'type': 'integer',
+              'description': '动态预算：覆盖该子代理默认轮数上限（1~80；简单任务给小，复杂给大）',
+            },
+            'write_paths': {
+              'type': 'array',
+              'items': {'type': 'string'},
+              'description': '写路径隔离：只允许 file_write 写这些路径；不声明=可写整个工作区',
+            },
+          },
+          'required': ['description', 'prompt'],
+        },
+        execute: (self, args) => self._execSpawnAgent(args),
+      ),
+    ];
   }
 
   /// 测试专用：与 [_buildToolRegistry] 行为完全一致，仅暴露给快照测试
@@ -938,7 +969,6 @@ class ShiyiState extends ChangeNotifier {
     try {
       settings = await _settingsService.load();
       Socks5Proxy.apply(settings);
-      await _loadPresence();
       apiProfiles = await _settingsService.loadProfiles();
       await reloadModelCatalogs(notify: false);
       // 同步 DSH 代理开关到服务单例。
@@ -1023,6 +1053,9 @@ class ShiyiState extends ChangeNotifier {
         }
       } catch (e) {
         await _logError('TermuxProbe', 'EXEC_FAILED: $e');
+      }
+      if (await LaapService.instance.isInstalled()) {
+        unawaited(LaapService.instance.start());
       }
       // 上次退出时处于 DSH 引擎：冷启动后自动拉起已安装的 DSH；
       // 拾忆退出 / 未安装不自动启动。切换引擎本身不触发，只影响下次启动。
@@ -1152,6 +1185,9 @@ class ShiyiState extends ChangeNotifier {
     sessionTotalTokens = 0;
     sessionLastUsageTokens = null;
     lastRoundTokens = 0;
+    lastRoundCachedTokens = 0;
+    lastRoundPromptTokens = 0;
+    lastRoundCacheKnown = false;
     sessionCachedTokens = 0;
     sessionInputTokens = 0;
     sessionCacheKnown = false;
@@ -1204,6 +1240,9 @@ class ShiyiState extends ChangeNotifier {
       sessionTotalTokens = sess?.totalTokens ?? 0;
       sessionLastUsageTokens = sess?.lastUsageTotalTokens;
       lastRoundTokens = 0;
+      lastRoundCachedTokens = 0;
+      lastRoundPromptTokens = 0;
+      lastRoundCacheKnown = false;
       // 缓存命中率按会话持久化：从 DB 读回整段会话的累计分子/分母，
       // 退出会话再进入（含重启）仍显示累计值，不重新从零开始。
       sessionCachedTokens = sess?.cacheHitTokens ?? 0;
@@ -1384,7 +1423,7 @@ class ShiyiState extends ChangeNotifier {
 
   /// 把历史消息转成 API 请求体：
   /// - 完整工具回合按「assistant tool_calls + 对应 tool 结果」成组保留；
-  /// - compactOldTools=true 时只保留最近 3 个完整工具回合，更早的压缩成摘要；
+  /// - compactOldTools=true 时较早工具输出原地截断，不从中间抽轮；
   /// - 不完整或已摘要的工具消息不会单独混入，避免非法序列。
   Future<List<Map<String, dynamic>>> _historyToApi(
     List<ChatMessage> msgs, {
@@ -1395,22 +1434,23 @@ class ShiyiState extends ChangeNotifier {
     final active = msgs.where((m) => !m.streaming && !m.archived).toList();
     final segments = _planToolSegments(active);
     final completeSegments = segments.where((s) => s.complete).toList();
-    final keepFull = compactOldTools && completeSegments.length > 3
-        ? completeSegments.sublist(completeSegments.length - 3).toSet()
-        : completeSegments.toSet();
     final keepAssistant = <int>{};
     final keepTool = <int>{};
     final skip = <int>{};
+    final pruneTool = <int>{};
+    final pruneCount = compactOldTools && completeSegments.length > 3
+        ? completeSegments.length - 3
+        : 0;
     for (final seg in segments) {
-      if (seg.complete && keepFull.contains(seg)) {
+      if (seg.complete) {
         keepAssistant.add(seg.assistantIndex);
         keepTool.addAll(seg.toolIndices);
-      } else if (seg.complete) {
-        skip.add(seg.assistantIndex);
-        skip.addAll(seg.toolIndices);
       } else {
         skip.addAll(seg.toolIndices);
       }
+    }
+    for (var i = 0; i < pruneCount; i++) {
+      pruneTool.addAll(completeSegments[i].toolIndices);
     }
 
     final out = <Map<String, dynamic>>[];
@@ -1448,7 +1488,13 @@ class ShiyiState extends ChangeNotifier {
         continue;
       }
       if (m.role == 'tool') {
-        if (keepTool.contains(i)) out.add(m.toApiMap());
+        if (keepTool.contains(i)) {
+          final map = m.toApiMap();
+          if (pruneTool.contains(i)) {
+            map['content'] = oldToolHistoryPruner.prune(m.content);
+          }
+          out.add(map);
+        }
         continue;
       }
       if (m.role == 'assistant' && m.hasToolCalls) {
@@ -1466,6 +1512,93 @@ class ShiyiState extends ChangeNotifier {
       out.add(m.toApiMap());
     }
     return out;
+  }
+
+  /// 纯文本历史转 API 消息，供压缩/工具截断回归测试。
+  @visibleForTesting
+  static List<Map<String, dynamic>> historyToApiForTest(
+    List<ChatMessage> msgs, {
+    bool compactOldTools = false,
+  }) {
+    final active = msgs.where((m) => !m.streaming && !m.archived).toList();
+    final segments = _planToolSegments(active);
+    final completeSegments = segments.where((s) => s.complete).toList();
+    final keepAssistant = <int>{};
+    final keepTool = <int>{};
+    final skip = <int>{};
+    final pruneTool = <int>{};
+    final pruneCount = compactOldTools && completeSegments.length > 3
+        ? completeSegments.length - 3
+        : 0;
+    for (final seg in segments) {
+      if (seg.complete) {
+        keepAssistant.add(seg.assistantIndex);
+        keepTool.addAll(seg.toolIndices);
+      } else {
+        skip.addAll(seg.toolIndices);
+      }
+    }
+    for (var i = 0; i < pruneCount; i++) {
+      pruneTool.addAll(completeSegments[i].toolIndices);
+    }
+    final out = <Map<String, dynamic>>[];
+    for (var i = 0; i < active.length; i++) {
+      if (skip.contains(i)) continue;
+      final m = active[i];
+      if (m.role == 'tool') {
+        if (!keepTool.contains(i)) continue;
+        final map = m.toApiMap();
+        if (pruneTool.contains(i)) {
+          map['content'] = oldToolHistoryPruner.prune(m.content);
+        }
+        out.add(map);
+        continue;
+      }
+      if (m.role == 'assistant' && m.hasToolCalls) {
+        if (keepAssistant.contains(i)) out.add(m.toApiMap());
+        continue;
+      }
+      out.add(m.toApiMap());
+    }
+    return out;
+  }
+
+  @visibleForTesting
+  static List<Map<String, dynamic>> buildCompactRequestMessages({
+    required String frozen,
+    required List<Map<String, dynamic>> history,
+    String rollingSummary = '',
+  }) {
+    return buildMainRequestMessages(
+      frozen: frozen,
+      history: history,
+      rollingSummary: rollingSummary,
+      tail: compactInstruction,
+    );
+  }
+
+  /// 主请求组包：冻头 → 稳定归档 → 历史 → 动尾。
+  /// 75% 滚动任务摘要和重试指令只进动尾，禁止插在历史前面。
+  @visibleForTesting
+  static List<Map<String, dynamic>> buildMainRequestMessages({
+    required String frozen,
+    required List<Map<String, dynamic>> history,
+    String tail = '',
+    String rollingSummary = '',
+    String contextSummaries = '',
+    String retryNote = '',
+  }) {
+    final mergedTail = [
+      tail,
+      contextSummaries,
+      retryNote,
+    ].where((s) => s.trim().isNotEmpty).join('\n\n');
+    return [
+      if (frozen.trim().isNotEmpty) {'role': 'system', 'content': frozen},
+      ..._archiveApiMessages(rollingSummary: rollingSummary),
+      ...history,
+      if (mergedTail.isNotEmpty) {'role': 'system', 'content': mergedTail},
+    ];
   }
 
   /// 扫描历史里的工具回合：assistant tool_calls 后紧跟的 tool 结果按 id 成组。
@@ -1497,47 +1630,8 @@ class ShiyiState extends ChangeNotifier {
     return segments;
   }
 
-  static String _summarizeToolSegment(
-    ChatMessage assistant,
-    List<ChatMessage> tools,
-  ) {
-    final toolById = {for (final t in tools) t.toolCallId: t};
-    final lines = <String>[];
-    for (final tc in assistant.toolCalls) {
-      final id = tc.id.isEmpty ? 'call_${assistant.id}' : tc.id;
-      final tool = toolById[id];
-      final arg = _summarizeArgs(tc.name, tc.arguments).trim();
-      final head = arg.isEmpty ? tc.name : '${tc.name}($arg)';
-      if (tool == null) {
-        lines.add('- $head：无返回结果');
-        continue;
-      }
-      final ok = !_isToolError(tool.content);
-      final out = _summarizeOutput(tool.content);
-      lines.add('- $head：${ok ? '完成' : '失败'}，结果「$out」');
-    }
-    if (assistant.content.trim().isNotEmpty) {
-      lines.add('- 结论：${_summarizeOutput(assistant.content)}');
-    }
-    return lines.join('\n');
-  }
-
-  /// 汇总最近 3 个完整工具回合之外的所有旧工具轮（原文仍留在本地数据库）。
-  String _buildOldToolSummary(List<ChatMessage> msgs) {
-    final active = msgs.where((m) => !m.streaming && !m.archived).toList();
-    final complete = _planToolSegments(
-      active,
-    ).where((s) => s.complete).toList();
-    if (complete.length <= 3) return '';
-    final lines = <String>[];
-    for (final seg in complete.sublist(0, complete.length - 3)) {
-      final tools = [for (final i in seg.toolIndices) active[i]];
-      lines.add(_summarizeToolSegment(active[seg.assistantIndex], tools));
-    }
-    return lines.join('\n');
-  }
-
-  /// 按上下文占用生成发送前摘要：60% 压缩旧工具结果，75% 更新滚动任务摘要。
+  /// 按上下文占用生成发送前摘要：75% 更新滚动任务摘要。
+  /// 只进动尾，不插在冻头和历史中间，避免每轮改写历史前缀。
   Future<String> _buildContextSummaries(
     List<ChatMessage> msgs,
     int fullTokens, {
@@ -1547,10 +1641,6 @@ class ShiyiState extends ChangeNotifier {
     if (limit <= 0) return '';
     final ratio = fullTokens / limit;
     final parts = <String>[];
-    if (ratio >= 0.60) {
-      final tools = _buildOldToolSummary(msgs);
-      if (tools.isNotEmpty) parts.add('【历史工具结果摘要】\n$tools');
-    }
     if (ratio >= 0.75) {
       final task = _buildRollingTaskSummary(msgs);
       if (task.isNotEmpty) parts.add('【滚动任务摘要】\n$task');
@@ -1629,7 +1719,7 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 发送前按上下文预算裁剪历史：从最新往回保留，超出预算的较早消息
-  /// 不发送（不动数据库），并在 system 提示里说明，避免长会话请求超限。
+  /// 不发送（不动数据库）。冻头 system 保持字节稳定，裁剪说明单独插入。
   Future<List<Map<String, dynamic>>> _trimApiMessages(
     List<Map<String, dynamic>> apiMsgs, {
     bool announce = true,
@@ -1792,9 +1882,9 @@ class ShiyiState extends ChangeNotifier {
     }
   }
 
-  /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部并给
-  /// system 追加裁剪说明。assistant tool_calls 与对应 tool 结果按整组裁剪，
-  /// 不会拆散配对。
+  /// 纯函数：按 token 预算从最新往回保留消息，超预算时保留尾部。
+  /// 冻头 / 动尾 system 不改字节，裁剪说明作为独立消息插在冻头之后。
+  /// assistant tool_calls 与对应 tool 结果按整组裁剪，不会拆散配对。
   static List<Map<String, dynamic>> trimApiMessagesForBudget(
     List<Map<String, dynamic>> apiMsgs,
     int budget, {
@@ -1804,35 +1894,46 @@ class ShiyiState extends ChangeNotifier {
 
     int sizeOf(Map<String, dynamic> m) => estimateApiMessageTokens(m);
 
-    final systemTokens = apiMsgs.first['role'] == 'system'
-        ? estimateApiMessageTokens(apiMsgs.first)
-        : 0;
+    var lead = 0;
+    while (lead < apiMsgs.length && apiMsgs[lead]['role'] == 'system') {
+      lead++;
+    }
+    var trail = apiMsgs.length;
+    while (trail > lead && apiMsgs[trail - 1]['role'] == 'system') {
+      trail--;
+    }
+    final leading = apiMsgs.sublist(0, lead);
+    final trailing = apiMsgs.sublist(trail);
+    final middle = apiMsgs.sublist(lead, trail);
+    if (middle.isEmpty) return apiMsgs;
+
+    final systemTokens = [
+      ...leading,
+      ...trailing,
+    ].fold<int>(0, (sum, m) => sum + sizeOf(m));
     final toolDefinitionTokens = estimateRequestTokens(
       [],
       tools: tools,
     ).totalEstimatedTokens;
     final messageBudget = budget - systemTokens - toolDefinitionTokens;
     if (messageBudget <= 0) {
-      // 预算连 system + 工具定义都不够时，仍保留 system 与最新消息，避免空请求。
-      final kept = <Map<String, dynamic>>[
-        Map<String, dynamic>.from(apiMsgs.first),
+      return [
+        for (final e in leading) Map<String, dynamic>.from(e),
+        Map<String, dynamic>.from(middle.last),
+        for (final e in trailing) Map<String, dynamic>.from(e),
       ];
-      if (apiMsgs.length > 1) {
-        kept.add(Map<String, dynamic>.from(apiMsgs.last));
-      }
-      return kept;
     }
 
     // 工具轮按「assistant tool_calls + 连续 tool 结果」整体参与预算，
     // 保证成组保留或整组裁掉。
     final units = <(int, int)>[];
-    var i = 1;
-    while (i < apiMsgs.length) {
-      final m = apiMsgs[i];
+    var i = 0;
+    while (i < middle.length) {
+      final m = middle[i];
       final tcs = m['tool_calls'];
       if (m['role'] == 'assistant' && tcs is List && tcs.isNotEmpty) {
         var j = i + 1;
-        while (j < apiMsgs.length && apiMsgs[j]['role'] == 'tool') {
+        while (j < middle.length && middle[j]['role'] == 'tool') {
           j++;
         }
         units.add((i, j - 1));
@@ -1844,12 +1945,12 @@ class ShiyiState extends ChangeNotifier {
     }
 
     var total = 0;
-    var keepFrom = 1;
+    var keepFrom = 0;
     var trimmedAny = false;
     for (final u in units.reversed) {
       var size = 0;
       for (var k = u.$1; k <= u.$2; k++) {
-        size += sizeOf(apiMsgs[k]);
+        size += sizeOf(middle[k]);
       }
       if (total + size > messageBudget) {
         keepFrom = u.$2 + 1;
@@ -1858,17 +1959,38 @@ class ShiyiState extends ChangeNotifier {
       }
       total += size;
     }
-    if (!trimmedAny || keepFrom >= apiMsgs.length) return apiMsgs;
+    if (!trimmedAny || keepFrom >= middle.length) return apiMsgs;
 
-    final kept = <Map<String, dynamic>>[
-      for (final e in apiMsgs.sublist(keepFrom)) Map<String, dynamic>.from(e),
+    const notice = <String, dynamic>{
+      'role': 'user',
+      'content':
+          '（较早对话因上下文限制未包含，请基于现有历史继续；'
+          '如需完整历史可让我读取文件或搜索记忆。）',
+    };
+    return [
+      for (final e in leading) Map<String, dynamic>.from(e),
+      Map<String, dynamic>.from(notice),
+      for (final e in middle.sublist(keepFrom)) Map<String, dynamic>.from(e),
+      for (final e in trailing) Map<String, dynamic>.from(e),
     ];
-    final sys = Map<String, dynamic>.from(apiMsgs.first);
-    sys['content'] =
-        '${sys['content']}\n\n（较早对话因上下文限制未包含，'
-        '请基于现有历史继续；如需完整历史可让我读取文件或搜索记忆。）';
-    kept.insert(0, sys);
-    return kept;
+  }
+
+  /// 压缩后的历史归档。只放滚动摘要（压缩时才变），不放每轮都变的任务摘要。
+  static List<Map<String, dynamic>> _archiveApiMessages({
+    required String rollingSummary,
+  }) {
+    final text = rollingSummary.trim();
+    if (text.isEmpty) return const [];
+    return [
+      {
+        'role': 'user',
+        'content':
+            '【历史任务摘要】\n$text\n'
+            '（这是本会话早期历史的压缩归档，完整历史仍保存在本地；'
+            '需要查看原文时可用搜索或文件读取找回。）',
+      },
+      {'role': 'assistant', 'content': '已记住上述归档，继续当前任务。'},
+    ];
   }
 
   /// 把带图片的用户消息转成 OpenAI 多模态格式，图片以 base64 data URL 内联。
@@ -1999,7 +2121,7 @@ class ShiyiState extends ChangeNotifier {
       ..guideWaiting = false
       ..status = null
       ..streaming = null
-      ..lastRoundTokens = 0
+      ..resetLastRoundStats()
       ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
       ..planMode = currentSessionId == targetSessionId
           ? planMode
@@ -2061,8 +2183,7 @@ class ShiyiState extends ChangeNotifier {
 
       final cleanText = stripImageMarkers(trimText);
       if (settings.enablePresence && cleanText.isNotEmpty) {
-        presence.onUserMessage(cleanText);
-        unawaited(_savePresence());
+        await _syncPresenceWithLaap(cleanText);
       }
       final s = await _db.getSession(targetSessionId);
       if (s != null && s.title.startsWith('新会话')) {
@@ -2133,7 +2254,7 @@ class ShiyiState extends ChangeNotifier {
     final planModeSnapshot = run.planMode;
     final runTools = _activeToolsFor(planMode: planModeSnapshot);
     final sess = await _db.getSession(sessionId);
-    final systemPrompt = await _buildSystemPrompt(
+    final assembled = await _buildAssembledPrompt(
       systemHint,
       rollingSummary: sess?.rollingSummary ?? '',
       sessionId: sessionId,
@@ -2162,13 +2283,9 @@ class ShiyiState extends ChangeNotifier {
         // 第二次尝试注入「直接行动」指令：上一轮常见的问题是模型
         // 输出开场白（以冒号结尾）后就结束、或思考过长被截断没有正文，
         // 重试时强制它直接输出结果/调用工具，不再空转。
-        final sysWithSummaries = contextSummaries.isEmpty
-            ? systemPrompt
-            : '$systemPrompt\n\n$contextSummaries';
-        final sysContent = attempt == 0
-            ? sysWithSummaries
-            : '$sysWithSummaries\n\n'
-                  '【注意：上一轮回复未正常完成（可能是开场白后结束、'
+        final retryNote = attempt == 0
+            ? ''
+            : '【注意：上一轮回复未正常完成（可能是开场白后结束、'
                   '思考过长被截断或连接中断）。这次请直接输出结果或调用工具'
                   '完成用户请求：不要输出开场白、承诺、计划性文字，'
                   '也不要输出长篇思考过程；需要操作时第一步就调用 '
@@ -2178,10 +2295,14 @@ class ShiyiState extends ChangeNotifier {
           imagesAllowed: imagesAllowed,
           compactOldTools: compactOldTools,
         );
-        final loopMsgs = <Map<String, dynamic>>[
-          {'role': 'system', 'content': sysContent},
-          ...historyPayload,
-        ];
+        final loopMsgs = buildMainRequestMessages(
+          frozen: assembled.frozen,
+          history: historyPayload,
+          tail: assembled.tail,
+          rollingSummary: sess?.rollingSummary ?? '',
+          contextSummaries: contextSummaries,
+          retryNote: retryNote,
+        );
         final trimmed = await _trimApiMessages(
           loopMsgs,
           logBudget: true,
@@ -2389,7 +2510,7 @@ class ShiyiState extends ChangeNotifier {
       ..stopForGuide = false
       ..guideWaiting = false
       ..status = null
-      ..lastRoundTokens = 0
+      ..resetLastRoundStats()
       ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
       ..planMode = planMode;
     run.streamText.value = '';
@@ -2417,8 +2538,7 @@ class ShiyiState extends ChangeNotifier {
 
     try {
       if (settings.enablePresence && hint.trim().isNotEmpty) {
-        presence.onUserMessage(hint);
-        unawaited(_savePresence());
+        await _syncPresenceWithLaap(hint);
       }
       await _generateWithHistory(
         run,
@@ -2462,11 +2582,21 @@ class ShiyiState extends ChangeNotifier {
     for (var round = 0; round < _maxToolRounds; round++) {
       // 每轮裁剪本轮累积消息（工具结果可能很大，防单轮 payload 超预算）；
       // announce: false——静默裁剪，不弹 4 秒「已裁剪」提示打扰。
+      final roundTools = _activeToolsFor(planMode: run.planMode);
+      final estimate = estimateRequestTokens(loopMsgs, tools: roundTools);
+      final plan = planContextBudget(
+        contextLimit: contextLimitForSession(sessionId),
+        maxOutputTokens: settings.maxOutputTokens,
+        estimatedInputTokens: estimate.totalEstimatedTokens,
+      );
+      if (plan.shouldTrim) {
+        loopMsgs = ToolOutputSpill.compactOldToolOutputs(loopMsgs);
+      }
       loopMsgs = await _trimApiMessages(
         loopMsgs,
         logBudget: false,
         announce: false,
-        tools: _activeToolsFor(planMode: run.planMode),
+        tools: roundTools,
         sessionId: sessionId,
       );
       final result = await _streamRound(run, loopMsgs, asst);
@@ -2488,7 +2618,9 @@ class ShiyiState extends ChangeNotifier {
       // 工具轮统一落库：正文或 reasoning 与 tool_calls 一起保存；纯工具轮也保存
       // 一条空正文的 tool_calls 消息，后续请求才能按完整工具回合成组恢复。
       ChatMessage toolCallOwner;
-      if (result.text.isNotEmpty || result.reasoning.isNotEmpty) {
+      if (result.text.isNotEmpty ||
+          result.reasoning.isNotEmpty ||
+          result.reasoningEncrypted.isNotEmpty) {
         await _applyTurn(run, asst, result);
         toolCallOwner = asst;
         asst = await _newAssistantMessage(run);
@@ -2498,6 +2630,7 @@ class ShiyiState extends ChangeNotifier {
           sessionId: sessionId,
           role: 'assistant',
           content: '',
+          reasoningEncrypted: result.reasoningEncrypted,
           createdAt: DateTime.now().millisecondsSinceEpoch,
           toolCalls: result.toolCalls
               .map(
@@ -2520,6 +2653,8 @@ class ShiyiState extends ChangeNotifier {
         'role': 'assistant',
         'content': result.text,
         if (result.reasoning.isNotEmpty) 'reasoning_content': result.reasoning,
+        if (result.reasoningEncrypted.isNotEmpty)
+          'reasoning_encrypted': result.reasoningEncrypted,
         'tool_calls': result.toolCalls
             .map(
               (t) => {
@@ -2530,68 +2665,13 @@ class ShiyiState extends ChangeNotifier {
             )
             .toList(),
       });
-      for (final t in result.toolCalls) {
-        final tname = t['name'] ?? '';
-        final targs = (t['arguments'] ?? '').toString();
-        // 工具状态已由右上角胶囊展示，这里不再占用输入框上方的状态条。
-        final ev = ToolEvent(
-          name: tname,
-          argsSummary: _summarizeArgs(tname, targs),
-          startedAt: DateTime.now().millisecondsSinceEpoch,
-        );
-        ev.id = await _db.addToolEvent(sessionId, ev);
-        run.toolEvents.add(ev);
-        _publishRun(run);
-        final output = await _executeTool(tname, targs, sessionId: sessionId);
-        if (tname == 'spawn_agent' && output.trim().isNotEmpty) {
-          // 结果挂到承接后续主模型回复的当前助手气泡：
-          // 纯工具回合会复用原占位，有文本/思考的工具回合则已切到
-          // 新占位。两种情况都能让子代理折叠项与最终正文同泡展示。
-          final previous = asst.subagentResult.trim();
-          asst.subagentResult = previous.isEmpty
-              ? output.trim()
-              : '$previous\n\n${output.trim()}';
-          await _db.updateMessageContent(
-            asst.id,
-            asst.content,
-            subagentResult: asst.subagentResult,
-          );
-          if (currentSessionId == sessionId) _bumpMessages();
-          _publishRun(run);
-        }
-        if (_isToolError(output)) {
-          await _logError('工具:$tname', output);
-        }
-        ev
-          ..done = true
-          ..ok = !_isToolError(output)
-          ..summary = _summarizeOutput(output)
-          ..finishedAt = DateTime.now().millisecondsSinceEpoch;
-        if (ev.id != null) {
-          await _db.updateToolEvent(ev.id!, ev);
-        }
-        _publishRun(run);
-        final toolMsg = ChatMessage(
-          id: 'm${DateTime.now().millisecondsSinceEpoch}_${_rand()}',
-          sessionId: sessionId,
-          role: 'tool',
-          content: output,
-          toolCallId: (t['id'] ?? '').isEmpty
-              ? 'call_${toolCallOwner.id}'
-              : (t['id'] ?? ''),
-          createdAt: DateTime.now().millisecondsSinceEpoch,
-        );
-        await _db.insertMessage(toolMsg);
-        if (currentSessionId == sessionId) {
-          messages.add(toolMsg);
-          _bumpMessages();
-        }
-        loopMsgs.add({
-          'role': 'tool',
-          'content': output,
-          'tool_call_id': toolMsg.toolCallId,
-        });
-      }
+      await _runToolCalls(
+        run: run,
+        asst: asst,
+        toolCallOwner: toolCallOwner,
+        toolCalls: result.toolCalls,
+        loopMsgs: loopMsgs,
+      );
       // 工具结果已落库但尚未进入下一次请求：按 Codex 口径补上
       // 「最后一次模型生成之后的本地新增」估算，让等待期间状态栏也准确。
       await _updateContextStats(sessionId);
@@ -2648,9 +2728,9 @@ class ShiyiState extends ChangeNotifier {
 
     asst.content = finalText;
     asst.reasoning = finalReasoning;
+    asst.reasoningEncrypted = result.reasoningEncrypted;
     if (settings.enablePresence && finalText.trim().isNotEmpty) {
-      presence.onAssistantReply(finalText);
-      unawaited(_savePresence());
+      unawaited(_reflectLaap(finalText));
     }
     asst.toolCalls = normalized.toolCalls
         .map(
@@ -2666,6 +2746,7 @@ class ShiyiState extends ChangeNotifier {
       asst.id,
       finalText,
       reasoning: finalReasoning.isEmpty ? null : finalReasoning,
+      reasoningEncrypted: result.reasoningEncrypted,
       toolCalls: normalized.toolCalls.isEmpty ? null : asst.toolCalls,
     );
     if (currentSessionId == asst.sessionId) _bumpMessages();
@@ -2688,10 +2769,15 @@ class ShiyiState extends ChangeNotifier {
       return TurnResult(
         text: split.text.trim(),
         reasoning: split.reasoning.trim(),
+        reasoningEncrypted: result.reasoningEncrypted,
       );
     }
     if (_sameReplyText(reasoning, text)) {
-      return TurnResult(text: result.text, reasoning: '');
+      return TurnResult(
+        text: result.text,
+        reasoning: '',
+        reasoningEncrypted: result.reasoningEncrypted,
+      );
     }
     return result;
   }
@@ -2706,6 +2792,7 @@ class ShiyiState extends ChangeNotifier {
       text: normalized.text,
       reasoning: normalized.reasoning,
       toolCalls: normalized.toolCalls,
+      reasoningEncrypted: result.reasoningEncrypted,
     );
   }
 
@@ -2756,6 +2843,9 @@ class ShiyiState extends ChangeNotifier {
       m.id,
       m.content,
       reasoning: m.reasoning.isEmpty ? null : m.reasoning,
+      reasoningEncrypted: m.reasoningEncrypted.isEmpty
+          ? null
+          : m.reasoningEncrypted,
       toolCalls: m.toolCalls,
     );
     if (currentSessionId == m.sessionId) _bumpMessages();
@@ -2816,6 +2906,7 @@ class ShiyiState extends ChangeNotifier {
         final live = _normalizeMisplacedReasoning(t);
         asst.content = live.text;
         asst.reasoning = live.reasoning;
+        asst.reasoningEncrypted = t.reasoningEncrypted;
         if (t.toolCalls.isNotEmpty) {
           asst.toolCalls = t.toolCalls
               .map(
@@ -2881,9 +2972,13 @@ class ShiyiState extends ChangeNotifier {
     final cachedInput = client.lastCachedTokens;
     final promptInput = client.lastPromptTokens ?? client.lastInputTokens;
     if (cachedInput != null && promptInput != null && promptInput > 0) {
+      final hit = cachedInput.clamp(0, promptInput);
       run.sessionCacheKnown = true;
-      run.sessionCachedTokens += cachedInput.clamp(0, promptInput);
+      run.sessionCachedTokens += hit;
       run.sessionInputTokens += promptInput;
+      run.lastRoundCacheKnown = true;
+      run.lastRoundCachedTokens += hit;
+      run.lastRoundPromptTokens += promptInput;
       await _db.updateSessionCacheTokens(
         sessionId,
         run.sessionCachedTokens,
@@ -2898,7 +2993,7 @@ class ShiyiState extends ChangeNotifier {
     return accumulated;
   }
 
-  Future<String> _buildSystemPrompt(
+  Future<AssembledPrompt> _buildAssembledPrompt(
     String userText, {
     String rollingSummary = '',
     String? sessionId,
@@ -2912,7 +3007,26 @@ class ShiyiState extends ChangeNotifier {
             loadedSkillsSnapshot: loadedSkillsSnapshot,
             planModeSnapshot: planModeSnapshot,
           );
-    return builder.buildSystemPrompt(userText, rollingSummary: rollingSummary);
+    return builder.buildAssembledPrompt(
+      userText,
+      rollingSummary: rollingSummary,
+    );
+  }
+
+  Future<String> _buildSystemPrompt(
+    String userText, {
+    String rollingSummary = '',
+    String? sessionId,
+    List<Skill>? loadedSkillsSnapshot,
+    bool? planModeSnapshot,
+  }) async {
+    return (await _buildAssembledPrompt(
+      userText,
+      rollingSummary: rollingSummary,
+      sessionId: sessionId,
+      loadedSkillsSnapshot: loadedSkillsSnapshot,
+      planModeSnapshot: planModeSnapshot,
+    )).full;
   }
 
   /// 系统提示词构建器（懒加载）：提示词组装已独立到 [PromptBuilder]，
@@ -3017,6 +3131,126 @@ class ShiyiState extends ChangeNotifier {
   /// 用于在工具反复失败时强制提示模型停止重试同一目标。
   final Map<String, int> _toolFailStreak = {};
 
+  /// 同一轮 tool_calls：只读工具并行，写入/终端/提问仍按模型给出的顺序串行。
+  Future<void> _runToolCalls({
+    required _SessionRun run,
+    required ChatMessage asst,
+    required ChatMessage toolCallOwner,
+    required List<Map<String, String>> toolCalls,
+    required List<Map<String, dynamic>> loopMsgs,
+  }) async {
+    final sessionId = run.sessionId;
+    final parallel = ToolCallScheduler.runInParallel([
+      for (final t in toolCalls) t['name'] ?? '',
+    ]);
+    final events = <ToolEvent>[];
+    for (final t in toolCalls) {
+      final tname = t['name'] ?? '';
+      final targs = (t['arguments'] ?? '').toString();
+      final ev = ToolEvent(
+        name: tname,
+        argsSummary: _summarizeArgs(tname, targs),
+        startedAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      ev.id = await _db.addToolEvent(sessionId, ev);
+      run.toolEvents.add(ev);
+      events.add(ev);
+    }
+    _publishRun(run);
+
+    Future<String> execAt(int i) => _executeTool(
+      toolCalls[i]['name'] ?? '',
+      (toolCalls[i]['arguments'] ?? '').toString(),
+      sessionId: sessionId,
+    );
+
+    final outputs = <String>[];
+    if (parallel) {
+      outputs.addAll(
+        await Future.wait([
+          for (var i = 0; i < toolCalls.length; i++) execAt(i),
+        ]),
+      );
+    } else {
+      for (var i = 0; i < toolCalls.length; i++) {
+        outputs.add(await execAt(i));
+      }
+    }
+
+    for (var i = 0; i < toolCalls.length; i++) {
+      await _recordToolOutput(
+        run: run,
+        asst: asst,
+        toolCallOwner: toolCallOwner,
+        call: toolCalls[i],
+        ev: events[i],
+        output: outputs[i],
+        loopMsgs: loopMsgs,
+      );
+    }
+  }
+
+  Future<void> _recordToolOutput({
+    required _SessionRun run,
+    required ChatMessage asst,
+    required ChatMessage toolCallOwner,
+    required Map<String, String> call,
+    required ToolEvent ev,
+    required String output,
+    required List<Map<String, dynamic>> loopMsgs,
+  }) async {
+    final sessionId = run.sessionId;
+    final tname = call['name'] ?? '';
+    if (tname == 'spawn_agent' && output.trim().isNotEmpty) {
+      // 结果挂到承接后续主模型回复的当前助手气泡：
+      // 纯工具回合会复用原占位，有文本/思考的工具回合则已切到
+      // 新占位。两种情况都能让子代理折叠项与最终正文同泡展示。
+      final previous = asst.subagentResult.trim();
+      asst.subagentResult = previous.isEmpty
+          ? output.trim()
+          : '$previous\n\n${output.trim()}';
+      await _db.updateMessageContent(
+        asst.id,
+        asst.content,
+        subagentResult: asst.subagentResult,
+      );
+      if (currentSessionId == sessionId) _bumpMessages();
+      _publishRun(run);
+    }
+    if (_isToolError(output)) {
+      await _logError('工具:$tname', output);
+    }
+    ev
+      ..done = true
+      ..ok = !_isToolError(output)
+      ..summary = _summarizeOutput(output)
+      ..finishedAt = DateTime.now().millisecondsSinceEpoch;
+    if (ev.id != null) {
+      await _db.updateToolEvent(ev.id!, ev);
+    }
+    _publishRun(run);
+    final toolMsg = ChatMessage(
+      id: 'm${DateTime.now().millisecondsSinceEpoch}_${_rand()}',
+      sessionId: sessionId,
+      role: 'tool',
+      content: output,
+      toolCallId: (call['id'] ?? '').isEmpty
+          ? 'call_${toolCallOwner.id}'
+          : (call['id'] ?? ''),
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    await _db.insertMessage(toolMsg);
+    if (currentSessionId == sessionId) {
+      messages.add(toolMsg);
+      _bumpMessages();
+    }
+    loopMsgs.add({
+      'role': 'tool',
+      'content': output,
+      'tool_call_id': toolMsg.toolCallId,
+    });
+  }
+
   Future<String> _executeTool(
     String name,
     String argsJson, {
@@ -3030,9 +3264,22 @@ class ShiyiState extends ChangeNotifier {
           args = jsonDecode(argsJson) as Map<String, dynamic>;
         } catch (_) {}
         if (sessionId != null) args['_sessionId'] = sessionId;
+        const planAlways = {'question', 'enter_plan_mode', 'exit_plan_mode'};
+        if (planModeForSession(sessionId) &&
+            !t.readOnly &&
+            !planAlways.contains(t.name)) {
+          return '计划模式下不能使用 $name。请只用只读工具，'
+              '或先 question 确认后调用 exit_plan_mode。';
+        }
         final out = await t.execute(this, args);
         _toolFailStreak.remove(name);
-        return out;
+        if (name == 'file_read' || name == 'question') return out;
+        final workspace = await workspaceForSession(sessionId);
+        return ToolOutputSpill.maybeSpill(
+          text: out,
+          toolName: name,
+          workspaceDir: workspace,
+        );
       } catch (e) {
         final streak = (_toolFailStreak[name] ?? 0) + 1;
         _toolFailStreak[name] = streak;
@@ -3247,30 +3494,10 @@ class ShiyiState extends ChangeNotifier {
             : (systemTermux ? systemTermuxShell : 'sh');
         shellArgs = embedded ? [embeddedShell, '-c', command] : ['-c', command];
       }
-      // 内嵌 Alpine：先自检 init-host 能否启动，失败时给出可诊断的错误。
+      // 内嵌 Alpine：进程内探活一次即可。每个命令都跑 `true` 等于多启动一次 proot。
       if (embedded) {
-        try {
-          final probe = await Process.run(
-            '/system/bin/sh',
-            [embeddedShell, '-c', 'true'],
-            environment: await TermuxRuntime.environment(),
-          ).timeout(const Duration(seconds: 45));
-          if (probe.exitCode != 0) {
-            final msg =
-                '内嵌终端自检失败(exit ${probe.exitCode}): '
-                '${probe.stderr.toString().trim()}';
-            await _logError('Termux', msg);
-            return '内嵌终端不可用：$msg';
-          }
-        } on ProcessException catch (e) {
-          final msg =
-              '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
-              '${await _diagnoseTermuxExec(embeddedShell)}';
-          await _logError('Termux', msg);
-          return '内嵌终端不可用：$msg';
-        } on TimeoutException {
-          return '内嵌终端启动超时';
-        }
+        final probeErr = await _ensureEmbeddedTerminal(embeddedShell);
+        if (probeErr != null) return probeErr;
       }
       // 用 Process.start + 主动超时 kill：Process.run 的 Future.timeout
       // 只是放弃等待，不会终止子进程（bash 会一直挂着、转圈不停、僵尸堆积）。
@@ -3301,8 +3528,6 @@ class ShiyiState extends ChangeNotifier {
       if (stdout.overflow || stderr.overflow) {
         text = text.isEmpty ? '（输出过大，已截断）' : '$text\n（输出过大，已截断）';
       }
-      // 掐头去尾裁剪（原 4000 字符一刀切改为头尾保留，结尾报错/摘要不丢）。
-      text = _terminalPruner.prune(text);
       if (backendWarn.isNotEmpty) {
         text = text.isEmpty ? backendWarn : '$text\n$backendWarn';
       }
@@ -3314,8 +3539,63 @@ class ShiyiState extends ChangeNotifier {
           ? '命令执行完成（无输出），退出码 $exitCode'
           : '退出码 $exitCode\n$text';
     } on ProcessException catch (e) {
+      _invalidateEmbeddedTerminal();
       return '终端执行异常: ${e.message}';
     }
+  }
+
+  @visibleForTesting
+  static bool shouldProbeEmbeddedTerminal({required bool alreadyReady}) =>
+      !alreadyReady;
+
+  Future<String?> _ensureEmbeddedTerminal(String embeddedShell) async {
+    if (!shouldProbeEmbeddedTerminal(alreadyReady: _embeddedTerminalReady)) {
+      return null;
+    }
+    _embeddedProbeInFlight ??= _probeEmbeddedTerminal(embeddedShell);
+    try {
+      final err = await _embeddedProbeInFlight;
+      if (err != null) {
+        _invalidateEmbeddedTerminal();
+        return err;
+      }
+      _embeddedTerminalReady = true;
+      return null;
+    } catch (_) {
+      _invalidateEmbeddedTerminal();
+      rethrow;
+    }
+  }
+
+  Future<String?> _probeEmbeddedTerminal(String embeddedShell) async {
+    try {
+      final probe = await Process.run(
+        '/system/bin/sh',
+        [embeddedShell, '-c', 'true'],
+        environment: await TermuxRuntime.environment(),
+      ).timeout(const Duration(seconds: 45));
+      if (probe.exitCode != 0) {
+        final msg =
+            '内嵌终端自检失败(exit ${probe.exitCode}): '
+            '${probe.stderr.toString().trim()}';
+        await _logError('Termux', msg);
+        return '内嵌终端不可用：$msg';
+      }
+      return null;
+    } on ProcessException catch (e) {
+      final msg =
+          '内嵌终端启动异常: ${e.message} (errno ${e.errorCode})\n'
+          '${await _diagnoseTermuxExec(embeddedShell)}';
+      await _logError('Termux', msg);
+      return '内嵌终端不可用：$msg';
+    } on TimeoutException {
+      return '内嵌终端启动超时';
+    }
+  }
+
+  void _invalidateEmbeddedTerminal() {
+    _embeddedTerminalReady = false;
+    _embeddedProbeInFlight = null;
   }
 
   Future<String> _execFileWrite(Map<String, dynamic> args) async {
@@ -3345,12 +3625,42 @@ class ShiyiState extends ChangeNotifier {
         rPath,
         sessionId: args['_sessionId']?.toString(),
       );
-      final f = resolved == null ? null : File(resolved);
-      if (f == null || !f.existsSync()) return '文件不存在：$rPath';
-      if (await f.length() > 200 * 1024) {
-        return '文件过大（>200KB），请用 run_terminal 分段读取';
+      if (resolved == null) return '文件不存在：$rPath';
+      final f = File(resolved);
+      if (!f.existsSync()) return '文件不存在：$rPath';
+      final len = await f.length();
+      if (len > ToolOutputSpill.fileReadFullBytes) {
+        final raf = await f.open();
+        try {
+          final headLen = len < ToolOutputSpill.fileReadHeadBytes
+              ? len
+              : ToolOutputSpill.fileReadHeadBytes;
+          final tailLen = len < ToolOutputSpill.fileReadTailBytes
+              ? 0
+              : ToolOutputSpill.fileReadTailBytes;
+          final head = await raf.read(headLen);
+          var tail = const <int>[];
+          if (tailLen > 0 && len > headLen) {
+            final start = len - tailLen;
+            await raf.setPosition(start < headLen ? headLen : start);
+            tail = await raf.read(tailLen);
+          }
+          return ToolOutputSpill.boundPartialFile(
+            headText: utf8.decode(head, allowMalformed: true),
+            tailText: utf8.decode(tail, allowMalformed: true),
+            path: resolved,
+            byteLength: len,
+          );
+        } finally {
+          await raf.close();
+        }
       }
-      return await f.readAsString();
+      final text = await f.readAsString();
+      return ToolOutputSpill.boundLoadedFile(
+        text: text,
+        path: resolved,
+        byteLength: len,
+      );
     } catch (e) {
       return '读取失败: $e';
     }
@@ -3771,7 +4081,10 @@ class ShiyiState extends ChangeNotifier {
     if (c is! List) return 0;
     var count = 0;
     for (final part in c) {
-      if (part is Map && part['type'] == 'image_url') count++;
+      if (part is Map &&
+          (part['type'] == 'image_url' || part['type'] == 'input_image')) {
+        count++;
+      }
     }
     return count * 1000;
   }
@@ -3875,14 +4188,19 @@ class ShiyiState extends ChangeNotifier {
         total += 1000 * extractImagePaths(m.content).length;
       }
     }
-    final sys = await _buildSystemPrompt(
+    final assembled = await _buildAssembledPrompt(
       '',
       rollingSummary: sess?.rollingSummary ?? '',
       sessionId: sessionId,
       loadedSkillsSnapshot: run?.loadedSkillsSnapshot,
       planModeSnapshot: run?.planMode,
     );
-    total += _estimateTokens(sys);
+    total += _estimateTokens(assembled.full);
+    for (final m in _archiveApiMessages(
+      rollingSummary: sess?.rollingSummary ?? '',
+    )) {
+      total += estimateApiMessageTokens(m);
+    }
     total += _estimateTokens(
       jsonEncode(_activeToolsFor(planMode: run?.planMode ?? false)),
     );
@@ -3905,36 +4223,37 @@ class ShiyiState extends ChangeNotifier {
     final keepStart = _compressionKeepStart(keep, sessionId);
     final toCompress = keep.sublist(0, keepStart);
     if (toCompress.length < 3) return fail;
-    final transcript = _buildCompressionTranscript(toCompress);
-    if (transcript.trim().isEmpty) return fail;
-    final limited = transcript.length <= 12000
-        ? transcript
-        : _tailChars(transcript, 12000);
-
+    final sess = await _db.getSession(sessionId);
+    final assembled = await _buildAssembledPrompt(
+      '',
+      rollingSummary: sess?.rollingSummary ?? '',
+      sessionId: sessionId,
+      planModeSnapshot: planModeForSession(sessionId),
+    );
+    final historyPayload = await _historyToApi(
+      toCompress,
+      imagesAllowed: false,
+    );
+    if (historyPayload.isEmpty) return fail;
+    final previous = sess?.rollingSummary.trim() ?? '';
+    final compactMsgs = buildCompactRequestMessages(
+      frozen: assembled.frozen,
+      history: historyPayload,
+      rollingSummary: previous,
+    );
     final client = LlmClient(
       baseUrl: clientSettings.baseUrl,
       apiKey: clientSettings.apiKey,
       model: clientSettings.model,
       protocol: clientSettings.apiProtocol,
       temperature: 0.2,
-      tools: const [],
+      tools: _activeToolsFor(planMode: planModeForSession(sessionId)),
     );
-    final summary = await client.completeOne([
-      {
-        'role': 'system',
-        'content':
-            '你是对话摘要助手。把下面的对话历史压缩成一份简洁的中文摘要，'
-            '保留关键事实、用户偏好、重要决定、未完成事项和当前状态，'
-            '控制在 400 字以内，只输出摘要内容，不要解释。',
-      },
-      {'role': 'user', 'content': limited},
-    ], temperature: 0.2);
+    final summary = await client.completeOne(compactMsgs, temperature: 0.2);
     final clean = summary.trim();
     if (clean.isEmpty || clean == '【无】') return fail;
 
     // 归档旧消息并把新摘要合并进会话滚动摘要；不删除原文、不插入假用户消息。
-    final sess = await _db.getSession(sessionId);
-    final previous = sess?.rollingSummary.trim() ?? '';
     final merged = [if (previous.isNotEmpty) previous, clean].join('\n\n');
     final rolling = merged.length <= 1600 ? merged : _tailChars(merged, 1600);
     await _db.updateSessionRollingSummary(sessionId, rolling);
@@ -4053,42 +4372,6 @@ class ShiyiState extends ChangeNotifier {
     if (text.runes.length <= maxChars) return text;
     final points = text.runes.toList();
     return String.fromCharCodes(points.skip(points.length - maxChars));
-  }
-
-  /// 把待归档消息转成摘要输入：完整工具轮压缩成结构化一行，正文直接保留。
-  static String _buildCompressionTranscript(List<ChatMessage> toCompress) {
-    final segments = _planToolSegments(toCompress);
-    final segByAssistant = {for (final s in segments) s.assistantIndex: s};
-    final skipTool = <int>{
-      for (final s in segments)
-        if (s.complete) ...s.toolIndices,
-    };
-    final lines = <String>[];
-    for (var i = 0; i < toCompress.length; i++) {
-      final m = toCompress[i];
-      if (m.role == 'tool') {
-        if (!skipTool.contains(i)) {
-          lines.add('tool: ${_summarizeOutput(m.content)}');
-        }
-        continue;
-      }
-      final seg = segByAssistant[i];
-      if (seg != null && seg.complete) {
-        final tools = [for (final t in seg.toolIndices) toCompress[t]];
-        lines.add(_summarizeToolSegment(m, tools));
-        continue;
-      }
-      final text = stripImageMarkers(m.content).trim();
-      if (text.isNotEmpty) {
-        lines.add('${m.role}: $text');
-      } else if (m.role == 'assistant' && m.hasToolCalls) {
-        final calls = m.toolCalls
-            .map((tc) => '${tc.name}(${_summarizeArgs(tc.name, tc.arguments)})')
-            .join(', ');
-        lines.add('assistant(tool_calls): $calls');
-      }
-    }
-    return lines.join('\n');
   }
 
   /// 自动压缩：发送消息前检查上下文是否超过压缩阈值。
@@ -4357,24 +4640,48 @@ echo "[rc=\$?]"
     }
   }
 
-  Future<void> _loadPresence() async {
+  Future<void> _syncPresenceWithLaap(String text) async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_presenceKey);
-      if (raw == null || raw.isEmpty) return;
-      final decoded = jsonDecode(raw);
-      if (decoded is Map<String, dynamic>) {
-        presence = PresenceEngine.fromJson(decoded);
-      } else if (decoded is Map) {
-        presence = PresenceEngine.fromJson(Map<String, dynamic>.from(decoded));
+      presence.cortexConnected = false;
+      final laap = LaapService.instance;
+      if (laap.status.value != LaapStatus.running) {
+        if (!await laap.isRunning()) return;
+        laap.status.value = LaapStatus.running;
       }
-    } catch (_) {}
+      final remote = await LaapApiClient.instance.cognitiveState(text);
+      final applied = presence.applyRemote(
+        needs: remote.needs,
+        valence: remote.valence,
+        energy: remote.energy,
+        arousal: remote.arousal,
+        attentionFocus: remote.attentionFocus,
+        cognitiveCycle: remote.cognitiveCycle,
+        preamble: remote.preamble,
+        cotHint: remote.cotHint,
+      );
+      if (applied) {
+        unawaited(
+          _logError(
+            'LAAP',
+            'cortex cycle=${presence.cognitiveCycle} '
+                'focus=${presence.attentionFocus} need=${presence.dominantNeed}',
+          ),
+        );
+      }
+    } catch (e) {
+      presence.cortexConnected = false;
+      unawaited(_logError('LAAP', '$e'));
+    }
   }
 
-  Future<void> _savePresence() async {
+  Future<void> _reflectLaap(String output) async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_presenceKey, jsonEncode(presence.toJson()));
+      final laap = LaapService.instance;
+      if (laap.status.value != LaapStatus.running) {
+        if (!await laap.isRunning()) return;
+        laap.status.value = LaapStatus.running;
+      }
+      await LaapApiClient.instance.reflect(output);
     } catch (_) {}
   }
 

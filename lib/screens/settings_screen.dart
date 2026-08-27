@@ -18,6 +18,7 @@ import '../services/settings_service.dart';
 import '../services/termux_runtime.dart';
 import '../services/update_service.dart';
 import '../widgets/ios_style.dart';
+import '../widgets/laap_service_panel.dart';
 import 'about_screen.dart';
 import 'dsh_center_screen.dart';
 import 'log_screen.dart';
@@ -646,7 +647,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
   /// 自定义 OpenAI 兼容接口自动补 /v1；内置预设和 Anthropic 原样保留。
   String _currentBaseUrl() {
     final raw = _baseCtrl.text.trim();
-    if (_isBuiltinPreset || _protocol != 'openai') return raw;
+    if (_isBuiltinPreset || _protocol == 'anthropic') return raw;
     return normalizeOpenAiBaseUrl(raw);
   }
 
@@ -855,6 +856,26 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
                   CupertinoButton(
                     padding: const EdgeInsets.symmetric(vertical: 10),
                     onPressed: () =>
+                        setDialogState(() => dialogProtocol = 'responses'),
+                    child: Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'OpenAI Responses',
+                            textAlign: TextAlign.left,
+                          ),
+                        ),
+                        if (dialogProtocol == 'responses')
+                          const Icon(
+                            CupertinoIcons.checkmark_circle_fill,
+                            color: CupertinoColors.activeBlue,
+                          ),
+                      ],
+                    ),
+                  ),
+                  CupertinoButton(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    onPressed: () =>
                         setDialogState(() => dialogProtocol = 'anthropic'),
                     child: Row(
                       children: [
@@ -919,9 +940,9 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
           ),
         );
     if (result == null || !mounted) return;
-    final baseUrl = result.apiProtocol == 'openai'
-        ? normalizeOpenAiBaseUrl(result.baseUrl)
-        : LlmClient.normalizeAnthropicBaseUrl(result.baseUrl.trim());
+    final baseUrl = result.apiProtocol == 'anthropic'
+        ? LlmClient.normalizeAnthropicBaseUrl(result.baseUrl.trim())
+        : normalizeOpenAiBaseUrl(result.baseUrl);
     final dup =
         modelPresets.any((p) => p.name == result.name) ||
         _profiles.any((p) => p.name == result.name);
@@ -1304,6 +1325,23 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
             ),
             CupertinoListTile(
               leading: _IosIconTile(
+                icon: CupertinoIcons.arrow_2_squarepath,
+                color: _iosGreen,
+              ),
+              title: const Text('OpenAI Responses'),
+              subtitle: const Text(
+                'OpenAI / DeepSeek / 百炼 / OpenRouter 原生 Responses',
+              ),
+              trailing: _protocol == 'responses'
+                  ? const Icon(
+                      CupertinoIcons.checkmark_circle_fill,
+                      color: CupertinoColors.activeBlue,
+                    )
+                  : null,
+              onTap: () => _setProtocol('responses'),
+            ),
+            CupertinoListTile(
+              leading: _IosIconTile(
                 icon: CupertinoIcons.sparkles,
                 color: _iosOrange,
               ),
@@ -1551,7 +1589,6 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
   late bool _tools;
   late bool _memory;
   late bool _autoLearn;
-  late bool _presence;
   late bool _notifications;
   late bool _enterToSend;
   late final _DebouncedSave _save;
@@ -1563,7 +1600,6 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
     _tools = s.enableTools;
     _memory = s.enableMemory;
     _autoLearn = s.enableAutoLearn;
-    _presence = s.enablePresence;
     _notifications = s.enableNotifications;
     _enterToSend = s.enterToSend;
     _save = _DebouncedSave(
@@ -1572,7 +1608,6 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
         enableTools: _tools,
         enableMemory: _memory,
         enableAutoLearn: _autoLearn,
-        enablePresence: _presence,
         enableNotifications: _notifications,
         enterToSend: _enterToSend,
       ),
@@ -1632,17 +1667,6 @@ class _InteractionSectionPageState extends State<_InteractionSectionPage> {
               value: _autoLearn,
               onChanged: (v) {
                 setState(() => _autoLearn = v);
-                _save.schedule();
-              },
-            ),
-            _switchTile(
-              icon: CupertinoIcons.person_crop_circle,
-              color: _iosTeal,
-              title: '活人感',
-              subtitle: '按对话生成这轮内心再讲出来。默认关闭，不影响工具',
-              value: _presence,
-              onChanged: (v) {
-                setState(() => _presence = v);
                 _save.schedule();
               },
             ),
@@ -1784,7 +1808,9 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                 color: _iosTeal,
               ),
               title: const Text('新建会话默认上下文'),
-              subtitle: const Text('只作用于之后新建的会话（默认 128k，最高 200w）。已有会话可在聊天页单独改。'),
+              subtitle: const Text(
+                '只作用于之后新建的会话（默认 128k，最高 200w）。已有会话可在聊天页单独改。',
+              ),
               trailing: _IosValueField(
                 controller: _contextLimitCtrl,
                 keyboardType: TextInputType.number,
@@ -2847,6 +2873,14 @@ class AgentEnginePageState extends State<AgentEnginePage> {
             ),
           ],
         ),
+        LaapServicePanel(
+          enablePresence: s.enablePresence,
+          onPresenceChanged: (v) {
+            unawaited(
+              widget.shiyi.updateSettings(s.copyWith(enablePresence: v)),
+            );
+          },
+        ),
         CupertinoListSection.insetGrouped(
           decoration: _iosSectionDecoration(dark),
           backgroundColor: _iosGroupedBackground(dark),
@@ -3186,9 +3220,7 @@ class _Socks5SectionPageState extends State<_Socks5SectionPage> {
   Future<void> _addOrEditServer({Socks5Server? existing}) async {
     final nameCtrl = TextEditingController(text: existing?.name ?? '');
     final hostCtrl = TextEditingController(text: existing?.host ?? '');
-    final portCtrl = TextEditingController(
-      text: '${existing?.port ?? 1080}',
-    );
+    final portCtrl = TextEditingController(text: '${existing?.port ?? 1080}');
     final userCtrl = TextEditingController(text: existing?.user ?? '');
     final passCtrl = TextEditingController(text: existing?.password ?? '');
     var showPass = false;
@@ -3300,7 +3332,8 @@ class _Socks5SectionPageState extends State<_Socks5SectionPage> {
       return;
     }
     final server = Socks5Server(
-      id: existing?.id ??
+      id:
+          existing?.id ??
           DateTime.now().microsecondsSinceEpoch.toRadixString(16),
       name: name.trim(),
       host: host,
@@ -3312,9 +3345,7 @@ class _Socks5SectionPageState extends State<_Socks5SectionPage> {
       if (existing == null) {
         _servers = [..._servers, server];
       } else {
-        _servers = [
-          for (final e in _servers) e.id == server.id ? server : e,
-        ];
+        _servers = [for (final e in _servers) e.id == server.id ? server : e];
       }
       _activeId = server.id;
       _hostCtrl.text = server.host;
@@ -3359,7 +3390,10 @@ class _Socks5SectionPageState extends State<_Socks5SectionPage> {
     );
     if (ok != true || !mounted) return;
     setState(() {
-      _servers = [for (final e in _servers) if (e.id != server.id) e];
+      _servers = [
+        for (final e in _servers)
+          if (e.id != server.id) e,
+      ];
       if (_activeId == server.id) {
         _activeId = _servers.isEmpty ? '' : _servers.first.id;
         if (_servers.isNotEmpty) {
@@ -3444,7 +3478,7 @@ class _Socks5SectionPageState extends State<_Socks5SectionPage> {
             footer: _iosSectionFooter(
               _detectHint ??
                   '会探测 127.0.0.1 的 7890 / 7891 / 7897 / 10808 / 1080。'
-                  '手机上 Clash 需开允许局域网，地址填电脑 IP。',
+                      '手机上 Clash 需开允许局域网，地址填电脑 IP。',
             ),
             children: [
               CupertinoListTile(
@@ -3526,9 +3560,7 @@ class _Socks5SectionPageState extends State<_Socks5SectionPage> {
             decoration: _iosSectionDecoration(dark),
             backgroundColor: _iosGroupedBackground(dark),
             header: const Text('当前通道'),
-            footer: _iosSectionFooter(
-              '没选已保存服务器时，用下面这组临时填写。也可直接把完整 URL 贴进主机栏。',
-            ),
+            footer: _iosSectionFooter('没选已保存服务器时，用下面这组临时填写。也可直接把完整 URL 贴进主机栏。'),
             children: [
               _IosTextFieldTile(
                 icon: CupertinoIcons.globe,
