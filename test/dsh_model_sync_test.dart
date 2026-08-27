@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:yaml/yaml.dart';
 import 'package:shiyi_agent_app/services/dsh_api.dart';
 import 'package:shiyi_agent_app/core/models.dart';
+import 'package:shiyi_agent_app/services/dsh_endpoint.dart';
 import 'package:shiyi_agent_app/services/dsh_model_sync.dart';
 
 void main() {
@@ -17,6 +18,97 @@ void main() {
   });
 
   group('DshModelSync file synchronization', () {
+    test('注入记录按本机、局域网、公网 scope 隔离', () async {
+      final local = AppSettings(
+        baseUrl: 'https://local.example/v1',
+        model: 'local-model',
+      );
+      final lan = AppSettings(
+        baseUrl: 'https://lan.example/v1',
+        model: 'lan-model',
+        dshConnectionMode: 'lan',
+        dshLanHost: '192.168.1.8',
+      );
+      final remote = AppSettings(
+        baseUrl: 'https://remote.example/v1',
+        model: 'remote-model',
+        dshConnectionMode: 'remote',
+        dshRemoteUrl: 'https://dsh.example.com',
+      );
+      final localScope = DshEndpoint.scopeKeyOf(local);
+      final lanScope = DshEndpoint.scopeKeyOf(lan);
+      final remoteScope = DshEndpoint.scopeKeyOf(remote);
+
+      await DshModelSync.rememberInjectedConfig(local, scopeKey: localScope);
+      await DshModelSync.rememberInjectedConfig(lan, scopeKey: lanScope);
+      await DshModelSync.rememberInjectedConfig(remote, scopeKey: remoteScope);
+
+      expect(
+        (await DshModelSync.listInjectedConfigs(
+          scopeKey: localScope,
+        )).single.model,
+        'local-model',
+      );
+      expect(
+        (await DshModelSync.listInjectedConfigs(
+          scopeKey: lanScope,
+        )).single.model,
+        'lan-model',
+      );
+      expect(
+        (await DshModelSync.listInjectedConfigs(
+          scopeKey: remoteScope,
+        )).single.model,
+        'remote-model',
+      );
+    });
+
+    test('公网 live 同步只走远端 API，不读取或写入本地 DSH 文件', () async {
+      final dir = await Directory.systemTemp.createTemp('dsh-remote-sync-');
+      addTearDown(() => dir.delete(recursive: true));
+      var homeRequested = false;
+      final mock = MockClient((req) async {
+        return http.Response(
+          jsonEncode({
+            'type': 'server-response',
+            'rpcId': 'remote-sync',
+            'result': {'ok': true, 'value': {}},
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+      final settings = AppSettings(
+        baseUrl: 'https://api.example/v1',
+        apiKey: 'sk-remote',
+        model: 'remote-model',
+        dshConnectionMode: 'remote',
+        dshRemoteUrl: 'https://dsh.example.com',
+      );
+      final api = DshApiClient(
+        baseUrl: 'https://dsh.example.com',
+        client: mock,
+      );
+
+      await DshModelSync.syncLive(
+        settings,
+        api,
+        scopeKey: DshEndpoint.scopeKeyOf(settings),
+        homeDir: () async {
+          homeRequested = true;
+          return dir.path;
+        },
+      );
+
+      expect(homeRequested, isFalse);
+      expect(await File('${dir.path}/settings.yaml').exists(), isFalse);
+      expect(await File('${dir.path}/.credentials.yaml').exists(), isFalse);
+      expect(
+        await File('${dir.path}/shiyi-free-search.json').exists(),
+        isFalse,
+      );
+    });
+
     test('并发同步串行替换 settings.yaml 且保留完整配置', () async {
       final dir = await Directory.systemTemp.createTemp('dsh-sync-race-');
       addTearDown(() => dir.delete(recursive: true));
@@ -373,6 +465,25 @@ llm-pi-ai:
         'model-c',
         'model-z',
       ]);
+    });
+
+    test('同一接口地址的不同配置 ID 不共享模型目录缓存', () async {
+      final first = AppSettings(
+        apiProfileId: 'profile-a',
+        baseUrl: 'https://same-gateway.example/v1',
+        model: 'model-a',
+      );
+      final second = AppSettings(
+        apiProfileId: 'profile-b',
+        baseUrl: 'https://same-gateway.example/v1',
+        model: 'model-b',
+      );
+
+      await DshModelSync.rememberModelCatalog(first, ['only-a']);
+      await DshModelSync.rememberModelCatalog(second, ['only-b']);
+
+      expect(await DshModelSync.cachedModelCatalogFor(first), ['only-a']);
+      expect(await DshModelSync.cachedModelCatalogFor(second), ['only-b']);
     });
 
     test('缓存模型可以删除，但当前主模型不能删除', () async {

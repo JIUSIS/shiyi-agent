@@ -2,6 +2,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../services/dsh_api.dart';
+import '../services/dsh_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 
@@ -29,7 +30,7 @@ class _DshPresetsScreenState extends State<DshPresetsScreen> {
   String? _error;
   bool _busy = false;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {

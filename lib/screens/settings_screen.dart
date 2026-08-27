@@ -8,6 +8,7 @@ import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/model_presets.dart';
 import '../core/models.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_model_sync.dart';
 import '../services/dsh_service.dart';
 import '../services/llm_client.dart';
@@ -246,7 +247,7 @@ class SettingsScreen extends StatelessWidget {
                             color: _iosIndigo,
                             title: 'Agent 引擎',
                             subtitle: s.agentEngine == 'dsh'
-                                ? 'DeepSeek Harness'
+                                ? DshEndpoint.shortLabel(s)
                                 : '拾忆（本地引擎）',
                             onTap: () =>
                                 _open(context, AgentEnginePage(shiyi: shiyi)),
@@ -617,19 +618,40 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       _profiles = profiles;
       _profilesLoaded = true;
       if (_presetName == null) {
-        final cur = _allProfiles
-            .where((p) => p.baseUrl == widget.shiyi.settings.baseUrl.trim())
-            .toList();
+        final savedId = widget.shiyi.settings.apiProfileId.trim();
+        final cur = savedId.isNotEmpty
+            ? _allProfiles.where((p) => p.profileId == savedId).toList()
+            : _allProfiles
+                  .where(
+                    (p) =>
+                        p.baseUrl == widget.shiyi.settings.baseUrl.trim() &&
+                        p.model == widget.shiyi.settings.model.trim(),
+                  )
+                  .toList();
         if (cur.isNotEmpty) _presetName = cur.first.name;
       }
     });
+    unawaited(_loadCachedModels());
   }
 
   AppSettings _modelCatalogSettings() => widget.shiyi.settings.copyWith(
     baseUrl: _currentBaseUrl(),
     model: _modelCtrl.text.trim(),
     apiProtocol: _protocol,
+    apiProfileId: _currentProfileId(),
   );
+
+  String _currentProfileId() {
+    final name = _presetName?.trim() ?? '';
+    if (name.isNotEmpty) {
+      for (final profile in _allProfiles) {
+        if (profile.name == name) return profile.profileId;
+      }
+    }
+    return name.isEmpty
+        ? ''
+        : createApiProfileId(name, _currentBaseUrl(), _protocol);
+  }
 
   Future<void> _loadCachedModels() async {
     final ids = await DshModelSync.cachedModelCatalogFor(
@@ -694,6 +716,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
     if (!mounted) return;
     final saved = {for (final p in _profiles) p.name: p};
     saved[_presetName!] = ApiProfile(
+      id: saved[_presetName!]?.id ?? '',
       name: _presetName!,
       baseUrl: _currentBaseUrl(),
       apiKey: _keyCtrl.text.trim(),
@@ -1014,6 +1037,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
     setState(() {
       final saved = {for (final p in _profiles) p.name: p};
       saved[name] = ApiProfile(
+        id: name == _presetName ? saved[_presetName!]?.id ?? '' : '',
         name: name,
         baseUrl: baseUrl,
         apiKey: _keyCtrl.text.trim(),
@@ -1034,9 +1058,14 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
         apiKey: _keyCtrl.text.trim(),
         model: _modelCtrl.text.trim(),
         apiProtocol: _protocol,
+        apiProfileId: _currentProfileId(),
       );
       await widget.shiyi.updateSettings(next);
-      await DshModelSync.injectNow(next, name: name);
+      await DshModelSync.injectNow(
+        next,
+        name: name,
+        scopeKey: DshService.instance.currentScopeKey,
+      );
       if (!mounted) return;
       await _showIosAlert(context, '完成', '配置「$name」已保存，并已注入到 DeepSeek Harness');
     }
@@ -1156,11 +1185,21 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
         return;
       }
       final settings = _modelCatalogSettings();
-      await DshModelSync.rememberModelCatalog(settings, ids);
+      await DshModelSync.rememberModelCatalog(
+        settings,
+        ids,
+        api: DshService.instance.api,
+        scopeKey: DshService.instance.currentScopeKey,
+      );
       await widget.shiyi.reloadModelCatalogs();
       if (!mounted) return;
       setState(() => _cachedModelIds = [...ids]..sort());
-      unawaited(DshModelSync.syncFromShiyi(settings));
+      unawaited(
+        DshModelSync.syncFromShiyi(
+          settings,
+          scopeKey: DshService.instance.currentScopeKey,
+        ),
+      );
       await _pickModelId(_cachedModelIds, title: '模型 ID');
     } catch (e) {
       if (mounted) await _showIosAlert(context, '获取模型失败', '$e');
@@ -2187,7 +2226,17 @@ class AgentEnginePage extends StatefulWidget {
 
 class AgentEnginePageState extends State<AgentEnginePage> {
   late String _engine;
+  late String _dshMode;
   late final _DebouncedSave _save;
+  late final TextEditingController _lanHostCtrl;
+  late final TextEditingController _lanPortCtrl;
+  late final TextEditingController _lanTokenCtrl;
+  late final TextEditingController _remoteUrlCtrl;
+  late final TextEditingController _remoteHostCtrl;
+  late final TextEditingController _remoteTokenCtrl;
+  bool _tokenVisible = false;
+  bool _testingConn = false;
+  String? _connectHint;
   String? _localVersion;
   String? _latestVersion;
   bool _checking = false;
@@ -2203,11 +2252,16 @@ class AgentEnginePageState extends State<AgentEnginePage> {
   @override
   void initState() {
     super.initState();
-    _engine = widget.shiyi.settings.agentEngine;
-    _save = _DebouncedSave(
-      widget.shiyi,
-      () => widget.shiyi.settings.copyWith(agentEngine: _engine),
-    );
+    final s = widget.shiyi.settings;
+    _engine = s.agentEngine;
+    _dshMode = DshEndpoint.modeOf(s);
+    _lanHostCtrl = TextEditingController(text: s.dshLanHost);
+    _lanPortCtrl = TextEditingController(text: '${s.dshLanPort}');
+    _lanTokenCtrl = TextEditingController(text: s.dshLanToken);
+    _remoteUrlCtrl = TextEditingController(text: s.dshRemoteUrl);
+    _remoteHostCtrl = TextEditingController(text: s.dshRemoteHost);
+    _remoteTokenCtrl = TextEditingController(text: s.dshRemoteToken);
+    _save = _DebouncedSave(widget.shiyi, _draftSettings);
     _dsh.status.addListener(_onDshTick);
     _dsh.progress.addListener(_onDshTick);
     _dsh.statusMessage.addListener(_onDshTick);
@@ -2226,8 +2280,15 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     _dsh.statusMessage.removeListener(_onDshTick);
     _dsh.installOutput.removeListener(_onDshTick);
     _installOutputScroll.dispose();
-    if (_save.hasPending) unawaited(_save.flush());
+    final pending = _save.hasPending ? _draftSettings() : null;
     _save.dispose();
+    _lanHostCtrl.dispose();
+    _lanPortCtrl.dispose();
+    _lanTokenCtrl.dispose();
+    _remoteUrlCtrl.dispose();
+    _remoteHostCtrl.dispose();
+    _remoteTokenCtrl.dispose();
+    if (pending != null) unawaited(widget.shiyi.updateSettings(pending));
     super.dispose();
   }
 
@@ -2420,7 +2481,10 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     });
     // 启动前先落盘合法配置：修复上次残留的非法 credentials/settings
     // YAML（如 API key 含换行），否则 DSH 启动即崩（invalid document）。
-    await DshModelSync.syncFromShiyi(widget.shiyi.settings);
+    await DshModelSync.syncFromShiyi(
+      widget.shiyi.settings,
+      scopeKey: DshService.instance.currentScopeKey,
+    );
     await _dsh.start();
   }
 
@@ -2522,6 +2586,61 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     );
   }
 
+  AppSettings _draftSettings() {
+    final port =
+        int.tryParse(_lanPortCtrl.text.trim()) ?? DshEndpoint.defaultPort;
+    return widget.shiyi.settings.copyWith(
+      agentEngine: _engine,
+      dshConnectionMode: _dshMode,
+      dshLanHost: _lanHostCtrl.text.trim(),
+      dshLanPort: DshEndpoint.validPort(port),
+      dshLanToken: _lanTokenCtrl.text,
+      dshRemoteUrl: _remoteUrlCtrl.text.trim(),
+      dshRemoteHost: _remoteHostCtrl.text.trim(),
+      dshRemoteToken: _remoteTokenCtrl.text,
+    );
+  }
+
+  void _setDshMode(String mode) {
+    if (_dshMode == mode) return;
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _dshMode = mode;
+      _connectHint = null;
+    });
+    unawaited(() async {
+      await _save.flush();
+      DshService.instance.applyConnection(widget.shiyi.settings);
+      if (mounted) unawaited(_refreshStatus());
+    }());
+  }
+
+  Future<void> _testConnection() async {
+    await _save.flush();
+    DshService.instance.applyConnection(widget.shiyi.settings);
+    setState(() {
+      _testingConn = true;
+      _connectHint = null;
+    });
+    final api = DshService.instance.api;
+    final url = api.baseUrl;
+    if (url.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _testingConn = false;
+        _connectHint = _dshMode == 'lan' ? '请填写局域网主机' : '请填写公网地址';
+      });
+      return;
+    }
+    final ok = await api.rpcPing();
+    if (!mounted) return;
+    setState(() {
+      _testingConn = false;
+      _connectHint = ok ? '连接成功：$url' : '连接失败：$url';
+    });
+    unawaited(_refreshStatus());
+  }
+
   void _select(String v) {
     if (_engine == v) return;
     FocusScope.of(context).unfocus();
@@ -2545,7 +2664,10 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     unawaited(() async {
       await _save.flush();
       if (widget.shiyi.settings.agentEngine == 'dsh') {
-        await DshModelSync.injectNow(widget.shiyi.settings);
+        await DshModelSync.injectNow(
+          widget.shiyi.settings,
+          scopeKey: DshService.instance.currentScopeKey,
+        );
       }
     }());
   }
@@ -2589,6 +2711,9 @@ class AgentEnginePageState extends State<AgentEnginePage> {
         _localVersion != null &&
         DshService.compareSemver(_latestVersion!, _localVersion!) > 0;
     final installed = _localVersion != null && _localVersion!.isNotEmpty;
+    final localMode = _dshMode == 'local';
+    final currentUrl = DshEndpoint.urlOf(_draftSettings());
+    final currentHost = DshEndpoint.displayHost(currentUrl);
     final fullRuntimeSubtitle = _checkingFullRuntime
         ? '正在检查 node-pty 与 koffi…'
         : _fullRuntimeReady == true
@@ -2617,7 +2742,15 @@ class AgentEnginePageState extends State<AgentEnginePage> {
               icon: CupertinoIcons.sparkles,
               color: _iosIndigo,
               title: 'DeepSeek Harness',
-              subtitle: '连接本机 DeepSeek Harness 服务（127.0.0.1:3080）',
+              subtitle: _dshMode == 'lan'
+                  ? (currentHost.isEmpty
+                        ? '连接局域网内的 DeepSeek Harness'
+                        : '连接局域网 $currentHost')
+                  : _dshMode == 'remote'
+                  ? (currentHost.isEmpty
+                        ? '连接公网远程 DeepSeek Harness'
+                        : '连接公网 $currentHost')
+                  : '连接本机 DeepSeek Harness 服务（127.0.0.1:3080）',
               selected: _engine == 'dsh',
               onTap: () => _select('dsh'),
             ),
@@ -2626,253 +2759,386 @@ class AgentEnginePageState extends State<AgentEnginePage> {
         CupertinoListSection.insetGrouped(
           decoration: _iosSectionDecoration(dark),
           backgroundColor: _iosGroupedBackground(dark),
-          header: const Text('DeepSeek Harness 服务'),
+          header: const Text('连接方式'),
+          footer: _iosSectionFooter(
+            _dshMode == 'lan'
+                ? '电脑上的 DSH 需允许局域网访问（监听 0.0.0.0:3080），手机填电脑 IP。不要填 127.0.0.1。'
+                : _dshMode == 'remote'
+                ? '可填公网 IP 或域名。Host 留空时扫描内置本地服务器预设，也可填写反向代理需要的 Host。'
+                : '本机模式会安装并启动当前设备上的 DSH（127.0.0.1:3080）。',
+          ),
           children: [
-            _ServiceRow(label: '本地版本', value: _localVersion ?? '未安装'),
-            _ServiceRow(
-              label: '最新版本',
-              value: _checking ? '检查中…' : (_latestVersion ?? '未检测'),
+            _BackendRow(
+              icon: CupertinoIcons.device_phone_portrait,
+              color: _iosBlue,
+              title: '本机',
+              subtitle: '127.0.0.1:3080，可安装 / 启停',
+              selected: _dshMode == 'local',
+              onTap: () => _setDshMode('local'),
             ),
-            _ServiceRow(
-              label: '服务状态',
-              value: installed ? _statusLabel(dshStatus) : '未安装',
+            _BackendRow(
+              icon: CupertinoIcons.wifi,
+              color: _iosTeal,
+              title: '局域网',
+              subtitle: '连接同一网络里的 DSH',
+              selected: _dshMode == 'lan',
+              onTap: () => _setDshMode('lan'),
             ),
-            _ServiceRow(label: '网络代理', value: _proxyLabel),
-            if (busy || _workError != null || _showInstallOutput)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (busy) ...[
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(4),
-                        child: LinearProgressIndicator(
-                          value: _dsh.progress.value > 0
-                              ? _dsh.progress.value.clamp(0.0, 1.0)
-                              : null,
-                          minHeight: 6,
-                          backgroundColor: dark
-                              ? const Color(0xFF3A3A3C)
-                              : const Color(0xFFE5E5EA),
-                          color: _iosBlue,
+            _BackendRow(
+              icon: CupertinoIcons.globe,
+              color: _iosIndigo,
+              title: '公网',
+              subtitle: '连接远程 IP / 域名',
+              selected: _dshMode == 'remote',
+              onTap: () => _setDshMode('remote'),
+            ),
+            if (_dshMode == 'lan') ...[
+              _IosTextFieldTile(
+                icon: CupertinoIcons.desktopcomputer,
+                color: _iosTeal,
+                title: '主机',
+                controller: _lanHostCtrl,
+                placeholder: '192.168.1.8 或 192.168.1.8:3080',
+                onChanged: (_) => _save.schedule(),
+              ),
+              _IosTextFieldTile(
+                icon: CupertinoIcons.number,
+                color: _iosGray,
+                title: '端口',
+                controller: _lanPortCtrl,
+                placeholder: '3080',
+                keyboardType: TextInputType.number,
+                onChanged: (_) => _save.schedule(),
+              ),
+              _IosSecretFieldTile(
+                icon: CupertinoIcons.lock_fill,
+                color: _iosOrange,
+                title: 'Token（可选）',
+                controller: _lanTokenCtrl,
+                placeholder: 'Bearer 或访问令牌',
+                obscure: !_tokenVisible,
+                onToggleVisibility: () =>
+                    setState(() => _tokenVisible = !_tokenVisible),
+                onChanged: (_) => _save.schedule(),
+              ),
+            ],
+            if (_dshMode == 'remote') ...[
+              _IosTextFieldTile(
+                icon: CupertinoIcons.link,
+                color: _iosIndigo,
+                title: '地址',
+                controller: _remoteUrlCtrl,
+                placeholder: '203.0.113.8:3080 或 https://dsh.example.com',
+                keyboardType: TextInputType.url,
+                onChanged: (_) => _save.schedule(),
+              ),
+              _IosTextFieldTile(
+                icon: CupertinoIcons.arrow_right_arrow_left,
+                color: _iosTeal,
+                title: 'Host（可选）',
+                controller: _remoteHostCtrl,
+                placeholder: '',
+                keyboardType: TextInputType.url,
+                onChanged: (_) => _save.schedule(),
+              ),
+              _IosSecretFieldTile(
+                icon: CupertinoIcons.lock_fill,
+                color: _iosOrange,
+                title: 'Token（可选）',
+                controller: _remoteTokenCtrl,
+                placeholder: 'Bearer 或访问令牌',
+                obscure: !_tokenVisible,
+                onToggleVisibility: () =>
+                    setState(() => _tokenVisible = !_tokenVisible),
+                onChanged: (_) => _save.schedule(),
+              ),
+            ],
+            CupertinoListTile(
+              leading: _IosIconTile(
+                icon: _testingConn
+                    ? CupertinoIcons.hourglass
+                    : CupertinoIcons.antenna_radiowaves_left_right,
+                color: _iosGreen,
+              ),
+              title: Text(_testingConn ? '正在测试…' : '测试连接'),
+              subtitle: Text(
+                _connectHint ?? (currentUrl.isEmpty ? '填写地址后再测' : currentUrl),
+              ),
+              onTap: _testingConn ? null : _testConnection,
+            ),
+          ],
+        ),
+        if (localMode) ...[
+          CupertinoListSection.insetGrouped(
+            decoration: _iosSectionDecoration(dark),
+            backgroundColor: _iosGroupedBackground(dark),
+            header: const Text('DeepSeek Harness 服务'),
+            children: [
+              _ServiceRow(label: '本地版本', value: _localVersion ?? '未安装'),
+              _ServiceRow(
+                label: '最新版本',
+                value: _checking ? '检查中…' : (_latestVersion ?? '未检测'),
+              ),
+              _ServiceRow(
+                label: '服务状态',
+                value: installed ? _statusLabel(dshStatus) : '未安装',
+              ),
+              _ServiceRow(label: '网络代理', value: _proxyLabel),
+              if (busy || _workError != null || _showInstallOutput)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (busy) ...[
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: LinearProgressIndicator(
+                            value: _dsh.progress.value > 0
+                                ? _dsh.progress.value.clamp(0.0, 1.0)
+                                : null,
+                            minHeight: 6,
+                            backgroundColor: dark
+                                ? const Color(0xFF3A3A3C)
+                                : const Color(0xFFE5E5EA),
+                            color: _iosBlue,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              _dsh.statusMessage.value.isEmpty
-                                  ? '准备中…'
-                                  : _dsh.statusMessage.value,
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                _dsh.statusMessage.value.isEmpty
+                                    ? '准备中…'
+                                    : _dsh.statusMessage.value,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  height: 1.3,
+                                  color: dark
+                                      ? CupertinoColors.white.withValues(
+                                          alpha: .65,
+                                        )
+                                      : CupertinoColors.black.withValues(
+                                          alpha: .55,
+                                        ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              '${(_dsh.progress.value * 100).round()}%',
                               style: TextStyle(
                                 fontSize: 13,
-                                height: 1.3,
+                                fontWeight: FontWeight.w600,
                                 color: dark
                                     ? CupertinoColors.white.withValues(
-                                        alpha: .65,
+                                        alpha: .8,
                                       )
                                     : CupertinoColors.black.withValues(
-                                        alpha: .55,
+                                        alpha: .7,
                                       ),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            '${(_dsh.progress.value * 100).round()}%',
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                              color: dark
-                                  ? CupertinoColors.white.withValues(alpha: .8)
-                                  : CupertinoColors.black.withValues(alpha: .7),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                    ],
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => setState(
-                        () => _showInstallOutput = !_showInstallOutput,
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            _showInstallOutput
-                                ? CupertinoIcons.chevron_down
-                                : CupertinoIcons.chevron_right,
-                            size: 13,
-                            color: CupertinoColors.systemGrey,
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            _showInstallOutput ? '隐藏终端输出' : '显示终端输出',
-                            style: const TextStyle(
-                              fontSize: 13,
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                      ],
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => setState(
+                          () => _showInstallOutput = !_showInstallOutput,
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              _showInstallOutput
+                                  ? CupertinoIcons.chevron_down
+                                  : CupertinoIcons.chevron_right,
+                              size: 13,
                               color: CupertinoColors.systemGrey,
                             ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (_showInstallOutput) ...[
-                      const SizedBox(height: 8),
-                      Container(
-                        width: double.infinity,
-                        constraints: const BoxConstraints(maxHeight: 240),
-                        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-                        decoration: BoxDecoration(
-                          color: dark
-                              ? const Color(0xFF1C1C1E)
-                              : const Color(0xFFF2F2F7),
-                          borderRadius: BorderRadius.circular(10),
+                            const SizedBox(width: 6),
+                            Text(
+                              _showInstallOutput ? '隐藏终端输出' : '显示终端输出',
+                              style: const TextStyle(
+                                fontSize: 13,
+                                color: CupertinoColors.systemGrey,
+                              ),
+                            ),
+                          ],
                         ),
-                        child: SingleChildScrollView(
-                          controller: _installOutputScroll,
-                          child: Text(
-                            _dsh.installOutput.value.isEmpty
-                                ? '等待终端输出…'
-                                : _dsh.installOutput.value,
-                            style: TextStyle(
-                              fontFamily: 'Menlo',
-                              fontFamilyFallback: const [
-                                'Courier',
-                                'monospace',
-                              ],
-                              fontSize: 11,
-                              height: 1.45,
-                              color: dark
-                                  ? const Color(0xFFD1D1D6)
-                                  : const Color(0xFF3A3A3C),
+                      ),
+                      if (_showInstallOutput) ...[
+                        const SizedBox(height: 8),
+                        Container(
+                          width: double.infinity,
+                          constraints: const BoxConstraints(maxHeight: 240),
+                          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                          decoration: BoxDecoration(
+                            color: dark
+                                ? const Color(0xFF1C1C1E)
+                                : const Color(0xFFF2F2F7),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: SingleChildScrollView(
+                            controller: _installOutputScroll,
+                            child: Text(
+                              _dsh.installOutput.value.isEmpty
+                                  ? '等待终端输出…'
+                                  : _dsh.installOutput.value,
+                              style: TextStyle(
+                                fontFamily: 'Menlo',
+                                fontFamilyFallback: const [
+                                  'Courier',
+                                  'monospace',
+                                ],
+                                fontSize: 11,
+                                height: 1.45,
+                                color: dark
+                                    ? const Color(0xFFD1D1D6)
+                                    : const Color(0xFF3A3A3C),
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                    ],
-                    if (_workError != null) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        _workError!,
-                        style: const TextStyle(
-                          fontSize: 13,
-                          color: CupertinoColors.systemRed,
+                      ],
+                      if (_workError != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          _workError!,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: CupertinoColors.systemRed,
+                          ),
                         ),
-                      ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
-              ),
-          ],
-        ),
-        CupertinoListSection.insetGrouped(
-          decoration: _iosSectionDecoration(dark),
-          backgroundColor: _iosGroupedBackground(dark),
-          children: [
-            CupertinoListTile(
-              leading: _IosIconTile(
-                icon: installed
-                    ? CupertinoIcons.trash_fill
-                    : CupertinoIcons.arrow_down_circle,
-                color: installed ? _iosRed : _iosBlue,
-              ),
-              // 未安装 = 安装；安装完成后同一入口变为卸载（保留 .dsh 数据）。
-              title: Text(installed ? '卸载 DeepSeek Harness' : '立即安装'),
-              subtitle: Text(
-                installed
-                    ? '卸载 npm 全局包，保留 .dsh 数据'
-                    : '从 npm 拉取安装，首次含 Node.js 与编译工具链，可能要几分钟',
-              ),
-              onTap: busy
-                  ? null
-                  : installed
-                  ? _confirmUninstall
-                  : _installOrUpdate,
-            ),
-            if (installed)
+            ],
+          ),
+          CupertinoListSection.insetGrouped(
+            decoration: _iosSectionDecoration(dark),
+            backgroundColor: _iosGroupedBackground(dark),
+            children: [
               CupertinoListTile(
                 leading: _IosIconTile(
-                  icon: CupertinoIcons.refresh,
-                  color: _iosTeal,
+                  icon: installed
+                      ? CupertinoIcons.trash_fill
+                      : CupertinoIcons.arrow_down_circle,
+                  color: installed ? _iosRed : _iosBlue,
                 ),
-                // 已安装时检测新版；有新版本时同一入口变为「立即更新」。
-                title: Text(hasUpdate ? '立即更新到 $_latestVersion' : '检查更新'),
-                subtitle: Text(hasUpdate ? '有新版本可用' : '检测 npm 最新版本'),
+                // 未安装 = 安装；安装完成后同一入口变为卸载（保留 .dsh 数据）。
+                title: Text(installed ? '卸载 DeepSeek Harness' : '立即安装'),
+                subtitle: Text(
+                  installed
+                      ? '卸载 npm 全局包，保留 .dsh 数据'
+                      : '从 npm 拉取安装，首次含 Node.js 与编译工具链，可能要几分钟',
+                ),
                 onTap: busy
                     ? null
-                    : hasUpdate
-                    ? _installOrUpdate
-                    : _checkUpdate,
+                    : installed
+                    ? _confirmUninstall
+                    : _installOrUpdate,
               ),
-            CupertinoListTile(
-              leading: _IosIconTile(
-                icon: CupertinoIcons.power,
-                color: dshStatus == DshStatus.running ? _iosGreen : _iosGray,
-              ),
-              title: Text(dshStatus == DshStatus.running ? '停止服务' : '启动服务'),
-              subtitle: Text(
-                installed
-                    ? 'dsh web（127.0.0.1:3080）'
-                    : '未安装 DeepSeek Harness，请先安装',
-              ),
-              onTap: busy
-                  ? null
-                  : !installed
-                  ? () => _showInfo('DeepSeek Harness 未安装，请先点击「立即安装」')
-                  : dshStatus == DshStatus.running
-                  ? _stopService
-                  : _startService,
-            ),
-            if (installed && Platform.isAndroid)
+              if (installed)
+                CupertinoListTile(
+                  leading: _IosIconTile(
+                    icon: CupertinoIcons.refresh,
+                    color: _iosTeal,
+                  ),
+                  // 已安装时检测新版；有新版本时同一入口变为「立即更新」。
+                  title: Text(hasUpdate ? '立即更新到 $_latestVersion' : '检查更新'),
+                  subtitle: Text(hasUpdate ? '有新版本可用' : '检测 npm 最新版本'),
+                  onTap: busy
+                      ? null
+                      : hasUpdate
+                      ? _installOrUpdate
+                      : _checkUpdate,
+                ),
               CupertinoListTile(
                 leading: _IosIconTile(
-                  icon: CupertinoIcons.wrench,
-                  color: _iosOrange,
+                  icon: CupertinoIcons.power,
+                  color: dshStatus == DshStatus.running ? _iosGreen : _iosGray,
                 ),
-                title: const Text('修复完整运行环境'),
-                subtitle: Text(fullRuntimeSubtitle),
-                onTap: busy || _checkingFullRuntime ? null : _repairFullMode,
+                title: Text(dshStatus == DshStatus.running ? '停止服务' : '启动服务'),
+                subtitle: Text(
+                  installed
+                      ? 'dsh web（127.0.0.1:3080）'
+                      : '未安装 DeepSeek Harness，请先安装',
+                ),
+                onTap: busy
+                    ? null
+                    : !installed
+                    ? () => _showInfo('DeepSeek Harness 未安装，请先点击「立即安装」')
+                    : dshStatus == DshStatus.running
+                    ? _stopService
+                    : _startService,
               ),
-            CupertinoListTile(
-              leading: const Icon(
-                CupertinoIcons.bell_fill,
-                color: CupertinoColors.systemGrey,
+              if (installed && Platform.isAndroid)
+                CupertinoListTile(
+                  leading: _IosIconTile(
+                    icon: CupertinoIcons.wrench,
+                    color: _iosOrange,
+                  ),
+                  title: const Text('修复完整运行环境'),
+                  subtitle: Text(fullRuntimeSubtitle),
+                  onTap: busy || _checkingFullRuntime ? null : _repairFullMode,
+                ),
+              CupertinoListTile(
+                leading: const Icon(
+                  CupertinoIcons.bell_fill,
+                  color: CupertinoColors.systemGrey,
+                ),
+                title: const Text('自动检查更新'),
+                subtitle: const Text('进入 DeepSeek Harness 模式时检测，发现新版会提示'),
+                trailing: CupertinoSwitch(
+                  value: s.dshAutoCheckUpdate,
+                  onChanged: (v) {
+                    unawaited(
+                      widget.shiyi.updateSettings(
+                        s.copyWith(dshAutoCheckUpdate: v),
+                      ),
+                    );
+                  },
+                ),
               ),
-              title: const Text('自动检查更新'),
-              subtitle: const Text('进入 DeepSeek Harness 模式时检测，发现新版会提示'),
-              trailing: CupertinoSwitch(
-                value: s.dshAutoCheckUpdate,
-                onChanged: (v) {
-                  unawaited(
-                    widget.shiyi.updateSettings(
-                      s.copyWith(dshAutoCheckUpdate: v),
-                    ),
-                  );
-                },
+              CupertinoListTile(
+                leading: const Icon(
+                  CupertinoIcons.globe,
+                  color: CupertinoColors.systemGreen,
+                ),
+                title: const Text('自动使用代理'),
+                subtitle: const Text('安装/更新 DeepSeek Harness 时自动检测系统代理或本地代理端口'),
+                trailing: CupertinoSwitch(
+                  value: s.dshUseProxy,
+                  onChanged: (v) {
+                    DshService.instance.useProxyEnabled = v;
+                    unawaited(
+                      widget.shiyi.updateSettings(s.copyWith(dshUseProxy: v)),
+                    );
+                  },
+                ),
               ),
-            ),
-            CupertinoListTile(
-              leading: const Icon(
-                CupertinoIcons.globe,
-                color: CupertinoColors.systemGreen,
+            ],
+          ),
+        ] else
+          CupertinoListSection.insetGrouped(
+            decoration: _iosSectionDecoration(dark),
+            backgroundColor: _iosGroupedBackground(dark),
+            header: const Text('连接状态'),
+            children: [
+              _ServiceRow(
+                label: '地址',
+                value: currentHost.isEmpty ? '未填写' : currentHost,
               ),
-              title: const Text('自动使用代理'),
-              subtitle: const Text('安装/更新 DeepSeek Harness 时自动检测系统代理或本地代理端口'),
-              trailing: CupertinoSwitch(
-                value: s.dshUseProxy,
-                onChanged: (v) {
-                  DshService.instance.useProxyEnabled = v;
-                  unawaited(
-                    widget.shiyi.updateSettings(s.copyWith(dshUseProxy: v)),
-                  );
-                },
+              _ServiceRow(
+                label: '状态',
+                value: dshStatus == DshStatus.running ? '已连接' : '未连接',
               ),
-            ),
-          ],
-        ),
+            ],
+          ),
         LaapServicePanel(
           enablePresence: s.enablePresence,
           onPresenceChanged: (v) {
@@ -2889,8 +3155,8 @@ class AgentEnginePageState extends State<AgentEnginePage> {
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
               child: Text(
                 '切换引擎后，会话页将使用对应引擎的会话与对话数据，'
-                '两套数据完全独立、互不影响。DeepSeek Harness 通过 npm 官方包安装与更新'
-                '（与 deepseek-harness 源码同步发布）。',
+                '两套数据完全独立、互不影响。本机 DSH 通过 npm 官方包安装；'
+                '局域网 / 公网只连接已有服务，不会在这台设备上安装或停止 DSH。',
                 style: TextStyle(
                   fontSize: 13,
                   height: 1.4,
@@ -3860,6 +4126,7 @@ class _IosTextFieldTile extends StatelessWidget {
   final TextEditingController controller;
   final String placeholder;
   final ValueChanged<String> onChanged;
+  final TextInputType? keyboardType;
   const _IosTextFieldTile({
     required this.icon,
     required this.color,
@@ -3867,6 +4134,7 @@ class _IosTextFieldTile extends StatelessWidget {
     required this.controller,
     required this.placeholder,
     required this.onChanged,
+    this.keyboardType,
   });
 
   @override
@@ -3896,6 +4164,7 @@ class _IosTextFieldTile extends StatelessWidget {
             child: CupertinoTextField(
               controller: controller,
               placeholder: placeholder,
+              keyboardType: keyboardType,
               style: TextStyle(
                 color: dark ? CupertinoColors.white : CupertinoColors.black,
               ),

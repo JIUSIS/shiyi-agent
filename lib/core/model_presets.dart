@@ -121,6 +121,7 @@ List<ApiProfile> mergeApiProfiles(Iterable<ApiProfile> saved) {
     final sp = byName[p.name];
     all.add(
       ApiProfile(
+        id: sp?.id ?? '',
         name: p.name,
         baseUrl: p.baseUrl,
         apiKey: sp?.apiKey ?? '',

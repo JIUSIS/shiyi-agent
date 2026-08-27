@@ -107,6 +107,7 @@
 - 拾忆会话必须支持多会话同时生成；会话 A 正在思考时，用户可以在会话 B 继续发送，二者互不打断。
 - 停止、引导、流式正文、思考过程、工具事件、模型提问、子代理进度、计划模式和本轮统计必须按会话隔离，禁止重新退化为单个全局运行状态。
 - `isBusy` 只表示“至少一个会话在运行”，不能用于拦截其他会话发送；页面和会话卡片必须使用 `isBusyForSession(sessionId)`。
+- 停止必须立即取消当前会话的 HTTP/SSE、子代理请求和 `run_terminal` 进程；禁止只设置标记后等待下一枚 token。引导发送/插话先收口旧回合，再启动新回合；旧回合迟到事件不得污染新回合。
 - 修改拾忆生成链路时必须保留跨会话并行回归测试：A/B 同时 active，停止 B 不得设置 A 的停止令牌，流式内容和工具事件不得串线。
 
 ## 思考档位规则
@@ -141,6 +142,18 @@
 
 ## 会话压缩入口
 - 输入区常驻 `ChatCompressionButton` 是唯一手动压缩入口。禁止再在达到阈值时弹出右下角「压缩上下文」胶囊。
+
+## DSH 连接
+- 三种并列：`local`（本机 `http://127.0.0.1:3080`，可安装/启停）/ `lan`（主机+端口，默认 3080）/ `remote`（完整 URL，可选 Token）。默认 `local`。
+- API / WS 一律读当前连接 URL，不要写死 `127.0.0.1:3080`。公网 URL 带路径前缀时，WS 必须挂在同一前缀下（`/app/api/events.mux`）。
+- DSH 文件页必须读取当前连接的 `host.describe` / `host.listDirectory`，初始目录取该主机 `cwd`，缺省再取远端 `home`。切换 local / lan / remote 时清掉旧路径、面包屑和在途结果，禁止把手机 `FileWorkspace.defaultWorkspacePath` 发给局域网/公网，也禁止远端失败后回退手机文件系统。`host.createDirectory` 必须发送父目录 `path` + 单段 `name`。当前官方 `host.*` 没有文件读取/写入/删除 RPC，不要用本地 `File` API伪装远端能力。
+- DSH 文件页的路径选择器必须展示当前远端可访问的根目录：Windows 通过 `host.listDirectory` 并发探测 `A:\` 到 `Z:\`，只保留成功盘符；Linux / Alpine 只探测 `/`。根盘扫描不能使用不存在的 `host.listDrives` RPC，也不能扫描手机本地磁盘。
+- 工作区左滑的“工作区文件夹”必须进入应用内 DSH 文件页并用 `host.listDirectory` 浏览工作区路径；不要对局域网 / 公网工作区调用 `host.openPath`，该接口依赖远端系统打开权限，可能返回 `403`。
+- 局域网 / 公网禁止 `ensureRunning()` 拉起本机进程，禁止 `stop()` / `dshStopOnExit` 杀本机 DSH，禁止用远程失败去卸本机包。搬家插件 `POST /__shiyi/move-session` 只存在于本机补丁；远程没有就降级，不要为了补插件去重启本机 DSH。
+- Token 进 `flutter_secure_storage`，不要写进 prefs JSON。局域网 DSH 需监听 `0.0.0.0`，手机不要填 `127.0.0.1`。
+- `lan` 只连接用户填写的主机与端口，禁止自动扫描。Host/端口候选扫描只在 `remote` 模式启用；远程自定义 `dshRemoteHost` 优先于内置 `127.0.0.1` / `localhost` / `0.0.0.0` 与常用端口组合，命中后 API / WS 共用同一 Host。
+- 内置回环 Host 返回 `200` 但 `session.list` / `workspace.list` 为空时，视为公网来源隔离视图，禁止记成连接成功；用户显式填写的 Host 可以连接空白新实例。
+- 远程模式不要把拾忆模型 `baseUrl` 改到 DSH；模型注入只走 live RPC，不要为了救配置去重写本机 `settings.yaml`。
 
 ## DSH 配置同步规则
 - 拾忆与 DSH 的协议/状态路径必须分开：模型注入走 `DshModelSync`，会话发送与模型选择走各自 API，禁止把拾忆请求误写成 DSH 文件协议。

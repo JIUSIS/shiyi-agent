@@ -192,6 +192,7 @@ class ToolCallScheduler {
   static const Set<String> readOnlyToolNames = {
     'search_sessions',
     'read_session',
+    'inspect_runtime',
     'search_memory',
     'run_skill',
     'web_search',

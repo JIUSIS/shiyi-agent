@@ -65,6 +65,40 @@
       ]
     }
   },
+  "inspect_runtime": {
+    "readOnly": true,
+    "description": "查看拾忆 App 的结构化运行审计日志，用于自查请求、协议、缓存、DSH 注入、工具、终端、文件、会话、LAAP 和错误。默认返回最近记录；可按模块、级别、关键词筛选。需要全貌诊断时使用 snapshot=true。日志中的 API Key、Token、Cookie 已脱敏。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "module": {
+          "type": "string",
+          "description": "模块过滤，如 LLM、DSH、工具、会话"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "error"
+          ],
+          "description": "日志级别过滤"
+        },
+        "query": {
+          "type": "string",
+          "description": "事件、结果或详情关键词"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "最多返回多少条，默认 80，最多 300"
+        },
+        "snapshot": {
+          "type": "boolean",
+          "description": "返回诊断摘要与最近记录"
+        }
+      }
+    }
+  },
   "search_memory": {
     "readOnly": true,
     "description": "检索用户的历史偏好、事实与经验。注意：只能查到本机已保存的记忆，无法获取任何外部或最新信息；需要最新信息请直接用 web_search。查阅其他会话请用 search_sessions / read_session，不要用本工具。",

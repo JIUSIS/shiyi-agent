@@ -283,16 +283,47 @@ void main() {
     openNotifier.dispose();
   });
 
+  testWidgets('左滑卡片销毁时延后通知父级，避免锁树期间 setState', (tester) async {
+    var visible = true;
+    Rect? openRect;
+    late StateSetter rebuild;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: StatefulBuilder(
+          builder: (context, setState) {
+            rebuild = setState;
+            return Scaffold(
+              body: visible
+                  ? SwipeActions(
+                      desktopOverride: false,
+                      actions: const [],
+                      onOpenRectChanged: (rect) {
+                        setState(() => openRect = rect);
+                      },
+                      child: const SizedBox(width: 120, height: 48),
+                    )
+                  : const SizedBox.shrink(),
+            );
+          },
+        ),
+      ),
+    );
+
+    rebuild(() => visible = false);
+    await tester.pump();
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(openRect, isNull);
+  });
+
   testWidgets('跨项目写入后高度因子贴齐，不从 0 长回来', (tester) async {
     const card = SizedBox(width: 80, height: 40);
     await tester.pumpWidget(
       const MaterialApp(
         home: Align(
           alignment: Alignment.topCenter,
-          child: HomeDragHeightFactor(
-            factor: 0,
-            child: card,
-          ),
+          child: HomeDragHeightFactor(factor: 0, child: card),
         ),
       ),
     );
@@ -303,11 +334,7 @@ void main() {
       const MaterialApp(
         home: Align(
           alignment: Alignment.topCenter,
-          child: HomeDragHeightFactor(
-            factor: 1,
-            snap: true,
-            child: card,
-          ),
+          child: HomeDragHeightFactor(factor: 1, snap: true, child: card),
         ),
       ),
     );
@@ -319,9 +346,7 @@ void main() {
   });
 
   testWidgets('已展开列表新增卡片不从下方滑入', (tester) async {
-    var children = const [
-      SizedBox(key: Key('a'), width: 80, height: 40),
-    ];
+    var children = const [SizedBox(key: Key('a'), width: 80, height: 40)];
     await tester.pumpWidget(
       MaterialApp(
         home: Align(

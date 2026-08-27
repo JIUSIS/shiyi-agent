@@ -8,11 +8,14 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/models.dart';
 import 'dsh_api.dart';
+import 'dsh_endpoint.dart';
 import 'file_workspace.dart';
 import 'network_proxy.dart';
 import 'notifier.dart';
 import 'termux_runtime.dart';
+import 'runtime_logger.dart';
 
 /// DSH 服务状态。
 
@@ -72,6 +75,9 @@ class DshService {
   /// 已记录的本地版本（null = 未安装/未知）。
   String? _localVersion;
 
+  /// 是否管理本机 DSH 进程。局域网 / 公网只走 HTTP/WS，不安装、不启停本机。
+  bool managesLocalProcess = true;
+
   /// 最近一次检测到的最新版本（null = 未检测）。
   String? latestVersion;
 
@@ -95,6 +101,45 @@ class DshService {
 
   /// 是否启用自动代理（与设置 dshUseProxy 同步，UI 切换时写入）。
   bool useProxyEnabled = true;
+
+  /// 三套 DSH 连接各自保留 HTTP/WS 客户端，切换时不覆盖另一套的
+  /// Host 探测、RPC 合并和连接参数。
+  final Map<String, DshApiClient> _apiClients = {
+    'local\u0000${DshEndpoint.localUrl}': DshApiClient.instance,
+  };
+  String _currentScopeKey = 'local\u0000${DshEndpoint.localUrl}';
+
+  DshApiClient get api =>
+      _apiClients[_currentScopeKey] ?? DshApiClient.instance;
+  String get currentScopeKey => _currentScopeKey;
+
+  DshApiClient apiFor(AppSettings s) {
+    final key = DshEndpoint.scopeKeyOf(s);
+    final client = _apiClients.putIfAbsent(
+      key,
+      () => DshApiClient(scopeKey: key),
+    );
+    _configureClient(client, s);
+    return client;
+  }
+
+  void _configureClient(DshApiClient client, AppSettings s) {
+    final mode = DshEndpoint.modeOf(s);
+    client.configure(
+      baseUrl: DshEndpoint.urlOf(s),
+      token: mode == 'remote'
+          ? s.dshRemoteToken
+          : mode == 'lan'
+          ? s.dshLanToken
+          : '',
+      customCompatibilityHosts: mode == 'remote'
+          ? DshEndpoint.remoteCustomCompatibilityHosts(s)
+          : const [],
+      compatibilityHosts: mode == 'remote'
+          ? DshEndpoint.remotePresetCompatibilityHosts(s)
+          : const [],
+    );
+  }
 
   /// 检测可用代理（尊重开关；关闭时返回 null 走直连）。
   Future<ProxyInfo?> _detectProxy() async {
@@ -658,6 +703,15 @@ class DshService {
         cur == DshStatus.uninstalling) {
       return cur;
     }
+    if (!managesLocalProcess) {
+      final running = await isRunning();
+      status.value = running ? DshStatus.running : DshStatus.idle;
+      final url = api.baseUrl;
+      statusMessage.value = running
+          ? '已连接 $url'
+          : (url.isEmpty ? '请填写 DeepSeek Harness 地址' : '无法连接 $url');
+      return status.value;
+    }
     final local = await localVersion();
     if (local == null || local.isEmpty) {
       status.value = DshStatus.idle;
@@ -672,6 +726,10 @@ class DshService {
   /// 页面先显示缓存与「后台启动中」，服务就绪后由状态监听自动刷新）；
   /// 已运行刷新状态。
   Future<bool> ensureAvailableOnLaunch() async {
+    if (!managesLocalProcess) {
+      await refreshStatus();
+      return true;
+    }
     if (!await isInstalled()) {
       await refreshStatus();
       return false;
@@ -702,6 +760,10 @@ class DshService {
         return 'DSH 卸载中…';
       default:
         break;
+    }
+    if (!managesLocalProcess) {
+      if (!await isRunning()) return 'DSH 未连接';
+      return null;
     }
     if (!await isInstalled()) return 'DSH 未安装';
     if (!await isRunning()) return 'DSH 未启动';
@@ -1922,17 +1984,17 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   /// 启动后把默认预设从旧 android 精简纠正回官方 standard。
   Future<void> _ensureOfficialDefaultPreset() async {
     try {
-      final list = await DshApiClient.instance.listPresets();
+      final list = await api.listPresets();
       final current = list.presets.where((p) => p.isDefault).toList();
       if (current.isEmpty) {
-        await DshApiClient.instance.setDefaultPreset('standard');
+        await api.setDefaultPreset('standard');
         return;
       }
       final preset = current.first;
       if (preset.id == 'android' ||
           preset.id.isEmpty ||
           preset.broken != null) {
-        await DshApiClient.instance.setDefaultPreset('standard');
+        await api.setDefaultPreset('standard');
       }
     } catch (_) {}
   }
@@ -2165,8 +2227,29 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     }
   }
 
+  /// 按设置切换 API 地址。远程模式关掉本机进程管理。
+  void applyConnection(AppSettings s) {
+    managesLocalProcess = DshEndpoint.isLocal(s);
+    _currentScopeKey = DshEndpoint.scopeKeyOf(s);
+    apiFor(s);
+    final uri = Uri.tryParse(DshEndpoint.urlOf(s));
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'connection.applied',
+        data: {
+          'mode': DshEndpoint.modeOf(s),
+          'scopeKey': _currentScopeKey,
+          'endpoint': uri == null
+              ? '<endpoint>'
+              : '${uri.scheme}://${uri.host}${uri.hasPort ? ':${uri.port}' : ''}${uri.path}',
+        },
+      ),
+    );
+  }
+
   /// 服务是否在运行（RPC 就绪探测，端口通了但 API 未初始化也算未就绪）。
-  Future<bool> isRunning() => DshApiClient.instance.rpcPing();
+  Future<bool> isRunning() => api.rpcPing();
 
   /// 连接失败 / 超时 / 假死：VPN 切换后 socket 仍 LISTEN 但握手失败（#113）。
   static bool looksUnreachable(Object error) {
@@ -2187,6 +2270,14 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
       status.value = DshStatus.running;
       return true;
     }
+    if (!managesLocalProcess) {
+      status.value = DshStatus.error;
+      final url = api.baseUrl;
+      statusMessage.value = url.isEmpty
+          ? '请填写 DeepSeek Harness 地址'
+          : '无法连接 $url';
+      return false;
+    }
     if (!await isInstalled()) {
       status.value = DshStatus.error;
       statusMessage.value = 'DeepSeek Harness 尚未安装，请到 Agent 引擎页安装';
@@ -2198,6 +2289,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
 
   /// 连接失败时自愈：杀掉旧进程并在当前网络环境下重启（#113 铁律）。
   Future<bool> recoverFromUnreachable() {
+    if (!managesLocalProcess) return isRunning();
     final existing = _recovering;
     if (existing != null) {
       return existing.then((_) => isRunning());
@@ -2253,6 +2345,15 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   }
 
   Future<bool> _start() async {
+    if (!managesLocalProcess) {
+      final ok = await isRunning();
+      status.value = ok ? DshStatus.running : DshStatus.error;
+      final url = api.baseUrl;
+      statusMessage.value = ok
+          ? '已连接 $url'
+          : (url.isEmpty ? '请填写 DeepSeek Harness 地址' : '无法连接 $url');
+      return ok;
+    }
     if (await isRunning()) {
       final repaired = await _repairDshPatchOverlays();
       final searchChanged = await _ensureBuiltInPlugins() || repaired;
@@ -2406,8 +2507,9 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     return p;
   }
 
-  /// 停止 DSH 服务。
+  /// 停止 DSH 服务。远程模式不杀本机进程。
   Future<void> stop() async {
+    if (!managesLocalProcess) return;
     status.value = DshStatus.stopping;
     statusMessage.value = '正在停止 DeepSeek Harness 服务…';
     if (Platform.isAndroid) {

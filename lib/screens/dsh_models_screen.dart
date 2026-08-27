@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../core/app_state.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_model_sync.dart';
+import '../services/dsh_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 
@@ -23,7 +24,7 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
   String? _error;
   bool _deleting = false;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {
@@ -37,7 +38,8 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
       _error = null;
     });
     try {
-      final stored = await DshModelSync.listInjectedConfigs();
+      final scopeKey = DshService.instance.currentScopeKey;
+      final stored = await DshModelSync.listInjectedConfigs(scopeKey: scopeKey);
       var configs = DshModelSync.configsForDisplay(
         stored: stored,
         settings: widget.shiyi?.settings,
@@ -89,7 +91,11 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
     if (!confirmed || !mounted) return;
     setState(() => _deleting = true);
     try {
-      await DshModelSync.removeInjectedConfig(config.id, api: _api);
+      await DshModelSync.removeInjectedConfig(
+        config.id,
+        api: _api,
+        scopeKey: DshService.instance.currentScopeKey,
+      );
       if (!mounted) return;
       await _load();
     } catch (e) {

@@ -274,8 +274,9 @@ DS Harness 引擎验证点（#114，两端共享）：
    无参数查询）；模型数据页重新进入后从当前拾忆模型设置恢复已选模型
 4. 会话页：子代理状态条显示在输入框缓存统计栏上方；技能候选胶囊
    显示在统计栏上方，可单独移除
-5. 文件页：默认浏览 agent 目录；路径栏上箭头/选目录/新建文件夹；
-   条目操作（复制路径/系统打开）
+5. 文件页：本机 DSH 默认浏览 agent 目录；局域网 / 公网连接改从对应主机
+   `host.describe.cwd/home` 起步，禁止回退本机文件系统。路径栏上箭头/选目录/新建文件夹；
+   条目操作（复制路径/系统打开，后者仅在远端声明 `canOpenPath` 时显示）
 6. 设置入口 = DS Harness 中心；中心顶部 Agent 引擎可切回拾忆，
    切换后返回落点为对应引擎设置页
 7. dsh 服务启动后 `host.describe` cwd = agent 目录（文件/工作区默认位置）
@@ -284,6 +285,14 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-08-27 2.6.0**（共享 `lib/`；详见 `docs/fix-log.md` #283-#291）：
+  DSH 支持本机 / 局域网 / 公网连接，文件页跟随远端 cwd/home 并扫描盘符；运行审计覆盖 App、LLM、缓存、DSH、工具、终端、文件、会话和 LAAP。
+  拾忆与 DSH 的停止先本地收口，拾忆主动关闭 HTTP/SSE，子代理和终端进程可取消；DSH 运行中可直接插话并过滤旧事件。
+  Windows 继续使用本机终端后端与本机 Python LAAP，不引入 Android Alpine 路径。
+- **2026-08-27**（共享 `lib/`；详见 `docs/fix-log.md` #283-#285）：
+  DSH 支持本机 / 局域网 / 公网连接；文件页跟随当前 DSH 的 cwd/home，切连接清旧目录和迟到请求，
+  不再把 Android/Windows 本机 agent 路径发给远端。`host.createDirectory` 对齐官方
+  `path + name` 协议。官方尚无远程文件读写/删除 RPC，界面不伪造该能力。
 - **2026-08-27 2.5.10**（共享 `lib/`；详见 `docs/fix-log.md` #274-#282）：
   拾忆直连第三条协议 Responses；冻头/动尾稳缓存；Responses 发图转 `input_image`。
   小米小窗 MediaQuery 钳制。LAAP 皮层本机部署，活人感按 Hermes 官方 preamble 注入动尾，

@@ -91,6 +91,9 @@ class Session {
 
   /// 本会话绑定的已保存配置名（[ApiProfile.name]）。空 = 跟随全局设置。
   String apiProfile;
+
+  /// 本会话绑定的已保存配置稳定 ID。新会话优先使用它，名称仅作旧版本兼容。
+  String apiProfileId;
   int createdAt;
   int updatedAt;
   int messageCount;
@@ -129,6 +132,7 @@ class Session {
     required this.title,
     required this.model,
     this.apiProfile = '',
+    this.apiProfileId = '',
     required this.createdAt,
     required this.updatedAt,
     this.messageCount = 0,
@@ -148,6 +152,7 @@ class Session {
     'title': title,
     'model': model,
     'api_profile': apiProfile,
+    'api_profile_id': apiProfileId,
     'created_at': createdAt,
     'updated_at': updatedAt,
     'total_tokens': totalTokens,
@@ -166,6 +171,7 @@ class Session {
     title: m['title'],
     model: m['model'],
     apiProfile: m['api_profile'] == null ? '' : '${m['api_profile']}',
+    apiProfileId: m['api_profile_id'] == null ? '' : '${m['api_profile_id']}',
     createdAt: m['created_at'],
     updatedAt: m['updated_at'],
     messageCount: m['message_count'] == null
@@ -598,6 +604,9 @@ class AppSettings {
   String apiKey;
   String model;
 
+  /// 内存中的配置身份，仅用于按已保存 API 配置隔离缓存；不写入全局设置 JSON。
+  String apiProfileId;
+
   /// API 协议：openai（Chat Completions）/ responses（OpenAI Responses）/ anthropic（Messages）。
   String apiProtocol;
   String systemPrompt;
@@ -665,6 +674,25 @@ class AppSettings {
   /// DSH DeepSeek 官方搜索 API Key（仅 provider=deepseek 时使用）。
   String dshSearchKey;
 
+  /// DSH 连接：local（本机 127.0.0.1:3080）/ lan（局域网）/ remote（公网）。
+  String dshConnectionMode;
+
+  /// 局域网主机（IP 或主机名）。可带端口，如 192.168.1.5:3080。
+  String dshLanHost;
+  int dshLanPort;
+
+  /// 局域网 DSH 可选鉴权 Token（进安全存储，不进 prefs JSON）。
+  String dshLanToken;
+
+  /// 公网地址。裸 IP 默认 HTTP，域名缺 scheme 时默认 HTTPS。
+  String dshRemoteUrl;
+
+  /// 公网转发可选 Host 请求头。可填写一个或多个主机，连接时优先尝试。
+  String dshRemoteHost;
+
+  /// 公网可选鉴权 Token（进安全存储，不进 prefs JSON）。
+  String dshRemoteToken;
+
   /// 自定义 SOCKS5 通道：打开后对话 / 拉模型 / 联网搜索走该代理。
   /// 给国内 IP 被中转站拦截时换境外出口用，默认关。
   bool socks5Enabled;
@@ -684,6 +712,7 @@ class AppSettings {
     this.baseUrl = 'https://api.deepseek.com/v1',
     this.apiKey = '',
     this.model = '',
+    this.apiProfileId = '',
     this.apiProtocol = 'openai',
     this.systemPrompt = '',
     this.temperature = 0.7,
@@ -711,6 +740,13 @@ class AppSettings {
     this.dshStopOnExit = true,
     this.dshSearchProvider = 'auto',
     this.dshSearchKey = '',
+    this.dshConnectionMode = 'local',
+    this.dshLanHost = '',
+    this.dshLanPort = 3080,
+    this.dshLanToken = '',
+    this.dshRemoteUrl = '',
+    this.dshRemoteHost = '',
+    this.dshRemoteToken = '',
     this.socks5Enabled = false,
     this.socks5Mode = 'off',
     this.socks5Host = '',
@@ -725,6 +761,7 @@ class AppSettings {
     String? baseUrl,
     String? apiKey,
     String? model,
+    String? apiProfileId,
     String? apiProtocol,
     String? systemPrompt,
     double? temperature,
@@ -752,6 +789,13 @@ class AppSettings {
     bool? dshStopOnExit,
     String? dshSearchProvider,
     String? dshSearchKey,
+    String? dshConnectionMode,
+    String? dshLanHost,
+    int? dshLanPort,
+    String? dshLanToken,
+    String? dshRemoteUrl,
+    String? dshRemoteHost,
+    String? dshRemoteToken,
     bool? socks5Enabled,
     String? socks5Mode,
     String? socks5Host,
@@ -764,6 +808,7 @@ class AppSettings {
     baseUrl: baseUrl ?? this.baseUrl,
     apiKey: apiKey ?? this.apiKey,
     model: model ?? this.model,
+    apiProfileId: apiProfileId ?? this.apiProfileId,
     apiProtocol: apiProtocol ?? this.apiProtocol,
     systemPrompt: systemPrompt ?? this.systemPrompt,
     temperature: temperature ?? this.temperature,
@@ -792,6 +837,13 @@ class AppSettings {
     dshStopOnExit: dshStopOnExit ?? this.dshStopOnExit,
     dshSearchProvider: dshSearchProvider ?? this.dshSearchProvider,
     dshSearchKey: dshSearchKey ?? this.dshSearchKey,
+    dshConnectionMode: dshConnectionMode ?? this.dshConnectionMode,
+    dshLanHost: dshLanHost ?? this.dshLanHost,
+    dshLanPort: dshLanPort ?? this.dshLanPort,
+    dshLanToken: dshLanToken ?? this.dshLanToken,
+    dshRemoteUrl: dshRemoteUrl ?? this.dshRemoteUrl,
+    dshRemoteHost: dshRemoteHost ?? this.dshRemoteHost,
+    dshRemoteToken: dshRemoteToken ?? this.dshRemoteToken,
     socks5Enabled: socks5Enabled ?? this.socks5Enabled,
     socks5Mode: socks5Mode ?? this.socks5Mode,
     socks5Host: socks5Host ?? this.socks5Host,
@@ -833,6 +885,13 @@ class AppSettings {
     'dshStopOnExit': dshStopOnExit,
     'dshSearchProvider': dshSearchProvider,
     'dshSearchKey': dshSearchKey,
+    'dshConnectionMode': dshConnectionMode,
+    'dshLanHost': dshLanHost,
+    'dshLanPort': dshLanPort,
+    'dshLanToken': dshLanToken,
+    'dshRemoteUrl': dshRemoteUrl,
+    'dshRemoteHost': dshRemoteHost,
+    'dshRemoteToken': dshRemoteToken,
     'socks5Enabled': socks5Enabled,
     'socks5Mode': socks5Mode,
     'socks5Host': socks5Host,
@@ -874,6 +933,13 @@ class AppSettings {
     dshStopOnExit: j['dshStopOnExit'] ?? true,
     dshSearchProvider: j['dshSearchProvider'] ?? 'auto',
     dshSearchKey: j['dshSearchKey'] ?? '',
+    dshConnectionMode: _dshConnectionModeFromJson(j['dshConnectionMode']),
+    dshLanHost: j['dshLanHost'] ?? '',
+    dshLanPort: _dshLanPortFromJson(j['dshLanPort']),
+    dshLanToken: j['dshLanToken'] ?? '',
+    dshRemoteUrl: j['dshRemoteUrl'] ?? '',
+    dshRemoteHost: j['dshRemoteHost'] ?? '',
+    dshRemoteToken: j['dshRemoteToken'] ?? '',
     socks5Enabled: j['socks5Enabled'] ?? false,
     socks5Mode: _socks5ModeFromJson(j),
     socks5Host: j['socks5Host'] ?? '',
@@ -883,6 +949,22 @@ class AppSettings {
     socks5Servers: _socks5ServersFromJson(j['socks5Servers']),
     socks5ActiveId: j['socks5ActiveId'] ?? '',
   );
+}
+
+String _dshConnectionModeFromJson(dynamic raw) {
+  switch ((raw ?? '').toString().trim().toLowerCase()) {
+    case 'lan':
+      return 'lan';
+    case 'remote':
+      return 'remote';
+    default:
+      return 'local';
+  }
+}
+
+int _dshLanPortFromJson(dynamic raw) {
+  final n = (raw as num?)?.toInt() ?? 3080;
+  return n > 0 && n <= 65535 ? n : 3080;
 }
 
 String _socks5ModeFromJson(Map<String, dynamic> j) {
@@ -957,15 +1039,24 @@ class Socks5Server {
   );
 }
 
-/// 一组可保存的 API 配置：名称 + 接口地址 + 密钥 + 模型。
+/// 为旧配置生成可重复的身份 ID。模型和密钥不参与身份，改模型不会新建一组缓存。
+String createApiProfileId(String name, String baseUrl, String apiProtocol) {
+  final fingerprint =
+      '${name.trim()}\n${baseUrl.trim().replaceAll(RegExp(r'/+$'), '')}\n${apiProtocol.trim()}';
+  return 'profile_${base64Url.encode(utf8.encode(fingerprint)).replaceAll('=', '')}';
+}
+
+/// 一组可保存的 API 配置：稳定 ID + 名称 + 接口地址 + 密钥 + 模型。
 /// 切换配置时自动带出密钥，不用每次重输。
 class ApiProfile {
+  final String id;
   final String name;
   final String baseUrl;
   final String apiKey;
   final String model;
   final String apiProtocol;
   const ApiProfile({
+    this.id = '',
     required this.name,
     required this.baseUrl,
     this.apiKey = '',
@@ -973,12 +1064,18 @@ class ApiProfile {
     this.apiProtocol = 'openai',
   });
 
+  String get profileId => id.trim().isNotEmpty
+      ? id.trim()
+      : createApiProfileId(name, baseUrl, apiProtocol);
+
   ApiProfile copyWith({
+    String? id,
     String? baseUrl,
     String? apiKey,
     String? model,
     String? apiProtocol,
   }) => ApiProfile(
+    id: id ?? this.id,
     name: name,
     baseUrl: baseUrl ?? this.baseUrl,
     apiKey: apiKey ?? this.apiKey,
@@ -987,6 +1084,7 @@ class ApiProfile {
   );
 
   Map<String, dynamic> toJson() => {
+    'id': profileId,
     'name': name,
     'baseUrl': baseUrl,
     'apiKey': apiKey,
@@ -995,6 +1093,7 @@ class ApiProfile {
   };
 
   factory ApiProfile.fromJson(Map<String, dynamic> j) => ApiProfile(
+    id: (j['id'] ?? '').toString(),
     name: j['name'] ?? '',
     baseUrl: j['baseUrl'] ?? '',
     apiKey: j['apiKey'] ?? '',

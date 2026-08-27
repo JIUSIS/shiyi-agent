@@ -1,15 +1,15 @@
-import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart' show Material, MaterialType, Theme;
+import 'package:flutter/material.dart'
+    show Material, MaterialType, Theme, Tooltip;
+import 'package:flutter/services.dart';
 
 import '../services/file_workspace.dart';
+import '../services/runtime_logger.dart';
 import '../widgets/ios_style.dart';
 
-/// 设置页内「日志」页：实时查看智能体错误日志
-/// （默认工作目录下 logs/error.log）。
+/// 设置页内「日志」页：查看 App 全链路运行审计。
 class LogScreen extends StatefulWidget {
   const LogScreen({super.key});
 
@@ -18,73 +18,64 @@ class LogScreen extends StatefulWidget {
 }
 
 class _LogScreenState extends State<LogScreen> {
-  String _content = '';
+  final _logger = RuntimeLogger.instance;
+  final _queryController = TextEditingController();
+  List<RuntimeLogEntry> _entries = const [];
   String _path = '';
-  bool _autoRefresh = true;
+  String _module = '';
+  String _level = 'all';
   bool _reading = false;
-  Timer? _timer;
 
   @override
   void initState() {
     super.initState();
     _load();
-    _timer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (_autoRefresh && mounted) _load(silent: true);
-    });
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _queryController.dispose();
     super.dispose();
   }
 
-  Future<void> _load({bool silent = false}) async {
+  Future<void> _load() async {
     if (_reading) return;
     _reading = true;
     try {
-      final dir = await FileWorkspace.current();
-      final file = File('$dir/logs/error.log');
-      final exists = await file.exists();
-      // 只读尾部（最多 256KB），避免每次 3 秒轮询全量读大日志文件。
-      String text = '';
-      if (exists) {
-        final len = await file.length();
-        const maxRead = 256 * 1024;
-        final skip = len > maxRead ? len - maxRead : 0;
-        final raf = await file.open();
-        try {
-          await raf.setPosition(skip);
-          final bytes = await raf.read(len - skip);
-          text = utf8.decode(bytes, allowMalformed: true);
-          if (skip > 0) {
-            // 从行边界开始，避免首行半截。
-            final idx = text.indexOf('\n');
-            if (idx != -1) text = text.substring(idx + 1);
-          }
-        } finally {
-          await raf.close();
-        }
-      }
+      final entries = await _logger.read(limit: 1000);
       if (!mounted) return;
-      if (silent && text == _content) return;
       setState(() {
-        _path = file.path;
-        _content = text;
+        _entries = entries;
+        _path = _logger.path ?? '';
       });
     } catch (_) {
-      if (mounted) setState(() => _content = '（读取日志失败）');
+      if (mounted) setState(() => _entries = const []);
     } finally {
       _reading = false;
     }
+  }
+
+  List<RuntimeLogEntry> get _filtered {
+    final query = _queryController.text.trim().toLowerCase();
+    return _entries
+        .where((entry) {
+          if (_module.isNotEmpty && entry.module != _module) return false;
+          if (_level != 'all' && entry.level != _level) return false;
+          if (query.isNotEmpty &&
+              !entry.oneLine.toLowerCase().contains(query)) {
+            return false;
+          }
+          return true;
+        })
+        .toList(growable: false);
   }
 
   Future<void> _clear() async {
     final ok = await showIosFadeDialog<bool>(
       context: context,
       builder: (ctx) => CupertinoAlertDialog(
-        title: const Text('清空日志'),
-        content: const Text('确定清空错误日志吗？'),
+        title: const Text('清空运行日志'),
+        content: const Text('会清空结构化运行审计日志，保留应用功能不变。'),
         actions: [
           CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx, false),
@@ -99,57 +90,117 @@ class _LogScreenState extends State<LogScreen> {
       ),
     );
     if (ok != true) return;
+    await _logger.clear();
     try {
-      final file = File(_path);
-      if (await file.exists()) {
-        await file.writeAsString('');
-      }
-      await _load();
+      final dir = await FileWorkspace.current();
+      final old = File('$dir/logs/error.log');
+      if (await old.exists()) await old.writeAsString('');
     } catch (_) {}
+    await _load();
   }
+
+  Future<void> _copy(RuntimeLogEntry entry) async {
+    await Clipboard.setData(ClipboardData(text: entry.oneLine));
+    if (!mounted) return;
+    await showIosFadeDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('已复制'),
+        content: const Text('日志详情已复制到剪贴板。'),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDetails(RuntimeLogEntry entry) {
+    showIosFadeDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: Text('${entry.module} · ${entry.event}'),
+        content: SingleChildScrollView(
+          child: Text(
+            entry.oneLine,
+            textAlign: TextAlign.left,
+            style: const TextStyle(fontSize: 12, height: 1.45),
+          ),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _copy(entry);
+            },
+            child: const Text('复制'),
+          ),
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _levelButton(String value, String label) => CupertinoButton(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    onPressed: () => setState(() => _level = value),
+    child: Text(
+      label,
+      style: TextStyle(
+        fontSize: 12,
+        color: _level == value
+            ? CupertinoColors.activeBlue
+            : CupertinoColors.secondaryLabel,
+        fontWeight: _level == value ? FontWeight.w600 : FontWeight.normal,
+      ),
+    ),
+  );
 
   @override
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
-    final lines = _content
-        .split('\n')
-        .where((l) => l.trim().isNotEmpty)
-        .toList()
-        .reversed
-        .toList();
+    final entries = _filtered;
+    final modules =
+        _entries
+            .map((e) => e.module)
+            .where((e) => e.isNotEmpty)
+            .toSet()
+            .toList()
+          ..sort();
+    final errors = _entries.where((e) => e.level == 'error').length;
+    final warnings = _entries.where((e) => e.level == 'warn').length;
     return CupertinoTheme(
       data: iosCupertinoTheme(context),
       child: Material(
         type: MaterialType.transparency,
         child: CupertinoPageScaffold(
           navigationBar: CupertinoNavigationBar(
-            middle: const Text('日志'),
+            middle: const Text('运行日志'),
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                CupertinoButton(
-                  padding: const EdgeInsets.all(8),
-                  onPressed: () => _load(),
-                  child: const Icon(CupertinoIcons.refresh),
-                ),
-                CupertinoButton(
-                  padding: const EdgeInsets.all(8),
-                  onPressed: () => setState(() => _autoRefresh = !_autoRefresh),
-                  child: Icon(
-                    _autoRefresh
-                        ? CupertinoIcons.arrow_2_circlepath
-                        : CupertinoIcons.arrow_2_circlepath_circle,
-                    color: _autoRefresh
-                        ? CupertinoColors.activeBlue
-                        : CupertinoColors.secondaryLabel,
+                Tooltip(
+                  message: '手动刷新',
+                  child: CupertinoButton(
+                    padding: const EdgeInsets.all(8),
+                    onPressed: _load,
+                    child: const Icon(CupertinoIcons.refresh),
                   ),
                 ),
-                CupertinoButton(
-                  padding: const EdgeInsets.all(8),
-                  onPressed: _clear,
-                  child: const Icon(
-                    CupertinoIcons.trash,
-                    color: CupertinoColors.systemRed,
+                Tooltip(
+                  message: '删除日志',
+                  child: CupertinoButton(
+                    padding: const EdgeInsets.all(8),
+                    onPressed: _clear,
+                    child: const Icon(
+                      CupertinoIcons.trash,
+                      color: CupertinoColors.systemRed,
+                    ),
                   ),
                 ),
               ],
@@ -162,49 +213,126 @@ class _LogScreenState extends State<LogScreen> {
               children: [
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                  child: CupertinoSearchTextField(
+                    controller: _queryController,
+                    placeholder: '搜索事件、模块、会话、错误或详情',
+                    onChanged: (_) => setState(() {}),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 2,
+                  ),
+                  child: Row(
+                    children: [
+                      _levelButton('all', '全部'),
+                      _levelButton('info', '信息'),
+                      _levelButton('warn', '警告 $warnings'),
+                      _levelButton('error', '错误 $errors'),
+                      const Spacer(),
+                      CupertinoButton(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        onPressed: () => setState(() => _module = ''),
+                        child: Text(
+                          _module.isEmpty ? '全部模块' : _module,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (modules.isNotEmpty)
+                  SizedBox(
+                    height: 32,
+                    child: ListView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      children: [
+                        for (final module in modules)
+                          CupertinoButton(
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            onPressed: () => setState(() => _module = module),
+                            child: Text(
+                              module,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: _module == module
+                                    ? CupertinoColors.activeBlue
+                                    : CupertinoColors.secondaryLabel,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
                   child: Text(
-                    _path.isEmpty ? '日志文件路径加载中…' : _path,
+                    _path.isEmpty ? '结构化日志路径加载中…' : _path,
                     style: const TextStyle(
-                      fontSize: 12,
+                      fontSize: 11,
                       color: CupertinoColors.secondaryLabel,
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
                 Expanded(
-                  child: lines.isEmpty
+                  child: entries.isEmpty
                       ? Center(
                           child: Text(
-                            '暂无错误日志\n生成错误或工具错误会自动记录到这里',
-                            textAlign: TextAlign.center,
+                            _entries.isEmpty ? '暂无运行日志' : '没有匹配的运行日志',
                             style: const TextStyle(
                               fontSize: 14,
-                              height: 1.6,
                               color: CupertinoColors.secondaryLabel,
                             ),
                           ),
                         )
                       : ListView.builder(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-                          itemCount: lines.length,
-                          itemBuilder: (context, i) => Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 3),
-                            child: Text(
-                              lines[i],
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                fontSize: 12,
-                                height: 1.4,
-                                color: dark
-                                    ? CupertinoColors.white.withValues(
-                                        alpha: .82,
-                                      )
-                                    : CupertinoColors.black.withValues(
-                                        alpha: .72,
-                                      ),
+                          padding: const EdgeInsets.fromLTRB(12, 4, 12, 16),
+                          itemCount: entries.length,
+                          itemBuilder: (context, i) {
+                            final entry = entries[i];
+                            final color = entry.level == 'error'
+                                ? CupertinoColors.systemRed
+                                : entry.level == 'warn'
+                                ? CupertinoColors.systemOrange
+                                : CupertinoColors.activeBlue;
+                            return CupertinoListTile(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                                vertical: 4,
                               ),
-                            ),
-                          ),
+                              leading: Icon(
+                                CupertinoIcons.circle_fill,
+                                size: 8,
+                                color: color,
+                              ),
+                              title: Text(
+                                '${entry.module} · ${entry.event}',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: dark
+                                      ? CupertinoColors.white
+                                      : CupertinoColors.black,
+                                ),
+                              ),
+                              subtitle: Text(
+                                '${entry.timestamp}  ${entry.result.isEmpty ? '' : entry.result} ${entry.durationMs == null ? '' : '${entry.durationMs}ms'}',
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: CupertinoColors.secondaryLabel,
+                                ),
+                              ),
+                              onTap: () => _showDetails(entry),
+                            );
+                          },
                         ),
                 ),
               ],

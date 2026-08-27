@@ -91,6 +91,17 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyi/background_service")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "sync" -> {
+                        val activeSessions = call.argument<Int>("activeSessions") ?: 0
+                        ShiyiBackgroundService.sync(applicationContext, activeSessions)
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyi/skillpack")
             .setMethodCallHandler { call, result ->
                 try {

@@ -136,7 +136,12 @@ class _SwipeActionsState extends State<SwipeActions>
   void dispose() {
     _swipeWindowTimer?.cancel();
     widget.openNotifier?.removeListener(_onOpenChanged);
-    widget.onOpenRectChanged?.call(null);
+    final onOpenRectChanged = widget.onOpenRectChanged;
+    if (onOpenRectChanged != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        onOpenRectChanged(null);
+      });
+    }
     _controller.dispose();
     super.dispose();
   }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -8,7 +9,9 @@ import 'package:yaml/yaml.dart';
 import '../core/models.dart';
 import '../core/reasoning_models.dart';
 import 'dsh_api.dart';
+import 'dsh_endpoint.dart';
 import 'dsh_service.dart';
+import 'runtime_logger.dart';
 
 /// 一份已注入到 DSH 的 API 配置。每份对应 `llm-pi-ai.providers` 下的一个提供商。
 class DshInjectedConfig {
@@ -64,6 +67,7 @@ class DshModelSync {
   static const _responseModelsPrefsPrefix = 'dsh_response_models_v1_';
   static const _modelCatalogPrefsPrefix = 'dsh_model_catalog_v1_';
   static const _injectedPrefsKey = 'dsh_injected_configs_v1';
+  static const _scopedInjectedPrefsPrefix = 'dsh_injected_configs_v2_';
   static const _injectedIdsPrefsKey = 'dsh_injected_provider_ids_v1';
 
   static const searchConfigFile = 'shiyi-free-search.json';
@@ -200,10 +204,42 @@ class DshModelSync {
     return value == providerId || value.startsWith('${providerId}_');
   }
 
-  static Future<List<DshInjectedConfig>> listInjectedConfigs() async {
+  static String _scopedKey(String scopeKey) {
+    final encoded = base64Url
+        .encode(utf8.encode(scopeKey.trim()))
+        .replaceAll('=', '');
+    return '$_scopedInjectedPrefsPrefix$encoded';
+  }
+
+  static String _injectedConfigsKey(String? scopeKey) {
+    final normalized = scopeKey?.trim() ?? '';
+    return normalized.isEmpty ? _injectedPrefsKey : _scopedKey(normalized);
+  }
+
+  static bool _isLocalScope(String? scopeKey) {
+    final normalized = scopeKey?.trim() ?? '';
+    return normalized.isEmpty || normalized.startsWith('local\u0000');
+  }
+
+  static Future<List<DshInjectedConfig>> listInjectedConfigs({
+    String? scopeKey,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
-    await _migrateLegacyInjectedIds(prefs);
-    final raw = prefs.getString(_injectedPrefsKey);
+    if (scopeKey == null || scopeKey.trim().isEmpty) {
+      await _migrateLegacyInjectedIds(prefs);
+    } else {
+      // 旧版只有一份全局注入记录，按兼容约定归入本机；局域网和公网
+      // 从此只读自己的桶，不会把本机配置显示成远端已注入。
+      final key = _injectedConfigsKey(scopeKey);
+      final localScope = DshEndpoint.scopeKeyOf(AppSettings());
+      if (scopeKey == localScope &&
+          !prefs.containsKey(key) &&
+          prefs.containsKey(_injectedPrefsKey)) {
+        final legacy = prefs.getString(_injectedPrefsKey);
+        if (legacy != null) await prefs.setString(key, legacy);
+      }
+    }
+    final raw = prefs.getString(_injectedConfigsKey(scopeKey));
     if (raw == null || raw.trim().isEmpty) return const [];
     try {
       final list = jsonDecode(raw);
@@ -219,16 +255,19 @@ class DshModelSync {
   }
 
   static Future<void> _saveInjectedConfigs(
-    List<DshInjectedConfig> items,
-  ) async {
+    List<DshInjectedConfig> items, {
+    String? scopeKey,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
-      _injectedPrefsKey,
+      _injectedConfigsKey(scopeKey),
       jsonEncode([for (final item in items) item.toJson()]),
     );
-    await prefs.setStringList(_injectedIdsPrefsKey, [
-      for (final item in items) item.id,
-    ]);
+    if (scopeKey == null || scopeKey.trim().isEmpty) {
+      await prefs.setStringList(_injectedIdsPrefsKey, [
+        for (final item in items) item.id,
+      ]);
+    }
   }
 
   static Future<void> _migrateLegacyInjectedIds(SharedPreferences prefs) async {
@@ -281,9 +320,10 @@ class DshModelSync {
   static Future<DshInjectedConfig> rememberInjectedConfig(
     AppSettings s, {
     String? name,
+    String? scopeKey,
   }) async {
     final incoming = _configFromSettings(s, name: name);
-    final current = await listInjectedConfigs();
+    final current = await listInjectedConfigs(scopeKey: scopeKey);
     final next = <DshInjectedConfig>[];
     var replaced = false;
     for (final item in current) {
@@ -300,7 +340,7 @@ class DshModelSync {
       }
     }
     if (!replaced) next.add(incoming);
-    await _saveInjectedConfigs(next);
+    await _saveInjectedConfigs(next, scopeKey: scopeKey);
     return incoming;
   }
 
@@ -338,8 +378,9 @@ class DshModelSync {
   static Future<({String id, String name, String env})> _targetProvider(
     AppSettings s, {
     String? name,
+    String? scopeKey,
   }) async {
-    final injected = await listInjectedConfigs();
+    final injected = await listInjectedConfigs(scopeKey: scopeKey);
     final match = injectedConfigForSettings(s, injected, name: name);
     if (match != null) {
       return (id: match.id, name: match.name, env: match.credentialEnv);
@@ -457,11 +498,15 @@ class DshModelSync {
           .toSet();
 
   static String _responseModelsPrefsKey(AppSettings s) {
-    final fingerprint = jsonEncode([
-      s.apiProtocol.trim(),
-      s.baseUrl.trim(),
-      s.model.trim(),
-    ]);
+    final id = s.apiProfileId.trim();
+    final fingerprint = id.isEmpty
+        ? jsonEncode([s.apiProtocol.trim(), s.baseUrl.trim(), s.model.trim()])
+        : jsonEncode([
+            id,
+            s.apiProtocol.trim(),
+            s.baseUrl.trim(),
+            s.model.trim(),
+          ]);
     final encoded = base64Url
         .encode(utf8.encode(fingerprint))
         .replaceAll('=', '');
@@ -469,7 +514,10 @@ class DshModelSync {
   }
 
   static String _modelCatalogPrefsKey(AppSettings s) {
-    final fingerprint = jsonEncode([s.apiProtocol.trim(), s.baseUrl.trim()]);
+    final id = s.apiProfileId.trim();
+    final fingerprint = id.isEmpty
+        ? jsonEncode([s.apiProtocol.trim(), s.baseUrl.trim()])
+        : jsonEncode([id, s.apiProtocol.trim(), s.baseUrl.trim()]);
     final encoded = base64Url
         .encode(utf8.encode(fingerprint))
         .replaceAll('=', '');
@@ -508,8 +556,9 @@ class DshModelSync {
     Iterable<String> responseModels = const [],
     Iterable<String> catalogModels = const [],
     String? name,
+    String? scopeKey,
   }) async {
-    final target = await _targetProvider(s, name: name);
+    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
     return mutateOps(
       s,
       responseModels: responseModels,
@@ -525,6 +574,7 @@ class DshModelSync {
     AppSettings s,
     Iterable<String> modelIds, {
     DshApiClient? api,
+    String? scopeKey,
   }) async {
     final incoming = _normalizedResponseModels(modelIds);
     if (incoming.isEmpty) return false;
@@ -547,6 +597,7 @@ class DshModelSync {
             s,
             responseModels: await responseModelsFor(s),
             catalogModels: merged,
+            scopeKey: scopeKey,
           ),
         );
       } catch (e) {
@@ -561,6 +612,7 @@ class DshModelSync {
     AppSettings s,
     String model, {
     DshApiClient? api,
+    String? scopeKey,
   }) async {
     final target = model.trim();
     if (target.isEmpty ||
@@ -583,6 +635,7 @@ class DshModelSync {
           s,
           responseModels: await responseModelsFor(s),
           catalogModels: stored,
+          scopeKey: scopeKey,
         ),
       );
     }
@@ -595,10 +648,11 @@ class DshModelSync {
     DshApiClient? api,
     Future<bool> Function()? isRunning,
     Future<String> Function()? homeDir,
+    String? scopeKey,
   }) async {
     final id = provider.trim();
     if (id.isEmpty || !isManagedProviderId(id)) return false;
-    final current = await listInjectedConfigs();
+    final current = await listInjectedConfigs(scopeKey: scopeKey);
     DshInjectedConfig? removed;
     final next = <DshInjectedConfig>[];
     for (final item in current) {
@@ -608,11 +662,11 @@ class DshModelSync {
         next.add(item);
       }
     }
-    await _saveInjectedConfigs(next);
+    await _saveInjectedConfigs(next, scopeKey: scopeKey);
 
-    final running = await (isRunning ?? DshService.instance.isRunning)();
+    final client = api ?? DshService.instance.api;
+    final running = await (isRunning ?? client.rpcPing)();
     if (running) {
-      final client = api ?? DshApiClient.instance;
       try {
         await client.mutateSettings(settingsNs, unsetProviderOps(id));
       } catch (e) {
@@ -627,31 +681,33 @@ class DshModelSync {
         }
       }
     }
-    try {
-      await _withFileSyncLock<void>(() async {
-        final home = await (homeDir ?? DshService.instance.homeDir)();
-        await Directory(home).create(recursive: true);
-        final file = File('$home/settings.yaml');
-        if (await file.exists()) {
-          final yaml = removeProviderYaml(await file.readAsString(), id);
-          await _writeAtomically(file, yaml);
-        }
-        if (removed != null &&
-            removed.credentialEnv != credentialEnv &&
-            removed.credentialEnv != searchCredentialEnv) {
-          final cred = File('$home/.credentials.yaml');
-          if (await cred.exists()) {
-            final text = upsertCredentialsYaml(
-              await cred.readAsString(),
-              removed.credentialEnv,
-              '',
-            );
-            await _writeAtomically(cred, text);
+    if (_isLocalScope(scopeKey)) {
+      try {
+        await _withFileSyncLock<void>(() async {
+          final home = await (homeDir ?? DshService.instance.homeDir)();
+          await Directory(home).create(recursive: true);
+          final file = File('$home/settings.yaml');
+          if (await file.exists()) {
+            final yaml = removeProviderYaml(await file.readAsString(), id);
+            await _writeAtomically(file, yaml);
           }
-        }
-      });
-    } catch (e) {
-      debugPrint('DshModelSync remove files failed: $e');
+          if (removed != null &&
+              removed.credentialEnv != credentialEnv &&
+              removed.credentialEnv != searchCredentialEnv) {
+            final cred = File('$home/.credentials.yaml');
+            if (await cred.exists()) {
+              final text = upsertCredentialsYaml(
+                await cred.readAsString(),
+                removed.credentialEnv,
+                '',
+              );
+              await _writeAtomically(cred, text);
+            }
+          }
+        });
+      } catch (e) {
+        debugPrint('DshModelSync remove files failed: $e');
+      }
     }
     return true;
   }
@@ -661,6 +717,7 @@ class DshModelSync {
     AppSettings s,
     Iterable<String> responseModels, {
     DshApiClient? api,
+    String? scopeKey,
   }) async {
     final incoming = _normalizedResponseModels(responseModels)
       ..remove(s.model.trim())
@@ -686,6 +743,7 @@ class DshModelSync {
             s,
             responseModels: merged,
             catalogModels: await cachedModelCatalogFor(s),
+            scopeKey: scopeKey,
           ),
         );
       } catch (e) {
@@ -752,8 +810,25 @@ class DshModelSync {
     Future<bool> Function()? isRunning,
     Future<String> Function()? homeDir,
     String? name,
+    String? scopeKey,
   }) async {
-    await rememberInjectedConfig(s, name: name);
+    final started = DateTime.now();
+    final requestId =
+        'dshsync_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'model_injection.started',
+        requestId: requestId,
+        data: {
+          'model': s.model,
+          'protocol': s.apiProtocol,
+          'baseUrl': _safeBaseUrl(s.baseUrl),
+          'name': name ?? '',
+        },
+      ),
+    );
+    await rememberInjectedConfig(s, name: name, scopeKey: scopeKey);
     await syncFromShiyi(
       s,
       api: api,
@@ -761,16 +836,43 @@ class DshModelSync {
       homeDir: homeDir,
       allowClear: true,
       name: name,
+      scopeKey: scopeKey,
     );
     final running = await (isRunning ?? DshService.instance.isRunning)();
     if (!running) return;
-    final client = api ?? DshApiClient.instance;
+    final client = api ?? DshService.instance.api;
     try {
       for (final sess in await client.listSessions()) {
-        await applyToSessionIfDifferent(client, sess.sessionId, s, name: name);
+        await applyToSessionIfDifferent(
+          client,
+          sess.sessionId,
+          s,
+          name: name,
+          scopeKey: scopeKey,
+        );
       }
+      unawaited(
+        RuntimeLogger.instance.info(
+          'DSH',
+          'model_injection.completed',
+          requestId: requestId,
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'ok',
+          data: {'model': s.model, 'protocol': s.apiProtocol},
+        ),
+      );
     } catch (e) {
       debugPrint('DshModelSync inject sessions failed: $e');
+      unawaited(
+        RuntimeLogger.instance.error(
+          'DSH',
+          'model_injection.sessions_failed',
+          requestId: requestId,
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'failed',
+          data: {'error': '$e'},
+        ),
+      );
     }
   }
 
@@ -783,12 +885,30 @@ class DshModelSync {
     Future<String> Function()? homeDir,
     bool allowClear = false,
     String? name,
+    String? scopeKey,
   }) async {
+    final requestId =
+        'dshsync_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'model_sync.started',
+        requestId: requestId,
+        data: {
+          'model': s.model,
+          'protocol': s.apiProtocol,
+          'baseUrl': _safeBaseUrl(s.baseUrl),
+          'allowClear': allowClear,
+          'name': name ?? '',
+        },
+      ),
+    );
     try {
+      final localProcess = DshEndpoint.isLocal(s);
       final resolveHome = homeDir ?? DshService.instance.homeDir;
-      final running = await (isRunning ?? DshService.instance.isRunning)();
+      final client = api ?? DshService.instance.apiFor(s);
+      final running = await (isRunning ?? client.rpcPing)();
       if (running) {
-        final client = api ?? DshApiClient.instance;
         try {
           await syncLive(
             s,
@@ -796,13 +916,20 @@ class DshModelSync {
             homeDir: resolveHome,
             allowClear: allowClear,
             name: name,
+            scopeKey: scopeKey,
           );
         } catch (e) {
           if (!_isMissingPiAiSettings(e)) rethrow;
+          if (!localProcess) return;
 
           // 非法 llm-pi-ai 配置会让整个命名空间加载失败，此时 live RPC
           // 已无法自救。先重写合法文件；生产环境再重启一次 DSH 让插件恢复。
-          await syncFiles(s, await resolveHome(), name: name);
+          await syncFiles(
+            s,
+            await resolveHome(),
+            name: name,
+            scopeKey: scopeKey,
+          );
           final canRestart =
               api == null && isRunning == null && homeDir == null;
           if (!canRestart) return;
@@ -810,18 +937,35 @@ class DshModelSync {
           if (!await DshService.instance.start()) return;
           await syncLive(
             s,
-            DshApiClient.instance,
+            client,
             homeDir: DshService.instance.homeDir,
             allowClear: allowClear,
             name: name,
+            scopeKey: scopeKey,
           );
         }
-      } else {
-        await syncFiles(s, await resolveHome(), name: name);
+      } else if (localProcess) {
+        await syncFiles(s, await resolveHome(), name: name, scopeKey: scopeKey);
       }
     } catch (e, st) {
       debugPrint('DshModelSync failed: $e\n$st');
+      unawaited(
+        RuntimeLogger.instance.error(
+          'DSH',
+          'model_sync.failed',
+          requestId: requestId,
+          result: 'failed',
+          data: {'error': '$e'},
+        ),
+      );
     }
+  }
+
+  static String _safeBaseUrl(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null) return '<endpoint>';
+    final port = uri.hasPort ? ':${uri.port}' : '';
+    return '${uri.scheme}://${uri.host}$port${uri.path}';
   }
 
   @visibleForTesting
@@ -831,12 +975,16 @@ class DshModelSync {
     Future<String> Function()? homeDir,
     bool allowClear = false,
     String? name,
+    String? scopeKey,
   }) async {
-    final home = await (homeDir ?? DshService.instance.homeDir)();
-    await writeSearchConfig(home, s);
-    await cleanupLegacySearchSettingsFile(home);
-    final target = await _targetProvider(s, name: name);
-    await syncAgentDefaultModelPatch(home, s, provider: target.id);
+    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
+    String? home;
+    if (DshEndpoint.isLocal(s)) {
+      home = await (homeDir ?? DshService.instance.homeDir)();
+      await writeSearchConfig(home, s);
+      await cleanupLegacySearchSettingsFile(home);
+      await syncAgentDefaultModelPatch(home, s, provider: target.id);
+    }
     if (canWriteProvider(s)) {
       final responseModels = await responseModelsFor(s);
       final catalogModels = await cachedModelCatalogFor(s);
@@ -877,7 +1025,7 @@ class DshModelSync {
 
     await syncCredential(target.env, s.apiKey.trim());
     await syncCredential(searchCredentialEnv, effectiveSearchKey(s));
-    if (!credentialsOk) {
+    if (!credentialsOk && home != null) {
       await writeCredentialsFile(
         home,
         s.apiKey.trim(),
@@ -892,6 +1040,7 @@ class DshModelSync {
     AppSettings s,
     String home, {
     String? name,
+    String? scopeKey,
   }) async {
     await _withFileSyncLock<void>(() async {
       await Directory(home).create(recursive: true);
@@ -903,7 +1052,7 @@ class DshModelSync {
         await File('${file.path}.corrupt').writeAsString(yaml, flush: true);
         yaml = '';
       }
-      final target = await _targetProvider(s, name: name);
+      final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
       if (canWriteProvider(s)) {
         final responseModels = await responseModelsFor(s);
         final catalogModels = await cachedModelCatalogFor(s);
@@ -1312,9 +1461,10 @@ class DshModelSync {
     String sessionId,
     AppSettings s, {
     String? name,
+    String? scopeKey,
   }) async {
     if (!canWriteProvider(s) || sessionId.isEmpty) return;
-    final target = await _targetProvider(s, name: name);
+    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
     await api.selectModel(sessionId, target.id, s.model.trim());
   }
 
@@ -1324,9 +1474,10 @@ class DshModelSync {
     String sessionId,
     AppSettings s, {
     String? name,
+    String? scopeKey,
   }) async {
     if (!canWriteProvider(s) || sessionId.isEmpty) return;
-    final target = await _targetProvider(s, name: name);
+    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
     try {
       final models = await api.sessionModels(sessionId);
       if (models.current.provider == target.id &&
@@ -1336,15 +1487,16 @@ class DshModelSync {
     } catch (_) {
       return;
     }
-    await applyToSession(api, sessionId, s, name: name);
+    await applyToSession(api, sessionId, s, name: name, scopeKey: scopeKey);
   }
 
   /// 会话已经选过模型时不要覆盖，避免打开旧会话把用户选择冲掉。
   static Future<void> syncSessionToAppModel(
     DshApiClient api,
     String sessionId,
-    AppSettings s,
-  ) async {
+    AppSettings s, {
+    String? scopeKey,
+  }) async {
     if (!canWriteProvider(s) || sessionId.isEmpty) return;
     try {
       final models = await api.sessionModels(sessionId);
@@ -1352,7 +1504,7 @@ class DshModelSync {
     } catch (_) {
       return;
     }
-    await applyToSession(api, sessionId, s);
+    await applyToSession(api, sessionId, s, scopeKey: scopeKey);
   }
 
   /// DSH 0.1.1 `credentialRef`：POSIX 标识符。顶层只认 version / refs / records。

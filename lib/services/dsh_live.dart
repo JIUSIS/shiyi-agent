@@ -220,8 +220,13 @@ class DshWsDownlink {
   static Uri uriFor(String httpBase, String path) {
     final base = Uri.parse(httpBase);
     final scheme = base.scheme == 'https' ? 'wss' : 'ws';
-    final prefix = path.startsWith('/') ? path : '/api/$path';
-    return base.replace(scheme: scheme, path: prefix);
+    final suffix = path.startsWith('/') ? path : '/api/$path';
+    var root = base.path;
+    if (root.endsWith('/') && root.length > 1) {
+      root = root.substring(0, root.length - 1);
+    }
+    final fullPath = (root.isEmpty || root == '/') ? suffix : '$root$suffix';
+    return base.replace(scheme: scheme, path: fullPath);
   }
 
   /// 解开一条下行文本。兼容 ServerRequest 信封、裸 MuxFrame、SSE data: 行。
@@ -271,16 +276,15 @@ class DshWsDownlink {
     String httpBase,
     String path, {
     Future<WebSocket> Function(Uri uri)? open,
+    Map<String, dynamic>? headers,
   }) async* {
     final uri = uriFor(httpBase, path);
     final httpScheme = uri.scheme == 'wss' ? 'https' : 'http';
     final origin = '$httpScheme://${uri.authority}';
+    final merged = <String, dynamic>{'Origin': origin, ...?headers};
     final ws = open != null
         ? await open(uri)
-        : await WebSocket.connect(
-            uri.toString(),
-            headers: <String, dynamic>{'Origin': origin},
-          );
+        : await WebSocket.connect(uri.toString(), headers: merged);
     try {
       await for (final raw in ws) {
         if (raw is! String) continue;

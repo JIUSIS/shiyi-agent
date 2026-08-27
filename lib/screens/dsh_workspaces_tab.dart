@@ -27,6 +27,7 @@ import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
 import 'dsh_center_screen.dart';
 import 'dsh_chat_screen.dart';
+import 'dsh_files_screen.dart';
 
 const _iosBlue = Color(0xFF0A84FF);
 const _iosRed = Color(0xFFFF3B30);
@@ -267,6 +268,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   String? _error;
   bool _busy = false;
   bool _hasCache = false;
+  String? _offlineCacheReason;
 
   final TextEditingController _searchCtrl = TextEditingController();
   final FocusNode _searchFocus = FocusNode();
@@ -274,7 +276,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   String _query = '';
   List<DshSessionSummary>? _searchHits;
   bool _searching = false;
-  int _pollTick = 0;
 
   /// 已展开的分组：工作区 id；默认展开默认工作区。
   final Set<String> _expandedGroups = <String>{};
@@ -326,7 +327,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   final List<double> _workspaceHeights = [];
   final List<double> _workspaceCenters = [];
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   /// 默认工作区：链接软件默认 agent 目录（FileWorkspace.defaultWorkspacePath）。
   /// 优先按路径匹配，兜底第一个工作区。
@@ -356,12 +357,10 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     // 缓存先落位再刷新：有缓存时 _load 不显示加载页，列表直接可见。
     unawaited(_loadCache().then((_) => _load()));
     DshService.instance.status.addListener(_onDshStatus);
-    // 思考中 3s 刷一次，让红绿灯跟着转；平时 30s。
-    _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+    // 远端列表可能由其他设备修改，空闲时也要同步工作区与会话。
+    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (!mounted) return;
-      _pollTick++;
-      final running = _sessions.any((s) => s.running);
-      if (running || _pollTick % 10 == 0) _loadSessions(silent: true);
+      unawaited(_load(quiet: true));
     });
   }
 
@@ -401,6 +400,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _loading = false;
         _hasCache = true;
         _error = null;
+        _offlineCacheReason = null;
         _applyExpandedPrefs();
       });
     } catch (_) {
@@ -410,9 +410,16 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   Timer? _refreshTimer;
   Timer? _retryTimer;
+  Future<void>? _refreshInFlight;
+  bool _refreshQueued = false;
+  bool _refreshQueuedLoud = false;
 
   void _onDshStatus() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    if (DshService.instance.status.value == DshStatus.running) {
+      unawaited(_load(quiet: true));
+    }
   }
 
   @override
@@ -430,7 +437,35 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     super.dispose();
   }
 
-  Future<void> _load({bool quiet = false}) async {
+  Future<void> _load({bool quiet = false}) {
+    if (!mounted) return Future<void>.value();
+    final inFlight = _refreshInFlight;
+    if (inFlight != null) {
+      _refreshQueued = true;
+      if (!quiet) _refreshQueuedLoud = true;
+      return inFlight;
+    }
+
+    final refresh = _runLoad(quiet: quiet);
+    _refreshInFlight = refresh;
+    unawaited(
+      refresh.whenComplete(() {
+        if (identical(_refreshInFlight, refresh)) _refreshInFlight = null;
+        if (!mounted || !_refreshQueued) {
+          _refreshQueued = false;
+          _refreshQueuedLoud = false;
+          return;
+        }
+        final queuedQuiet = !_refreshQueuedLoud;
+        _refreshQueued = false;
+        _refreshQueuedLoud = false;
+        unawaited(_load(quiet: queuedQuiet));
+      }),
+    );
+    return refresh;
+  }
+
+  Future<void> _runLoad({required bool quiet}) async {
     final hasCache =
         _hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty;
     // 跨组提交中不要先 setState：本地名单还是旧归属时源槽会被撑开。
@@ -444,13 +479,12 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     final reason = await DshService.instance.unavailableReason();
     if (reason != null) {
       if (!mounted) return;
-      if (!quiet || !hasCache) {
-        setState(() {
-          _loading = false;
-          // 有缓存时保留列表，服务未就绪只后台轮询，不拿错误页盖住主页。
-          _error = hasCache ? null : reason;
-        });
-      }
+      setState(() {
+        _loading = false;
+        // 有缓存时保留列表，但必须明确标出这是离线快照，不能伪装成已连接。
+        _error = hasCache ? null : reason;
+        _offlineCacheReason = hasCache ? reason : null;
+      });
       _scheduleServiceRetry();
       return;
     }
@@ -464,7 +498,9 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _api.listSessions,
         recover: false,
       );
-      if (r.items.isEmpty && mounted) {
+      if (r.items.isEmpty &&
+          mounted &&
+          DshService.instance.managesLocalProcess) {
         // 没有工作区时自动创建：链接软件默认 agent 目录。
         try {
           await DshService.instance.withRecover(
@@ -482,6 +518,8 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _sessions = list;
         _loading = false;
         _hasCache = true;
+        _error = null;
+        _offlineCacheReason = null;
         _applyExpandedPrefs();
         _reapplyPendingMove();
       });
@@ -499,6 +537,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       setState(() {
         _loading = false;
         _error = hasCache ? null : (hint ?? '$e');
+        _offlineCacheReason = hasCache ? (hint ?? '$e') : null;
       });
       if (hint != null || hasCache) _scheduleServiceRetry();
     }
@@ -516,11 +555,16 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _retryTimer = null;
         await _load();
       } else {
-        // 有缓存时保留列表，只让顶部「后台启动中」提示服务状态；
-        // 没有缓存才显示错误页。
+        // 有缓存时保留列表并标出离线状态；没有缓存才显示错误页。
         setState(() {
-          if (!_hasCache && _workspaces.isEmpty && _sessions.isEmpty) {
+          final hasCache =
+              _hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty;
+          if (hasCache) {
+            _error = null;
+            _offlineCacheReason = reason;
+          } else {
             _error = reason;
+            _offlineCacheReason = null;
           }
         });
       }
@@ -558,32 +602,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     return dshSaveExpandedWorkspaceIds(_expandedGroups);
   }
 
-  Future<void> _loadSessions({bool silent = false}) async {
-    if (_crossDropCommitting) return;
-    try {
-      final list = await _api.listSessions();
-      if (!mounted) return;
-      setState(() {
-        _sessions = list;
-        _hasCache = true;
-      });
-      unawaited(
-        dshWriteWorkspaceListCache(
-          workspaces: _workspaces,
-          sessions: _sessions,
-          archivedSessionIds: _archivedSessionIds,
-        ),
-      );
-    } catch (_) {
-      if (!silent &&
-          mounted &&
-          !_hasCache &&
-          _workspaces.isEmpty &&
-          _sessions.isEmpty) {
-        setState(() => _error = '会话列表刷新失败');
-      }
-    }
-  }
+  Future<void> _loadSessions({bool silent = false}) => _load(quiet: silent);
 
   // ── 搜索（本地过滤标题/路径） ───────────────────────────────────────
 
@@ -899,37 +918,15 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     _toast('已复制会话 ID');
   }
 
-  Future<void> _showWorkspaceFolder(DshWorkspace w) async {
-    final action = await showIosFadeModalPopup<String>(
-      context: context,
-      builder: (ctx) => CupertinoTheme(
-        data: iosCupertinoTheme(context),
-        child: CupertinoActionSheet(
-          title: Text(
-            '「${_displayName(w)}」工作目录',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          message: Text(w.path, maxLines: 3, overflow: TextOverflow.ellipsis),
-          actions: [
-            CupertinoActionSheetAction(
-              onPressed: () => Navigator.pop(ctx, 'open'),
-              child: const Text('打开文件夹'),
-            ),
-          ],
-          cancelButton: CupertinoActionSheetAction(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-        ),
+  void _showWorkspaceFolder(DshWorkspace w) {
+    if (!mounted || w.path.trim().isEmpty) return;
+    Navigator.push(
+      context,
+      MacPageRoute(
+        builder: (_) =>
+            DshFilesScreen(shiyi: widget.shiyi, initialPath: w.path),
       ),
     );
-    if (action != 'open' || !mounted) return;
-    try {
-      await _api.openPath(w.path);
-    } catch (e) {
-      _toast('无法打开：$e');
-    }
   }
 
   Future<void> _moveSession(DshSessionSummary s) async {
@@ -982,7 +979,12 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       final id = await _api.createSession(workspaceId: w.workspaceId);
       if (!mounted || id.isEmpty) return;
       try {
-        await DshModelSync.applyToSession(_api, id, widget.shiyi.settings);
+        await DshModelSync.applyToSession(
+          _api,
+          id,
+          widget.shiyi.settings,
+          scopeKey: DshService.instance.currentScopeKey,
+        );
       } catch (_) {}
       try {
         await DshChatCache.writeContextLimit(
@@ -1133,6 +1135,44 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                         ),
                       ),
                     ],
+                  ),
+                ),
+              if (_hasCache && _offlineCacheReason != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Material(
+                    color: CupertinoColors.systemOrange.withValues(alpha: .1),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(10, 6, 4, 6),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            CupertinoIcons.wifi_slash,
+                            size: 15,
+                            color: CupertinoColors.systemOrange,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              '正在显示离线缓存 · ${_offlineCacheReason!}',
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Theme.of(context).hintColor,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: _load,
+                            tooltip: '重新连接',
+                            visualDensity: VisualDensity.compact,
+                            icon: const Icon(CupertinoIcons.refresh, size: 16),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               Expanded(child: ClipRect(child: _buildBody())),
@@ -2420,7 +2460,9 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     } on DshApiException catch (e) {
       if (e.code != 'plugin-missing') rethrow;
     }
-    await DshService.instance.start();
+    if (DshService.instance.managesLocalProcess) {
+      await DshService.instance.start();
+    }
     try {
       return await _api.moveSessionToWorkspace(
         sessionId: sessionId,

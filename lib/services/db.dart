@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,6 +8,7 @@ import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../core/models.dart';
+import 'runtime_logger.dart';
 
 class AppDatabase {
   static final AppDatabase _instance = AppDatabase._();
@@ -27,6 +29,7 @@ class AppDatabase {
   }
 
   Future<Database> _open() async {
+    final started = DateTime.now();
     try {
       // Windows 桌面端 sqflite 没有原生实现：切换到 FFI（sqlite3.dll）。
       // Android/iOS 继续走默认原生实现。全局 databaseFactory 赋值是幂等的。
@@ -40,7 +43,7 @@ class AppDatabase {
           : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 21,
+        version: 22,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -55,8 +58,24 @@ class AppDatabase {
         },
       );
       _db = db;
+      await RuntimeLogger.instance.info(
+        '数据库',
+        'database.opened',
+        durationMs: DateTime.now().difference(started).inMilliseconds,
+        result: 'ok',
+        data: {'version': 22},
+      );
       return db;
-    } catch (_) {
+    } catch (e) {
+      unawaited(
+        RuntimeLogger.instance.error(
+          '数据库',
+          'database.open_failed',
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'failed',
+          data: {'error': '$e'},
+        ),
+      );
       // 打开失败：重置共享 future，允许下次调用重试
       //（否则失败的 future 会被永久缓存，本进程内 DB 层彻底失效）。
       _opening = null;
@@ -71,6 +90,7 @@ class AppDatabase {
       title TEXT NOT NULL,
       model TEXT,
       api_profile TEXT,
+      api_profile_id TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -326,6 +346,13 @@ class AppDatabase {
     if (oldV < 21) {
       await _ensureReasoningEncryptedColumn(db);
     }
+    // v21 -> v22：sessions 绑定 API 配置稳定 ID，避免同一接口地址的配置串线。
+    if (oldV < 22) {
+      final cols = await db.rawQuery('PRAGMA table_info(sessions)');
+      if (!cols.any((c) => c['name'] == 'api_profile_id')) {
+        await db.execute('ALTER TABLE sessions ADD COLUMN api_profile_id TEXT');
+      }
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -360,6 +387,9 @@ class AppDatabase {
     }
     if (!sessionCols.any((c) => c['name'] == 'api_profile')) {
       await db.execute('ALTER TABLE sessions ADD COLUMN api_profile TEXT');
+    }
+    if (!sessionCols.any((c) => c['name'] == 'api_profile_id')) {
+      await db.execute('ALTER TABLE sessions ADD COLUMN api_profile_id TEXT');
     }
     if (!sessionCols.any((c) => c['name'] == 'context_limit')) {
       await db.execute(
@@ -517,6 +547,7 @@ class AppDatabase {
     String? title,
     String? model,
     String? apiProfile,
+    String? apiProfileId,
     int? contextLimit,
   }) async {
     final db = await this.db;
@@ -525,6 +556,7 @@ class AppDatabase {
     if (title != null) updates['title'] = title;
     if (model != null) updates['model'] = model;
     if (apiProfile != null) updates['api_profile'] = apiProfile;
+    if (apiProfileId != null) updates['api_profile_id'] = apiProfileId;
     if (contextLimit != null) updates['context_limit'] = contextLimit;
     await db.update('sessions', updates, where: 'id = ?', whereArgs: [id]);
   }
@@ -564,12 +596,7 @@ class AppDatabase {
       'project_id': projectId == null || projectId.isEmpty ? null : projectId,
     };
     if (sortOrder != null) updates['sort_order'] = sortOrder;
-    await db.update(
-      'sessions',
-      updates,
-      where: 'id = ?',
-      whereArgs: [id],
-    );
+    await db.update('sessions', updates, where: 'id = ?', whereArgs: [id]);
   }
 
   /// 按给定 id 顺序写入项目 sort_order（下标即顺序）。

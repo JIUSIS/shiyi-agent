@@ -22,6 +22,7 @@ import '../services/subagent.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
 import '../services/notifier.dart';
+import '../services/android_background_service.dart';
 import '../services/socks5_config.dart';
 import 'presence_engine.dart';
 import 'prompt_builder.dart';
@@ -29,6 +30,7 @@ import 'prompt_section.dart';
 import 'session_bridge.dart';
 import 'tool_result_pruner.dart';
 import 'tool_output_spill.dart';
+import '../services/runtime_logger.dart';
 
 /// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
 /// readOnly=true 的工具在计划模式（planMode）下仍然可用；
@@ -121,6 +123,9 @@ class _SessionRun {
   bool stopRequested = false;
   bool stopForGuide = false;
   bool guideWaiting = false;
+  Completer<void>? completion;
+  final Set<LlmClient> activeLlmClients = <LlmClient>{};
+  final Set<Process> activeProcesses = <Process>{};
   ChatMessage? streaming;
   String? status;
   Map<String, dynamic>? pendingQuestion;
@@ -335,6 +340,11 @@ class ShiyiState extends ChangeNotifier {
   /// 刷新已保存配置列表（设置页写入后调用）。
   Future<void> reloadApiProfiles({bool notify = true}) async {
     apiProfiles = await _settingsService.loadProfiles();
+    if (settings.apiProfileId.trim().isEmpty) {
+      final matched = profileMatchingSettings(settings, apiProfiles);
+      if (matched != null) settings.apiProfileId = matched.profileId;
+    }
+    await _migrateSessionProfileIds();
     await reloadModelCatalogs(notify: false);
     if (notify) notifyListeners();
   }
@@ -348,9 +358,10 @@ class ShiyiState extends ChangeNotifier {
           baseUrl: p.baseUrl,
           apiProtocol: p.apiProtocol,
           model: p.model,
+          apiProfileId: p.profileId,
         ),
       );
-      next[p.name] = ids;
+      next[p.profileId] = ids;
     }
     modelCatalogsByProfile = next;
     if (notify) notifyListeners();
@@ -360,12 +371,13 @@ class ShiyiState extends ChangeNotifier {
   List<String> cachedModelsForProfile(ApiProfile profile) {
     final ids = <String>{
       if (profile.model.trim().isNotEmpty) profile.model.trim(),
+      ...?modelCatalogsByProfile[profile.profileId],
       ...?modelCatalogsByProfile[profile.name],
     };
     return ids.toList()..sort();
   }
 
-  /// 当前会话绑定的已保存配置；旧会话没有绑定时按模型/全局设置回退。
+  /// 当前会话绑定的已保存配置。稳定 ID 严格匹配，旧名称仅用于兼容迁移。
   ApiProfile? profileForSession(String? sessionId) {
     if (sessionId == null) {
       return profileMatchingSettings(settings, apiProfiles);
@@ -377,23 +389,28 @@ class ShiyiState extends ChangeNotifier {
         break;
       }
     }
+    final profileId = sess?.apiProfileId.trim() ?? '';
+    if (profileId.isNotEmpty) {
+      for (final p in apiProfiles) {
+        if (p.profileId == profileId) return p;
+      }
+      return null;
+    }
     final name = sess?.apiProfile.trim() ?? '';
     if (name.isNotEmpty) {
       for (final p in apiProfiles) {
         if (p.name == name) return p;
       }
-    }
-    final model = sess?.model.trim() ?? '';
-    if (model.isNotEmpty) {
-      for (final p in apiProfiles) {
-        if (p.model.trim() == model) return p;
-      }
-      for (final p in apiProfiles) {
-        if (cachedModelsForProfile(p).contains(model)) return p;
-      }
+      return null;
     }
     return profileMatchingSettings(settings, apiProfiles);
   }
+
+  bool _sessionHasMissingProfile(Session? session) =>
+      session != null &&
+      (session.apiProfileId.trim().isNotEmpty ||
+          session.apiProfile.trim().isNotEmpty) &&
+      profileForSession(session.id) == null;
 
   /// 拾忆主请求使用的会话级接口配置；未绑定时回退全局设置。
   /// 上下文上限优先用本会话自定义，0 / 未绑定则用全局「新建会话默认」。
@@ -413,6 +430,14 @@ class ShiyiState extends ChangeNotifier {
     );
     final p = profileForSession(sessionId);
     if (p == null) {
+      if (_sessionHasMissingProfile(sess)) {
+        return settings.copyWith(
+          apiKey: '',
+          model: sess!.model.trim(),
+          apiProfileId: sess.apiProfileId.trim(),
+          contextLimit: limit,
+        );
+      }
       final sessionModel = sess?.model.trim() ?? '';
       if (sessionModel.isEmpty && limit == settings.contextLimit) {
         return settings;
@@ -425,11 +450,12 @@ class ShiyiState extends ChangeNotifier {
     final sessionModel = sess?.model.trim() ?? '';
     return settings.copyWith(
       baseUrl: p.baseUrl,
-      apiKey: p.apiKey.isNotEmpty ? p.apiKey : settings.apiKey,
+      apiKey: p.apiKey,
       model: sessionModel.isNotEmpty
           ? sessionModel
           : (p.model.isNotEmpty ? p.model : settings.model),
       apiProtocol: p.apiProtocol,
+      apiProfileId: p.profileId,
       contextLimit: limit,
     );
   }
@@ -462,11 +488,13 @@ class ShiyiState extends ChangeNotifier {
       sessionId,
       model: chosen.isEmpty ? settings.model : chosen,
       apiProfile: profile.name,
+      apiProfileId: profile.profileId,
     );
     for (final s in sessions) {
       if (s.id == sessionId) {
         s.model = chosen.isEmpty ? settings.model : chosen;
         s.apiProfile = profile.name;
+        s.apiProfileId = profile.profileId;
       }
     }
     notifyListeners();
@@ -507,6 +535,16 @@ class ShiyiState extends ChangeNotifier {
     if (bumpRevision || oldBusy != isBusy) busyRevision.value++;
     if (preferred != null && preferred.sessionId == currentSessionId) {
       _syncCurrentRunView(preferred);
+    }
+    // Android 前台服务只在确有生成任务时运行；拾忆与 DSH 注入链路共用
+    // 当前 Flutter 进程，因此后台继续沿用现有会话隔离、流式和落库逻辑。
+    if (Platform.isAndroid) {
+      final activeSessions = _sessionRuns.values
+          .where((run) => run.active)
+          .length;
+      unawaited(
+        AndroidBackgroundService.instance.sync(activeSessions: activeSessions),
+      );
     }
   }
 
@@ -686,6 +724,29 @@ class ShiyiState extends ChangeNotifier {
         },
         readOnly: true,
         execute: (self, args) => self._execReadSession(args),
+      ),
+      AgentTool(
+        name: 'inspect_runtime',
+        description:
+            '查看拾忆 App 的结构化运行审计日志，用于自查请求、协议、缓存、DSH 注入、'
+            '工具、终端、文件、会话、LAAP 和错误。默认返回最近记录；可按模块、级别、'
+            '关键词筛选。需要全貌诊断时使用 snapshot=true。日志中的 API Key、Token、Cookie 已脱敏。',
+        parameters: {
+          'type': 'object',
+          'properties': {
+            'module': {'type': 'string', 'description': '模块过滤，如 LLM、DSH、工具、会话'},
+            'level': {
+              'type': 'string',
+              'enum': ['info', 'warn', 'error'],
+              'description': '日志级别过滤',
+            },
+            'query': {'type': 'string', 'description': '事件、结果或详情关键词'},
+            'limit': {'type': 'integer', 'description': '最多返回多少条，默认 80，最多 300'},
+            'snapshot': {'type': 'boolean', 'description': '返回诊断摘要与最近记录'},
+          },
+        },
+        readOnly: true,
+        execute: (self, args) => self._execInspectRuntime(args),
       ),
       AgentTool(
         name: 'search_memory',
@@ -966,18 +1027,48 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> init() async {
     if (loaded) return;
+    final started = DateTime.now();
+    unawaited(RuntimeLogger.instance.info('App', 'state.init.started'));
     try {
       settings = await _settingsService.load();
       Socks5Proxy.apply(settings);
+      DshService.instance.applyConnection(settings);
       apiProfiles = await _settingsService.loadProfiles();
+      final matchedProfile = profileMatchingSettings(settings, apiProfiles);
+      if (matchedProfile != null) {
+        settings.apiProfileId = matchedProfile.profileId;
+      }
       await reloadModelCatalogs(notify: false);
       // 同步 DSH 代理开关到服务单例。
       DshService.instance.useProxyEnabled = settings.dshUseProxy;
       await FileWorkspace.ensure();
       await _reloadAll();
       loadedNotifier.value = true;
+      unawaited(
+        RuntimeLogger.instance.info(
+          'App',
+          'state.init.completed',
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'ok',
+          data: {
+            'sessions': sessions.length,
+            'projects': projects.length,
+            'memories': memories.length,
+            'skills': skills.length,
+          },
+        ),
+      );
     } catch (e) {
       initErrorNotifier.value = '$e';
+      unawaited(
+        RuntimeLogger.instance.error(
+          'App',
+          'state.init.failed',
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'failed',
+          data: {'error': '$e'},
+        ),
+      );
     }
     notifyListeners();
     // 后台安装内嵌 Termux（完整 Linux 环境），不阻塞启动。
@@ -1060,12 +1151,31 @@ class ShiyiState extends ChangeNotifier {
       // 上次退出时处于 DSH 引擎：冷启动后自动拉起已安装的 DSH；
       // 拾忆退出 / 未安装不自动启动。切换引擎本身不触发，只影响下次启动。
       if (settings.agentEngine == 'dsh' && await _lastEngineWasDsh()) {
-        // 先落盘合法配置再启动：上次写入若残留非法 YAML（如 API key
-        // 粘贴带入换行 → .credentials.yaml 解析失败），DSH 启动即崩，
-        // 文件路径同步会清洗重写（DSH 未运行时不走 live）。
-        await DshModelSync.syncFromShiyi(settings);
-        final ok = await DshService.instance.ensureRunning();
-        if (ok) await DshModelSync.syncFromShiyi(settings);
+        DshService.instance.applyConnection(settings);
+        if (DshService.instance.managesLocalProcess) {
+          // 先落盘合法配置再启动：上次写入若残留非法 YAML（如 API key
+          // 粘贴带入换行 → .credentials.yaml 解析失败），DSH 启动即崩，
+          // 文件路径同步会清洗重写（DSH 未运行时不走 live）。
+          await DshModelSync.syncFromShiyi(
+            settings,
+            scopeKey: DshService.instance.currentScopeKey,
+          );
+          final ok = await DshService.instance.ensureRunning();
+          if (ok) {
+            await DshModelSync.syncFromShiyi(
+              settings,
+              scopeKey: DshService.instance.currentScopeKey,
+            );
+          }
+        } else {
+          await DshService.instance.refreshStatus();
+          if (await DshService.instance.isRunning()) {
+            await DshModelSync.syncFromShiyi(
+              settings,
+              scopeKey: DshService.instance.currentScopeKey,
+            );
+          }
+        }
       }
     } catch (e) {
       await _logError('Termux', '$e');
@@ -1076,10 +1186,30 @@ class ShiyiState extends ChangeNotifier {
 
   Future<void> _reloadAll() async {
     sessions = await _db.listSessions();
+    await _migrateSessionProfileIds();
     projects = await _db.listProjects();
     _rebuildProjectIndex();
     memories = await _db.listMemories();
     skills = await _db.listSkills();
+  }
+
+  Future<void> _migrateSessionProfileIds() async {
+    for (final session in sessions) {
+      if (session.apiProfileId.trim().isNotEmpty ||
+          session.apiProfile.trim().isEmpty) {
+        continue;
+      }
+      ApiProfile? match;
+      for (final profile in apiProfiles) {
+        if (profile.name == session.apiProfile) {
+          match = profile;
+          break;
+        }
+      }
+      if (match == null) continue;
+      session.apiProfileId = match.profileId;
+      await _db.touchSession(session.id, apiProfileId: match.profileId);
+    }
   }
 
   void _rebuildProjectIndex() {
@@ -1169,6 +1299,8 @@ class ShiyiState extends ChangeNotifier {
         title: '新会话 ${_fmtStamp(DateTime.now())}',
         model: settings.model,
         apiProfile: profileMatchingSettings(settings, apiProfiles)?.name ?? '',
+        apiProfileId:
+            profileMatchingSettings(settings, apiProfiles)?.profileId ?? '',
         createdAt: now,
         updatedAt: now,
         projectId: projectId,
@@ -1177,6 +1309,18 @@ class ShiyiState extends ChangeNotifier {
       ),
     );
     currentSessionId = id;
+    unawaited(
+      RuntimeLogger.instance.info(
+        '会话',
+        'session.created',
+        sessionId: id,
+        data: {
+          'projectId': projectId,
+          'model': settings.model,
+          'protocol': settings.apiProtocol,
+        },
+      ),
+    );
     messages = [];
     _bumpMessages();
     _messagesLoadedForSessionId = id;
@@ -1205,6 +1349,9 @@ class ShiyiState extends ChangeNotifier {
     _clearTrimNotice();
     currentSessionId = id;
     viewingSessionId = id;
+    unawaited(
+      RuntimeLogger.instance.info('会话', 'session.selected', sessionId: id),
+    );
     unreadSessions.remove(id);
     loadedSkills.clear();
     messages = await _db.listMessages(id);
@@ -2107,6 +2254,24 @@ class ShiyiState extends ChangeNotifier {
     final run = _runFor(targetSessionId);
     if (run.active) return;
     final clientSettings = clientSettingsForSession(targetSessionId);
+    final sendStarted = DateTime.now();
+    final sendRequestId =
+        'turn_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    unawaited(
+      RuntimeLogger.instance.info(
+        '会话',
+        'turn.started',
+        sessionId: targetSessionId,
+        requestId: sendRequestId,
+        data: {
+          'chars': trimText.length,
+          'model': clientSettings.model,
+          'protocol': clientSettings.apiProtocol,
+          'hasImages':
+              trimText.contains('[image:') || trimText.contains('[[image:'),
+        },
+      ),
+    );
     if (clientSettings.apiKey.isEmpty || clientSettings.model.isEmpty) {
       run.status = '请先在设置中配置 API 密钥与模型';
       _publishRun(run);
@@ -2119,6 +2284,7 @@ class ShiyiState extends ChangeNotifier {
       ..stopRequested = false
       ..stopForGuide = false
       ..guideWaiting = false
+      ..completion = Completer<void>()
       ..status = null
       ..streaming = null
       ..resetLastRoundStats()
@@ -2134,6 +2300,7 @@ class ShiyiState extends ChangeNotifier {
     _refreshBusySummary(preferred: run, bumpRevision: true);
     _publishRun(run);
 
+    var turnFailed = false;
     try {
       if (currentSessionId == targetSessionId) {
         viewingSessionId = targetSessionId;
@@ -2196,9 +2363,26 @@ class ShiyiState extends ChangeNotifier {
       }
 
       await _generateWithHistory(run, firstAsst, systemHint: cleanText);
+    } on LlmCancelledException {
+      // 用户主动停止不算生成错误；保留已输出内容并立即收口占位消息。
+      await _finalizeAbort(run, run.streaming);
+      run.status = null;
+      _publishRun(run);
     } catch (e) {
+      turnFailed = true;
       run.status = '错误: $e';
       await _logError('生成', '$e');
+      unawaited(
+        RuntimeLogger.instance.error(
+          '会话',
+          'turn.failed',
+          sessionId: targetSessionId,
+          requestId: sendRequestId,
+          durationMs: DateTime.now().difference(sendStarted).inMilliseconds,
+          result: 'failed',
+          data: {'error': '$e'},
+        ),
+      );
       final st = run.streaming;
       if (st != null) {
         st.streaming = false;
@@ -2208,6 +2392,23 @@ class ShiyiState extends ChangeNotifier {
       if (currentSessionId == targetSessionId) _bumpMessages();
       _publishRun(run);
     } finally {
+      unawaited(
+        RuntimeLogger.instance.log(
+          level: turnFailed ? 'error' : 'info',
+          module: '会话',
+          event: turnFailed ? 'turn.failed' : 'turn.completed',
+          sessionId: targetSessionId,
+          requestId: sendRequestId,
+          durationMs: DateTime.now().difference(sendStarted).inMilliseconds,
+          result: turnFailed ? 'failed' : 'ok',
+          data: {
+            'lastRoundTokens': run.lastRoundTokens,
+            'lastRoundCachedTokens': run.lastRoundCachedTokens,
+            'lastRoundPromptTokens': run.lastRoundPromptTokens,
+            'cacheKnown': run.lastRoundCacheKnown,
+          },
+        ),
+      );
       run
         ..active = false
         ..streaming = null
@@ -2235,6 +2436,10 @@ class ShiyiState extends ChangeNotifier {
         }
       }
       _publishRun(run);
+      final completion = run.completion;
+      if (completion != null && !completion.isCompleted) {
+        completion.complete();
+      }
     }
     // 输出完成后后台提炼记忆，不阻塞界面（busy 已释放）。
     unawaited(_maybeAutoRefine(targetSessionId));
@@ -2416,37 +2621,15 @@ class ShiyiState extends ChangeNotifier {
         ..status = '正在打断当前回复…';
       _publishRun(run);
       stopSession(targetSessionId);
-      var waited = 0;
-      // 兜底超时：stopSession() 已释放该会话的阻塞点（含挂起的 question），
-      // 12 秒仍未退出说明有异常卡死，强置空闲避免应用永久不可交互。
-      while (run.active && waited < 150) {
-        await Future.delayed(const Duration(milliseconds: 80));
-        waited++;
+      final completion = run.completion;
+      if (completion != null) {
+        await completion.future;
       }
       run
         ..guideWaiting = false
         ..stopForGuide = false
         ..status = null;
       _publishRun(run);
-      if (run.active) {
-        // 先给旧循环最多 3 秒真正退出（stop 已释放 question/流式阻塞点），
-        // 避免强置空闲后旧循环的工具仍在写 DB 造成双写。
-        var grace = 0;
-        while (run.streaming != null && grace < 40) {
-          await Future.delayed(const Duration(milliseconds: 80));
-          grace++;
-        }
-        if (run.streaming != null) {
-          await _logError('引导', '引导发送等待超时，强置空闲（isBusy 卡死兜底）');
-          run
-            ..active = false
-            ..streaming = null;
-          run.streamText.value = '';
-          run.streamReasoning.value = '';
-          _refreshBusySummary(preferred: run, bumpRevision: true);
-          _publishRun(run);
-        }
-      }
     }
     await send(text, sessionId: targetSessionId);
     return true;
@@ -2862,9 +3045,48 @@ class ShiyiState extends ChangeNotifier {
     final run = _existingRun(sessionId);
     if (run?.active != true) return;
     run!.stopRequested = true;
+    run.status = '正在停止…';
     // 释放该会话挂起的 question，避免主循环永久阻塞。
     _releasePendingQuestion(run, '（已中断）');
+    for (final client in List<LlmClient>.of(run.activeLlmClients)) {
+      client.cancel();
+    }
+    for (final process in List<Process>.of(run.activeProcesses)) {
+      _interruptAgentProcess(run, process);
+    }
     _publishRun(run);
+  }
+
+  /// 中断 run_terminal 的当前进程；先发中断，再短延迟强杀，避免工具进程
+  /// 卡住时引导消息一直等不到旧回合退出。
+  void _interruptAgentProcess(_SessionRun run, Process process) {
+    try {
+      process.stdin.add([0x03]);
+      unawaited(process.stdin.flush());
+    } catch (_) {}
+    try {
+      process.kill(ProcessSignal.sigint);
+    } catch (_) {
+      try {
+        process.kill();
+      } catch (_) {}
+    }
+    unawaited(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (!run.activeProcesses.contains(process)) return;
+      try {
+        process.kill(ProcessSignal.sigkill);
+      } catch (_) {
+        try {
+          process.kill();
+        } catch (_) {}
+      }
+      if (Platform.isWindows) {
+        try {
+          await Process.run('taskkill', ['/F', '/T', '/PID', '${process.pid}']);
+        } catch (_) {}
+      }
+    }());
   }
 
   /// 完成挂起的 question 等待（停止/退出时调用），避免主循环永久阻塞。
@@ -2893,6 +3115,7 @@ class ShiyiState extends ChangeNotifier {
       apiKey: clientSettings.apiKey,
       model: clientSettings.model,
       protocol: clientSettings.apiProtocol,
+      sessionId: sessionId,
       temperature: settings.temperature,
       maxTokens: settings.maxOutputTokens,
       tools: _activeToolsFor(planMode: run.planMode),
@@ -2946,7 +3169,12 @@ class ShiyiState extends ChangeNotifier {
         _publishRun(run);
       },
     );
-    await client.send(msgs);
+    run.activeLlmClients.add(client);
+    try {
+      await client.send(msgs);
+    } finally {
+      run.activeLlmClients.remove(client);
+    }
     // 以服务端真实 usage 作为会话上下文统计基线（Codex 口径）。
     // 工具多轮循环时每次请求都会覆盖为最新一轮的真实 total。
     final usageTotal = client.lastTotalTokens;
@@ -2983,6 +3211,35 @@ class ShiyiState extends ChangeNotifier {
         sessionId,
         run.sessionCachedTokens,
         run.sessionInputTokens,
+      );
+      unawaited(
+        RuntimeLogger.instance.info(
+          '缓存',
+          'cache.usage',
+          sessionId: sessionId,
+          data: {
+            'cachedTokens': hit,
+            'inputTokens': promptInput,
+            'hitRate': promptInput == 0 ? 0 : hit / promptInput,
+            'sessionCachedTokens': run.sessionCachedTokens,
+            'sessionInputTokens': run.sessionInputTokens,
+            'cacheKnown': true,
+          },
+        ),
+      );
+    } else {
+      unawaited(
+        RuntimeLogger.instance.warn(
+          '缓存',
+          'cache.unknown',
+          sessionId: sessionId,
+          data: {
+            'cachedTokens': cachedInput,
+            'inputTokens': promptInput,
+            'cacheKnown': false,
+            'reason': 'provider_did_not_return_cache_usage',
+          },
+        ),
       );
     }
     run.lastRoundTokens += used;
@@ -3153,6 +3410,14 @@ class ShiyiState extends ChangeNotifier {
         startedAt: DateTime.now().millisecondsSinceEpoch,
       );
       ev.id = await _db.addToolEvent(sessionId, ev);
+      unawaited(
+        RuntimeLogger.instance.info(
+          '工具',
+          'tool.started',
+          sessionId: sessionId,
+          data: {'name': tname, 'args': ev.argsSummary, 'parallel': parallel},
+        ),
+      );
       run.toolEvents.add(ev);
       events.add(ev);
     }
@@ -3220,11 +3485,27 @@ class ShiyiState extends ChangeNotifier {
     if (_isToolError(output)) {
       await _logError('工具:$tname', output);
     }
+    final finishedAt = DateTime.now().millisecondsSinceEpoch;
+    unawaited(
+      RuntimeLogger.instance.log(
+        level: _isToolError(output) ? 'error' : 'info',
+        module: '工具',
+        event: 'tool.completed',
+        sessionId: sessionId,
+        durationMs: ev.startedAt == 0 ? null : finishedAt - ev.startedAt,
+        result: _isToolError(output) ? 'failed' : 'ok',
+        data: {
+          'name': tname,
+          'summary': _summarizeOutput(output),
+          'outputChars': output.length,
+        },
+      ),
+    );
     ev
       ..done = true
       ..ok = !_isToolError(output)
       ..summary = _summarizeOutput(output)
-      ..finishedAt = DateTime.now().millisecondsSinceEpoch;
+      ..finishedAt = finishedAt;
     if (ev.id != null) {
       await _db.updateToolEvent(ev.id!, ev);
     }
@@ -3373,6 +3654,36 @@ class ShiyiState extends ChangeNotifier {
     );
   }
 
+  Future<String> _execInspectRuntime(Map<String, dynamic> args) async {
+    final limit = (int.tryParse('${args['limit'] ?? 80}') ?? 80).clamp(1, 300);
+    if (args['snapshot'] == true) {
+      return RuntimeLogger.instance.diagnosticSnapshot(limit: limit);
+    }
+    final module = (args['module'] ?? '').toString().trim().toLowerCase();
+    final level = (args['level'] ?? '').toString().trim().toLowerCase();
+    final query = (args['query'] ?? '').toString().trim().toLowerCase();
+    final all = await RuntimeLogger.instance.read(limit: 600);
+    final filtered = all
+        .where((entry) {
+          if (module.isNotEmpty &&
+              !entry.module.toLowerCase().contains(module)) {
+            return false;
+          }
+          if (level.isNotEmpty && entry.level.toLowerCase() != level) {
+            return false;
+          }
+          if (query.isNotEmpty &&
+              !entry.oneLine.toLowerCase().contains(query)) {
+            return false;
+          }
+          return true;
+        })
+        .take(limit);
+    final lines = filtered.map((entry) => entry.oneLine).toList();
+    if (lines.isEmpty) return '没有找到匹配的运行审计日志';
+    return lines.join('\n');
+  }
+
   Future<String> _execRunSkill(Map<String, dynamic> args) async {
     final name = (args['name'] ?? '').toString().trim();
     final skill = name.isEmpty ? null : await _db.getSkillByName(name);
@@ -3511,33 +3822,39 @@ class ShiyiState extends ChangeNotifier {
       final stderr = _CappedByteBuffer(64 * 1024);
       proc.stdout.listen(stdout.add);
       proc.stderr.listen(stderr.add);
-      int? exitCode;
+      final activeRun = _existingRun(args['_sessionId']?.toString());
+      activeRun?.activeProcesses.add(proc);
       try {
-        exitCode = await proc.exitCode.timeout(const Duration(seconds: 120));
-      } on TimeoutException {
-        proc.kill();
-        await _logError('Termux', 'run_terminal 超时已终止: $command');
-        exitCode = null;
+        int? exitCode;
+        try {
+          exitCode = await proc.exitCode.timeout(const Duration(seconds: 120));
+        } on TimeoutException {
+          proc.kill();
+          await _logError('Termux', 'run_terminal 超时已终止: $command');
+          exitCode = null;
+        }
+        final out = utf8.decode(stdout.bytes, allowMalformed: true).trim();
+        final err = utf8.decode(stderr.bytes, allowMalformed: true).trim();
+        final buf = StringBuffer();
+        if (out.isNotEmpty) buf.write(out);
+        if (err.isNotEmpty) buf.write(buf.isEmpty ? err : '\n$err');
+        var text = buf.toString();
+        if (stdout.overflow || stderr.overflow) {
+          text = text.isEmpty ? '（输出过大，已截断）' : '$text\n（输出过大，已截断）';
+        }
+        if (backendWarn.isNotEmpty) {
+          text = text.isEmpty ? backendWarn : '$text\n$backendWarn';
+        }
+        if (exitCode == null) {
+          return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
+              '如需长任务请拆分命令或增加耗时。';
+        }
+        return text.isEmpty
+            ? '命令执行完成（无输出），退出码 $exitCode'
+            : '退出码 $exitCode\n$text';
+      } finally {
+        activeRun?.activeProcesses.remove(proc);
       }
-      final out = utf8.decode(stdout.bytes, allowMalformed: true).trim();
-      final err = utf8.decode(stderr.bytes, allowMalformed: true).trim();
-      final buf = StringBuffer();
-      if (out.isNotEmpty) buf.write(out);
-      if (err.isNotEmpty) buf.write(buf.isEmpty ? err : '\n$err');
-      var text = buf.toString();
-      if (stdout.overflow || stderr.overflow) {
-        text = text.isEmpty ? '（输出过大，已截断）' : '$text\n（输出过大，已截断）';
-      }
-      if (backendWarn.isNotEmpty) {
-        text = text.isEmpty ? backendWarn : '$text\n$backendWarn';
-      }
-      if (exitCode == null) {
-        return '终端执行超时（已强制终止）：命令超过 120 秒未完成。'
-            '如需长任务请拆分命令或增加耗时。';
-      }
-      return text.isEmpty
-          ? '命令执行完成（无输出），退出码 $exitCode'
-          : '退出码 $exitCode\n$text';
     } on ProcessException catch (e) {
       _invalidateEmbeddedTerminal();
       return '终端执行异常: ${e.message}';
@@ -3835,6 +4152,16 @@ class ShiyiState extends ChangeNotifier {
           toolsJson: _toolsJsonFor(def.allowedTools),
           // 子代理上下文预算：主会话 contextLimit 的 75%（留出输出与工具定义空间）。
           contextBudgetTokens: parentLimit > 0 ? (parentLimit * 3) ~/ 4 : 0,
+          onClientCreated: run == null
+              ? null
+              : (client) {
+                  run.activeLlmClients.add(client);
+                },
+          onClientFinished: run == null
+              ? null
+              : (client) {
+                  run.activeLlmClients.remove(client);
+                },
           // 执行层二次校验（纵深防御：即使 Runner 被改坏，白名单外工具也到不了 _executeTool）。
           executeTool: (name, argsJson) async {
             if (!def.allowedTools.contains(name)) {
@@ -4599,6 +4926,14 @@ echo "[rc=\$?]"
   }
 
   Future<void> _logError(String source, String message) async {
+    unawaited(
+      RuntimeLogger.instance.error(
+        source,
+        'error',
+        result: 'failed',
+        data: {'message': message},
+      ),
+    );
     try {
       final dir = await FileWorkspace.current();
       final file = File('$dir/logs/error.log');
@@ -4620,6 +4955,10 @@ echo "[rc=\$?]"
   }
 
   Future<void> updateSettings(AppSettings s) async {
+    if (s.apiProfileId.trim().isEmpty) {
+      final matched = profileMatchingSettings(s, apiProfiles);
+      if (matched != null) s.apiProfileId = matched.profileId;
+    }
     final modelChanged = DshModelSync.isModelSettingsChange(settings, s);
     final engineChanged = s.agentEngine != settings.agentEngine;
     if (s.model != settings.model) _knownImageUnsupported = false;
@@ -4630,13 +4969,35 @@ echo "[rc=\$?]"
     }
     settings = s;
     Socks5Proxy.apply(s);
+    DshService.instance.applyConnection(s);
     notifyListeners();
     await _settingsService.save(s);
+    final uri = Uri.tryParse(s.baseUrl.trim());
+    unawaited(
+      RuntimeLogger.instance.info(
+        '设置',
+        'settings.updated',
+        data: {
+          'model': s.model,
+          'protocol': s.apiProtocol,
+          'endpoint': uri == null
+              ? '<endpoint>'
+              : '${uri.scheme}://${uri.host}${uri.hasPort ? ':${uri.port}' : ''}${uri.path}',
+          'engine': s.agentEngine,
+        },
+      ),
+    );
     if (engineChanged) {
       await _rememberLastEngine(s.agentEngine);
     }
     if (modelChanged) {
-      unawaited(DshModelSync.syncFromShiyi(s, allowClear: true));
+      unawaited(
+        DshModelSync.syncFromShiyi(
+          s,
+          allowClear: true,
+          scopeKey: DshService.instance.currentScopeKey,
+        ),
+      );
     }
   }
 
@@ -4661,10 +5022,14 @@ echo "[rc=\$?]"
       );
       if (applied) {
         unawaited(
-          _logError(
+          RuntimeLogger.instance.info(
             'LAAP',
-            'cortex cycle=${presence.cognitiveCycle} '
-                'focus=${presence.attentionFocus} need=${presence.dominantNeed}',
+            'cognitive_state.applied',
+            data: {
+              'cycle': presence.cognitiveCycle,
+              'focus': presence.attentionFocus,
+              'need': presence.dominantNeed,
+            },
           ),
         );
       }

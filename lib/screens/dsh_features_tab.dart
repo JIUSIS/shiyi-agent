@@ -212,7 +212,10 @@ class _DshFeaturesTabState extends State<DshFeaturesTab> {
 
   Widget _statusBanner(String reason) {
     final dark = Theme.of(context).brightness == Brightness.dark;
-    final severe = reason.contains('未安装') || reason.contains('未启动');
+    final severe =
+        reason.contains('未安装') ||
+        reason.contains('未启动') ||
+        reason.contains('未连接');
     final color = severe
         ? CupertinoColors.systemRed
         : CupertinoColors.systemOrange;

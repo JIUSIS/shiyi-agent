@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../core/reasoning_models.dart';
+import 'runtime_logger.dart';
 import 'socks5_config.dart';
 
 class LlmException implements Exception {
@@ -16,6 +17,11 @@ class LlmException implements Exception {
 /// 流式回复提前中断（未收到 [DONE] 或连接断开），可自动重试。
 class LlmInterruptedException extends LlmException {
   LlmInterruptedException(super.message);
+}
+
+/// 用户主动停止当前请求。与网络断流区分开，禁止进入自动重试路径。
+class LlmCancelledException extends LlmException {
+  LlmCancelledException([String message = '生成已停止']) : super(message);
 }
 
 /// Result emitted for each assistant turn.
@@ -38,6 +44,7 @@ class LlmClient {
   final String apiKey;
   final String model;
   final String protocol; // openai | anthropic | responses
+  final String sessionId;
   final double temperature;
   final int maxTokens;
   final List<Map<String, dynamic>> tools;
@@ -84,11 +91,16 @@ class LlmClient {
   /// Responses 加密思考，续写/工具轮必须原样回放。
   String _lastRoundReasoningEncrypted = '';
 
+  /// 当前传输客户端。停止时关闭它，底层 SSE/HTTP Future 会立即结束。
+  http.Client? _activeHttpClient;
+  bool _cancelRequested = false;
+
   LlmClient({
     required this.baseUrl,
     required this.apiKey,
     required this.model,
     this.protocol = 'openai',
+    this.sessionId = '',
     required this.temperature,
     this.maxTokens = 8192,
     required this.tools,
@@ -100,6 +112,20 @@ class LlmClient {
   });
 
   bool get _isResponses => protocol == 'responses';
+
+  bool get isCancelled => _cancelRequested;
+
+  /// 立即取消当前流式请求。可在 [send] 尚未拿到响应头时调用。
+  void cancel() {
+    _cancelRequested = true;
+    _activeHttpClient?.close();
+  }
+
+  void _throwIfCancelled() {
+    if (_cancelRequested || (shouldStop?.call() ?? false)) {
+      throw LlmCancelledException();
+    }
+  }
 
   String get _endpoint {
     if (protocol == 'anthropic') {
@@ -138,8 +164,7 @@ class LlmClient {
       'Authorization': 'Bearer $apiKey',
     if (apiKey.isNotEmpty && protocol == 'anthropic') 'x-api-key': apiKey,
     if (protocol == 'anthropic') 'anthropic-version': '2023-06-01',
-    if (protocol == 'anthropic')
-      'anthropic-beta': 'prompt-caching-2024-07-31',
+    if (protocol == 'anthropic') 'anthropic-beta': 'prompt-caching-2024-07-31',
   };
 
   /// 续写指令：上一轮只输出了计划且没有实际工具调用时，改用“工具唤醒”提示，
@@ -167,8 +192,13 @@ class LlmClient {
     lastCachedTokens = null;
     _lastRoundReasoning = '';
     _lastRoundReasoningEncrypted = '';
+    final requestId =
+        'llm_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    final requestStarted = DateTime.now();
     final client = await Socks5Proxy.client();
+    _activeHttpClient = client;
     try {
+      _throwIfCancelled();
       var includeUsage = true;
       // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级到 8192 重试。
       var outputLimit = maxTokens;
@@ -199,6 +229,7 @@ class LlmClient {
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
       for (var round = 0; round < 8; round++) {
+        _throwIfCancelled();
         final body = _buildRequestBody(
           messages: [...messages, ...continuation],
           stream: true,
@@ -227,16 +258,56 @@ class LlmClient {
             '[reqmeta] protocol=$protocol '
             'bytes=${utf8.encode(bodyPreview).length} ${_contentMeta(body)}',
           );
-          onDiag?.call(
-            '[reqbody] ${_previewRequestBody(bodyPreview)}',
+          onDiag?.call('[reqbody] ${_previewRequestBody(bodyPreview)}');
+          unawaited(
+            RuntimeLogger.instance.info(
+              'LLM',
+              'request.sent',
+              sessionId: sessionId,
+              requestId: requestId,
+              data: {
+                'protocol': protocol,
+                'model': model,
+                'endpoint': _safeEndpoint(_endpoint),
+                'round': round + 1,
+                'stream': true,
+                'bytes': utf8.encode(bodyPreview).length,
+                'messages': messages.length,
+                'tools': tools.length,
+                'images': _imageCount(body),
+                'cache': 'server_usage_pending',
+              },
+            ),
           );
         }
         try {
+          _throwIfCancelled();
           final response = await client
               .send(request)
               .timeout(const Duration(seconds: 60));
+          _throwIfCancelled();
           if (response.statusCode != 200) {
             final err = await response.stream.bytesToString();
+            _throwIfCancelled();
+            unawaited(
+              RuntimeLogger.instance.warn(
+                'LLM',
+                'response.status',
+                sessionId: sessionId,
+                requestId: requestId,
+                durationMs: DateTime.now()
+                    .difference(requestStarted)
+                    .inMilliseconds,
+                result: 'HTTP ${response.statusCode}',
+                data: {
+                  'protocol': protocol,
+                  'model': model,
+                  'statusCode': response.statusCode,
+                  'round': round + 1,
+                  'error': _short(err),
+                },
+              ),
+            );
             // 思考参数被网关拒绝：先分别去掉不兼容字段重试。
             final e = err.toLowerCase();
             if (useMaxCompletion && e.contains('max_completion_tokens')) {
@@ -292,6 +363,31 @@ class LlmClient {
               : _isResponses
               ? await _parseResponsesSse(response.stream)
               : await _parseOpenAiSse(response.stream);
+          _throwIfCancelled();
+          unawaited(
+            RuntimeLogger.instance.info(
+              'LLM',
+              needContinue ? 'response.continue' : 'response.completed',
+              sessionId: sessionId,
+              requestId: requestId,
+              durationMs: DateTime.now()
+                  .difference(requestStarted)
+                  .inMilliseconds,
+              result: 'HTTP ${response.statusCode}',
+              data: {
+                'protocol': protocol,
+                'model': model,
+                'statusCode': response.statusCode,
+                'round': round + 1,
+                'inputTokens': lastInputTokens ?? lastPromptTokens ?? 0,
+                'outputTokens': lastOutputTokens ?? 0,
+                'totalTokens': lastTotalTokens ?? 0,
+                'cachedTokens': lastCachedTokens ?? 0,
+                'cacheKnown': lastCachedTokens != null,
+                'textChars': _lastRoundText.length,
+              },
+            ),
+          );
           if (!needContinue) return;
           // 纯文本截断：追加已输出 + 继续指令，发起续写请求。
           final lastText = _lastRoundText.trim();
@@ -322,13 +418,42 @@ class LlmClient {
           ]);
           includeUsage = false;
         } on TimeoutException {
+          if (_cancelRequested || (shouldStop?.call() ?? false)) {
+            throw LlmCancelledException();
+          }
           // 瞬态超时（网络抖动/网关繁忙）：首轮自动重试一次。
           if (round == 0) {
             onDiag?.call('[stream] 请求超时，自动重试一次');
+            unawaited(
+              RuntimeLogger.instance.warn(
+                'LLM',
+                'request.retry',
+                sessionId: sessionId,
+                requestId: requestId,
+                result: 'timeout',
+                data: {'round': round + 1},
+              ),
+            );
             continue;
           }
+          unawaited(
+            RuntimeLogger.instance.error(
+              'LLM',
+              'request.failed',
+              sessionId: sessionId,
+              requestId: requestId,
+              durationMs: DateTime.now()
+                  .difference(requestStarted)
+                  .inMilliseconds,
+              result: 'timeout',
+              data: {'round': round + 1},
+            ),
+          );
           throw LlmException('请求超时：网络连接或响应过慢，请重试');
         } on http.ClientException catch (e) {
+          if (_cancelRequested || (shouldStop?.call() ?? false)) {
+            throw LlmCancelledException();
+          }
           final m = e.message;
           // 连接类瞬态错误（连接超时/拒绝/断连/DNS 失败）：首轮自动重试
           // 一次；仍失败则转成可读的中文提示，不再把原始
@@ -340,13 +465,37 @@ class LlmClient {
                   m.contains('Connection reset') ||
                   m.contains('Failed host lookup'))) {
             onDiag?.call('[stream] 连接异常，自动重试一次: $m');
+            unawaited(
+              RuntimeLogger.instance.warn(
+                'LLM',
+                'request.retry',
+                sessionId: sessionId,
+                requestId: requestId,
+                result: 'connection',
+                data: {'round': round + 1, 'error': m},
+              ),
+            );
             continue;
           }
+          unawaited(
+            RuntimeLogger.instance.error(
+              'LLM',
+              'request.failed',
+              sessionId: sessionId,
+              requestId: requestId,
+              durationMs: DateTime.now()
+                  .difference(requestStarted)
+                  .inMilliseconds,
+              result: 'connection',
+              data: {'round': round + 1, 'error': m},
+            ),
+          );
           throw LlmException('网络连接失败：${_short(m)}，请检查网络/代理或稍后重试');
         }
       }
     } finally {
       client.close();
+      if (identical(_activeHttpClient, client)) _activeHttpClient = null;
     }
   }
 
@@ -396,6 +545,30 @@ class LlmClient {
     );
   }
 
+  static String _safeEndpoint(String endpoint) {
+    final uri = Uri.tryParse(endpoint);
+    if (uri == null) return '<endpoint>';
+    final port = uri.hasPort ? ':${uri.port}' : '';
+    return '${uri.scheme}://${uri.host}$port${uri.path}';
+  }
+
+  static int _imageCount(Map<String, dynamic> body) {
+    final root = body['input'] ?? body['messages'];
+    if (root is! List) return 0;
+    var count = 0;
+    for (final item in root) {
+      if (item is! Map || item['content'] is! List) continue;
+      for (final part in item['content'] as List) {
+        if (part is Map &&
+            ((part['type'] ?? '').toString() == 'image_url' ||
+                (part['type'] ?? '').toString() == 'input_image')) {
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
   Map<String, dynamic> _buildChatCompletionsBody({
     required List<Map<String, dynamic>> messages,
     required bool stream,
@@ -419,7 +592,8 @@ class LlmClient {
       ],
       'stream': stream,
       if (includeUsage) 'stream_options': {'include_usage': true},
-      if (effortField == null || effortField.isEmpty) 'temperature': temperature,
+      if (effortField == null || effortField.isEmpty)
+        'temperature': temperature,
       if (useMaxCompletionTokens ?? _useMaxCompletionTokens)
         'max_completion_tokens': maxTokens
       else
@@ -497,11 +671,7 @@ class LlmClient {
     final effortField = _openAiReasoningEffort(reasoningEffort);
     final input = _toResponsesInput(split.messages);
     if (split.tail.trim().isNotEmpty) {
-      input.add({
-        'type': 'message',
-        'role': 'system',
-        'content': split.tail,
-      });
+      input.add({'type': 'message', 'role': 'system', 'content': split.tail});
     }
     return <String, dynamic>{
       'model': model,
@@ -510,7 +680,8 @@ class LlmClient {
       'stream': stream,
       'max_output_tokens': maxTokens,
       if (sendStore) 'store': false,
-      if (effortField == null || effortField.isEmpty) 'temperature': temperature,
+      if (effortField == null || effortField.isEmpty)
+        'temperature': temperature,
       if (thinkingEnabled && baseUrl.contains('deepseek.com'))
         'thinking': {'type': 'enabled'},
       if (effortField != null && effortField.isNotEmpty)
@@ -542,11 +713,7 @@ class LlmClient {
         rest.add(m);
       }
     }
-    return (
-      frozen: frozen,
-      tail: tailParts.join('\n\n'),
-      messages: rest,
-    );
+    return (frozen: frozen, tail: tailParts.join('\n\n'), messages: rest);
   }
 
   List<Map<String, dynamic>> _toResponsesInput(
@@ -617,10 +784,7 @@ class LlmClient {
   ) {
     final enc = (message['reasoning_encrypted'] ?? '').toString().trim();
     if (enc.isEmpty) return;
-    input.add({
-      'type': 'reasoning',
-      'encrypted_content': enc,
-    });
+    input.add({'type': 'reasoning', 'encrypted_content': enc});
   }
 
   static Map<String, dynamic> _withoutResponsesOnlyFields(
@@ -750,7 +914,6 @@ class LlmClient {
     }
     return names;
   }
-
 
   List<Map<String, dynamic>> _toResponsesTools(
     List<Map<String, dynamic>> tools,
@@ -1223,8 +1386,11 @@ class LlmClient {
       if (type == 'response.output_item.added' ||
           type == 'response.output_item.done') {
         final item = json['item'];
-        final outputIndex = (json['output_index'] as num?)?.toInt() ??
-            (toolBuf.isEmpty ? 0 : (toolBuf.keys.reduce((a, b) => a > b ? a : b) + 1));
+        final outputIndex =
+            (json['output_index'] as num?)?.toInt() ??
+            (toolBuf.isEmpty
+                ? 0
+                : (toolBuf.keys.reduce((a, b) => a > b ? a : b) + 1));
         if (item is Map<String, dynamic>) {
           handleFunctionItem(item, outputIndex);
           handleReasoningItem(item);
@@ -1319,7 +1485,9 @@ class LlmClient {
       final data = line.substring(5).trim();
       if (rawFramesLeft > 0) {
         rawFramesLeft--;
-        final preview = data.length <= 500 ? data : '${data.substring(0, 500)}…';
+        final preview = data.length <= 500
+            ? data
+            : '${data.substring(0, 500)}…';
         onDiag?.call('[sse] $preview');
       }
       if (data == '[DONE]') {
@@ -1436,7 +1604,6 @@ class LlmClient {
         );
     return completer.future;
   }
-
 
   Future<bool> _parseOpenAiSse(Stream<List<int>> raw) async {
     final lineBuffer = StringBuffer(); // 行缓冲

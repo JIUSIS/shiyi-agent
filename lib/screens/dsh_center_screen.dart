@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
 import '../services/update_service.dart';
 import '../widgets/ios_style.dart';
@@ -58,11 +59,22 @@ class _DshCenterScreenState extends State<DshCenterScreen> {
   }
 
   Future<void> _load() async {
-    _localVersion = await DshService.instance.localVersion();
-    if (_localVersion != null && _localVersion!.isNotEmpty) {
+    final shiyi = widget.shiyi;
+    if (shiyi != null) {
+      DshService.instance.applyConnection(shiyi.settings);
+    }
+    if (shiyi != null && !DshEndpoint.isLocal(shiyi.settings)) {
       _running = await DshService.instance.isRunning();
+      _localVersion = DshEndpoint.displayHost(
+        DshEndpoint.urlOf(shiyi.settings),
+      );
     } else {
-      _running = false;
+      _localVersion = await DshService.instance.localVersion();
+      if (_localVersion != null && _localVersion!.isNotEmpty) {
+        _running = await DshService.instance.isRunning();
+      } else {
+        _running = false;
+      }
     }
     if (mounted) setState(() {});
   }
@@ -87,8 +99,13 @@ class _DshCenterScreenState extends State<DshCenterScreen> {
     final themeMode = shiyi?.settings.themeMode ?? 'system';
     final dark = _isDark(context, themeMode);
     final sid = widget.sessionId;
+    final remote = shiyi != null && !DshEndpoint.isLocal(shiyi.settings);
     final installed = _localVersion != null && _localVersion!.isNotEmpty;
-    final engineSub = !installed
+    final engineSub = remote
+        ? (_running
+              ? 'DeepSeek Harness · 已连接 · ${_localVersion ?? DshEndpoint.shortLabel(shiyi.settings)}'
+              : 'DeepSeek Harness · 未连接 · ${DshEndpoint.shortLabel(shiyi.settings)}')
+        : !installed
         ? 'DeepSeek Harness · 未安装'
         : _running
         ? 'DeepSeek Harness · 服务运行中 · $_localVersion'

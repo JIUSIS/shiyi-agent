@@ -37,7 +37,7 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
   Timer? _refreshTimer;
   bool _updatePrompted = false;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {
@@ -139,7 +139,12 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
       final id = await _api.createSession();
       if (!mounted || id.isEmpty) return;
       try {
-        await DshModelSync.applyToSession(_api, id, widget.shiyi.settings);
+        await DshModelSync.applyToSession(
+          _api,
+          id,
+          widget.shiyi.settings,
+          scopeKey: DshService.instance.currentScopeKey,
+        );
       } catch (_) {}
       try {
         await DshChatCache.writeContextLimit(
@@ -298,8 +303,8 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
               ),
               const SizedBox(height: 14),
               Text(
-                '请确认 DeepSeek Harness 正在本机运行（http://127.0.0.1:3080）。\n'
-                '可在设置 →「Agent 引擎」切回拾忆引擎。',
+                '请确认 DeepSeek Harness 可访问（${_api.baseUrl.isEmpty ? "未填写地址" : _api.baseUrl}）。\n'
+                '可在设置 →「Agent 引擎」切换本机 / 局域网 / 公网，或切回拾忆引擎。',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 12,

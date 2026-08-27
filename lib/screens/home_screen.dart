@@ -121,7 +121,8 @@ class _HomeScreenState extends State<HomeScreen>
     if (state == AppLifecycleState.detached) {
       // 进程销毁（杀后台/卸载等）时按用户开关决定是否停 DSH；
       // 仅退后台不杀，避免每次重开都等 dsh 冷启动。
-      if (widget.shiyi.settings.dshStopOnExit) {
+      if (widget.shiyi.settings.dshStopOnExit &&
+          DshService.instance.managesLocalProcess) {
         unawaited(DshService.instance.stop());
       }
     } else if (state == AppLifecycleState.resumed) {
@@ -131,6 +132,13 @@ class _HomeScreenState extends State<HomeScreen>
 
   /// 打开 app 时自动体检：未安装提示；未开启自动拉起；已开启刷新状态。
   Future<void> _checkDshOnLaunch() async {
+    DshService.instance.applyConnection(widget.shiyi.settings);
+    if (!DshService.instance.managesLocalProcess) {
+      if (widget.shiyi.settings.agentEngine == 'dsh') {
+        await DshService.instance.refreshStatus();
+      }
+      return;
+    }
     final ok = await DshService.instance.ensureAvailableOnLaunch();
     if (!ok && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -228,7 +236,8 @@ class _HomeScreenState extends State<HomeScreen>
     );
     if (ok == true && mounted) {
       // 显式退出按用户开关决定是否停服务；退后台保持常驻，重开即用。
-      if (widget.shiyi.settings.dshStopOnExit) {
+      if (widget.shiyi.settings.dshStopOnExit &&
+          DshService.instance.managesLocalProcess) {
         await DshService.instance.stop();
       }
       SystemNavigator.pop();

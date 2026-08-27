@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
 import '../core/models.dart';
+import 'dsh_endpoint.dart';
 import 'dsh_live.dart';
+import 'runtime_logger.dart';
 
 /// DSH（DeepSeek Harness）HTTP RPC API 客户端。
 ///
@@ -467,11 +470,17 @@ class DshHostInfo {
   final String platform;
   final String arch;
   final String cwd;
+  final String home;
+  final String version;
+  final bool canOpenPath;
   final String? name;
   DshHostInfo({
     required this.platform,
     required this.arch,
     required this.cwd,
+    this.home = '',
+    this.version = '',
+    this.canOpenPath = false,
     this.name,
   });
 
@@ -479,6 +488,9 @@ class DshHostInfo {
     platform: (j['platform'] ?? '').toString(),
     arch: (j['arch'] ?? '').toString(),
     cwd: (j['cwd'] ?? '').toString(),
+    home: (j['home'] ?? '').toString(),
+    version: (j['version'] ?? '').toString(),
+    canOpenPath: j['canOpenPath'] == true,
     name: j['name']?.toString(),
   );
 }
@@ -488,11 +500,13 @@ class DshDirEntry {
   final String name;
   final String path;
   final bool isDirectory;
+  final bool hidden;
   final int? size;
   DshDirEntry({
     required this.name,
     required this.path,
     required this.isDirectory,
+    this.hidden = false,
     this.size,
   });
 
@@ -503,8 +517,83 @@ class DshDirEntry {
         j['isDirectory'] == true ||
         j['kind'] == 'directory' ||
         (!j.containsKey('isDirectory') && !j.containsKey('kind')),
+    hidden: j['hidden'] == true,
     size: (j['size'] as num?)?.toInt(),
   );
+}
+
+/// `host.listDirectory` 的完整目录快照。
+class DshDirectoryListing {
+  final String path;
+  final String home;
+  final List<DshDirEntry> crumbs;
+  final List<DshDirEntry> entries;
+  final bool truncated;
+
+  const DshDirectoryListing({
+    required this.path,
+    required this.home,
+    required this.crumbs,
+    required this.entries,
+    required this.truncated,
+  });
+
+  factory DshDirectoryListing.fromJson(Map<String, dynamic> j) {
+    List<DshDirEntry> parse(dynamic raw) => raw is List
+        ? raw
+              .whereType<Map>()
+              .map((e) => DshDirEntry.fromJson(e.cast<String, dynamic>()))
+              .toList()
+        : const <DshDirEntry>[];
+
+    return DshDirectoryListing(
+      path: (j['path'] ?? '').toString(),
+      home: (j['home'] ?? '').toString(),
+      crumbs: parse(j['crumbs']),
+      entries: parse(j['items'] ?? j['entries']),
+      truncated: j['truncated'] == true,
+    );
+  }
+}
+
+/// 探测当前 DSH 主机可访问的文件系统根目录。
+///
+/// DSH 目前没有独立的 host.listDrives RPC，因此 Windows 使用官方
+/// host.listDirectory 逐个探测盘符；Unix-like 主机使用 `/` 作为根目录。
+extension DshApiRootDirectoryScan on DshApiClient {
+  Future<List<DshDirEntry>> scanRootDirectories({
+    String platform = '',
+    String pathHint = '',
+  }) async {
+    final isWindows = _looksLikeWindowsHost(platform, pathHint);
+    final candidates = isWindows
+        ? List<String>.generate(26, (i) => '${String.fromCharCode(65 + i)}:\\')
+        : const ['/'];
+
+    final results = await Future.wait(
+      candidates.map((root) async {
+        try {
+          final listing = await directoryListing(
+            root,
+          ).timeout(const Duration(seconds: 3));
+          return DshDirEntry(
+            name: root,
+            path: listing.path.isEmpty ? root : listing.path,
+            isDirectory: true,
+          );
+        } catch (_) {
+          return null;
+        }
+      }),
+    );
+    return results.whereType<DshDirEntry>().toList();
+  }
+
+  static bool _looksLikeWindowsHost(String platform, String pathHint) {
+    final value = platform.trim().toLowerCase();
+    if (value.contains('win')) return true;
+    return RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(pathHint.trim());
+  }
 }
 
 /// 设置命名空间（settings.describe 行）。
@@ -558,22 +647,117 @@ class DshToolCallInfo {
 }
 
 /// DSH 会话客户端：会话列表 / 历史 / 发消息 / 新建。
-/// 默认地址 http://127.0.0.1:3080（本机 DSH 服务）。
+/// 默认地址本机 http://127.0.0.1:3080；局域网 / 公网由 [configure] 切换。
 class DshApiClient {
-  DshApiClient({String baseUrl = 'http://127.0.0.1:3080', http.Client? client})
-    : _baseUrl = baseUrl.endsWith('/')
-          ? baseUrl.substring(0, baseUrl.length - 1)
-          : baseUrl,
-      _client = client ?? http.Client();
+  DshApiClient({
+    String baseUrl = DshEndpoint.localUrl,
+    String token = '',
+    String scopeKey = '',
+    List<String> customCompatibilityHosts = const [],
+    List<String> compatibilityHosts = const [],
+    http.Client? client,
+  }) : _scopeKey = scopeKey.trim(),
+       _baseUrl = DshEndpoint.stripSlash(baseUrl),
+       _token = token.trim(),
+       _customHostCandidates = _normalizeCompatibilityHosts(
+         customCompatibilityHosts,
+       ),
+       _compatHostCandidates = _normalizeCompatibilityHosts(compatibilityHosts),
+       _client = client ?? http.Client();
 
   /// 全局单例：会话列表与聊天页共享同一连接（避免重复探测/缓存丢失）。
   static final DshApiClient instance = DshApiClient();
 
-  final String _baseUrl;
+  String _baseUrl;
+  final String _scopeKey;
+  String _token;
+  List<String> _customHostCandidates;
+  List<String> _compatHostCandidates;
+  String? _compatHostOverride;
   final http.Client _client;
   static const Duration _timeout = Duration(seconds: 30);
 
   String get baseUrl => _baseUrl;
+  String get token => _token;
+  String get scopeKey => _scopeKey;
+
+  /// 切换当前连接。空地址表示尚未填好，RPC 会直接失败。
+  void configure({
+    String? baseUrl,
+    String? token,
+    List<String> customCompatibilityHosts = const [],
+    List<String> compatibilityHosts = const [],
+  }) {
+    final nextCustomHosts = _normalizeCompatibilityHosts(
+      customCompatibilityHosts,
+    );
+    final nextCompatibilityHosts = _normalizeCompatibilityHosts(
+      compatibilityHosts,
+    );
+    if (baseUrl != null) {
+      final next = DshEndpoint.stripSlash(baseUrl);
+      if (next != _baseUrl ||
+          !_sameStrings(nextCustomHosts, _customHostCandidates) ||
+          !_sameStrings(nextCompatibilityHosts, _compatHostCandidates)) {
+        _compatHostOverride = null;
+      }
+      _baseUrl = next;
+    }
+    _customHostCandidates = nextCustomHosts;
+    _compatHostCandidates = nextCompatibilityHosts;
+    if (token != null) _token = token;
+  }
+
+  static List<String> _normalizeCompatibilityHosts(Iterable<String> values) {
+    final out = <String>[];
+    for (final value in values) {
+      final normalized = value.trim();
+      if (normalized.isNotEmpty && !out.contains(normalized)) {
+        out.add(normalized);
+      }
+    }
+    return out;
+  }
+
+  static bool _sameStrings(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  Map<String, String> _headers({String? hostOverride}) {
+    final headers = <String, String>{'content-type': 'application/json'};
+    final host = hostOverride ?? _compatHostOverride;
+    if (host != null && host.isNotEmpty) headers['host'] = host;
+    final raw = _token.trim();
+    if (raw.isNotEmpty) {
+      headers['authorization'] = raw.toLowerCase().startsWith('bearer ')
+          ? raw
+          : 'Bearer $raw';
+    }
+    return headers;
+  }
+
+  Map<String, dynamic> _wsHeaders() {
+    final headers = <String, dynamic>{};
+    final host = _compatHostOverride;
+    if (host != null && host.isNotEmpty) {
+      headers['Host'] = host;
+      final scheme = Uri.tryParse(_baseUrl)?.scheme == 'https'
+          ? 'https'
+          : 'http';
+      headers['Origin'] = '$scheme://$host';
+    }
+    final raw = _token.trim();
+    if (raw.isNotEmpty) {
+      headers['Authorization'] = raw.toLowerCase().startsWith('bearer ')
+          ? raw
+          : 'Bearer $raw';
+    }
+    return headers;
+  }
 
   static String _newRpcId() {
     final r = Random.secure();
@@ -600,6 +784,7 @@ class DshApiClient {
   }
 
   Future<bool> _doRpcPing() async {
+    if (_baseUrl.isEmpty) return false;
     try {
       await _rpc('session.list', {}).timeout(const Duration(seconds: 5));
       return true;
@@ -613,42 +798,204 @@ class DshApiClient {
     String method,
     Map<String, dynamic> payload,
   ) async {
-    final http.Response res;
+    final started = DateTime.now();
+    final requestId =
+        'dshrpc_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'rpc.started',
+        requestId: requestId,
+        data: {
+          'method': method,
+          'endpoint': _safeEndpoint('$_baseUrl/api/$method'),
+        },
+      ),
+    );
+    final encoded = jsonEncode({
+      'type': 'client-request',
+      'rpcId': _newRpcId(),
+      'method': method,
+      'payload': payload,
+    });
+    http.Response res;
     try {
       res = await _client
           .post(
             Uri.parse('$_baseUrl/api/$method'),
-            headers: const {'content-type': 'application/json'},
-            body: jsonEncode({
-              'type': 'client-request',
-              'rpcId': _newRpcId(),
-              'method': method,
-              'payload': payload,
-            }),
+            headers: _headers(),
+            body: encoded,
           )
           .timeout(_timeout);
+      if (res.statusCode == 403 &&
+          _compatHostOverride == null &&
+          (method == 'session.list' || method == 'workspace.list') &&
+          (_customHostCandidates.isNotEmpty ||
+              _compatHostCandidates.isNotEmpty)) {
+        final custom = await _scanCompatibilityHosts(
+          method: method,
+          encoded: encoded,
+          candidates: _customHostCandidates,
+          allowEmpty: true,
+        );
+        final preset =
+            custom ??
+            await _scanCompatibilityHosts(
+              method: method,
+              encoded: encoded,
+              candidates: _compatHostCandidates,
+              allowEmpty: false,
+            );
+        if (preset != null) res = preset;
+      }
     } catch (e) {
+      unawaited(
+        RuntimeLogger.instance.error(
+          'DSH',
+          'rpc.failed',
+          requestId: requestId,
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'unreachable',
+          data: {'method': method, 'error': '$e'},
+        ),
+      );
       throw DshApiException('DeepSeek Harness 服务不可达：$e');
     }
     if (res.statusCode != 200) {
+      unawaited(
+        RuntimeLogger.instance.warn(
+          'DSH',
+          'rpc.status',
+          requestId: requestId,
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'HTTP ${res.statusCode}',
+          data: {'method': method, 'statusCode': res.statusCode},
+        ),
+      );
       throw DshApiException('DeepSeek Harness HTTP ${res.statusCode}');
     }
     final Map<String, dynamic> body;
     try {
       body = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
     } catch (_) {
+      unawaited(
+        RuntimeLogger.instance.error(
+          'DSH',
+          'rpc.failed',
+          requestId: requestId,
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'invalid_response',
+          data: {'method': method, 'statusCode': res.statusCode},
+        ),
+      );
       throw DshApiException('DeepSeek Harness 响应解析失败');
     }
     final result = (body['result'] as Map?)?.cast<String, dynamic>();
     if (result == null) throw DshApiException('DeepSeek Harness 响应缺少 result');
     if (result['ok'] != true) {
       final err = (result['error'] as Map?)?.cast<String, dynamic>();
+      unawaited(
+        RuntimeLogger.instance.warn(
+          'DSH',
+          'rpc.rejected',
+          requestId: requestId,
+          durationMs: DateTime.now().difference(started).inMilliseconds,
+          result: 'rejected',
+          data: {
+            'method': method,
+            'code': err?['code']?.toString() ?? '',
+            'error': err?['message']?.toString() ?? 'unknown',
+          },
+        ),
+      );
       throw DshApiException(
         err?['message']?.toString() ?? '未知错误',
         code: err?['code']?.toString(),
       );
     }
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'rpc.completed',
+        requestId: requestId,
+        durationMs: DateTime.now().difference(started).inMilliseconds,
+        result: 'ok',
+        data: {'method': method, 'statusCode': res.statusCode},
+      ),
+    );
     return (result['value'] as Map?)?.cast<String, dynamic>() ?? const {};
+  }
+
+  static String _safeEndpoint(String value) {
+    final uri = Uri.tryParse(value);
+    if (uri == null) return '<endpoint>';
+    final port = uri.hasPort ? ':${uri.port}' : '';
+    return '${uri.scheme}://${uri.host}$port${uri.path}';
+  }
+
+  Future<http.Response?> _scanCompatibilityHosts({
+    required String method,
+    required String encoded,
+    required List<String> candidates,
+    required bool allowEmpty,
+  }) async {
+    for (final host in candidates) {
+      try {
+        final retry = await _client
+            .post(
+              Uri.parse('$_baseUrl/api/$method'),
+              headers: _headers(hostOverride: host),
+              body: encoded,
+            )
+            .timeout(const Duration(seconds: 3));
+        if (_isCompatibleDshResponse(retry, allowEmpty: allowEmpty)) {
+          _compatHostOverride = host;
+          return retry;
+        }
+        if (!allowEmpty &&
+            method == 'session.list' &&
+            _isCompatibleDshResponse(retry, allowEmpty: true)) {
+          final workspaceProbe = await _client
+              .post(
+                Uri.parse('$_baseUrl/api/workspace.list'),
+                headers: _headers(hostOverride: host),
+                body: jsonEncode({
+                  'type': 'client-request',
+                  'rpcId': _newRpcId(),
+                  'method': 'workspace.list',
+                  'payload': const <String, dynamic>{},
+                }),
+              )
+              .timeout(const Duration(seconds: 3));
+          if (_isCompatibleDshResponse(workspaceProbe, allowEmpty: false)) {
+            _compatHostOverride = host;
+            return retry;
+          }
+        }
+      } catch (_) {
+        // 单个 Host 失败时继续扫描剩余预设。
+      }
+    }
+    return null;
+  }
+
+  static bool _isCompatibleDshResponse(
+    http.Response response, {
+    required bool allowEmpty,
+  }) {
+    if (response.statusCode != 200) return false;
+    try {
+      final body = jsonDecode(utf8.decode(response.bodyBytes));
+      if (body is! Map) return false;
+      final result = body['result'];
+      if (result is! Map || result['ok'] != true) return false;
+      if (allowEmpty) return true;
+      final value = result['value'];
+      final items = value is Map ? value['items'] : null;
+      return items is List && items.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// 会话列表（按 updatedAt 倒序；过滤子代理会话——它们由 agent 派生，
@@ -786,7 +1133,7 @@ class DshApiClient {
       res = await _client
           .post(
             Uri.parse('$_baseUrl/api/respond'),
-            headers: const {'content-type': 'application/json'},
+            headers: _headers(),
             body: jsonEncode({
               'type': 'client-response',
               'rpcId': rpcId,
@@ -1029,7 +1376,7 @@ class DshApiClient {
       res = await _client
           .post(
             Uri.parse("$_baseUrl/__shiyi/move-session"),
-            headers: const {"content-type": "application/json"},
+            headers: _headers(),
             body: jsonEncode(payload),
           )
           .timeout(const Duration(seconds: 60));
@@ -1221,19 +1568,24 @@ class DshApiClient {
     return DshHostInfo.fromJson(v);
   }
 
-  /// 目录列表（host.listDirectory）。
+  /// 完整目录快照（host.listDirectory）；省略 path 时由远端列出其 home。
+  Future<DshDirectoryListing> directoryListing([String? path]) async {
+    final normalized = path?.trim() ?? '';
+    final v = await _rpc(
+      'host.listDirectory',
+      normalized.isEmpty ? const {} : {'path': normalized},
+    );
+    return DshDirectoryListing.fromJson(v);
+  }
+
+  /// 目录条目兼容入口。
   Future<List<DshDirEntry>> listDirectory(String path) async {
-    final v = await _rpc('host.listDirectory', {'path': path});
-    final items = (v['items'] ?? v['entries'] ?? const []) as List;
-    return items
-        .map((e) => DshDirEntry.fromJson((e as Map).cast<String, dynamic>()))
-        .toList();
+    return (await directoryListing(path)).entries;
   }
 
   /// DSH 宿主账户的 home。host.listDirectory 省略 path 时会返回该字段。
   Future<String> hostHome() async {
-    final v = await _rpc('host.listDirectory', {});
-    return (v['home'] ?? '').toString();
+    return (await directoryListing()).home;
   }
 
   /// 选择目录（host.pickDirectory）。
@@ -1247,9 +1599,10 @@ class DshApiClient {
     await _rpc('host.openPath', {'path': path});
   }
 
-  /// 创建目录（host.createDirectory）。
-  Future<void> createDirectory(String path) async {
-    await _rpc('host.createDirectory', {'path': path});
+  /// 创建目录（host.createDirectory）。name 必须是单个路径段。
+  Future<String> createDirectory(String path, String name) async {
+    final v = await _rpc('host.createDirectory', {'path': path, 'name': name});
+    return (v['path'] ?? '').toString();
   }
 
   // ── 设置域 ────────────────────────────────────────────────────────────
@@ -1418,11 +1771,11 @@ class DshApiClient {
 
   /// 全会话 mux 下行。调用方按 sessionId 过滤。
   Stream<Map<String, dynamic>> watchMux() =>
-      DshWsDownlink.connect(_baseUrl, 'events.mux');
+      DshWsDownlink.connect(_baseUrl, 'events.mux', headers: _wsHeaders());
 
   /// 主机级下行：running 翻转、会话增删。
   Stream<Map<String, dynamic>> watchHost() =>
-      DshWsDownlink.connect(_baseUrl, 'events.host');
+      DshWsDownlink.connect(_baseUrl, 'events.host', headers: _wsHeaders());
 
   /// DSH 把运行时沙箱快照写成 sourced user/message。这是官方注入，不改 DSH；
   /// 拾忆把它挂到相邻真实气泡上，做成可展开组件，默认收起。

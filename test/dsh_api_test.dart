@@ -113,6 +113,84 @@ void main() {
     expect(await clientWith(mock).rpcPing(), isFalse);
   });
 
+  test('远程 403 优先尝试自定义 Host，并记住兼容身份', () async {
+    final hosts = <String?>[];
+    var calls = 0;
+    final mock = MockClient((req) async {
+      calls++;
+      hosts.add(req.headers['host']);
+      if (calls == 1) return http.Response('forbidden', 403);
+      return http.Response(
+        jsonEncode(okValue({'items': []})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = DshApiClient(
+      baseUrl: 'http://203.0.113.8:56646',
+      customCompatibilityHosts: const ['192.168.2.175:43120'],
+      compatibilityHosts: const ['127.0.0.1:56646'],
+      client: mock,
+    );
+
+    expect(await client.rpcPing(), isTrue);
+    await client.listSessions();
+
+    expect(calls, 3);
+    expect(hosts, [null, '192.168.2.175:43120', '192.168.2.175:43120']);
+  });
+
+  test('内置回环 Host 的空隔离视图不会被误判为连接成功', () async {
+    var calls = 0;
+    final mock = MockClient((req) async {
+      calls++;
+      if (calls == 1) return http.Response('forbidden', 403);
+      return http.Response(
+        jsonEncode(okValue({'items': []})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = DshApiClient(
+      baseUrl: 'http://203.0.113.8:56646',
+      compatibilityHosts: const ['127.0.0.1:56646'],
+      client: mock,
+    );
+
+    expect(await client.rpcPing(), isFalse);
+    expect(calls, 3);
+  });
+
+  test('内置 Host 会话为空但工作区非空时允许命中', () async {
+    final hosts = <String?>[];
+    final mock = MockClient((req) async {
+      hosts.add(req.headers['host']);
+      if (hosts.length == 1) return http.Response('forbidden', 403);
+      final method = req.url.pathSegments.last;
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'items': method == 'workspace.list'
+                ? [
+                    {'workspaceId': 'w1'},
+                  ]
+                : const [],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = DshApiClient(
+      baseUrl: 'https://dsh.example.com',
+      compatibilityHosts: const ['localhost:43120'],
+      client: mock,
+    );
+
+    expect(await client.rpcPing(), isTrue);
+    expect(hosts, [null, 'localhost:43120', 'localhost:43120']);
+  });
+
   test('history：user/message + assistant/message 重建为消息（文本/思考）', () async {
     final mock = MockClient(
       (req) async => http.Response(
@@ -1383,6 +1461,151 @@ void main() {
     final entries = await client.listDirectory('/root/.dsh/skills');
     expect(entries.single.name, 'global-skill');
     expect(entries.single.isDirectory, isTrue);
+  });
+
+  test('host.describe：保留远端 cwd/home 与打开能力', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'version': '0.1.1-rc.2',
+            'cwd': '/srv/project',
+            'home': '/home/dsh',
+            'canOpenPath': true,
+            'attachedSessions': 2,
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+
+    final host = await clientWith(mock).hostDescribe();
+
+    expect(host.cwd, '/srv/project');
+    expect(host.home, '/home/dsh');
+    expect(host.version, '0.1.1-rc.2');
+    expect(host.canOpenPath, isTrue);
+  });
+
+  test('host.listDirectory：远程地址、Token、规范路径和面包屑端到端透传', () async {
+    late Uri requestUrl;
+    late Map<String, String> requestHeaders;
+    late Map<String, dynamic> requestPayload;
+    final mock = MockClient((req) async {
+      requestUrl = req.url;
+      requestHeaders = req.headers;
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      requestPayload = (body['payload'] as Map).cast<String, dynamic>();
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'path': '/srv/project',
+            'home': '/home/dsh',
+            'crumbs': [
+              {'name': '/', 'path': '/', 'hidden': false},
+              {'name': 'srv', 'path': '/srv', 'hidden': false},
+              {'name': 'project', 'path': '/srv/project', 'hidden': false},
+            ],
+            'entries': [
+              {'name': '.git', 'path': '/srv/project/.git', 'hidden': true},
+            ],
+            'truncated': false,
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = DshApiClient(
+      baseUrl: 'https://dsh.example.com/gateway',
+      token: 'remote-secret',
+      client: mock,
+    );
+
+    final listing = await client.directoryListing('/srv/./project');
+
+    expect(
+      requestUrl.toString(),
+      'https://dsh.example.com/gateway/api/host.listDirectory',
+    );
+    expect(requestHeaders['authorization'], 'Bearer remote-secret');
+    expect(requestPayload, {'path': '/srv/./project'});
+    expect(listing.path, '/srv/project');
+    expect(listing.home, '/home/dsh');
+    expect(listing.crumbs.map((e) => e.path), ['/', '/srv', '/srv/project']);
+    expect(listing.entries.single.hidden, isTrue);
+  });
+
+  test('host.createDirectory：按官方 path + name 协议创建远端目录', () async {
+    late Map<String, dynamic> requestPayload;
+    final mock = MockClient((req) async {
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      requestPayload = (body['payload'] as Map).cast<String, dynamic>();
+      return http.Response(
+        jsonEncode(okValue({'path': '/srv/project/new-folder'})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final created = await clientWith(
+      mock,
+    ).createDirectory('/srv/project', 'new-folder');
+
+    expect(requestPayload, {'path': '/srv/project', 'name': 'new-folder'});
+    expect(created, '/srv/project/new-folder');
+  });
+
+  test('host.listDirectory：Windows 根盘扫描只返回可访问盘符', () async {
+    final roots = <String>[];
+    final mock = MockClient((req) async {
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      final payload = (body['payload'] as Map).cast<String, dynamic>();
+      final path = payload['path']?.toString() ?? '';
+      if (path == r'C:\' || path == r'D:\') {
+        roots.add(path);
+        return http.Response(
+          jsonEncode(okValue({'path': path, 'entries': const []})),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return http.Response(
+        jsonEncode(errValue('not-found', 'drive unavailable')),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final result = await clientWith(
+      mock,
+    ).scanRootDirectories(pathHint: r'C:\Users\Administrator');
+
+    expect(result.map((e) => e.path), containsAll([r'C:\', r'D:\']));
+    expect(result.every((e) => e.isDirectory), isTrue);
+    expect(roots, containsAll([r'C:\', r'D:\']));
+  });
+
+  test('host.listDirectory：Unix-like 主机只探测根目录', () async {
+    final paths = <String>[];
+    final mock = MockClient((req) async {
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      final payload = (body['payload'] as Map).cast<String, dynamic>();
+      paths.add(payload['path']?.toString() ?? '');
+      return http.Response(
+        jsonEncode(okValue({'path': '/', 'entries': const []})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final result = await clientWith(
+      mock,
+    ).scanRootDirectories(platform: 'linux', pathHint: '/root/project');
+
+    expect(result.map((e) => e.path), ['/']);
+    expect(paths, ['/']);
   });
 
   test('subagent.list：按官方 id/label/activity 条目解析', () async {

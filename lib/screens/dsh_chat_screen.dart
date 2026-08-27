@@ -112,6 +112,8 @@ class _DshChatScreenState extends State<DshChatScreen>
   int _contextLimit = kDefaultContextLimit;
   late String _cwd = widget.initialSummary?.cwd ?? '';
   bool _stopping = false;
+  bool _ignoreLateRunningStatus = false;
+  int _sendGeneration = 0;
   bool _showToolLog = false;
   String? _speakingId;
   late DshSessionSummary? _summary = widget.initialSummary;
@@ -151,7 +153,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   static const _liveId = 'dsh-live';
   static const _maxHistorySettleDelayStep = 8;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {
@@ -881,10 +883,13 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   Future<void> _send() async {
     final text = _input.text.trim();
-    if ((text.isEmpty && _pendingImages.isEmpty && _pendingFiles.isEmpty) ||
-        _sending) {
+    if (text.isEmpty && _pendingImages.isEmpty && _pendingFiles.isEmpty) {
       return;
     }
+    if (_sending || _running || _awaitingFinalReply) {
+      _interruptLocallyForPrompt();
+    }
+    final sendGeneration = ++_sendGeneration;
     final content = StringBuffer();
     for (final path in _pendingImages) {
       content.writeln('![图片]($path)');
@@ -914,6 +919,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     _awaitingFinalReply = true;
     _turnEndSeen = false;
     _pendingPromptText = prompt;
+    _ignoreLateRunningStatus = false;
     _live.begin();
     _resetLiveNotifiers();
     setState(() {
@@ -930,6 +936,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         () => _api.prompt(widget.sessionId, prompt),
         recover: true,
       );
+      if (!mounted || sendGeneration != _sendGeneration) return;
       setState(() {
         _sending = false;
         _running = true;
@@ -939,7 +946,7 @@ class _DshChatScreenState extends State<DshChatScreen>
       _syncSubagentPolling();
       unawaited(_refreshSubagents());
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || sendGeneration != _sendGeneration) return;
       setState(() {
         _sending = false;
         _messages.removeWhere((m) => m.id == optimistic.id);
@@ -955,22 +962,45 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
   }
 
+  /// 插话时先在本地立刻收口，再异步通知 DSH 取消旧回合，避免等待网络响应。
+  void _interruptLocallyForPrompt() {
+    _ignoreLateRunningStatus = true;
+    _sending = false;
+    _running = false;
+    _awaitingFinalReply = false;
+    _turnEndSeen = false;
+    _pendingPromptText = null;
+    _stopPoll();
+    _syncSubagentPolling();
+    _finalizeSubagentStatus();
+    _clearLiveUi(preserveVisible: true);
+    if (mounted) setState(() {});
+    unawaited(_api.cancel(widget.sessionId).catchError((_) {}));
+  }
+
   Future<void> _stop() async {
     if (_stopping) return;
-    setState(() => _stopping = true);
+    ++_sendGeneration;
+    _ignoreLateRunningStatus = true;
+    _sending = false;
+    _running = false;
+    _awaitingFinalReply = false;
+    _turnEndSeen = false;
+    _pendingPromptText = null;
+    _stopPoll();
+    _syncSubagentPolling();
+    _finalizeSubagentStatus();
+    _clearLiveUi(preserveVisible: true);
+    if (mounted) {
+      setState(() {
+        _stopping = true;
+        _sending = false;
+        _running = false;
+      });
+    }
     try {
-      await _api.cancel(widget.sessionId);
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-      if (!mounted) return;
-      setState(() => _running = false);
-      _awaitingFinalReply = false;
-      _turnEndSeen = false;
-      _pendingPromptText = null;
-      _syncSubagentPolling();
-      _finalizeSubagentStatus();
-      _clearLiveUi(preserveVisible: true);
-      _stopPoll();
-      await _refreshHistory(clearLive: true);
+      await _api.cancel(widget.sessionId).timeout(const Duration(seconds: 2));
+      unawaited(_refreshHistory(clearLive: true));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -1435,6 +1465,13 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (ev == null) return;
     final kind = ev['type']?.toString() ?? '';
 
+    // 停止/插话后，服务端旧回合可能还有迟到事件；新回合开始前全部丢弃，
+    // 防止旧输出把本地 UI 再次点亮或串入新消息。
+    if (_ignoreLateRunningStatus) {
+      if (kind == 'turn/end') _finishPendingTurn();
+      return;
+    }
+
     if (kind == 'user/message' && _isDuplicateSubagentReport(ev)) {
       // DSH may replay a report already delivered through inbox/spliced. The
       // following auto turn is only an acknowledgement of that same report.
@@ -1626,7 +1663,12 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (fresh.isEmpty) return;
     _syncedResponseModels.addAll(fresh);
     unawaited(
-      DshModelSync.rememberResponseModels(shiyi.settings, fresh, api: _api),
+      DshModelSync.rememberResponseModels(
+        shiyi.settings,
+        fresh,
+        api: _api,
+        scopeKey: DshService.instance.currentScopeKey,
+      ),
     );
   }
 
@@ -2328,6 +2370,7 @@ class _DshChatScreenState extends State<DshChatScreen>
                           LiquidGlassChatComposer(
                             input: _input,
                             busy: _sending || _running,
+                            allowSendWhileBusy: true,
                             enterToSend:
                                 widget.shiyi?.settings.enterToSend ?? true,
                             pendingImages: _pendingImages,
@@ -2374,8 +2417,7 @@ class _DshChatScreenState extends State<DshChatScreen>
                                 ? null
                                 : _compactContext,
                             compressBusy: _compacting,
-                            onContextLimit:
-                                _compacting || _sending || _running
+                            onContextLimit: _compacting || _sending || _running
                                 ? null
                                 : _editContextLimit,
                             contextLimitLabel: formatContextLimitLabel(

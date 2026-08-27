@@ -12,7 +12,10 @@ class SettingsService {
   static const _visionApiKeyKey = 'shiyi_vision_api_key';
   static const _socks5PasswordKey = 'shiyi_socks5_password';
   static const _socks5ServerPasswordsKey = 'shiyi_socks5_server_passwords';
-  static const _profileKeyPrefix = 'shiyi_profile_api_key_';
+  static const _dshRemoteTokenKey = 'shiyi_dsh_remote_token';
+  static const _dshLanTokenKey = 'shiyi_dsh_lan_token';
+  static const _profileKeyPrefix = 'shiyi_profile_api_key_v2_';
+  static const _legacyProfileKeyPrefix = 'shiyi_profile_api_key_';
 
   Future<AppSettings> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -39,6 +42,8 @@ class SettingsService {
       s.apiKey = await _readKey(_mainApiKeyKey);
       s.visionApiKey = await _readKey(_visionApiKeyKey);
       s.socks5Password = await _readKey(_socks5PasswordKey);
+      s.dshRemoteToken = await _readKey(_dshRemoteTokenKey);
+      s.dshLanToken = await _readKey(_dshLanTokenKey);
       s.socks5Servers = await _attachServerPasswords(s.socks5Servers);
       s.contextLimit = sanitizeLoadedContextLimit(s.contextLimit);
       // 旧版本没有输出上限字段：按已选预设带出建议值，
@@ -72,10 +77,14 @@ class SettingsService {
     final json = s.toJson()
       ..remove('apiKey')
       ..remove('visionApiKey')
-      ..remove('socks5Password');
+      ..remove('socks5Password')
+      ..remove('dshRemoteToken')
+      ..remove('dshLanToken');
     await _writeKey(_mainApiKeyKey, s.apiKey);
     await _writeKey(_visionApiKeyKey, s.visionApiKey);
     await _writeKey(_socks5PasswordKey, s.socks5Password);
+    await _writeKey(_dshRemoteTokenKey, s.dshRemoteToken);
+    await _writeKey(_dshLanTokenKey, s.dshLanToken);
     await _writeServerPasswords(s.socks5Servers);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, jsonEncode(json));
@@ -93,11 +102,13 @@ class SettingsService {
       final list = jsonDecode(raw) as List<dynamic>;
       var dirty = false;
       final out = <ApiProfile>[];
+      final legacyUrlsMigrated = <String>{};
       for (final e in list) {
         final j = (e as Map<String, dynamic>);
         final p = ApiProfile.fromJson(j);
         final isPreset = modelPresets.any((m) => m.name == p.name);
-        final baseUrl = isPreset ||
+        final baseUrl =
+            isPreset ||
                 (p.apiProtocol != 'openai' && p.apiProtocol != 'responses')
             ? p.baseUrl
             : normalizeOpenAiBaseUrl(p.baseUrl);
@@ -105,17 +116,34 @@ class SettingsService {
           j['baseUrl'] = baseUrl;
           dirty = true;
         }
+        final profileId = p.id.trim().isNotEmpty
+            ? p.id.trim()
+            : createApiProfileId(p.name, baseUrl, p.apiProtocol);
+        if (profileId != p.id.trim()) {
+          j['id'] = profileId;
+          dirty = true;
+        }
         final legacy = (j['apiKey'] ?? '').toString();
         if (legacy.isNotEmpty) {
-          await _writeKey(_profileKey(baseUrl), legacy);
+          await _writeKey(_profileKey(profileId), legacy);
           j.remove('apiKey');
           dirty = true;
         }
+        var apiKey = await _readKey(_profileKey(profileId));
+        if (apiKey.isEmpty && legacyUrlsMigrated.add(_normalizedUrl(baseUrl))) {
+          final oldKey = await _readKey(_legacyProfileKey(baseUrl));
+          if (oldKey.isNotEmpty) {
+            apiKey = oldKey;
+            await _writeKey(_profileKey(profileId), oldKey);
+            await _secure.delete(key: _legacyProfileKey(baseUrl));
+          }
+        }
         out.add(
           ApiProfile(
+            id: profileId,
             name: p.name,
             baseUrl: baseUrl,
-            apiKey: await _readKey(_profileKey(baseUrl)),
+            apiKey: apiKey,
             model: p.model,
             apiProtocol: p.apiProtocol,
           ),
@@ -135,17 +163,27 @@ class SettingsService {
 
   Future<void> saveProfiles(List<ApiProfile> profiles) async {
     for (final p in profiles) {
-      await _writeKey(_profileKey(p.baseUrl), p.apiKey);
+      await _writeKey(_profileKey(p.profileId), p.apiKey);
+      await _secure.delete(key: _legacyProfileKey(p.baseUrl));
     }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       _profilesKey,
-      jsonEncode([for (final p in profiles) p.toJson()..remove('apiKey')]),
+      jsonEncode([
+        for (final p in profiles)
+          p.copyWith(id: p.profileId).toJson()..remove('apiKey'),
+      ]),
     );
   }
 
-  static String _profileKey(String baseUrl) =>
-      '$_profileKeyPrefix${baseUrl.trim().replaceAll(RegExp(r'/+$'), '')}';
+  static String _profileKey(String profileId) =>
+      '$_profileKeyPrefix${profileId.trim()}';
+
+  static String _legacyProfileKey(String baseUrl) =>
+      '$_legacyProfileKeyPrefix${_normalizedUrl(baseUrl)}';
+
+  static String _normalizedUrl(String url) =>
+      url.trim().replaceAll(RegExp(r'/+$'), '');
 
   Future<void> _writeKey(String key, String value) async {
     if (value.isEmpty) {

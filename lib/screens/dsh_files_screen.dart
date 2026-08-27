@@ -1,10 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../services/dsh_api.dart';
-import '../services/file_workspace.dart';
+import '../services/dsh_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import 'dsh_center_screen.dart';
@@ -31,12 +33,14 @@ class DshFilesScreen extends StatefulWidget {
 
 class _DshFilesScreenState extends State<DshFilesScreen> {
   String _path = '';
+  String _cwdPath = '';
   List<DshDirEntry> _items = [];
+  List<DshDirEntry> _roots = const [];
   bool _loading = true;
   String? _error;
   final List<String> _stack = [];
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {
@@ -45,6 +49,7 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
     if (initialPath.isEmpty) {
       _loadHome();
     } else {
+      _cwdPath = initialPath;
       _loadDir(initialPath);
     }
   }
@@ -55,20 +60,27 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
       _error = null;
     });
     try {
-      // 默认浏览软件默认 agent 目录；不可用时回退 dsh 主机 cwd。
-      final agent = FileWorkspace.defaultWorkspacePath;
+      DshHostInfo? host;
       try {
-        final items = await _api.listDirectory(agent);
-        if (!mounted) return;
-        setState(() {
-          _path = agent;
-          _items = items;
-          _loading = false;
-        });
-        return;
+        host = await _api.hostDescribe();
       } catch (_) {}
-      final host = await _api.hostDescribe();
-      await _loadDir(host.cwd);
+      final cwd = host?.cwd.trim() ?? '';
+      final listing = cwd.isNotEmpty
+          ? await _api.directoryListing(cwd)
+          : await _api.directoryListing();
+      if (!mounted) return;
+      setState(() {
+        _cwdPath = cwd.isNotEmpty ? cwd : listing.path;
+        _path = listing.path.isNotEmpty ? listing.path : cwd;
+        _items = listing.entries;
+        _loading = false;
+      });
+      unawaited(
+        _loadRoots(
+          platform: host?.platform ?? '',
+          pathHint: listing.path.isNotEmpty ? listing.path : cwd,
+        ),
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -78,17 +90,29 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
     }
   }
 
+  Future<void> _loadRoots({
+    required String platform,
+    required String pathHint,
+  }) async {
+    final roots = await _api.scanRootDirectories(
+      platform: platform,
+      pathHint: pathHint,
+    );
+    if (!mounted) return;
+    setState(() => _roots = roots);
+  }
+
   Future<void> _loadDir(String path) async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      final items = await _api.listDirectory(path);
+      final listing = await _api.directoryListing(path);
       if (!mounted) return;
       setState(() {
-        _path = path;
-        _items = items;
+        _path = listing.path.isNotEmpty ? listing.path : path;
+        _items = listing.entries;
         _loading = false;
       });
     } catch (e) {
@@ -117,16 +141,40 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
   }
 
   Future<void> _pick() async {
-    try {
-      final path = await _api.pickDirectory();
-      if (path == null || path.isEmpty) return;
-      _loadDir(path);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('选择失败：$e')));
+    final locations = <String, String>{};
+    void add(String label, String path) {
+      final normalized = path.trim();
+      if (normalized.isNotEmpty && !locations.containsValue(normalized)) {
+        locations[label] = normalized;
+      }
     }
+
+    for (final root in _roots) {
+      add(root.name.isEmpty ? root.path : root.name, root.path);
+    }
+    add('工作目录', _cwdPath);
+    if (locations.isEmpty) return;
+
+    final selected = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: const Text('选择位置'),
+        actions: [
+          for (final location in locations.entries)
+            CupertinoActionSheetAction(
+              onPressed: () => Navigator.pop(ctx, location.value),
+              child: Text(location.key),
+            ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
+        ),
+      ),
+    );
+    if (selected == null || selected == _path) return;
+    _stack.clear();
+    _loadDir(selected);
   }
 
   void _pop() {

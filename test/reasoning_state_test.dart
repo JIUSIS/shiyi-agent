@@ -115,15 +115,27 @@ void main() {
       state.clientSettingsForSession('session-a').apiProtocol,
       'anthropic',
     );
-    expect(state.clientSettingsForSession('session-a').model, 'claude-sonnet-4-5');
-    expect(state.clientSettingsForSession('session-b').model, 'deepseek-v4-flash');
+    expect(
+      state.clientSettingsForSession('session-a').model,
+      'claude-sonnet-4-5',
+    );
+    expect(
+      state.clientSettingsForSession('session-b').model,
+      'deepseek-v4-flash',
+    );
     expect(state.settings.model, 'deepseek-chat');
     expect(state.settings.apiProtocol, 'openai');
 
     sessionA.model = 'claude-opus-4-1';
     expect(state.profileForSession('session-a')?.name, 'Custom Claude');
-    expect(state.clientSettingsForSession('session-a').model, 'claude-opus-4-1');
-    expect(state.clientSettingsForSession('session-a').baseUrl, 'https://api.anthropic.com');
+    expect(
+      state.clientSettingsForSession('session-a').model,
+      'claude-opus-4-1',
+    );
+    expect(
+      state.clientSettingsForSession('session-a').baseUrl,
+      'https://api.anthropic.com',
+    );
     expect(state.settings.model, 'deepseek-chat');
   });
 
@@ -139,10 +151,55 @@ void main() {
         '家里的网关': ['cached-id', 'local-model'],
       };
 
-    expect(state.cachedModelsForProfile(profile), [
-      'cached-id',
-      'local-model',
-    ]);
+    expect(state.cachedModelsForProfile(profile), ['cached-id', 'local-model']);
+  });
+
+  test('同一接口的会话按稳定配置 ID 取密钥，不按模型名串组', () {
+    final first = const ApiProfile(
+      name: '分组 A',
+      baseUrl: 'https://gateway.example/v1',
+      apiKey: 'key-a',
+      model: 'model-a',
+    );
+    final second = const ApiProfile(
+      name: '分组 B',
+      baseUrl: 'https://gateway.example/v1',
+      apiKey: 'key-b',
+      model: 'model-b',
+    );
+    final state = ShiyiState()
+      ..settings = AppSettings(
+        baseUrl: first.baseUrl,
+        apiKey: 'global-key',
+        model: first.model,
+      )
+      ..apiProfiles = [first, second]
+      ..sessions = [
+        Session(
+          id: 'bound',
+          title: 'bound',
+          model: 'model-a',
+          apiProfile: first.name,
+          apiProfileId: second.profileId,
+          createdAt: 1,
+          updatedAt: 1,
+        ),
+        Session(
+          id: 'missing',
+          title: 'missing',
+          model: 'model-a',
+          apiProfile: '已删除分组',
+          apiProfileId: 'profile_missing',
+          createdAt: 1,
+          updatedAt: 1,
+        ),
+      ];
+
+    expect(state.profileForSession('bound')?.name, second.name);
+    expect(state.clientSettingsForSession('bound').apiKey, 'key-b');
+    expect(state.clientSettingsForSession('bound').baseUrl, first.baseUrl);
+    expect(state.profileForSession('missing'), isNull);
+    expect(state.clientSettingsForSession('missing').apiKey, isEmpty);
   });
 
   test('mergeApiProfiles 保留内置预设并追加自定义配置', () {

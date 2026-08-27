@@ -10,6 +10,7 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_live.dart';
+import '../services/dsh_service.dart';
 import '../widgets/dsh_stats_bar.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
@@ -37,7 +38,7 @@ class _DshSubagentsScreenState extends State<DshSubagentsScreen> {
   String? _error;
   Timer? _refreshTimer;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {
@@ -341,7 +342,7 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
   bool _autoScrollScheduled = false;
   static const _liveId = 'sub-live';
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
   bool get _continuable => widget.mode == 'continuable';
   bool get _lightsBusy => _sending || _running || _stopping;
 

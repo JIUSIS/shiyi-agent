@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -11,15 +12,48 @@ import 'core/media_query_fix.dart';
 import 'services/permission_service.dart';
 import 'core/app_theme.dart';
 import 'services/dsh_service.dart';
+import 'services/runtime_logger.dart';
 import 'screens/welcome_screen.dart';
 import 'widgets/macos_window_buttons.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+    unawaited(
+      RuntimeLogger.instance.error(
+        'Flutter',
+        'uncaught_error',
+        result: 'failed',
+        data: {
+          'exception': '${details.exception}',
+          'stack': '${details.stack ?? ''}',
+        },
+      ),
+    );
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    unawaited(
+      RuntimeLogger.instance.error(
+        'Dart',
+        'uncaught_error',
+        result: 'failed',
+        data: {'exception': '$error', 'stack': '$stack'},
+      ),
+    );
+    return true;
+  };
   // 强制 edge-to-edge：状态栏/导航栏透明沉浸（targetSdk 35+ 系统强制，
   // 显式开启保持旧版本一致体验）。
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   final initialThemeMode = await _readInitialThemeMode();
+  unawaited(
+    RuntimeLogger.instance.info(
+      'App',
+      'startup',
+      data: {'platform': Platform.operatingSystem, 'version': '2.6.0'},
+    ),
+  );
   runApp(ShiyiAgentApp(initialThemeMode: initialThemeMode));
   unawaited(PermissionService.ensureOnLaunch());
 }
@@ -69,6 +103,22 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
 
   Future<void> _checkDshOnLaunch() async {
     if (!Platform.isAndroid) return;
+    if (!shiyi.loaded) {
+      void onLoaded() {
+        shiyi.loadedNotifier.removeListener(onLoaded);
+        unawaited(_checkDshOnLaunch());
+      }
+
+      shiyi.loadedNotifier.addListener(onLoaded);
+      return;
+    }
+    DshService.instance.applyConnection(shiyi.settings);
+    if (!DshService.instance.managesLocalProcess) {
+      if (shiyi.settings.agentEngine == 'dsh') {
+        await DshService.instance.refreshStatus();
+      }
+      return;
+    }
     final ok = await DshService.instance.ensureAvailableOnLaunch();
     if (ok) return;
     _messengerKey.currentState?.showSnackBar(

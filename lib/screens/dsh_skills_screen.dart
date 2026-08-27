@@ -50,7 +50,7 @@ class _DshSkillsScreenState extends State<DshSkillsScreen> {
   String? _error;
   int _loadGeneration = 0;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {

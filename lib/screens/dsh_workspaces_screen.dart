@@ -8,6 +8,7 @@ import '../core/models.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
 import '../services/dsh_model_sync.dart';
+import '../services/dsh_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
@@ -37,7 +38,7 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
   String? _error;
   bool _busy = false;
 
-  DshApiClient get _api => DshApiClient.instance;
+  DshApiClient get _api => DshService.instance.api;
 
   @override
   void initState() {
@@ -177,7 +178,12 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
       final shiyi = widget.shiyi;
       if (shiyi != null) {
         try {
-          await DshModelSync.applyToSession(_api, id, shiyi.settings);
+          await DshModelSync.applyToSession(
+            _api,
+            id,
+            shiyi.settings,
+            scopeKey: DshService.instance.currentScopeKey,
+          );
         } catch (_) {}
         try {
           await DshChatCache.writeContextLimit(

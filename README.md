@@ -1,19 +1,19 @@
 # 拾忆 ShiYi
 
-> 运行在 Android 手机上的个人 AI 工作台 —— 让 AI 不只是回答问题，而是参与你的实际工作：读取资料、修改文件、运行命令、整理项目。
+> 运行在 Android 手机与 Windows 桌面的个人 AI 工作台 —— 让 AI 不只是回答问题，而是参与你的实际工作：读取资料、修改文件、运行命令、整理项目。
 
 [![Release](https://img.shields.io/github/v/release/JIUSIS/shiyi-agent)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-important)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Android-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
+[![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Windows-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.5.10.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.5.10/shiyi-agent-v2.5.10.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.6.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.6.0/shiyi-agent-v2.6.0.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
 ## 关于拾忆
 
-拾忆（ShiYi）是一款运行在 Android 手机上的个人 AI 工作台。它将大语言模型、长期记忆、项目文件管理、内置终端与技能系统整合为一个应用，并可切换拾忆本地引擎或 DeepSeek Harness。AI 从"聊天助手"升级为"随身工作伙伴"——你可以把资料丢给它、把项目交给它、把重复任务委托给它，它会在你的手机里完成实际工作。界面按 Apple 设计理念（HIG）统一重构，使用毛玻璃导航、Inset Grouped 分组卡片与深浅色跟随。
+拾忆（ShiYi）是一款运行在 Android 手机与 Windows 桌面的个人 AI 工作台。它将大语言模型、长期记忆、项目文件管理、内置终端与技能系统整合为一个应用，并可切换拾忆本地引擎或 DeepSeek Harness。AI 从"聊天助手"升级为"随身工作伙伴"——你可以把资料丢给它、把项目交给它、把重复任务委托给它，在手机或电脑上完成实际工作。界面按 Apple 设计理念（HIG）统一重构，使用毛玻璃导航、Inset Grouped 分组卡片与深浅色跟随。
 
 ## 功能特性
 
@@ -50,7 +50,7 @@
 
 ### 内置终端
 
-- 底部「终端」栏与 AI 的 `run_terminal` 共用内嵌 Alpine（bash / python3 / apk），**无需安装 Termux、无需 root**；点画面输入，输入 / 输出 / 警告 / 错误分色；双指捏合缩放字号，命令前缀补全，命令行按 token 分色
+- Android 端底部「终端」栏与 AI 的 `run_terminal` 共用内嵌 Alpine（bash / python3 / apk），**无需另装 Termux**；点画面输入，输入 / 输出 / 警告 / 错误分色；双指捏合缩放字号，命令前缀补全，命令行按 token 分色。内嵌终端依赖 Android 设备的执行权限环境，无 root 设备可能受 SELinux 限制
 - **2026-08-15 起基于 Alpine Linux**（proot + minirootfs，APK 内置约 3.9MB，取代旧 Termux bootstrap 40MB+）：
   - 包管理 `apk`（清华镜像优先 + 官方兜底，网络抖动自动重试），命令全部在 Alpine 沙箱内执行；
   - Node.js 环境（`apk add nodejs npm`）随 DeepSeek Harness 引擎自动安装，无需手动配置；
@@ -138,9 +138,9 @@
 
 项目可以设置统一的工作目录，项目下没有单独设置目录的会话会自动继承；每个会话也仍可覆盖为自己的独立目录。AI 在当前会话中创建、读取和修改的文件默认围绕生效的工作目录管理，不同项目互不干扰。
 
-### 内置终端（免 root）
+### 内置终端
 
-应用内集成了移动端终端环境（bash + python3），不需要额外安装 Termux，也不需要 root。它基于 Android 应用沙箱 + 内嵌用户空间（proot + Alpine Linux minirootfs）实现，首次启动自动部署。主页底部「终端」栏与 AI 工具走同一条 `init-host` 启动链。
+Android 端集成了移动端终端环境（bash + python3），不需要额外安装 Termux。它基于 Android 应用沙箱 + 内嵌用户空间（proot + Alpine Linux minirootfs）实现，首次启动自动部署；在无 root 设备上，是否可用取决于系统 SELinux 对内嵌 ELF 执行和文件操作的限制。主页底部「终端」栏与 AI 工具走同一条 `init-host` 启动链。Windows 端使用本机 WSL、Git Bash、PowerShell 7 或 cmd。
 
 ### 技能系统
 
@@ -150,10 +150,10 @@
 
 | 层次 | 技术 |
 | --- | --- |
-| 客户端 | Flutter / Dart（Android，targetSdk 27，兼容 SELinux 直接执行内嵌终端 ELF） |
+| 客户端 | Flutter 3.44.2 / Dart 3.12.2（Android `compileSdk 36` / `targetSdk 36`，Windows 桌面） |
 | 数据存储 | SQLite（会话与消息）、SharedPreferences（设置） |
 | 终端环境 | 内置 Alpine Linux 用户空间（minirootfs 固化进 assets + proot 沙箱，apk 包管理） |
-| 模型接入 | LLM API + 多模态图片处理 |
+| 模型接入 | OpenAI Chat Completions / Responses、Anthropic Messages、其他兼容 LLM API + 多模态图片处理 |
 
 ## 从源码构建
 
@@ -167,6 +167,14 @@ flutter run
 # 构建 release APK（需先配置签名，见下）
 flutter build apk --release
 ```
+
+Windows 桌面版：
+
+```bash
+flutter build windows --release
+```
+
+Windows 分发时需要连同 `build/windows/x64/runner/Release/` 目录中的依赖文件一起分发。
 
 ### 签名配置
 

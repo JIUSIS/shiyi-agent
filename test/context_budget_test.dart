@@ -619,6 +619,7 @@ void main() {
         'save_memory',
         'search_sessions',
         'read_session',
+        'inspect_runtime',
         'search_memory',
         'run_skill',
         'web_search',

@@ -54,6 +54,7 @@ class SubagentDefinition {
     'search_memory',
     'search_sessions',
     'read_session',
+    'inspect_runtime',
     'run_skill',
     'web_search',
     'web_extract',
@@ -73,6 +74,7 @@ class SubagentDefinition {
     'search_memory',
     'search_sessions',
     'read_session',
+    'inspect_runtime',
   };
 
   static const String _readOnlyBlock = '''
@@ -299,6 +301,10 @@ class SubagentRunner {
   /// 用户停止生成时返回 true。
   final bool Function()? shouldStop;
 
+  /// 让父会话在停止时能立即取消子代理正在进行的 HTTP 请求。
+  final void Function(LlmClient client)? onClientCreated;
+  final void Function(LlmClient client)? onClientFinished;
+
   /// 每轮开始前的进度回调（供 UI 展示子代理内部状态）。
   final void Function(int round, int maxTurns, String lastTool)? onProgress;
 
@@ -321,6 +327,8 @@ class SubagentRunner {
     required this.executeTool,
     required this.workingDir,
     this.shouldStop,
+    this.onClientCreated,
+    this.onClientFinished,
     this.onProgress,
     this.contextBudgetTokens = 0,
     this.roundOverride,
@@ -354,6 +362,8 @@ class SubagentRunner {
         result = roundOverride != null
             ? await roundOverride!(msgs)
             : await _round(msgs);
+      } on LlmCancelledException {
+        return SubagentResult.stopped(totalTokens: totalTokens);
       } on LlmException catch (e) {
         // 请求失败必须如实返回失败状态，不能伪装成成功报告。
         // 注意：_round 已带「子代理请求失败: 」前缀，这里不再重复拼接。
@@ -500,11 +510,16 @@ class SubagentRunner {
       shouldStop: shouldStop,
       onTurn: (t) => accumulated = t,
     );
+    onClientCreated?.call(client);
     try {
       await client.send(msgs);
+    } on LlmCancelledException {
+      rethrow;
     } catch (e) {
       // 请求失败必须让上层看到异常，不能伪装成“成功生成”的最终报告。
       throw LlmException('子代理请求失败: $e');
+    } finally {
+      onClientFinished?.call(client);
     }
     if (client.lastTotalTokens != null && client.lastTotalTokens! > 0) {
       totalTokens += client.lastTotalTokens!;

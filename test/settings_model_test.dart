@@ -7,14 +7,14 @@ void main() {
   test('enablePresence 默认关闭，并随设置 JSON 往返持久化', () {
     expect(AppSettings().enablePresence, isFalse);
     expect(AppSettings.fromJson({}).enablePresence, isFalse);
-    expect(AppSettings.fromJson({'enablePresence': true}).enablePresence, isTrue);
+    expect(
+      AppSettings.fromJson({'enablePresence': true}).enablePresence,
+      isTrue,
+    );
 
     final saved = AppSettings(enablePresence: true).toJson();
     expect(AppSettings.fromJson(saved).enablePresence, isTrue);
-    expect(
-      AppSettings().copyWith(enablePresence: true).enablePresence,
-      isTrue,
-    );
+    expect(AppSettings().copyWith(enablePresence: true).enablePresence, isTrue);
   });
 
   test('enterToSend 默认开启，并随设置 JSON 往返持久化', () {
@@ -51,6 +51,29 @@ void main() {
     expect(
       ApiProfile.fromJson(responsesProfile.toJson()).apiProtocol,
       'responses',
+    );
+  });
+
+  test('API 配置 ID 不依赖模型和密钥，但同名同地址之外互相隔离', () {
+    final first = ApiProfile(
+      name: '分组 A',
+      baseUrl: 'https://gateway.example/v1',
+      apiKey: 'key-a',
+      model: 'model-a',
+    );
+    final second = ApiProfile(
+      name: '分组 B',
+      baseUrl: 'https://gateway.example/v1',
+      apiKey: 'key-b',
+      model: 'model-b',
+    );
+
+    expect(first.profileId, isNot(second.profileId));
+    expect(first.copyWith(model: 'model-c').profileId, first.profileId);
+    expect(ApiProfile.fromJson(first.toJson()).profileId, first.profileId);
+    expect(
+      AppSettings(apiProfileId: first.profileId).toJson(),
+      isNot(contains('apiProfileId')),
     );
   });
 
