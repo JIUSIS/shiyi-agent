@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../services/dsh_api.dart';
 import 'chat_liquid_glass.dart';
@@ -33,6 +32,20 @@ class DshStatsBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = summary;
     if (s == null || s.stepCount <= 0) return const SizedBox.shrink();
+    final groups = detailGroups(s);
+    return ChatStatsChip(label: compactLabel(s), detail: groups.join(' | '));
+  }
+
+  static String compactLabel(DshSessionSummary s) {
+    if (s.hasBilling && s.billedInputTokens > 0) {
+      return '缓存 ${(s.cacheReadTokens / s.billedInputTokens * 100).round()}%';
+    }
+    return '${s.turnCount} 轮';
+  }
+
+  static bool hasContent(DshSessionSummary? s) => s != null && s.stepCount > 0;
+
+  static List<String> detailGroups(DshSessionSummary s) {
     final groups = <String>['${s.turnCount} 轮 · ${s.stepCount} 步'];
     final durations = <String>[];
     if (s.llmMs > 0) durations.add('LLM ${_fmtDuration(s.llmMs)}');
@@ -55,25 +68,6 @@ class DshStatsBar extends StatelessWidget {
         '输入 ${_fmtTokens(s.billedInputTokens)} tok · 输出 ${_fmtTokens(s.outputTokens)} tok',
       );
     }
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
-      child: LiquidGlassLens(
-        style: chatLiquidGlassStyle(context, cornerRadius: 10),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          child: Text(
-            groups.join(' | '),
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.labelSmall!.copyWith(
-              fontSize: 11,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ),
-      ),
-    );
+    return groups;
   }
 }

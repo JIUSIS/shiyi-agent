@@ -11,6 +11,7 @@ void main() {
     bool Function()? shouldStop,
     int contextBudgetTokens = 0,
     Future<String> Function(String name, String args)? executeTool,
+    void Function(List<Map<String, dynamic>> msgs)? onTranscript,
   }) {
     return SubagentRunner(
       baseUrl: 'http://fake',
@@ -23,8 +24,31 @@ void main() {
       shouldStop: shouldStop,
       contextBudgetTokens: contextBudgetTokens,
       roundOverride: round,
+      onTranscript: onTranscript,
     );
   }
+
+  test('run 过程回流转写本，最终带上助手报告', () async {
+    final snapshots = <int>[];
+    final runner = makeRunner(
+      round: (msgs) async {
+        if (msgs.any((m) => m['role'] == 'tool')) {
+          return TurnResult(text: '找到了配置');
+        }
+        return TurnResult(
+          toolCalls: [
+            {'id': 'c1', 'name': 'file_read', 'arguments': '{}'},
+          ],
+        );
+      },
+      onTranscript: (msgs) => snapshots.add(msgs.length),
+    );
+    final r = await runner.run(def, '找配置');
+    expect(r.isSuccess, isTrue);
+    expect(snapshots, isNotEmpty);
+    expect(snapshots.first, greaterThanOrEqualTo(2));
+    expect(snapshots.last, greaterThanOrEqualTo(4));
+  });
 
   group('SubagentResult 状态与展示文本', () {
     test('success 携带报告与 token', () {

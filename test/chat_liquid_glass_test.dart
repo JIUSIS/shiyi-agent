@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
+import 'package:shiyi_agent_app/core/models.dart';
+import 'package:shiyi_agent_app/core/subagent_live.dart';
 import 'package:shiyi_agent_app/widgets/chat_liquid_glass.dart';
+import 'package:shiyi_agent_app/widgets/subagent_mini_session.dart';
 
 Widget _composer({
   required TextEditingController input,
@@ -26,6 +29,8 @@ Widget _composer({
   String permissionValue = '',
   ValueChanged<String>? onPermissionChanged,
   bool permissionEnabled = true,
+  VoidCallback? onWorkspacePressed,
+  String workspaceTooltip = '项目目录',
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -64,6 +69,8 @@ Widget _composer({
             permissionValue: permissionValue,
             onPermissionChanged: onPermissionChanged,
             permissionEnabled: permissionEnabled,
+            onWorkspacePressed: onWorkspacePressed,
+            workspaceTooltip: workspaceTooltip,
           ),
         ),
       ),
@@ -192,7 +199,438 @@ void main() {
       ),
     );
 
-    expect(find.text(status), findsOneWidget);
+    expect(find.text('子代理'), findsOneWidget);
+    expect(find.byTooltip(status), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('多个子代理直接打开 mini 会话并可左右滑动', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const status = '子代理 1/2 · 运行中';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: SubagentStatusBar(
+              text: status,
+              agents: [
+                SubagentLiveSnapshot(
+                  id: 'a',
+                  title: 'explore',
+                  subtitle: '第 3/15 轮 · 正在调用 file_read',
+                  prompt: '找一下配置文件',
+                  messages: [
+                    ChatMessage(
+                      id: 'u1',
+                      sessionId: 'a',
+                      role: 'user',
+                      content: '找一下配置文件',
+                      createdAt: 0,
+                    ),
+                  ],
+                ),
+                SubagentLiveSnapshot(
+                  id: 'b',
+                  title: 'worker',
+                  subtitle: '第 2/40 轮 · 正在调用 file_write',
+                  prompt: '改配置',
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('子代理 2'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(tester.takeException(), isNull);
+    expect(find.text('explore'), findsWidgets);
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsOneWidget);
+    expect(find.text('找一下配置文件'), findsWidgets);
+
+    await tester.drag(
+      find.byKey(const ValueKey('subagent-mini-session')),
+      const Offset(-240, 0),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('worker'), findsWidgets);
+    expect(find.text('改配置'), findsWidgets);
+    expect(tester.takeException(), isNull);
+
+    await tester.tapAt(const Offset(12, 12));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('单个子代理点击状态条直接打开 mini 会话，返回关闭', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const status = '子代理 1/1 · explore · 第 1/15 轮 · 思考中';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: SubagentStatusBar(
+              text: status,
+              agents: const [
+                SubagentLiveSnapshot(
+                  id: 'only',
+                  title: 'explore',
+                  subtitle: '第 1/15 轮 · 思考中',
+                  prompt: '只读检查这些文件',
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsOneWidget);
+    expect(find.text('只读检查这些文件'), findsWidgets);
+
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('子代理已完成时按钮仍在，关闭途中卸掉不红屏', (tester) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    var show = true;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              if (!show) return const SizedBox.shrink();
+              return Align(
+                alignment: Alignment.bottomCenter,
+                child: SubagentStatusBar(
+                  text: '子代理 · 已完成',
+                  agents: const [
+                    SubagentLiveSnapshot(
+                      id: 'done',
+                      title: 'explore',
+                      subtitle: '已完成',
+                      running: false,
+                      prompt: '检查完毕',
+                    ),
+                  ],
+                  onOpenChanged: (open) {
+                    if (!open) setState(() => show = false);
+                  },
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('子代理'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('检查完毕'), findsWidgets);
+
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('缓存按钮固定最左且与子代理同高', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: ChatComposerFloatChips(
+              stats: ChatStatsChip(label: '缓存 75%', detail: '本轮 1.2k · 缓存 75%'),
+              subagent: SubagentStatusBar(
+                text: '子代理 1/1 · 运行中',
+                agents: [
+                  SubagentLiveSnapshot(
+                    id: 'a',
+                    title: 'explore',
+                    running: true,
+                    prompt: '检查文件',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final cache = tester.getRect(find.byKey(const ValueKey('chat-stats-chip')));
+    final sub = tester.getRect(
+      find.byKey(const ValueKey('subagent-live-chip')),
+    );
+    expect(cache.height, closeTo(32, 0.5));
+    expect(sub.height, closeTo(32, 0.5));
+    expect(cache.height, closeTo(sub.height, 0.5));
+    expect(cache.left, lessThan(sub.left));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('打开子代理后卸掉会话页不红屏', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: SubagentStatusBar(
+              text: '子代理',
+              agents: [
+                SubagentLiveSnapshot(id: 'a', title: 'explore', prompt: '检查文件'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: Text('home'))),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('home'), findsOneWidget);
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('连续点击子代理只会有一个小窗', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: SubagentStatusBar(
+              text: '子代理 2',
+              agents: [
+                SubagentLiveSnapshot(
+                  id: 'a',
+                  title: 'explore',
+                  running: true,
+                  prompt: '检查文件',
+                ),
+                SubagentLiveSnapshot(
+                  id: 'b',
+                  title: 'worker',
+                  running: true,
+                  prompt: '改配置',
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final chip = find.byKey(const ValueKey('subagent-live-chip'));
+    await tester.tap(chip);
+    await tester.pump();
+    await tester.tap(chip);
+    await tester.pump();
+    await tester.tap(chip);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsOneWidget);
+    expect(find.text('explore'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('打开子代理动画中途卸掉页面不红屏', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: SubagentStatusBar(
+              text: '子代理',
+              agents: [
+                SubagentLiveSnapshot(
+                  id: 'a',
+                  title: 'explore',
+                  running: true,
+                  prompt: '检查文件',
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 40));
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: Text('home'))),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('home'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('打开子代理后连续返回到上一页不红屏', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: Builder(
+              builder: (context) {
+                return TextButton(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const Scaffold(
+                          body: Align(
+                            alignment: Alignment.bottomCenter,
+                            child: SubagentStatusBar(
+                              text: '子代理',
+                              agents: [
+                                SubagentLiveSnapshot(
+                                  id: 'a',
+                                  title: 'explore',
+                                  prompt: '检查文件',
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                  child: const Text('open-chat'),
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('open-chat'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey('subagent-mini-session')), findsNothing);
+    expect(tester.takeException(), isNull);
+
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('open-chat'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('输入框工具栏显示项目目录图标，缓存条是小按钮', (tester) async {
+    final input = TextEditingController();
+    addTearDown(input.dispose);
+    var tapped = false;
+
+    await tester.pumpWidget(
+      _composer(
+        input: input,
+        allowSendWhileBusy: true,
+        onWorkspacePressed: () => tapped = true,
+        workspaceTooltip: '/storage/emulated/0/agent',
+      ),
+    );
+
+    expect(find.byKey(const ValueKey('chat-workspace-button')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('chat-workspace-button')));
+    expect(tapped, isTrue);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: ChatStatsChip(label: '缓存 75%', detail: '本轮 1.2k · 缓存 75%'),
+        ),
+      ),
+    );
+    expect(find.byKey(const ValueKey('chat-stats-chip')), findsOneWidget);
+    expect(find.text('缓存 75%'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('chat-stats-chip')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.text('本轮 1.2k · 缓存 75%'), findsWidgets);
     expect(tester.takeException(), isNull);
   });
 
@@ -784,7 +1222,10 @@ void main() {
         onModelChanged: (_) {},
         permissionOptions: const [
           PermissionPresetOption(value: 'readonly', label: 'Read Only'),
-          PermissionPresetOption(value: 'workspace-write', label: 'Workspace Write'),
+          PermissionPresetOption(
+            value: 'workspace-write',
+            label: 'Workspace Write',
+          ),
           PermissionPresetOption(value: 'full', label: 'Full access'),
         ],
         permissionValue: 'readonly',

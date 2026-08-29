@@ -21,6 +21,7 @@ import '../services/file_workspace.dart';
 import '../services/settings_service.dart';
 import '../services/skill_pack.dart';
 import '../services/subagent.dart';
+import 'subagent_live.dart';
 import '../services/termux_runtime.dart';
 import '../services/web_tools.dart';
 import '../services/notifier.dart';
@@ -136,6 +137,7 @@ class _SessionRun {
   final ValueNotifier<String> streamText = ValueNotifier('');
   final ValueNotifier<String> streamReasoning = ValueNotifier('');
   final List<ToolEvent> toolEvents = [];
+  final List<SubagentLiveRun> subagents = [];
   List<Skill> loadedSkillsSnapshot = const [];
   bool planMode = false;
 
@@ -269,6 +271,17 @@ class ShiyiState extends ChangeNotifier {
   final ValueNotifier<int> messagesRevision = ValueNotifier(0);
 
   void _bumpMessages() => messagesRevision.value++;
+
+  /// 子代理 mini 会话专用：进度/转写本变化时只刷新状态条，不重建整列气泡。
+  final ValueNotifier<int> subagentLiveRevision = ValueNotifier(0);
+
+  void _bumpSubagentLive() => subagentLiveRevision.value++;
+
+  List<SubagentLiveSnapshot> subagentsForSession(String? sessionId) {
+    final run = _existingRun(sessionId);
+    if (run == null) return const <SubagentLiveSnapshot>[];
+    return [for (final item in run.subagents) item.toSnapshot()];
+  }
 
   /// 会话列表版本号：主页会话 tab 只监听它，删除/新建/重命名后立即刷新。
   final ValueNotifier<int> sessionsRevision = ValueNotifier(0);
@@ -2631,7 +2644,11 @@ class ShiyiState extends ChangeNotifier {
     return parts.map((e) => '【图片：$e】').join('\n');
   }
 
-  Future<void> send(String text, {String? sessionId, ChatMessage? pendingUserMessage}) async {
+  Future<void> send(
+    String text, {
+    String? sessionId,
+    ChatMessage? pendingUserMessage,
+  }) async {
     final trimText = text.trim();
     if (trimText.isEmpty) return;
     var targetSessionId = sessionId ?? currentSessionId;
@@ -2681,6 +2698,8 @@ class ShiyiState extends ChangeNotifier {
       ..planMode = currentSessionId == targetSessionId
           ? planMode
           : run.planMode;
+    run.subagents.clear();
+    _bumpSubagentLive();
     run.streamText.value = '';
     run.streamReasoning.value = '';
     if (run.toolEvents.isEmpty) {
@@ -3161,6 +3180,8 @@ class ShiyiState extends ChangeNotifier {
       ..resetLastRoundStats()
       ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
       ..planMode = planMode;
+    run.subagents.clear();
+    _bumpSubagentLive();
     run.streamText.value = '';
     run.streamReasoning.value = '';
     if (run.toolEvents.isEmpty) {
@@ -4617,6 +4638,19 @@ class ShiyiState extends ChangeNotifier {
             : null;
         final clientSettings = clientSettingsForSession(toolSessionId);
         final parentLimit = contextLimitForSession(toolSessionId);
+        final live = SubagentLiveRun(
+          id: (spawnSessionId ?? 'session') + '-' + i.toString(),
+          type: def.name,
+          prompt: prompt,
+          index: i + 1,
+          total: total,
+          maxTurns: override ?? def.maxTurns,
+        );
+        live.messages = subagentTranscriptToMessages(live.id, [
+          {'role': 'user', 'content': prompt},
+        ]);
+        run?.subagents.add(live);
+        _bumpSubagentLive();
         final runner = SubagentRunner(
           baseUrl: clientSettings.baseUrl,
           apiKey: clientSettings.apiKey,
@@ -4685,12 +4719,32 @@ class ShiyiState extends ChangeNotifier {
           shouldStop: () => run?.stopRequested ?? false,
           // 进度回流：显示「第 i/N 个子代理 · 类型 · 第 n/m 轮 · 工具」。
           onProgress: (round, max, tool) {
-            final t2 = tool.isEmpty ? '思考中' : '正在调用 $tool';
+            live.round = round + 1;
+            live.maxTurns = max;
+            live.lastTool = tool;
             if (run == null) return;
             run.status =
-                '子代理 ${i + 1}/$total · ${def.name} · '
-                '第 ${round + 1}/$max 轮 · $t2';
+                '子代理 ' +
+                (i + 1).toString() +
+                '/' +
+                total.toString() +
+                ' · ' +
+                def.name +
+                ' · ' +
+                live.statusLine;
             _publishRun(run);
+            _bumpSubagentLive();
+          },
+          onLiveTurn: (turn) {
+            live.liveContent = turn.text;
+            live.liveReasoning = turn.reasoning;
+            _bumpSubagentLive();
+          },
+          onTranscript: (msgs) {
+            live.messages = subagentTranscriptToMessages(live.id, msgs);
+            live.liveContent = '';
+            live.liveReasoning = '';
+            _bumpSubagentLive();
           },
         );
         SubagentResult result;
@@ -4703,6 +4757,10 @@ class ShiyiState extends ChangeNotifier {
             totalTokens: runner.totalTokens,
           );
         }
+        live.running = false;
+        live.liveContent = '';
+        live.liveReasoning = '';
+        _bumpSubagentLive();
         if (result.totalTokens > 0) subagentTokens += result.totalTokens;
         // 最终报告也做掐头去尾裁剪（worker 40 轮的报告可能超长，不能裸奔进主上下文）。
         final reportText = _subagentReportPruner.prune(result.toModelText());
@@ -4723,7 +4781,11 @@ class ShiyiState extends ChangeNotifier {
     // 全部结束后清掉轮次状态条，避免残留「第 n/m 轮」。
     if (run != null) {
       run.status = null;
+      for (final item in run.subagents) {
+        item.running = false;
+      }
       _publishRun(run);
+      _bumpSubagentLive();
     }
     return results.join('\n\n');
   }

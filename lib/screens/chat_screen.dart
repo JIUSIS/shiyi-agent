@@ -19,6 +19,7 @@ import '../services/tts_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/agent_question_panel.dart';
 import '../widgets/chat_liquid_glass.dart';
+import '../widgets/subagent_mini_session.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/tool_pill.dart';
@@ -56,6 +57,7 @@ class _ChatScreenState extends State<ChatScreen>
   );
   MacPageRoute? _route;
   bool _showToolLog = false;
+  bool _subagentPeekOpen = false;
   bool _autoScrollScheduled = false;
   final Set<String> _enteredMessageIds = {};
   final Set<String> _enteredUserTexts = {};
@@ -306,6 +308,35 @@ class _ChatScreenState extends State<ChatScreen>
     final w = await widget.shiyi.workspaceForSession(_pageSessionId);
     if (!mounted) return;
     setState(() => _workspace = w);
+  }
+
+  Widget _composerFloatChips() {
+    return ValueListenableBuilder<int>(
+      valueListenable: widget.shiyi.subagentLiveRevision,
+      builder: (context, revision, child) {
+        final liveStatus = widget.shiyi.statusForSession(_pageSessionId);
+        final agents = widget.shiyi.subagentsForSession(_pageSessionId);
+        final showSubagent = agents.isNotEmpty || _subagentPeekOpen;
+        return ChatComposerFloatChips(
+          stats: ListenableBuilder(
+            listenable: widget.shiyi,
+            builder: (context, _) => _TokenStats(shiyi: widget.shiyi),
+          ),
+          subagent: showSubagent
+              ? SubagentStatusBar(
+                  key: const ValueKey('composer-subagent-bar'),
+                  text: liveStatus ?? '子代理',
+                  agents: agents,
+                  onOpenChanged: (open) {
+                    if (mounted) {
+                      setState(() => _subagentPeekOpen = open);
+                    }
+                  },
+                )
+              : null,
+        );
+      },
+    );
   }
 
   /// 弹出会话工作目录设置面板。
@@ -1252,9 +1283,7 @@ class _ChatScreenState extends State<ChatScreen>
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
                                       if (status != null &&
-                                          status.startsWith('子代理'))
-                                        SubagentStatusBar(text: status)
-                                      else if (status != null)
+                                          !status.startsWith('子代理'))
                                         Builder(
                                           builder: (context) {
                                             final isError = status.startsWith(
@@ -1295,11 +1324,6 @@ class _ChatScreenState extends State<ChatScreen>
                               ),
                               ListenableBuilder(
                                 listenable: widget.shiyi,
-                                builder: (context, _) =>
-                                    _TokenStats(shiyi: widget.shiyi),
-                              ),
-                              ListenableBuilder(
-                                listenable: widget.shiyi,
                                 builder: (context, _) => _LoadedSkillChips(
                                   skills: widget.shiyi.loadedSkills,
                                   onRemove: (s) =>
@@ -1311,65 +1335,6 @@ class _ChatScreenState extends State<ChatScreen>
                                 builder: (context, _) => _PlanModeChip(
                                   planMode: widget.shiyi.planModeForSession(
                                     _pageSessionId,
-                                  ),
-                                ),
-                              ),
-                              // 当前会话项目目录条：点击可修改。
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(
-                                  12,
-                                  0,
-                                  12,
-                                  4,
-                                ),
-                                child: LiquidGlassLens(
-                                  style: chatLiquidGlassStyle(
-                                    context,
-                                    cornerRadius: 10,
-                                  ),
-                                  child: Material(
-                                    color: Colors.transparent,
-                                    child: InkWell(
-                                      onTap: _pickWorkspace,
-                                      borderRadius: BorderRadius.circular(10),
-                                      child: Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 10,
-                                          vertical: 5,
-                                        ),
-                                        child: Row(
-                                          children: [
-                                            Icon(
-                                              Icons.folder_outlined,
-                                              size: 14,
-                                              color: theme.colorScheme.primary,
-                                            ),
-                                            const SizedBox(width: 6),
-                                            Expanded(
-                                              child: Text(
-                                                _workspace ?? '项目目录…',
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: theme
-                                                    .textTheme
-                                                    .labelSmall!
-                                                    .copyWith(
-                                                      color: theme
-                                                          .colorScheme
-                                                          .onSurfaceVariant,
-                                                    ),
-                                              ),
-                                            ),
-                                            const SizedBox(width: 4),
-                                            Icon(
-                                              Icons.edit_outlined,
-                                              size: 13,
-                                              color: theme.hintColor,
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
                                   ),
                                 ),
                               ),
@@ -1440,6 +1405,7 @@ class _ChatScreenState extends State<ChatScreen>
                                   );
                                 },
                               ),
+                              _composerFloatChips(),
                               ListenableBuilder(
                                 listenable: widget.shiyi,
                                 builder: (context, _) {
@@ -1481,21 +1447,21 @@ class _ChatScreenState extends State<ChatScreen>
                                     modelValue: sessionProfile?.name ?? '',
                                     modelId: sessionSettings.model,
                                     onModelChanged: (selection) {
-                                            for (final p
-                                                in widget.shiyi.apiProfiles) {
-                                              if (p.name == selection.profile) {
-                                                unawaited(
-                                                  widget.shiyi
-                                                      .setApiProfileForSession(
-                                                        _pageSessionId,
-                                                        p,
-                                                        model: selection.model,
-                                                      ),
-                                                );
-                                                break;
-                                              }
-                                            }
-                                          },
+                                      for (final p
+                                          in widget.shiyi.apiProfiles) {
+                                        if (p.name == selection.profile) {
+                                          unawaited(
+                                            widget.shiyi
+                                                .setApiProfileForSession(
+                                                  _pageSessionId,
+                                                  p,
+                                                  model: selection.model,
+                                                ),
+                                          );
+                                          break;
+                                        }
+                                      }
+                                    },
                                     modelEnabled: true,
                                     thinkingOptions: buildReasoningOptions(
                                       thinkingCaps,
@@ -1521,18 +1487,18 @@ class _ChatScreenState extends State<ChatScreen>
                                                 on,
                                               )
                                         : null,
-                                    onCompress:
-                                        _pageSessionId == null
+                                    onCompress: _pageSessionId == null
                                         ? null
                                         : _compressContext,
                                     compressBusy: _pageBusy,
-                                    onContextLimit:
-                                        _pageSessionId == null
+                                    onContextLimit: _pageSessionId == null
                                         ? null
                                         : _editContextLimit,
                                     contextLimitLabel: formatContextLimitLabel(
                                       sessionSettings.contextLimit,
                                     ),
+                                    onWorkspacePressed: _pickWorkspace,
+                                    workspaceTooltip: _workspace ?? '项目目录',
                                   );
                                 },
                               ),
@@ -1753,8 +1719,8 @@ class _TokenStats extends StatelessWidget {
     final cacheText = !shiyi.sessionCacheKnown || shiyi.sessionInputTokens <= 0
         ? '缓存 --'
         : '缓存 ${(shiyi.sessionCachedTokens / shiyi.sessionInputTokens * 100).round()}%';
-    final roundCacheText = !shiyi.lastRoundCacheKnown ||
-            shiyi.lastRoundPromptTokens <= 0
+    final roundCacheText =
+        !shiyi.lastRoundCacheKnown || shiyi.lastRoundPromptTokens <= 0
         ? '本轮命中 --'
         : '本轮命中 ${_fmt(shiyi.lastRoundCachedTokens)}/未缓存 ${_fmt((shiyi.lastRoundPromptTokens - shiyi.lastRoundCachedTokens).clamp(0, shiyi.lastRoundPromptTokens))}';
     final color = remainInt <= 20
@@ -1762,24 +1728,11 @@ class _TokenStats extends StatelessWidget {
         : remainInt <= 50
         ? theme.colorScheme.tertiary
         : theme.colorScheme.onSurfaceVariant;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
-      child: LiquidGlassLens(
-        style: chatLiquidGlassStyle(context, cornerRadius: 10),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          child: Text(
-            '本轮 ${_fmt(round)} · 上下文剩 $remainInt% · $cacheText · $roundCacheText',
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.labelSmall!.copyWith(
-              color: color,
-              fontSize: 11,
-            ),
-          ),
-        ),
-      ),
+    return ChatStatsChip(
+      label: cacheText,
+      detail:
+          '本轮 ${_fmt(round)} · 上下文剩 $remainInt% · $cacheText · $roundCacheText',
+      color: color,
     );
   }
 }

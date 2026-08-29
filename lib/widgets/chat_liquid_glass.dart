@@ -87,10 +87,7 @@ class LiquidGlassPopupRoute<T> extends PopupRoute<T> {
 }
 
 class _LiquidGlassPopupBody extends StatefulWidget {
-  const _LiquidGlassPopupBody({
-    required this.builder,
-    required this.onState,
-  });
+  const _LiquidGlassPopupBody({required this.builder, required this.onState});
 
   final WidgetBuilder builder;
   final ValueChanged<_LiquidGlassPopupBodyState?> onState;
@@ -224,35 +221,7 @@ class ChatGlassNoticeBar extends StatelessWidget {
   }
 }
 
-/// 拾忆与 DSH 共用的子代理运行状态条。
-/// 只负责统一液态玻璃外观，状态文本和可见性由各引擎提供。
-class SubagentStatusBar extends StatelessWidget {
-  final String text;
-
-  const SubagentStatusBar({super.key, required this.text});
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
-      child: LiquidGlassLens(
-        style: chatLiquidGlassStyle(context, cornerRadius: 10),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-          child: Text(
-            text,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.bodySmall!.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
+/// 子代理状态条见 subagent_mini_session.dart，保持拾忆 / DSH 同一套入口。
 
 /// 思考强度选项。空字符串表示跟随提供商默认，`off` 表示显式关闭。
 class ThinkingIntensityOption {
@@ -652,9 +621,7 @@ class _AutoScrollLabelState extends State<AutoScrollLabel>
     if (_overflow <= 0) return 0;
     final travel = _travelDuration();
     final totalMs = (_hold + travel + _hold + travel).inMilliseconds;
-    final at = Duration(
-      milliseconds: (_controller.value * totalMs).round(),
-    );
+    final at = Duration(milliseconds: (_controller.value * totalMs).round());
     final holdMs = _hold.inMilliseconds;
     final travelMs = travel.inMilliseconds;
     if (at.inMilliseconds <= holdMs) return 0;
@@ -942,9 +909,7 @@ class _PermissionMenuRow extends StatelessWidget {
           child: Row(
             children: [
               Icon(
-                checked
-                    ? CupertinoIcons.checkmark
-                    : CupertinoIcons.shield,
+                checked ? CupertinoIcons.checkmark : CupertinoIcons.shield,
                 size: 14,
                 color: checked ? _iosBlue : theme.hintColor,
               ),
@@ -971,7 +936,8 @@ class _PermissionMenuRow extends StatelessWidget {
 }
 
 /// 会话页共用的思考开关；点亮为开，点灭为关。不持有引擎状态。
-class ThinkingToggleButton extends StatelessWidget {  final bool on;
+class ThinkingToggleButton extends StatelessWidget {
+  final bool on;
   final VoidCallback? onPressed;
 
   const ThinkingToggleButton({
@@ -1380,16 +1346,18 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
     final accent = widget.enabled
         ? (_isOpen ? _iosBlue : theme.colorScheme.onSurfaceVariant)
         : theme.disabledColor;
-    final labelStyle = theme.textTheme.labelLarge?.copyWith(
-      color: accent,
-      fontSize: 13,
-      fontWeight: FontWeight.w600,
-      letterSpacing: -0.24,
-    ) ?? const TextStyle(
-      fontSize: 13,
-      fontWeight: FontWeight.w600,
-      letterSpacing: -0.24,
-    );
+    final labelStyle =
+        theme.textTheme.labelLarge?.copyWith(
+          color: accent,
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -0.24,
+        ) ??
+        const TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -0.24,
+        );
     final mimoPainter = TextPainter(
       text: TextSpan(text: 'mimo-2.5', style: labelStyle),
       textDirection: TextDirection.ltr,
@@ -1593,6 +1561,290 @@ class ChatCompressionButton extends StatelessWidget {
   }
 }
 
+/// 输入框工具栏里的项目目录入口，只留文件夹图标。
+class ChatWorkspaceButton extends StatelessWidget {
+  final VoidCallback onPressed;
+  final String tooltip;
+
+  const ChatWorkspaceButton({
+    super.key,
+    required this.onPressed,
+    this.tooltip = '项目目录',
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Tooltip(
+      message: tooltip.isEmpty ? '项目目录' : tooltip,
+      child: GestureDetector(
+        key: const ValueKey('chat-workspace-button'),
+        onTap: onPressed,
+        behavior: HitTestBehavior.opaque,
+        child: SizedBox(
+          width: 32,
+          height: 32,
+          child: Icon(
+            CupertinoIcons.folder,
+            size: 18,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 输入框上方悬浮芯片的统一外壳：高 32、字 13、行高 18/13。
+class ChatComposerChip extends StatelessWidget {
+  static const double height = 32;
+  static const double radius = 16;
+
+  final String tooltip;
+  final VoidCallback onTap;
+  final List<Widget> children;
+  final GlobalKey? anchorKey;
+  final Key? chipKey;
+  final Color? color;
+
+  const ChatComposerChip({
+    super.key,
+    required this.tooltip,
+    required this.onTap,
+    required this.children,
+    this.anchorKey,
+    this.chipKey,
+    this.color,
+  });
+
+  static TextStyle labelStyle(ThemeData theme, {Color? color}) {
+    return (theme.textTheme.labelLarge ?? const TextStyle()).copyWith(
+      fontSize: 13,
+      height: 18 / 13,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 0,
+      color: color ?? theme.colorScheme.onSurface,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final fg = color ?? theme.colorScheme.onSurface;
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        key: anchorKey,
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: LiquidGlassLens(
+          style: chatLiquidGlassStyle(context, cornerRadius: radius),
+          child: SizedBox(
+            key: chipKey,
+            height: height,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: IconTheme(
+                data: IconThemeData(size: 13, color: fg),
+                child: DefaultTextStyle(
+                  style: labelStyle(theme, color: fg),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: children,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 输入框上方悬浮按钮行：缓存永远在最左，子代理在它右边。
+class ChatComposerFloatChips extends StatelessWidget {
+  final Widget? stats;
+  final Widget? subagent;
+
+  const ChatComposerFloatChips({super.key, this.stats, this.subagent});
+
+  @override
+  Widget build(BuildContext context) {
+    final children = <Widget>[
+      ?stats,
+      if (stats != null && subagent != null) const SizedBox(width: 8),
+      ?subagent,
+    ];
+    if (children.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+      child: Row(children: children),
+    );
+  }
+}
+
+/// 输入框上方的缓存/统计小按钮，点开看完整文案。
+class ChatStatsChip extends StatefulWidget {
+  final String label;
+  final String detail;
+  final Color? color;
+
+  const ChatStatsChip({
+    super.key,
+    required this.label,
+    required this.detail,
+    this.color,
+  });
+
+  @override
+  State<ChatStatsChip> createState() => _ChatStatsChipState();
+}
+
+class _ChatStatsChipState extends State<ChatStatsChip>
+    with SingleTickerProviderStateMixin {
+  final GlobalKey _buttonKey = GlobalKey();
+  LiquidGlassPopupRoute<void>? _popup;
+  Rect _anchor = Rect.zero;
+  late final AnimationController _anim;
+  late final Animation<double> _reveal;
+
+  @override
+  void initState() {
+    super.initState();
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 200),
+      reverseDuration: const Duration(milliseconds: 140),
+    );
+    _reveal = CurvedAnimation(
+      parent: _anim,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
+
+  bool get _isOpen => _popup != null;
+
+  Future<void> _dismiss() async {
+    final route = _popup;
+    if (route == null) return;
+    _popup = null;
+    if (mounted) setState(() {});
+    if (_anim.value > 0) {
+      try {
+        await _anim.reverse();
+      } catch (_) {}
+    }
+    if (route.isActive) {
+      route.navigator?.removeRoute(route);
+    }
+  }
+
+  void _show() {
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    _anchor = box.localToGlobal(Offset.zero) & box.size;
+    HapticFeedback.selectionClick();
+    _popup = LiquidGlassPopupRoute<void>(
+      builder: _buildOverlay,
+      onDismiss: () => unawaited(_dismiss()),
+    );
+    Navigator.of(context, rootNavigator: true).push(_popup!);
+    _anim.forward(from: 0);
+    setState(() {});
+  }
+
+  Widget _buildOverlay(BuildContext overlayContext) {
+    final dark = Theme.of(overlayContext).brightness == Brightness.dark;
+    final mq = MediaQuery.of(overlayContext);
+    final maxWidth = mq.size.width - 24;
+    final width = maxWidth <= 200 ? maxWidth.clamp(0.0, 280.0) : 280.0;
+    final maxLeft = mq.size.width - width - 12.0;
+    final left = maxLeft < 12 ? 12.0 : _anchor.left.clamp(12.0, maxLeft);
+    final minBottom = mq.padding.bottom + 8.0;
+    final maxBottom = mq.size.height - mq.padding.top - 96.0;
+    final rawBottom = mq.size.height - _anchor.top + 6;
+    final bottom = maxBottom < minBottom
+        ? minBottom
+        : rawBottom.clamp(minBottom, maxBottom);
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: () => unawaited(_dismiss()),
+          ),
+        ),
+        Positioned(
+          left: left,
+          bottom: bottom,
+          width: width,
+          child: FadeTransition(
+            opacity: _reveal,
+            child: Material(
+              color: Colors.transparent,
+              elevation: 12,
+              shadowColor: Colors.black.withValues(alpha: dark ? .36 : .14),
+              borderRadius: BorderRadius.circular(14),
+              clipBehavior: Clip.antiAlias,
+              child: LiquidGlassLens(
+                style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                  child: Text(
+                    widget.detail,
+                    style: Theme.of(overlayContext).textTheme.bodySmall
+                        ?.copyWith(fontSize: 13, height: 18 / 13),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  void dispose() {
+    final route = _popup;
+    _popup = null;
+    if (route?.isActive == true) {
+      route!.navigator?.removeRoute(route);
+    }
+    _anim.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = widget.color ?? theme.colorScheme.onSurface;
+    return ChatComposerChip(
+      tooltip: widget.detail,
+      anchorKey: _buttonKey,
+      chipKey: const ValueKey('chat-stats-chip'),
+      color: color,
+      onTap: () {
+        if (_isOpen) {
+          unawaited(_dismiss());
+        } else {
+          _show();
+        }
+      },
+      children: [
+        Icon(CupertinoIcons.chart_bar, size: 13, color: color),
+        const SizedBox(width: 6),
+        Text(
+          widget.label,
+          style: ChatComposerChip.labelStyle(theme, color: color),
+        ),
+      ],
+    );
+  }
+}
+
 class LiquidGlassChatComposer extends StatelessWidget {
   final TextEditingController input;
   final bool busy;
@@ -1628,6 +1880,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final String permissionValue;
   final ValueChanged<String>? onPermissionChanged;
   final bool permissionEnabled;
+  final VoidCallback? onWorkspacePressed;
+  final String workspaceTooltip;
 
   const LiquidGlassChatComposer({
     super.key,
@@ -1665,6 +1919,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.permissionValue = '',
     this.onPermissionChanged,
     this.permissionEnabled = true,
+    this.onWorkspacePressed,
+    this.workspaceTooltip = '项目目录',
   });
 
   bool _handleKey(KeyEvent event) {
@@ -1732,7 +1988,8 @@ class LiquidGlassChatComposer extends StatelessWidget {
                     onCompress != null ||
                     onContextLimit != null ||
                     (permissionOptions.isNotEmpty &&
-                        onPermissionChanged != null)) ...[
+                        onPermissionChanged != null) ||
+                    onWorkspacePressed != null) ...[
                   Row(
                     children: [
                       if (modelOptions.isNotEmpty && onModelChanged != null)
@@ -1751,6 +2008,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
                         )
                       else
                         const Spacer(),
+                      if (onWorkspacePressed != null)
+                        ChatWorkspaceButton(
+                          onPressed: onWorkspacePressed!,
+                          tooltip: workspaceTooltip,
+                        ),
                       if (permissionOptions.isNotEmpty &&
                           onPermissionChanged != null)
                         PermissionPresetSelector(

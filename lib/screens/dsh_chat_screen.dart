@@ -11,6 +11,7 @@ import 'package:path/path.dart' as p;
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../core/subagent_live.dart';
 import '../core/slash_trigger.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
@@ -28,6 +29,7 @@ import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/agent_question_panel.dart';
 import '../widgets/chat_liquid_glass.dart';
+import '../widgets/subagent_mini_session.dart';
 import '../widgets/dsh_directory_picker.dart';
 import '../widgets/dsh_stats_bar.dart';
 import '../widgets/tool_pill.dart';
@@ -132,6 +134,8 @@ class _DshChatScreenState extends State<DshChatScreen>
   int _sendGeneration = 0;
   DateTime? _lastSendAt;
   bool _showToolLog = false;
+  bool _subagentPeekOpen = false;
+  final Map<String, SubagentLiveSnapshot> _subagentDetails = {};
   String? _speakingId;
   late DshSessionSummary? _summary = widget.initialSummary;
   Map<String, dynamic>? _pendingQuestion;
@@ -466,19 +470,101 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   int get _subagentTotalCount {
-    return _runningSubagentCount;
+    return _subagents.where((e) => e.kind != 'diagnostic').length;
+  }
+
+  String get _subagentBarText {
+    final n = _runningSubagentCount;
+    final total = _subagentTotalCount;
+    if (n > 0) {
+      return '子代理 ' + n.toString() + '/' + total.toString() + ' · 运行中';
+    }
+    if (total > 0) return '子代理 ' + total.toString() + ' · 已完成';
+    return '子代理';
+  }
+
+  String _dshSubagentTitle(DshSubagentEntry e) {
+    final title = e.title;
+    if (title != null && title.isNotEmpty) return title;
+    final shortId = e.sessionId.split('-').first;
+    return shortId.isEmpty ? '子代理' : '子代理 ' + shortId;
+  }
+
+  String _dshSubagentSubtitle(DshSubagentEntry e) {
+    final parts = <String>[
+      e.mode == 'continuable' ? '可继续对话' : '一次性',
+      e.running ? '运行中' : '已完成',
+    ];
+    if (e.turnCount > 0) {
+      parts.insert(0, e.turnCount.toString() + ' 轮');
+    }
+    return parts.join(' · ');
+  }
+
+  List<SubagentLiveSnapshot> _subagentSnapshots() {
+    final out = <SubagentLiveSnapshot>[];
+    for (final e in _subagents) {
+      if (e.kind == 'diagnostic') continue;
+      final cached = _subagentDetails[e.sessionId];
+      final base =
+          cached ??
+          SubagentLiveSnapshot(
+            id: e.sessionId,
+            title: _dshSubagentTitle(e),
+            subtitle: _dshSubagentSubtitle(e),
+            running: e.running,
+          );
+      out.add(
+        base.copyWith(
+          title: _dshSubagentTitle(e),
+          subtitle: _dshSubagentSubtitle(e),
+          running: e.running,
+        ),
+      );
+    }
+    return out;
+  }
+
+  Future<SubagentLiveSnapshot> _resolveDshSubagent(
+    SubagentLiveSnapshot agent,
+  ) async {
+    DshSubagentEntry? entry;
+    for (final e in _subagents) {
+      if (e.sessionId == agent.id) {
+        entry = e;
+        break;
+      }
+    }
+    final mode = (entry == null || entry.mode.isEmpty)
+        ? 'one-shot'
+        : entry.mode;
+    try {
+      final bundle = await _api.subagentHistoryBundle(
+        widget.sessionId,
+        agent.id,
+        mode: mode,
+      );
+      final next = agent.copyWith(
+        title: entry == null ? agent.title : _dshSubagentTitle(entry),
+        subtitle: entry == null ? agent.subtitle : _dshSubagentSubtitle(entry),
+        running: (entry?.running ?? agent.running) || bundle.live.open,
+        messages: bundle.messages,
+        liveContent: bundle.live.text,
+        liveReasoning: bundle.live.reasoning,
+      );
+      _subagentDetails[agent.id] = next;
+      return next;
+    } catch (_) {
+      return agent;
+    }
   }
 
   /// 会话是否仍处于“正在思考/运行”状态。
   ///
   /// 只要父会话整轮还没收口（`_running` / `_awaitingFinalReply` / 正在发送），
-  /// 或有运行中的子代理，都算活跃——此时「子代理 · 运行中」与消息区「思考中」
-  /// 指示都应常驻。它只由真实活动驱动，不包含派生的显示标记，避免自我锁定。
-  bool get _isThinkingActive =>
-      _running ||
-      _sending ||
-      _awaitingFinalReply ||
-      _subagents.any((e) => e.kind != 'diagnostic' && e.running);
+  /// 都算活跃。子代理是否还在跑跟父会话思考占位分开：主 agent 等待
+  /// 子代理返回时可以停，但子代理按钮仍在。
+  bool get _isThinkingActive => _running || _sending || _awaitingFinalReply;
 
   void _restoreSnapshot(DshChatSnapshot cached, {required bool notify}) {
     void restore() {
@@ -1282,22 +1368,14 @@ class _DshChatScreenState extends State<DshChatScreen>
         _resetLiveNotifiers();
         _ensureLiveBubble();
       } else if (!me.running && (wasRunning || _awaitingFinalReply)) {
-        // 轮询发现远端已停止（mux 不在时的兜底路径）：与 mux 分支 /
-        // 本地 _stop() 同一套收口，且不再重拉子代理列表（远端对已中止
-        // 回合的条目仍报 running:true，重拉会把状态条灌回来）。
-        // 条件含 _awaitingFinalReply：mux turn/end 抢先把 _running 置 false
-        // 后若收口失手，这里下一拍仍能恢复（清理幂等）。
-        ++_sendGeneration;
-        _resetSubagentStatusForNewTurn();
-        _ignoreLateRunningStatus = true;
+        // 与 mux running=false 同一口径：主 agent 可能只是在等子代理。
         _sending = false;
         _awaitingFinalReply = false;
         _turnEndSeen = true;
         _pendingPromptText = null;
-        _stopPoll();
-        _finalizeSubagentStatus();
         _clearLiveUi(preserveVisible: true);
         _syncSubagentPolling();
+        unawaited(_refreshSubagents());
         unawaited(_refreshHistory(clearLive: true));
         return;
       }
@@ -1692,7 +1770,6 @@ class _DshChatScreenState extends State<DshChatScreen>
   Future<void> _stop() async {
     if (_stopping) return;
     ++_sendGeneration;
-    _resetSubagentStatusForNewTurn();
     _ignoreLateRunningStatus = true;
     _sending = false;
     _running = false;
@@ -1701,7 +1778,6 @@ class _DshChatScreenState extends State<DshChatScreen>
     _pendingPromptText = null;
     _stopPoll();
     _syncSubagentPolling();
-    _finalizeSubagentStatus();
     _clearLiveUi(preserveVisible: true);
     if (mounted) {
       setState(() {
@@ -1715,6 +1791,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         () => _api.cancel(widget.sessionId).timeout(const Duration(seconds: 2)),
       );
       unawaited(_refreshHistory(clearLive: true));
+      unawaited(_refreshSubagents());
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -2173,25 +2250,15 @@ class _DshChatScreenState extends State<DshChatScreen>
           _resetLiveNotifiers();
           _ensureLiveBubble();
         } else if (!running && (wasRunning || _awaitingFinalReply)) {
-          // 远端（官方 Web UI / 其他客户端）点了停止：与本地 _stop() 同一套
-          // 收口，否则「思考中」面板和子代理状态条会残留（历史刷新的
-          // allowClose 受 _awaitingFinalReply 阻塞，子代理列表不清空）。
-          // 注意：收口后不能再 _refreshSubagents()——远端 subagent.list 对
-          // 已中止回合的条目仍报 running:true，重拉会把状态条原样灌回来
-          // （#305 首版就是败在这里）。
-          // 条件含 _awaitingFinalReply：mux turn/end 先置 _running=false 后
-          // 若历史刷新失手，轮询仍能在下一拍把状态收回来（清理幂等）。
-          ++_sendGeneration;
-          _resetSubagentStatusForNewTurn();
-          _ignoreLateRunningStatus = true;
+          // 主 agent 等子代理返回时也会 running=false，不能当成停止。
+          // 只收思考面板，子代理跟 subagent.list 走，并允许稍后恢复。
           _sending = false;
           _awaitingFinalReply = false;
           _turnEndSeen = true;
           _pendingPromptText = null;
-          _stopPoll();
-          _finalizeSubagentStatus();
           _clearLiveUi(preserveVisible: true);
           _syncSubagentPolling();
+          unawaited(_refreshSubagents());
           unawaited(_refreshHistory(clearLive: true));
           return;
         }
@@ -2440,12 +2507,8 @@ class _DshChatScreenState extends State<DshChatScreen>
     try {
       final result = await _api.listSubagents(widget.sessionId);
       if (!mounted || refreshGeneration != _subagentRefreshGeneration) return;
-      // 总闸：父回合已收口（本地/远端停止、turn/end、会话重开）时，
-      // subagent.list 里残留的 running 条目不再采信——中止的回合不可能
-      // 还有活着的子代理，采信会让状态条与「思考中」占位永久残留。
-      final turnActive = _running || _sending || _awaitingFinalReply;
       setState(() {
-        _subagents = turnActive ? result.entries : const [];
+        _subagents = result.entries;
       });
       _syncSubagentPolling();
     } catch (_) {
@@ -3044,13 +3107,6 @@ class _DshChatScreenState extends State<DshChatScreen>
                               ),
                             ),
                           ),
-                        if (_runningSubagentCount > 0)
-                          SubagentStatusBar(
-                            text:
-                                '子代理 $_runningSubagentCount/$_subagentTotalCount · 运行中',
-                          ),
-                        DshStatsBar(summary: _summary),
-                        if (_cwd.isNotEmpty) _workspaceBar(theme),
                         AnimatedSwitcher(
                           duration: const Duration(milliseconds: 220),
                           switchInCurve: Curves.easeOutCubic,
@@ -3091,6 +3147,7 @@ class _DshChatScreenState extends State<DshChatScreen>
                                   onCancel: _cancelQuestion,
                                 ),
                         ),
+                        if (_pendingQuestion == null) _composerFloatChips(),
                         if (_pendingQuestion == null)
                           LiquidGlassChatComposer(
                             input: _input,
@@ -3135,6 +3192,8 @@ class _DshChatScreenState extends State<DshChatScreen>
                             contextLimitLabel: formatContextLimitLabel(
                               _contextLimit,
                             ),
+                            onWorkspacePressed: _openWorkspace,
+                            workspaceTooltip: _cwd.isEmpty ? '项目目录' : _cwd,
                           ),
                       ],
                     ),
@@ -3212,60 +3271,25 @@ class _DshChatScreenState extends State<DshChatScreen>
     );
   }
 
-  Widget _workspaceBar(ThemeData theme) {
-    final dark = theme.brightness == Brightness.dark;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(10),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: dark ? .14 : .05),
-              blurRadius: 8,
-              offset: const Offset(0, 1),
-            ),
-          ],
-        ),
-        child: LiquidGlassLens(
-          style: chatLiquidGlassStyle(context, cornerRadius: 10),
-          child: Material(
-            color: Colors.transparent,
-            child: InkWell(
-              onTap: _openWorkspace,
-              borderRadius: BorderRadius.circular(10),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 5,
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.folder_outlined,
-                      size: 14,
-                      color: theme.colorScheme.primary,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        _cwd,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.labelSmall!.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Icon(Icons.open_in_new, size: 13, color: theme.hintColor),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
+  Widget _composerFloatChips() {
+    final showSubagent = _subagentTotalCount > 0 || _subagentPeekOpen;
+    final showStats = DshStatsBar.hasContent(_summary);
+    if (!showSubagent && !showStats) return const SizedBox.shrink();
+    return ChatComposerFloatChips(
+      stats: showStats ? DshStatsBar(summary: _summary) : null,
+      subagent: showSubagent
+          ? SubagentStatusBar(
+              key: const ValueKey('composer-subagent-bar'),
+              text: _subagentBarText,
+              agents: _subagentSnapshots(),
+              resolveDetail: _resolveDshSubagent,
+              onOpenChanged: (open) {
+                if (mounted) {
+                  setState(() => _subagentPeekOpen = open);
+                }
+              },
+            )
+          : null,
     );
   }
 

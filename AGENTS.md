@@ -45,7 +45,7 @@
 - **终端交互铁律**：没有底部独立输入框，点画面输入；执行中输入仍可用（busy 时回车喂 stdin）。切引擎不发 Ctrl+C。输入法弹出贴底、滑动历史不弹键盘。输入浅蓝 / 正常输出灰绿 / 警告黄 / 错误红；命令行再按 token 分色（命令绿、flag 紫、字符串橙、路径蓝）。独立 `/` 才弹技能。
 - **终端字号与补全**：双指捏合缩放字号，下限 1、上限 28，默认 13；捏合不算点击，不弹键盘。字体必须带中文回退（`NotoSansSC` 等），禁止纯 monospace 导致汉字缺字。输入时按前缀补全内置命令，历史命令优先，未提交部分用浅色幽灵字显示。
 - **默认工作目录**：`/storage/emulated/0/agent`。人设 / 工具规则 / `run_terminal` 描述只写 Alpine / apk / 该路径，不出现 Windows 的「文档\agent」或 WSL / Git Bash / PowerShell。
-- **构建隔离**：`flutter build apk` 只编 `android/` + 共享 `lib/`，不会把 `windows/` 的 exe / C++ 标题栏打进 APK。反过来编 Windows 也不会产出 APK。两端各打各的包。
+- **构建隔离**：`flutter build apk` 只编 `android/` + 共享 `lib/`，不会把 `windows/` 的 exe / C++ 标题栏打进 APK。反过来编 Windows 也不会产出 APK。两端各打各的包。正式包只打 `arm64-v8a`（`ndk.abiFilters` + `flutter build apk --release --target-platform android-arm64`）。
 
 ## Windows 桌面版（exe）
 - 2026-08-14 起项目支持 Windows 桌面完整版。**不要和 Android 搞混**：
@@ -79,6 +79,9 @@
 - 输入框、消息气泡、工具胶囊、状态条、提问面板、附件预览等能共享的部分必须优先抽成共享组件，禁止复制两套后分别维护。
 - 只有协议或引擎能力确实不同的界面允许单独实现，并需在维护文档说明原因。
 - 输入区的液态玻璃抽屉（选择模型 / 权限预设 / 思考强度）必须走 `LiquidGlassPopupRoute`（透明 `PopupRoute`，`PopScope canPop:false` 拦截返回）：按返回键先收抽屉，模型抽屉二级菜单先回一级再收。禁止改回 `OverlayEntry` 直插 root overlay——不进导航栈会让返回键穿透抽屉直接退页。抽屉内容切换（如二级菜单）走路由级 `markNeedsBuild`，关闭走「先播收合动画再 `removeRoute`」。
+- 子代理按钮可点：从按钮上沿浮出 mini 会话，多个子代理左右滑查看。走 `OverlayPortal` + 状态条 `PopScope`，点空白或返回关闭。禁止再 `Navigator.push(PopupRoute)` 挂 rootNavigator——状态条重建会丢旧路由，连续点击会叠多层并红屏。小窗用实心 Material，不要再套 `LiquidGlassLens` / `MessageBubble` 玻璃。拾忆读 live 转写本，DSH 读 `subagent.history`。两端共用 `SubagentStatusBar`。
+- 输入区项目目录入口收成文件夹图标，放在权限盾牌旁边，只留图标。缓存和子代理做成输入框上方悬浮芯片：共用 `ChatComposerChip`（高 32、字 13、行高 18/13），`ChatComposerFloatChips` 里缓存永远最左、子代理在右边。进度圈强制 10×10。
+- 子代理列表跟 live 任务，不跟主 agent 是否 running。父会话 idle / 等待子代理返回时，状态条和芯片不得清掉；拾忆本轮快照留到下一条用户消息；DSH 跟 `subagent.list`。
 
 ## DSH 新建会话预设
 - 新建 DSH 会话（工作区红绿灯 / 左滑新建 / 会话 tab）必须先 `pickDshAgentPreset`，再 `session.create(agentPreset:)`。取消返回 `null` 不创建；目录失败返回 `''` 时不传 `agentPreset`，按服务器默认。会话开始后预设锁定，不要创建后再 `agentPreset.select`。

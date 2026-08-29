@@ -308,6 +308,12 @@ class SubagentRunner {
   /// 每轮开始前的进度回调（供 UI 展示子代理内部状态）。
   final void Function(int round, int maxTurns, String lastTool)? onProgress;
 
+  /// 单轮流式/完成后的文本回流（供 mini 会话展示）。
+  final void Function(TurnResult turn)? onLiveTurn;
+
+  /// 子代理对话转写本变化（system/user/assistant/tool 全量快照）。
+  final void Function(List<Map<String, dynamic>> msgs)? onTranscript;
+
   /// 子代理上下文预算（token，与主循环估算口径一致）。
   /// <= 0 表示不裁剪；超预算时裁剪早期工具轮，防复杂任务撑爆上下文。
   final int contextBudgetTokens;
@@ -330,6 +336,8 @@ class SubagentRunner {
     this.onClientCreated,
     this.onClientFinished,
     this.onProgress,
+    this.onLiveTurn,
+    this.onTranscript,
     this.contextBudgetTokens = 0,
     this.roundOverride,
   });
@@ -351,6 +359,7 @@ class SubagentRunner {
       },
       {'role': 'user', 'content': prompt},
     ];
+    onTranscript?.call(List<Map<String, dynamic>>.of(msgs));
 
     for (var round = 0; round < budget; round++) {
       if (shouldStop?.call() ?? false) {
@@ -359,9 +368,12 @@ class SubagentRunner {
       onProgress?.call(round, budget, '');
       final TurnResult? result;
       try {
-        result = roundOverride != null
-            ? await roundOverride!(msgs)
-            : await _round(msgs);
+        if (roundOverride != null) {
+          result = await roundOverride!(msgs);
+          if (result != null) onLiveTurn?.call(result);
+        } else {
+          result = await _round(msgs);
+        }
       } on LlmCancelledException {
         return SubagentResult.stopped(totalTokens: totalTokens);
       } on LlmException catch (e) {
@@ -374,6 +386,8 @@ class SubagentRunner {
       }
       if (result.toolCalls.isEmpty) {
         // 无工具调用 = 任务完成，最终文本即报告。
+        msgs.add({'role': 'assistant', 'content': result.text});
+        onTranscript?.call(List<Map<String, dynamic>>.of(msgs));
         return SubagentResult.success(
           result.text.trim(),
           totalTokens: totalTokens,
@@ -437,6 +451,7 @@ class SubagentRunner {
               : (tc['id'] ?? ''),
         });
       }
+      onTranscript?.call(List<Map<String, dynamic>>.of(msgs));
       // 超预算时裁剪早期工具轮（保留 system + user + 最近轮）。
       _enforceContextBudget(msgs);
     }
@@ -508,7 +523,10 @@ class SubagentRunner {
       maxTokens: maxTokens,
       tools: toolsJson,
       shouldStop: shouldStop,
-      onTurn: (t) => accumulated = t,
+      onTurn: (t) {
+        accumulated = t;
+        onLiveTurn?.call(t);
+      },
     );
     onClientCreated?.call(client);
     try {
