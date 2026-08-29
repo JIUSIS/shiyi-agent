@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../core/reasoning_models.dart';
+import 'llm_error.dart';
 import 'runtime_logger.dart';
 import 'socks5_config.dart';
 
@@ -14,6 +15,17 @@ class LlmException implements Exception {
   String toString() => message;
 }
 
+/// HTTP 错误：保留状态码、供应商错误码和参数名，避免 400 只剩一段模糊文本。
+class LlmHttpException extends LlmException {
+  final LlmErrorInfo info;
+  final String rawBody;
+
+  LlmHttpException(this.info, this.rawBody) : super(info.userMessage);
+
+  int get statusCode => info.statusCode;
+  bool get retryable => info.retryable;
+}
+
 /// 流式回复提前中断（未收到 [DONE] 或连接断开），可自动重试。
 class LlmInterruptedException extends LlmException {
   LlmInterruptedException(super.message);
@@ -21,7 +33,7 @@ class LlmInterruptedException extends LlmException {
 
 /// 用户主动停止当前请求。与网络断流区分开，禁止进入自动重试路径。
 class LlmCancelledException extends LlmException {
-  LlmCancelledException([String message = '生成已停止']) : super(message);
+  LlmCancelledException([super.message = '生成已停止']);
 }
 
 /// Result emitted for each assistant turn.
@@ -356,7 +368,10 @@ class LlmClient {
               onDiag?.call('[stream] max_tokens 过大被拒绝，降级 8192 重试');
               continue;
             }
-            throw LlmException('HTTP ${response.statusCode}: ${_short(err)}');
+            throw LlmHttpException(
+              LlmErrorInfo.fromHttp(response.statusCode, err),
+              err,
+            );
           }
           final needContinue = protocol == 'anthropic'
               ? await _parseAnthropicSse(response.stream)
@@ -1106,7 +1121,10 @@ class LlmClient {
           .timeout(const Duration(seconds: 90));
       final raw = await response.stream.bytesToString();
       if (response.statusCode != 200) {
-        throw LlmException('HTTP ${response.statusCode}: ${_short(raw)}');
+        throw LlmHttpException(
+          LlmErrorInfo.fromHttp(response.statusCode, raw),
+          raw,
+        );
       }
       final json = _tryDecode(raw);
       if (json == null) throw LlmException('响应解析失败');
@@ -1184,7 +1202,10 @@ class LlmClient {
           .get(uri, headers: _headers(streaming: false))
           .timeout(const Duration(seconds: 30));
       if (res.statusCode != 200) {
-        throw LlmException('HTTP ${res.statusCode}: ${_short(res.body)}');
+        throw LlmHttpException(
+          LlmErrorInfo.fromHttp(res.statusCode, res.body),
+          res.body,
+        );
       }
       final json = _tryDecode(res.body);
       if (json == null) throw LlmException('响应解析失败');

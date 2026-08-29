@@ -600,14 +600,66 @@ extension DshApiRootDirectoryScan on DshApiClient {
 class DshSettingsNamespace {
   final String ns;
   final Map<String, dynamic> value;
+  final Map<String, dynamic> base;
+  final Map<String, dynamic> user;
   final List<DshCredentialSlot> secrets;
   final int revision;
+
+  /// 命名空间的 schemastery 序列化 schema（{uid, refs} 引用图）。
+  /// 旧版 DSH 可能不下发；只读展示用。
+  final Map<String, dynamic> schema;
   DshSettingsNamespace({
     required this.ns,
     required this.value,
+    this.base = const {},
+    this.user = const {},
     required this.secrets,
     required this.revision,
+    this.schema = const {},
   });
+}
+
+/// 权限预设可选项（permission 命名空间 schema 里 advertised 的表项）。
+class DshPermissionPresetOption {
+  final String key;
+  final String label;
+  const DshPermissionPresetOption({required this.key, required this.label});
+}
+
+/// 目标 DSH 的权限预设表（permissionPresets 服务）。
+class DshPermissionPresets {
+  final String defaultPreset;
+  final int revision;
+  final List<DshPermissionPresetOption> options;
+  const DshPermissionPresets({
+    required this.defaultPreset,
+    required this.revision,
+    required this.options,
+  });
+}
+
+/// 目标 DSH 实时插件清单条目（pluginInventory/list）。
+class DshPluginInventoryEntry {
+  final String entryId;
+  final String moduleName;
+  final bool enabled;
+
+  /// null / failed / pending / active / loading / unloading。
+  final String fiberPhase;
+  const DshPluginInventoryEntry({
+    required this.entryId,
+    required this.moduleName,
+    required this.enabled,
+    required this.fiberPhase,
+  });
+
+  factory DshPluginInventoryEntry.fromJson(Map<String, dynamic> j) =>
+      DshPluginInventoryEntry(
+        entryId: (j['entryId'] ?? '').toString(),
+        moduleName: (j['moduleName'] ?? '').toString(),
+        enabled: j['enabled'] == true,
+        fiberPhase: j['fiberPhase']?.toString() ?? '',
+      );
 }
 
 /// 目标引用（goal.* 的 ref）。
@@ -653,12 +705,14 @@ class DshApiClient {
     String baseUrl = DshEndpoint.localUrl,
     String token = '',
     String scopeKey = '',
+    String hostOverride = '',
     List<String> customCompatibilityHosts = const [],
     List<String> compatibilityHosts = const [],
     http.Client? client,
   }) : _scopeKey = scopeKey.trim(),
        _baseUrl = DshEndpoint.stripSlash(baseUrl),
        _token = token.trim(),
+       _configuredHostOverride = hostOverride.trim(),
        _customHostCandidates = _normalizeCompatibilityHosts(
          customCompatibilityHosts,
        ),
@@ -671,6 +725,7 @@ class DshApiClient {
   String _baseUrl;
   final String _scopeKey;
   String _token;
+  String _configuredHostOverride;
   List<String> _customHostCandidates;
   List<String> _compatHostCandidates;
   String? _compatHostOverride;
@@ -685,9 +740,11 @@ class DshApiClient {
   void configure({
     String? baseUrl,
     String? token,
+    String? hostOverride,
     List<String> customCompatibilityHosts = const [],
     List<String> compatibilityHosts = const [],
   }) {
+    final nextHostOverride = hostOverride?.trim() ?? _configuredHostOverride;
     final nextCustomHosts = _normalizeCompatibilityHosts(
       customCompatibilityHosts,
     );
@@ -697,12 +754,14 @@ class DshApiClient {
     if (baseUrl != null) {
       final next = DshEndpoint.stripSlash(baseUrl);
       if (next != _baseUrl ||
+          nextHostOverride != _configuredHostOverride ||
           !_sameStrings(nextCustomHosts, _customHostCandidates) ||
           !_sameStrings(nextCompatibilityHosts, _compatHostCandidates)) {
         _compatHostOverride = null;
       }
       _baseUrl = next;
     }
+    _configuredHostOverride = nextHostOverride;
     _customHostCandidates = nextCustomHosts;
     _compatHostCandidates = nextCompatibilityHosts;
     if (token != null) _token = token;
@@ -729,8 +788,11 @@ class DshApiClient {
 
   Map<String, String> _headers({String? hostOverride}) {
     final headers = <String, String>{'content-type': 'application/json'};
-    final host = hostOverride ?? _compatHostOverride;
-    if (host != null && host.isNotEmpty) headers['host'] = host;
+    final host = _effectiveHostOverride(hostOverride);
+    if (host != null) {
+      headers['host'] = host;
+      headers['origin'] = _originForHost(host);
+    }
     final raw = _token.trim();
     if (raw.isNotEmpty) {
       headers['authorization'] = raw.toLowerCase().startsWith('bearer ')
@@ -742,13 +804,10 @@ class DshApiClient {
 
   Map<String, dynamic> _wsHeaders() {
     final headers = <String, dynamic>{};
-    final host = _compatHostOverride;
-    if (host != null && host.isNotEmpty) {
+    final host = _effectiveHostOverride(null);
+    if (host != null) {
       headers['Host'] = host;
-      final scheme = Uri.tryParse(_baseUrl)?.scheme == 'https'
-          ? 'https'
-          : 'http';
-      headers['Origin'] = '$scheme://$host';
+      headers['Origin'] = _originForHost(host);
     }
     final raw = _token.trim();
     if (raw.isNotEmpty) {
@@ -758,6 +817,22 @@ class DshApiClient {
     }
     return headers;
   }
+
+  String? _effectiveHostOverride(String? explicit) {
+    final value = explicit?.trim();
+    if (value != null && value.isNotEmpty) return value;
+    if (_configuredHostOverride.isNotEmpty) return _configuredHostOverride;
+    final compatible = _compatHostOverride?.trim();
+    return compatible == null || compatible.isEmpty ? null : compatible;
+  }
+
+  String _originForHost(String host) {
+    final scheme = Uri.tryParse(_baseUrl)?.scheme == 'https' ? 'https' : 'http';
+    return '$scheme://$host';
+  }
+
+  /// 仅供协议回归测试确认 WS 与 HTTP 使用同一身份头。
+  Map<String, dynamic> debugWebSocketHeaders() => _wsHeaders();
 
   static String _newRpcId() {
     final r = Random.secure();
@@ -828,8 +903,11 @@ class DshApiClient {
           )
           .timeout(_timeout);
       if (res.statusCode == 403 &&
+          _configuredHostOverride.isEmpty &&
           _compatHostOverride == null &&
-          (method == 'session.list' || method == 'workspace.list') &&
+          (method == 'session.list' ||
+              method == 'workspace.list' ||
+              method == 'settings.describe') &&
           (_customHostCandidates.isNotEmpty ||
               _compatHostCandidates.isNotEmpty)) {
         final custom = await _scanCompatibilityHosts(
@@ -862,6 +940,17 @@ class DshApiClient {
       throw DshApiException('DeepSeek Harness 服务不可达：$e');
     }
     if (res.statusCode != 200) {
+      String? errorCode;
+      String? errorMessage;
+      try {
+        final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+        final result = (decoded is Map ? decoded['result'] : null) as Map?;
+        final error =
+            (result?['error'] ?? (decoded is Map ? decoded['error'] : null))
+                as Map?;
+        errorCode = error?['code']?.toString();
+        errorMessage = error?['message']?.toString();
+      } catch (_) {}
       unawaited(
         RuntimeLogger.instance.warn(
           'DSH',
@@ -872,7 +961,12 @@ class DshApiClient {
           data: {'method': method, 'statusCode': res.statusCode},
         ),
       );
-      throw DshApiException('DeepSeek Harness HTTP ${res.statusCode}');
+      final trimmedError = errorMessage?.trim() ?? '';
+      final suffix = trimmedError.isEmpty ? '' : '：$trimmedError';
+      throw DshApiException(
+        'DeepSeek Harness HTTP ${res.statusCode}$suffix',
+        code: errorCode ?? 'http-${res.statusCode}',
+      );
     }
     final Map<String, dynamic> body;
     try {
@@ -1023,6 +1117,7 @@ class DshApiClient {
   /// 作为 cwd，并 `attachSession` 入账；只带 [cwd] 不会写入 `sessionIds`，
   /// 之后 `insertSessionBefore` 会因未入账失败。
   Future<String> createSession({
+    String? agentPreset,
     String? cwd,
     String? sessionId,
     String? workspaceId,
@@ -1037,6 +1132,8 @@ class DshApiClient {
     if (sessionId != null && sessionId.trim().isNotEmpty) {
       payload['sessionId'] = sessionId.trim();
     }
+    final preset = agentPreset?.trim() ?? '';
+    if (preset.isNotEmpty) payload['agentPreset'] = preset;
     final value = await _rpc('session.create', payload);
     return (value['sessionId'] ?? '').toString();
   }
@@ -1189,10 +1286,34 @@ class DshApiClient {
       if (reasoningEffort != null && reasoningEffort.isNotEmpty)
         'reasoningEffort': reasoningEffort,
     });
-    return DshModelSelection.fromJson(
+    final selection = DshModelSelection.fromJson(
       (v['selected'] as Map?)?.cast<String, dynamic>() ?? const {},
     );
+    // 服务端回执进审计：排查「公网端模型没有立即变化」时，这里能看到
+    // 远端到底承认了什么（200 不等于真的换过去了）。
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'session_model.selected',
+        sessionId: sessionId,
+        data: {
+          'provider': selection.provider,
+          'model': selection.model,
+          'reasoningEffort': selection.reasoningEffort ?? '',
+        },
+      ),
+    );
+    return selection;
   }
+
+  /// 目标 provider/model 不支持所请求思考档位的服务端拒绝
+  /// （例如 `model "X" does not support reasoning effort "high"`）。
+  /// 切模型时的降级重试判定：静态思考目录只是客户端猜测，服务端声明
+  /// 才是权威——被这类拒绝时应去掉档位重试，而不是让整个切换失败。
+  static bool isReasoningEffortRejection(String message) =>
+      message.contains('does not support reasoning effort') ||
+      message.contains('unsupported reasoning effort') ||
+      message.contains('reasoning effort') && message.contains('not support');
 
   /// 全量模型目录（llm.models，跨提供方）。
   Future<List<DshModelGroup>> llmModels() async {
@@ -1203,13 +1324,39 @@ class DshApiClient {
   /// 可配置的模型提供方（llm.providers）。
   Future<List<Map<String, dynamic>>> llmProviders() async {
     final v = await _rpc('llm.providers', {});
-    return ((v['providers'] as List?) ?? const [])
-        .map((e) => (e as Map).cast<String, dynamic>())
-        .toList();
+    if (!v.containsKey('providers')) {
+      throw DshApiException('目标 DSH 未返回 provider 目录', code: 'unsupported');
+    }
+    final raw = v['providers'];
+    if (raw is List) {
+      return raw
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
+    }
+    if (raw is Map) {
+      return [
+        for (final entry in raw.entries)
+          if (entry.value is Map)
+            {
+              'id': entry.key.toString(),
+              ...(entry.value as Map).cast<String, dynamic>(),
+            },
+      ];
+    }
+    return const [];
   }
 
   static List<DshModelGroup> _parseModelGroups(dynamic raw) {
-    return ((raw as List?) ?? const []).map((e) {
+    final entries = raw is List
+        ? raw
+        : raw is Map
+        ? raw.entries
+              .where((e) => e.value is Map)
+              .map((e) => {'id': e.key.toString(), ...e.value as Map})
+              .toList()
+        : const <dynamic>[];
+    return entries.map((e) {
       final g = (e as Map).cast<String, dynamic>();
       final models = ((g['models'] as List?) ?? const []).map((m) {
         final mm = (m as Map).cast<String, dynamic>();
@@ -1618,6 +1765,9 @@ class DshApiClient {
       return DshSettingsNamespace(
         ns: (n['ns'] ?? '').toString(),
         value: (n['value'] as Map?)?.cast<String, dynamic>() ?? const {},
+        base: (n['base'] as Map?)?.cast<String, dynamic>() ?? const {},
+        user: (n['user'] as Map?)?.cast<String, dynamic>() ?? const {},
+        schema: (n['schema'] as Map?)?.cast<String, dynamic>() ?? const {},
         secrets: ((n['secrets'] as List?) ?? const [])
             .map(
               (s) => DshCredentialSlot.fromJson(
@@ -1660,6 +1810,107 @@ class DshApiClient {
       'ops': ops,
       'expectedRevision': ?expectedRevision,
     });
+  }
+
+  // ── 权限预设（permissionPresets 服务） ──────────────────────────────
+
+  /// 读权限预设表。未挂 permissionPresets 服务的 DSH 返回 null（按钮隐藏）。
+  Future<DshPermissionPresets?> describePermissionPresets() async {
+    final describe = await describeSettings();
+    for (final namespace in describe.namespaces) {
+      if (namespace.ns != 'permission') continue;
+      final current = (namespace.value['defaultPreset'] ?? '').toString();
+      final options = permissionOptionsFromSchema(namespace.schema);
+      if (current.isEmpty && options.isEmpty) return null;
+      return DshPermissionPresets(
+        defaultPreset: current,
+        revision: namespace.revision,
+        options: options,
+      );
+    }
+    return null;
+  }
+
+  /// 实时切换当前会话的权限预设（typert `commands/execute`，即官方输入框
+  /// 弹层走的 `/permission <preset>` 命令）。对当前会话立即生效并写入
+  /// `permission/preset` 事件；agent 未物化（会话冷）时服务端拒绝。
+  /// 返回命令回执文本；kind=error 或 RPC 失败抛 [DshApiException]。
+  /// 注意：typert assertExactArguments 要求可选参数的键也必须存在，
+  /// `images` 缺键会被网关以 "missing images" 拒绝，必须显式传空数组。
+  Future<String> executeSessionCommand(String sessionId, String line) async {
+    final value = await _rpc('commands/execute', {
+      'args': {'agentId': sessionId, 'line': line, 'images': <dynamic>[]},
+    });
+    final outcome = (value['result'] as Map?)?.cast<String, dynamic>();
+    final kind = (outcome?['kind'] ?? '').toString();
+    final text = (outcome?['text'] ?? '').toString();
+    if (value.isEmpty || kind != 'success') {
+      throw DshApiException(text.isEmpty ? '命令未被 DSH 接受' : text);
+    }
+    return text;
+  }
+
+  /// 从 schemastery 序列化 schema（{uid, refs} 引用图）解析预设表：
+  /// 根对象 → dict.defaultPreset → union.list → const{value, meta.description}。
+  /// 形状对不上时返回空列表（按钮隐藏，不硬编码预设名）。
+  static List<DshPermissionPresetOption> permissionOptionsFromSchema(
+    Map<String, dynamic> schema,
+  ) {
+    try {
+      final refs = (schema['refs'] as Map?)?.cast<String, dynamic>();
+      if (refs == null) return const [];
+      final root = refs['${schema['uid']}'];
+      final dict = root is Map ? (root['dict'] as Map?) : null;
+      final unionId = dict?['defaultPreset'];
+      final union = unionId == null ? null : refs['$unionId'];
+      if (union is! Map || union['type'] != 'union') return const [];
+      final list = (union['list'] as List?) ?? const [];
+      final options = <DshPermissionPresetOption>[];
+      for (final id in list) {
+        final ref = refs['$id'];
+        if (ref is! Map || ref['type'] != 'const') continue;
+        final key = '${ref['value']}';
+        if (key.isEmpty) continue;
+        final meta = ref['meta'];
+        final label = meta is Map && meta['description'] != null
+            ? '${meta['description']}'
+            : key;
+        options.add(DshPermissionPresetOption(key: key, label: label));
+      }
+      return options;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 折叠 history 事件流里最后一次 `permission/preset`（data.preset）。
+  static String? permissionPresetFromValue(Map<String, dynamic> value) {
+    String? preset;
+    for (final entry in (value['events'] as List?) ?? const []) {
+      final ev = ((entry as Map)['event'] as Map?)?.cast<String, dynamic>();
+      if (ev?['type']?.toString() != 'permission/preset') continue;
+      final data = (ev?['data'] as Map?)?.cast<String, dynamic>();
+      preset = (data?['preset'] ?? '').toString();
+    }
+    return preset;
+  }
+
+  // ── 插件清单（typert pluginInventory/list，实时只读） ───────────────
+
+  /// 目标 DSH 当前装载的插件实时清单（含 fiber 装载相位）。
+  /// 远端连接的插件页用这条 RPC，不读本机补丁文件。
+  Future<List<DshPluginInventoryEntry>> pluginInventoryList() async {
+    final value = await _rpc('pluginInventory/list', {
+      'args': <String, dynamic>{},
+    });
+    final entries = (value['entries'] as List?) ?? const [];
+    return entries
+        .map(
+          (e) => DshPluginInventoryEntry.fromJson(
+            (e as Map).cast<String, dynamic>(),
+          ),
+        )
+        .toList();
   }
 
   // ── 目标域 ────────────────────────────────────────────────────────────
@@ -1745,6 +1996,7 @@ class DshApiClient {
       live: DshLiveTurn.fromHistoryValue(value),
       responseModels: _responseModelsFromValue(value),
       turnEnded: _historyTurnEnded(value),
+      permissionPreset: permissionPresetFromValue(value),
     );
   }
 

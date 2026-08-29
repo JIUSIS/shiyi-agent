@@ -677,6 +677,11 @@ class AppSettings {
   /// DSH 连接：local（本机 127.0.0.1:3080）/ lan（局域网）/ remote（公网）。
   String dshConnectionMode;
 
+  /// DSH 使用的 API 来源：shiyi（拾忆 API）/ dsh（目标 DSH 自有 API）。
+  /// 缺省按连接模式迁移：本机保留拾忆 API，局域网/公网默认使用 DSH 自有 API，
+  /// 防止旧版本升级后把拾忆密钥意外同步到第三方主机。
+  String dshApiSource;
+
   /// 局域网主机（IP 或主机名）。可带端口，如 192.168.1.5:3080。
   String dshLanHost;
   int dshLanPort;
@@ -692,6 +697,11 @@ class AppSettings {
 
   /// 公网可选鉴权 Token（进安全存储，不进 prefs JSON）。
   String dshRemoteToken;
+
+  /// 拾忆 API 中转服务：远端 DSH 只拿到中转地址和独立令牌，真实 API Key 留在手机。
+  bool dshRelayEnabled;
+  String dshRelayPublicUrl;
+  int dshRelayPort;
 
   /// 自定义 SOCKS5 通道：打开后对话 / 拉模型 / 联网搜索走该代理。
   /// 给国内 IP 被中转站拦截时换境外出口用，默认关。
@@ -741,12 +751,16 @@ class AppSettings {
     this.dshSearchProvider = 'auto',
     this.dshSearchKey = '',
     this.dshConnectionMode = 'local',
+    this.dshApiSource = 'shiyi',
     this.dshLanHost = '',
     this.dshLanPort = 3080,
     this.dshLanToken = '',
     this.dshRemoteUrl = '',
     this.dshRemoteHost = '',
     this.dshRemoteToken = '',
+    this.dshRelayEnabled = false,
+    this.dshRelayPublicUrl = '',
+    this.dshRelayPort = 43121,
     this.socks5Enabled = false,
     this.socks5Mode = 'off',
     this.socks5Host = '',
@@ -790,12 +804,16 @@ class AppSettings {
     String? dshSearchProvider,
     String? dshSearchKey,
     String? dshConnectionMode,
+    String? dshApiSource,
     String? dshLanHost,
     int? dshLanPort,
     String? dshLanToken,
     String? dshRemoteUrl,
     String? dshRemoteHost,
     String? dshRemoteToken,
+    bool? dshRelayEnabled,
+    String? dshRelayPublicUrl,
+    int? dshRelayPort,
     bool? socks5Enabled,
     String? socks5Mode,
     String? socks5Host,
@@ -838,12 +856,16 @@ class AppSettings {
     dshSearchProvider: dshSearchProvider ?? this.dshSearchProvider,
     dshSearchKey: dshSearchKey ?? this.dshSearchKey,
     dshConnectionMode: dshConnectionMode ?? this.dshConnectionMode,
+    dshApiSource: dshApiSource ?? this.dshApiSource,
     dshLanHost: dshLanHost ?? this.dshLanHost,
     dshLanPort: dshLanPort ?? this.dshLanPort,
     dshLanToken: dshLanToken ?? this.dshLanToken,
     dshRemoteUrl: dshRemoteUrl ?? this.dshRemoteUrl,
     dshRemoteHost: dshRemoteHost ?? this.dshRemoteHost,
     dshRemoteToken: dshRemoteToken ?? this.dshRemoteToken,
+    dshRelayEnabled: dshRelayEnabled ?? this.dshRelayEnabled,
+    dshRelayPublicUrl: dshRelayPublicUrl ?? this.dshRelayPublicUrl,
+    dshRelayPort: dshRelayPort ?? this.dshRelayPort,
     socks5Enabled: socks5Enabled ?? this.socks5Enabled,
     socks5Mode: socks5Mode ?? this.socks5Mode,
     socks5Host: socks5Host ?? this.socks5Host,
@@ -886,12 +908,16 @@ class AppSettings {
     'dshSearchProvider': dshSearchProvider,
     'dshSearchKey': dshSearchKey,
     'dshConnectionMode': dshConnectionMode,
+    'dshApiSource': dshApiSource,
     'dshLanHost': dshLanHost,
     'dshLanPort': dshLanPort,
     'dshLanToken': dshLanToken,
     'dshRemoteUrl': dshRemoteUrl,
     'dshRemoteHost': dshRemoteHost,
     'dshRemoteToken': dshRemoteToken,
+    'dshRelayEnabled': dshRelayEnabled,
+    'dshRelayPublicUrl': dshRelayPublicUrl,
+    'dshRelayPort': dshRelayPort,
     'socks5Enabled': socks5Enabled,
     'socks5Mode': socks5Mode,
     'socks5Host': socks5Host,
@@ -934,12 +960,19 @@ class AppSettings {
     dshSearchProvider: j['dshSearchProvider'] ?? 'auto',
     dshSearchKey: j['dshSearchKey'] ?? '',
     dshConnectionMode: _dshConnectionModeFromJson(j['dshConnectionMode']),
+    dshApiSource: _dshApiSourceFromJson(
+      j['dshApiSource'],
+      _dshConnectionModeFromJson(j['dshConnectionMode']),
+    ),
     dshLanHost: j['dshLanHost'] ?? '',
     dshLanPort: _dshLanPortFromJson(j['dshLanPort']),
     dshLanToken: j['dshLanToken'] ?? '',
     dshRemoteUrl: j['dshRemoteUrl'] ?? '',
     dshRemoteHost: j['dshRemoteHost'] ?? '',
     dshRemoteToken: j['dshRemoteToken'] ?? '',
+    dshRelayEnabled: j['dshRelayEnabled'] == true,
+    dshRelayPublicUrl: j['dshRelayPublicUrl'] ?? '',
+    dshRelayPort: _dshRelayPortFromJson(j['dshRelayPort']),
     socks5Enabled: j['socks5Enabled'] ?? false,
     socks5Mode: _socks5ModeFromJson(j),
     socks5Host: j['socks5Host'] ?? '',
@@ -962,9 +995,21 @@ String _dshConnectionModeFromJson(dynamic raw) {
   }
 }
 
+String _dshApiSourceFromJson(dynamic raw, String connectionMode) {
+  final value = raw?.toString().trim().toLowerCase();
+  if (value == 'shiyi' || value == 'dsh') return value!;
+  // Remote defaults must be credential-isolated when loading old settings.
+  return connectionMode == 'local' ? 'shiyi' : 'dsh';
+}
+
 int _dshLanPortFromJson(dynamic raw) {
   final n = (raw as num?)?.toInt() ?? 3080;
   return n > 0 && n <= 65535 ? n : 3080;
+}
+
+int _dshRelayPortFromJson(dynamic raw) {
+  final n = (raw as num?)?.toInt() ?? 43121;
+  return n > 0 && n <= 65535 ? n : 43121;
 }
 
 String _socks5ModeFromJson(Map<String, dynamic> j) {

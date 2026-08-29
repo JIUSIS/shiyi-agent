@@ -512,6 +512,7 @@ class _DebouncedSave {
   final AppSettings Function() _build;
   final Future<void> Function()? after;
   Timer? _timer;
+  Future<void> _active = Future<void>.value();
 
   /// 是否有尚未落盘的编辑。
   bool get hasPending => _timer != null;
@@ -520,22 +521,37 @@ class _DebouncedSave {
     _timer?.cancel();
     _timer = Timer(const Duration(milliseconds: 600), () async {
       _timer = null;
-      await shiyi.updateSettings(_build());
-      await after?.call();
+      _active = _performSave();
+      await _active;
     });
+  }
+
+  Future<void> _performSave() async {
+    await shiyi.updateSettings(_build());
+    await after?.call();
   }
 
   /// 立即保存未落盘的编辑（页面 dispose 时调用，防快速返回丢改动）。
   Future<void> flush() async {
     _timer?.cancel();
     _timer = null;
-    await shiyi.updateSettings(_build());
-    await after?.call();
+    await _active;
+    _active = _performSave();
+    await _active;
+  }
+
+  void cancel() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  Future<void> cancelAndWait() async {
+    cancel();
+    await _active;
   }
 
   void dispose() {
-    _timer?.cancel();
-    _timer = null;
+    cancel();
   }
 }
 
@@ -1061,13 +1077,15 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
         apiProfileId: _currentProfileId(),
       );
       await widget.shiyi.updateSettings(next);
-      await DshModelSync.injectNow(
-        next,
-        name: name,
-        scopeKey: DshService.instance.currentScopeKey,
-      );
       if (!mounted) return;
-      await _showIosAlert(context, '完成', '配置「$name」已保存，并已注入到 DeepSeek Harness');
+      final relay = DshModelSync.canUseShiyiRelay(next);
+      await _showIosAlert(
+        context,
+        '完成',
+        relay
+            ? '配置「$name」已保存，将通过手机临时中转提供给目标 DSH。真实 API 地址和密钥不会离开本机'
+            : '配置「$name」已保存。',
+      );
     }
   }
 
@@ -1076,19 +1094,39 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       await _showIosAlert(context, '提示', '当前没有选中的配置');
       return;
     }
-    final isBuiltin = modelPresets.any((p) => p.name == _presetName);
-    if (isBuiltin) {
-      await _showIosAlert(context, '提示', '内置预设不可删除');
+    final name = _presetName!;
+    ModelPreset? builtinPreset;
+    for (final preset in modelPresets) {
+      if (preset.name == name) {
+        builtinPreset = preset;
+        break;
+      }
+    }
+    ApiProfile? savedProfile;
+    for (final profile in _profiles) {
+      if (profile.name == name) {
+        savedProfile = profile;
+        break;
+      }
+    }
+    if (savedProfile == null && builtinPreset == null) {
+      await _showIosAlert(context, '提示', '这条配置尚未保存');
       return;
     }
-    final name = _presetName!;
+    final targetProfileId =
+        savedProfile?.profileId ??
+        createApiProfileId(name, _currentBaseUrl(), _protocol);
     await _settleInputFocusBeforeOverlay(context);
     if (!mounted) return;
     final ok = await showIosFadeDialog<bool>(
       context: context,
       builder: (ctx) => CupertinoAlertDialog(
         title: const Text('删除配置'),
-        content: Text('确定删除「$name」吗？'),
+        content: Text(
+          builtinPreset == null
+              ? '确定删除「$name」及其已保存密钥吗？'
+              : '确定清除「$name」的已保存配置，并恢复内置预设初始值吗？',
+        ),
         actions: [
           CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx, false),
@@ -1103,16 +1141,60 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       ),
     );
     if (ok != true || !mounted) return;
-    setState(() {
-      _profiles.removeWhere((p) => p.name == name);
-      _presetName = null;
-      _keyHint = 'sk-...';
-    });
-    await SettingsService().saveProfiles(_profiles);
-    await widget.shiyi.reloadApiProfiles();
-    if (mounted) {
-      await _showIosAlert(context, '完成', '配置「$name」已删除');
+
+    await _save.cancelAndWait();
+    final latestProfiles = await SettingsService().loadProfiles();
+    savedProfile = null;
+    for (final profile in latestProfiles) {
+      if (profile.profileId == targetProfileId) {
+        savedProfile = profile;
+        break;
+      }
     }
+    if (savedProfile != null) {
+      _profiles = await SettingsService().deleteProfile(savedProfile);
+    } else {
+      _profiles = latestProfiles;
+    }
+    if (!mounted) return;
+
+    final fallbackPreset =
+        builtinPreset ??
+        modelPresets.firstWhere(
+          (preset) => preset.name == 'DeepSeek',
+          orElse: () => modelPresets.first,
+        );
+    setState(() {
+      _presetName = fallbackPreset.name;
+      _keyHint = fallbackPreset.keyHint;
+      _protocol = fallbackPreset.apiProtocol;
+      _baseCtrl.text = fallbackPreset.baseUrl;
+      _keyCtrl.clear();
+      _modelCtrl.text = fallbackPreset.model;
+    });
+    await widget.shiyi.reloadApiProfiles();
+    if (!mounted) return;
+    await widget.shiyi.updateSettings(
+      widget.shiyi.settings.copyWith(
+        baseUrl: fallbackPreset.baseUrl,
+        apiKey: '',
+        model: fallbackPreset.model,
+        apiProtocol: fallbackPreset.apiProtocol,
+        apiProfileId: createApiProfileId(
+          fallbackPreset.name,
+          fallbackPreset.baseUrl,
+          fallbackPreset.apiProtocol,
+        ),
+        maxOutputTokens: fallbackPreset.suggestedMaxTokens,
+      ),
+    );
+    unawaited(_loadCachedModels());
+    if (!mounted) return;
+    await _showIosAlert(
+      context,
+      '完成',
+      builtinPreset == null ? '配置「$name」及其密钥已删除' : '配置「$name」已清除，内置预设已恢复初始值',
+    );
   }
 
   Future<void> _pickModelId(List<String> ids, {required String title}) async {
@@ -1194,12 +1276,6 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
       await widget.shiyi.reloadModelCatalogs();
       if (!mounted) return;
       setState(() => _cachedModelIds = [...ids]..sort());
-      unawaited(
-        DshModelSync.syncFromShiyi(
-          settings,
-          scopeKey: DshService.instance.currentScopeKey,
-        ),
-      );
       await _pickModelId(_cachedModelIds, title: '模型 ID');
     } catch (e) {
       if (mounted) await _showIosAlert(context, '获取模型失败', '$e');
@@ -1471,7 +1547,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
                 color: _iosBlue,
               ),
               title: const Text('保存当前配置'),
-              subtitle: const Text('保存命名配置，并手动注入到 DeepSeek Harness'),
+              subtitle: const Text('保存后可在 DSH 会话中临时使用，用完自动清理'),
               trailing: const CupertinoListTileChevron(),
               onTap: _saveCurrentProfile,
             ),
@@ -1484,7 +1560,7 @@ class _ApiSectionPageState extends State<_ApiSectionPage> {
                 '删除当前配置',
                 style: TextStyle(color: CupertinoColors.systemRed),
               ),
-              subtitle: const Text('删除选中的自定义接口配置'),
+              subtitle: const Text('自定义配置彻底删除，内置预设恢复初始值'),
               trailing: const CupertinoListTileChevron(),
               onTap: _deleteCurrentProfile,
             ),
@@ -2479,12 +2555,6 @@ class AgentEnginePageState extends State<AgentEnginePage> {
       _workError = null;
       _showInstallOutput = true;
     });
-    // 启动前先落盘合法配置：修复上次残留的非法 credentials/settings
-    // YAML（如 API key 含换行），否则 DSH 启动即崩（invalid document）。
-    await DshModelSync.syncFromShiyi(
-      widget.shiyi.settings,
-      scopeKey: DshService.instance.currentScopeKey,
-    );
     await _dsh.start();
   }
 
@@ -2592,6 +2662,8 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     return widget.shiyi.settings.copyWith(
       agentEngine: _engine,
       dshConnectionMode: _dshMode,
+      dshRelayEnabled: false,
+      dshRelayPublicUrl: '',
       dshLanHost: _lanHostCtrl.text.trim(),
       dshLanPort: DshEndpoint.validPort(port),
       dshLanToken: _lanTokenCtrl.text,
@@ -2663,12 +2735,6 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     // 引擎切换需立即落盘，不等防抖；返回主页后由主页按新引擎渲染 tab。
     unawaited(() async {
       await _save.flush();
-      if (widget.shiyi.settings.agentEngine == 'dsh') {
-        await DshModelSync.injectNow(
-          widget.shiyi.settings,
-          scopeKey: DshService.instance.currentScopeKey,
-        );
-      }
     }());
   }
 
@@ -2764,7 +2830,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
             _dshMode == 'lan'
                 ? '电脑上的 DSH 需允许局域网访问（监听 0.0.0.0:3080），手机填电脑 IP。不要填 127.0.0.1。'
                 : _dshMode == 'remote'
-                ? '可填公网 IP 或域名。Host 留空时扫描内置本地服务器预设，也可填写反向代理需要的 Host。'
+                ? '可填公网 IP 或域名。公网与局域网共用手机局域网 Relay，目标 DSH 主机需能访问手机 Wi-Fi IP。'
                 : '本机模式会安装并启动当前设备上的 DSH（127.0.0.1:3080）。',
           ),
           children: [

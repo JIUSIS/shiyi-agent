@@ -8,13 +8,13 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
-import '../services/dsh_model_sync.dart';
 import '../services/dsh_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
 import 'dsh_center_screen.dart';
 import 'dsh_chat_screen.dart';
+import 'dsh_new_session.dart';
 
 /// DeepSeek Harness 引擎会话列表：Agent 引擎切到 DeepSeek Harness 时
 /// 替代本地会话 tab。视觉与拾忆会话列表一致（Inset Grouped + 左上新建
@@ -136,16 +136,12 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
 
   Future<void> _newSession() async {
     try {
-      final id = await _api.createSession();
+      final preset = await pickDshAgentPreset(context);
+      if (preset == null) return;
+      final id = await _api.createSession(
+        agentPreset: preset.isEmpty ? null : preset,
+      );
       if (!mounted || id.isEmpty) return;
-      try {
-        await DshModelSync.applyToSession(
-          _api,
-          id,
-          widget.shiyi.settings,
-          scopeKey: DshService.instance.currentScopeKey,
-        );
-      } catch (_) {}
       try {
         await DshChatCache.writeContextLimit(
           id,

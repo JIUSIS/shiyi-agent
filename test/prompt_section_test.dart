@@ -270,6 +270,66 @@ void main() {
       expect(prompt, contains('read_session'));
     });
 
+    test('会话世界状态进入动尾，执行闭环保持在冻头', () {
+      final shiyi = makeState();
+      shiyi.skills.add(
+        Skill(
+          id: 1,
+          name: 'catalog-skill',
+          description: '目录技能',
+          content: '目录技能内容',
+          createdAt: 0,
+          files: const {},
+        ),
+      );
+      shiyi.loadedSkills.add(
+        Skill(
+          id: 2,
+          name: 'loaded-skill',
+          description: '已加载技能',
+          content: '已加载技能内容',
+          createdAt: 0,
+          files: const {},
+        ),
+      );
+
+      final sections = shiyi.buildPromptSectionsForTest('输入');
+      expect(
+        sections.singleWhere((s) => s.name == 'workspace').cacheTier,
+        PromptCacheTier.tail,
+      );
+      expect(
+        sections.singleWhere((s) => s.name == 'skills').cacheTier,
+        PromptCacheTier.tail,
+      );
+      expect(
+        sections
+            .singleWhere((s) => s.name == 'loaded-skill:loaded-skill')
+            .cacheTier,
+        PromptCacheTier.tail,
+      );
+      expect(
+        sections.singleWhere((s) => s.name == 'execution-contract').cacheTier,
+        PromptCacheTier.frozen,
+      );
+    });
+
+    test('工作目录变化只改变动尾，不污染冻头', () async {
+      final shiyi = makeState();
+      final first = await assemblePromptParts(
+        shiyi.buildPromptSectionsForTest('输入'),
+      );
+      shiyi.sessions.first.workspaceDir = '/tmp/other-workspace';
+      final second = await assemblePromptParts(
+        shiyi.buildPromptSectionsForTest('输入'),
+      );
+
+      expect(second.frozen, first.frozen);
+      expect(second.tail, isNot(first.tail));
+      expect(second.tail, contains('/tmp/other-workspace'));
+      expect(second.frozen, contains('【执行闭环】'));
+    });
+
     test('已加载技能内容支持 {{变量}} 插值', () async {
       final shiyi = makeState();
       shiyi.loadedSkills.add(

@@ -146,7 +146,8 @@ class _DshFeaturesTabState extends State<DshFeaturesTab> {
                       ? () => Navigator.push(
                           context,
                           MacPageRoute(
-                            builder: (_) => const DshWorkspacesScreen(),
+                            builder: (_) =>
+                                DshWorkspacesScreen(shiyi: widget.shiyi),
                           ),
                         )
                       : _showUnavailable,
@@ -155,7 +156,9 @@ class _DshFeaturesTabState extends State<DshFeaturesTab> {
                   icon: CupertinoIcons.square_stack_3d_up_fill,
                   color: _modelOrange,
                   title: '模型数据',
-                  subtitle: available ? '已注入 API 配置 / 删除' : _unavailableReason!,
+                  subtitle: available
+                      ? 'API 配置 / 新增 / 修改 / 删除'
+                      : _unavailableReason!,
                   enabled: available,
                   onTap: available
                       ? () => Navigator.push(
@@ -197,7 +200,7 @@ class _DshFeaturesTabState extends State<DshFeaturesTab> {
                       ? () => Navigator.push(
                           context,
                           MacPageRoute(
-                            builder: (_) => const DshPluginsScreen(),
+                            builder: (_) => DshPluginsScreen(shiyi: widget.shiyi),
                           ),
                         )
                       : _showUnavailable,

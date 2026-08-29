@@ -78,6 +78,14 @@
 - 修改任一聊天 UI 时，必须同步检查并更新另一引擎，不能只修拾忆或只修 DSH。
 - 输入框、消息气泡、工具胶囊、状态条、提问面板、附件预览等能共享的部分必须优先抽成共享组件，禁止复制两套后分别维护。
 - 只有协议或引擎能力确实不同的界面允许单独实现，并需在维护文档说明原因。
+- 输入区的液态玻璃抽屉（选择模型 / 权限预设 / 思考强度）必须走 `LiquidGlassPopupRoute`（透明 `PopupRoute`，`PopScope canPop:false` 拦截返回）：按返回键先收抽屉，模型抽屉二级菜单先回一级再收。禁止改回 `OverlayEntry` 直插 root overlay——不进导航栈会让返回键穿透抽屉直接退页。抽屉内容切换（如二级菜单）走路由级 `markNeedsBuild`，关闭走「先播收合动画再 `removeRoute`」。
+
+## DSH 新建会话预设
+- 新建 DSH 会话（工作区红绿灯 / 左滑新建 / 会话 tab）必须先 `pickDshAgentPreset`，再 `session.create(agentPreset:)`。取消返回 `null` 不创建；目录失败返回 `''` 时不传 `agentPreset`，按服务器默认。会话开始后预设锁定，不要创建后再 `agentPreset.select`。
+- 弹层选项走 `CupertinoListSection.insetGrouped`：标题 Body 17（行高 22）、说明 Footnote 13（行高 18）、垂直 padding 12、leading 29 圆角 7。禁止裸默认 `CupertinoListTile` 副标题 6px 内边距（会顶格顶满）。
+
+## 主页底部 Tab
+- 手机端底部 Tab 悬浮覆盖。内容留白 `_mobileTabBarHeight(58) - viewInsets.bottom`（下限 0）。键盘弹起清掉这段空白，键盘收起仍给 Tab 留空。外层 `Scaffold(resizeToAvoidBottomInset: false)`，Tab 贴屏幕底。禁止把 58px 死垫叠在键盘上面——内层会话 Scaffold 仍按 viewInsets 垫底，再叠死 58 会在输入法上方多出一条空带。拾忆与 DSH 共用这一层。
 
 ## 拾忆主页长按拖拽
 - 项目卡片、会话卡片长按拖起**整张卡片**（头像/标题/背景），不用半透明标题影子。
@@ -153,15 +161,21 @@
 - Token 进 `flutter_secure_storage`，不要写进 prefs JSON。局域网 DSH 需监听 `0.0.0.0`，手机不要填 `127.0.0.1`。
 - `lan` 只连接用户填写的主机与端口，禁止自动扫描。Host/端口候选扫描只在 `remote` 模式启用；远程自定义 `dshRemoteHost` 优先于内置 `127.0.0.1` / `localhost` / `0.0.0.0` 与常用端口组合，命中后 API / WS 共用同一 Host。
 - 内置回环 Host 返回 `200` 但 `session.list` / `workspace.list` 为空时，视为公网来源隔离视图，禁止记成连接成功；用户显式填写的 Host 可以连接空白新实例。
-- 远程模式不要把拾忆模型 `baseUrl` 改到 DSH；模型注入只走 live RPC，不要为了救配置去重写本机 `settings.yaml`。
+- 局域网 URL 始终连接用户填写的真实电脑 IP；若目标 DSH 对来源身份做隔离，HTTP 与 WebSocket 可以统一使用兼容 `Host` / `Origin`（例如 `127.0.0.1:<端口>`），但不得把 TCP 目标改回手机回环地址。兼容身份必须按连接 scope 保存并在切换主机时清除。
+- 拾忆 API 走向（#307 统一，本机 = 局域网）：**本机与局域网 DSH 都走「手机临时中转」租约**（随用随删；本机经 `http://127.0.0.1:<dshRelayPort>`，局域网经手机局域网 IP + `dshRelayPort`），选中「手机临时中转 · <配置>」即按会话注入 + selectModel。**公网 DSH 拨不进手机**（#294/#297 已证，隧道方案全部否决）：走**直接注入**——`injectShiyiProfileForRemote` 把真实 baseUrl + API Key 持久写入目标 `settings.yaml` / `.credentials.yaml`（`injectShiyiDirectNow`，provider 按手机实例派生、幂等），选中「拾忆 API · <配置>」即注入 + selectModel；用户在目标 DSH 模型数据页可查看、可手动删除，公网目标主机因此持有真实密钥，这是用户知情接受的边界。禁止再往公网链路上加 Relay / 隧道。发送撞上失效 provider（`no adapter serves provider` / `model-unavailable`，#308）自动重取租约重试一次。三条连接链路按 scope 隔离，不得回退读取手机本地 DSH 文件。目标 DSH 必须开放 `settings.mutate` / `credentials.set` 才能登记（返回 403 时保持只读并提示开启管理权限）。
+- 插件页按连接 scope 分流：本机读 `$DSH_HOME` 两层补丁文件（DshPluginStore，可启停/删除/改配置）；局域网 / 公网走官方 typert `pluginInventory/list` 实时清单（`POST /api/pluginInventory/list`，payload `{args:{}}`，只读），**禁止用本机补丁文件冒充远端插件状态**，远端修改需登目标服务器改 cordis.patch.yml。
+- Relay 可达地址：本机 DSH 走 `http://127.0.0.1:<dshRelayPort>`（与 Relay 同设备，不依赖 Wi-Fi）；局域网走手机局域网 IP + `dshRelayPort`（`ShiyiApiRelay.preferredLanIpv4`）；公网不走 Relay（直接注入）。**公网不引入任何隧道**：Cloudflare Quick Tunnel（#294）与 SSH 反向隧道（#295/#296）先后实测放弃，#297 全部回退。
+- 密钥边界不变：真实 API Key 与上游 `baseUrl` 不离开手机，目标 DSH 只保存临时 Relay provider / token；SSH 反向隧道端到端加密，模型正文不经任何第三方。
+- 多台手机连接同一目标 DSH 时，Relay provider 与凭据引用必须包含手机实例派生标识，禁止共用固定 `shiyi_relay` / `SHIYI_RELAY_TOKEN` 后互相覆盖。
 
 ## DSH 配置同步规则
-- 拾忆与 DSH 的协议/状态路径必须分开：模型注入走 `DshModelSync`，会话发送与模型选择走各自 API，禁止把拾忆请求误写成 DSH 文件协议。
-- 所有会读改写 DSH 文件（`settings.yaml` / `.credentials.yaml` / `cordis.patch.yml`）的入口必须走 `DshModelSync` 共享串行队列；`unawaited(syncFromShiyi)` 可以保留，但不能各自加锁。
-- `settings.yaml` 必须临时文件写完再 `rename` 原子替换，禁止直接 `writeAsString` 截断目标。DSH 启动解析时只能看到完整旧文件或完整新文件。
-- 启动同步若发现 `settings.yaml` 已损坏，先备份为 `settings.yaml.corrupt` 再重建干净配置；不要把坏快照再喂给行级 upsert。
+- **本机 = 局域网 = 公网，同一套代码路径（#307 统一）**：拾忆 API 在本机与局域网走「手机临时中转」租约（随用随删；本机 DSH 与 Relay 同设备，中转地址 `http://127.0.0.1:<dshRelayPort>`，不依赖 Wi-Fi），公网走直接注入（`injectShiyiDirectNow`，目标主机持有真实 Key，用户知情接受）。旧的「API 来源」全局开关与批量注入链路（syncFromShiyi / syncLive / syncFiles / injectNow / applyToSession）已整体移除，`dshApiSource` 字段仅存兼容不再读取；禁止再往本机加独立的注入/同步特殊路径。
+- 拾忆与 DSH 的协议/状态路径必须分开：目标 DSH 自有 API 走原生 `session.selectModel` / `session.prompt`；拾忆 API 的中转模式只通过 `ShiyiApiRelay` 和独立 Relay provider 接通，真实上游请求仍在手机执行。禁止把拾忆请求误写成 DSH 文件协议或伪造 `commands/execute` 为远端工具 RPC。
+- 发送自愈（#308）：prompt 命中 `no adapter serves provider` / `model-unavailable`（会话服务端选择指向已删除的 provider，如清理过的旧注入路由）且当前有中转选择时，自动重取一次中转租约（重新注入 + selectModel）并重试一次发送，再失败才报错。
 - 密钥只进 credentials / `.credentials.yaml`，禁止写入 provider settings。
-- DSH 0.1.1 的 `.credentials.yaml` 只认 `version: 1` + `refs` / `records`。禁止把 `SHIYI_API_KEY` 写到顶层；启动同步必须把旧扁平文档和混写文档收进 `refs`。
+- “模型数据”三模式同一套目标 provider UI（`usesTargetModelCatalog` 恒 true）：合并 `settings.describe`、`llm.providers`、`llm.models` 与 `credentials.describe`，按一份 provider 显示一张卡。展示口径 = `active || declared` 且 settingsNs 非空（内置 deepseek-official / llm-deepseek 显示并带「内置声明」徽标；vision-toolkit-* 空命名空间镜像与未启用未手写的目录噪音隐藏）。清除按命名空间分发：llm-pi-ai 路由走 `unsetProviderOps`；其他有 settingsPath 的按声明路径原位 unset；内置无路由无凭据的弹说明不发空 mutate。本机也走这套 UI，旧的「已注入配置」列表已删。
 - `profiles/web/cordis.patch.yml` 必须是顶层 YAML 数组。空文件会让 DSH 退出码 1；启动前由 `_repairDshPatchOverlays` 写成 `[]`。搬家插件不要往这一层 insert。
-- 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML / 凭据文档。YAML 或凭据损坏应靠启动同步自愈，不要误导用户点修复环境。
+- 「修复完整运行环境」只检查 Alpine / Node / node-pty / koffi，不修复 YAML / 凭据文档。批量注入移除后本机不再由 app 写 settings.yaml；配置问题在模型数据页或服务器侧处理，不要误导用户点修复环境。
   Windows 没有这条「修复完整运行环境」Alpine 流程，桌面终端走本机 WSL / Git Bash / pwsh / cmd。
+- **页面数据口径**：局域网 / 公网强制实时（不拿手机缓存冒充远端状态）；本机保留页面缓存（cache-first，同设备数据秒开，#307 真机反馈后保留）。工作区 Tab 只保留「DSH 后台启动中，完成后自动刷新」一个小横幅，「正在显示离线缓存」横幅已删。
+- DSH 会话页权限按钮（输入区盾牌图标）：选项读 `settings.describe` 的 `permission` 命名空间 schema（schemastery `{uid, refs}` 引用图：根对象 dict.defaultPreset → union.list → const{value, meta.description}），禁止硬编码预设名。**切换对当前会话实时生效**：走 typert `commands/execute`（`POST /api/commands/execute`，client-request 信封，payload `{args: {agentId, line: '/permission <preset>'}}`，即官方输入框弹层同一条 `/permission` 命令链路），成功写入 `permission/preset` 会话事件；当前值从 history 折叠该事件（无事件=创建时组合默认，用服务器 defaultPreset 估计），mux 下行 `permission/preset` 实时反映其他客户端的切换。`settings.mutate defaultPreset` 是另一条语义（新会话默认，官方设置行走这条），不要和实时切换混用。会话未物化（agent 冷）时 commands/execute 会被服务端拒绝，如实报错。未挂 permissionPresets 服务的 DSH 按钮隐藏。

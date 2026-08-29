@@ -77,6 +77,42 @@ void main() {
     expect(await DshChatCache.readContextLimit('s1'), 1000000);
   });
 
+  test('临时中转选择按 DSH scope 和会话隔离，只保存选中的配置', () async {
+    const selection = DshRelaySelection(
+      profileId: 'profile-a',
+      model: 'model-a',
+      reasoningEffort: 'high',
+    );
+    await DshChatCache.writeRelaySelection(
+      'lan\u0000192.168.1.2',
+      's1',
+      selection,
+    );
+
+    final restored = await DshChatCache.readRelaySelection(
+      'lan\u0000192.168.1.2',
+      's1',
+    );
+    expect(restored, isNotNull);
+    expect(restored!.profileId, 'profile-a');
+    expect(restored.model, 'model-a');
+    expect(restored.reasoningEffort, 'high');
+    expect(
+      await DshChatCache.readRelaySelection('lan\u0000192.168.1.3', 's1'),
+      isNull,
+    );
+    expect(
+      await DshChatCache.readRelaySelection('lan\u0000192.168.1.2', 's2'),
+      isNull,
+    );
+
+    await DshChatCache.clearRelaySelection('lan\u0000192.168.1.2', 's1');
+    expect(
+      await DshChatCache.readRelaySelection('lan\u0000192.168.1.2', 's1'),
+      isNull,
+    );
+  });
+
   test('空正文的思考消息缓存往返后仍保持折叠字段', () async {
     await DshChatCache.write(
       's1',
@@ -210,7 +246,6 @@ void main() {
   test('相同旧问题不会误确认刚发送的乐观消息', () {
     final old = _message('u1', 'user', '重复问题');
     final pending = _message('dsh-opt-2', 'user', '重复问题');
-
     final notConfirmed = dshMergeHistoryPreservingProgress(
       current: [old, pending],
       incoming: [_message('u1', 'user', '重复问题')],
@@ -227,6 +262,21 @@ void main() {
       preserveLocalProgress: false,
     );
     expect(confirmed.any((m) => m.id == pending.id), isFalse);
+  });
+
+  test('输出完成后不再把已确认消息旁的乐观占位补成重复', () {
+    final merged = dshMergeHistoryPreservingProgress(
+      current: [
+        _message('u1', 'user', 'hi'),
+        _message('dsh-opt-2', 'user', 'hi'),
+      ],
+      incoming: [
+        _message('u1', 'user', 'hi'),
+        _message('a2', 'assistant', '你好'),
+      ],
+      preserveLocalProgress: false,
+    );
+    expect(merged.map((m) => m.id), ['u1', 'a2']);
   });
 
   test('会话结束后完全以 DSH history 为准', () {

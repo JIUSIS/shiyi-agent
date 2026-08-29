@@ -57,11 +57,37 @@ class _StaggeredSessionsState extends State<StaggeredSessions>
       duration: const Duration(milliseconds: 420),
     )..value = widget.expanded ? 1 : 0;
     _controller.addListener(_onTick);
+    _controller.addStatusListener(_onStatus);
     _syncCurves(widget.children.length);
   }
 
   void _onTick() {
     if (mounted) setState(() {});
+    _convergeFromStall();
+  }
+
+  void _onStatus(AnimationStatus status) {
+    if (status == AnimationStatus.completed ||
+        status == AnimationStatus.dismissed) {
+      _convergeFromStall();
+    }
+  }
+
+  /// 动画被拖拽交错打断时，把 heightFactor 收敛回当前展开目标，
+  /// 避免列表停留在中间值导致后半段被裁剪、滑不到底。
+  void _convergeFromStall() {
+    if (!mounted) return;
+    if (widget.instant) {
+      _controller.value = widget.expanded ? 1 : 0;
+      return;
+    }
+    if (_controller.isAnimating) return;
+    final collapseNow = widget.fastCollapse && widget.expanded;
+    if (widget.expanded && !collapseNow && _controller.value < 1) {
+      _controller.forward();
+    } else if ((!widget.expanded || collapseNow) && _controller.value > 0) {
+      _controller.reverse();
+    }
   }
 
   void _syncCurves(int n) {
@@ -101,12 +127,15 @@ class _StaggeredSessionsState extends State<StaggeredSessions>
       } else {
         _controller.reverse();
       }
+    } else {
+      _convergeFromStall();
     }
   }
 
   @override
   void dispose() {
     _controller.removeListener(_onTick);
+    _controller.removeStatusListener(_onStatus);
     for (final c in _curves) {
       c.dispose();
     }

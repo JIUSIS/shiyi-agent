@@ -10,7 +10,9 @@ import '../core/home_list_order.dart';
 import '../core/model_presets.dart';
 import '../core/models.dart';
 import '../services/db.dart';
+import '../services/dsh_api.dart';
 import '../services/dsh_service.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/laap_api.dart';
 import '../services/laap_service.dart';
 import '../services/dsh_model_sync.dart';
@@ -31,6 +33,7 @@ import 'session_bridge.dart';
 import 'tool_result_pruner.dart';
 import 'tool_output_spill.dart';
 import '../services/runtime_logger.dart';
+import '../services/shiyi_api_relay.dart';
 
 /// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
 /// readOnly=true 的工具在计划模式（planMode）下仍然可用；
@@ -178,6 +181,11 @@ class ShiyiState extends ChangeNotifier {
 
   /// 各已保存配置对应的缓存模型 ID，按配置名隔离。
   Map<String, List<String>> modelCatalogsByProfile = {};
+  Future<void> _dshApiSyncTail = Future<void>.value();
+  String _relayInstanceId = '';
+  final Map<String, DshRelayLease> _activeDshRelayLeases = {};
+  final Set<String> _cleanedDshRelayScopes = {};
+  final Set<String> _watchedDshRelayTokens = {};
   List<Session> sessions = [];
   List<Project> projects = [];
   final Map<String, String> _projectIdBySession = {};
@@ -346,7 +354,374 @@ class ShiyiState extends ChangeNotifier {
     }
     await _migrateSessionProfileIds();
     await reloadModelCatalogs(notify: false);
+    _refreshRelayRoutes();
     if (notify) notifyListeners();
+  }
+
+  /// Relay 路由只保存在手机内存中。远端 DSH 看到的是 route id，真实地址
+  /// 和 API key 永远留在这里，不进入远端 provider 配置。
+  void _refreshRelayRoutes() {
+    if (!ShiyiApiRelay.instance.isRunning) return;
+    for (final lease in _activeDshRelayLeases.values) {
+      final profile = apiProfiles
+          .where((item) => item.profileId == lease.profileId)
+          .firstOrNull;
+      if (profile == null || profile.apiKey.trim().isEmpty) continue;
+      ShiyiApiRelay.instance.registerLease(
+        routeId: lease.routeId,
+        token: lease.token,
+        settings: settings.copyWith(
+          baseUrl: profile.baseUrl,
+          apiKey: profile.apiKey,
+          model: lease.model,
+          apiProtocol: profile.apiProtocol,
+          apiProfileId: profile.profileId,
+        ),
+      );
+    }
+  }
+
+  Future<String> _relayBaseUrl(AppSettings s) async {
+    final port = DshEndpoint.validPort(s.dshRelayPort);
+    // 本机 DSH 与 Relay 同设备：直接走回环，不依赖 Wi-Fi。
+    if (DshEndpoint.isLocal(s)) {
+      return 'http://127.0.0.1:$port${ShiyiApiRelay.routePrefix}';
+    }
+    final host = await ShiyiApiRelay.preferredLanIpv4();
+    return ShiyiApiRelay.reachableBaseUrl(lanIpv4: host, port: port);
+  }
+
+  String relayProviderForProfile(ApiProfile profile, {String sessionId = ''}) =>
+      sessionId.trim().isEmpty
+      ? DshModelSync.relayProviderForProfile(
+          profile,
+          relayInstanceId: _relayInstanceId,
+        )
+      : DshModelSync.relayProviderForSession(
+          profile,
+          sessionId: sessionId,
+          relayInstanceId: _relayInstanceId,
+        );
+
+  /// 公网 DSH 用不了手机 Relay（服务器拨不进手机局域网地址）：按用户要求
+  /// 把拾忆配置直接注入目标主机——真实 baseUrl + API Key 持久写入目标
+  /// settings.yaml / .credentials.yaml，目标主机的模型数据页可查看、可手动
+  /// 删除。provider 按手机实例派生（不带会话后缀），重复注入幂等。
+  /// 返回注入的 provider id；[sessionId] 非空时顺带 selectModel。
+  Future<String> injectShiyiProfileForRemote({
+    required ApiProfile profile,
+    String? sessionId,
+    String? model,
+  }) {
+    return _queueDshApiSync(() async {
+      if (DshEndpoint.modeOf(settings) != 'remote') {
+        throw StateError('仅公网 DSH 使用直接注入；局域网走手机安全中转');
+      }
+      if (profile.apiKey.trim().isEmpty) {
+        throw StateError('拾忆配置缺少 API Key，无法注入');
+      }
+      final relaySettings = _relaySettingsForProfile(
+        profile,
+        model: (model ?? profile.model).trim(),
+      );
+      final api = DshService.instance.apiFor(relaySettings);
+      final provider = relayProviderForProfile(profile);
+      await DshModelSync.injectShiyiDirectNow(
+        relaySettings,
+        api: api,
+        provider: provider,
+        name: '拾忆 · ${profile.name}',
+        sessionId: sessionId,
+      );
+      return provider;
+    });
+  }
+
+  Future<String> _ensureDshRelayToken() async {
+    var token = await _settingsService.loadDshRelayToken();
+    if (token.trim().isEmpty) {
+      token = ShiyiApiRelay.newToken();
+      await _settingsService.saveDshRelayToken(token);
+    }
+    final nextId = DshModelSync.relayInstanceIdForToken(token);
+    if (_relayInstanceId != nextId) {
+      _relayInstanceId = nextId;
+      if (loaded) notifyListeners();
+    }
+    return token;
+  }
+
+  AppSettings _relaySettingsForProfile(
+    ApiProfile profile, {
+    required String model,
+  }) => settings.copyWith(
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: model.trim().isEmpty ? profile.model : model.trim(),
+    apiProtocol: profile.apiProtocol,
+    apiProfileId: profile.profileId,
+    dshApiSource: 'shiyi',
+  );
+
+  /// 为一次 DSH 会话回合临时登记且只登记用户选中的手机 API 配置。
+  Future<DshRelayLease> acquireDshRelayLease({
+    required ApiProfile profile,
+    required String sessionId,
+    required String model,
+  }) {
+    return _queueDshApiSync(() async {
+      final id = sessionId.trim();
+      final modelId = model.trim();
+      if (id.isEmpty) throw ArgumentError('DSH 会话 ID 为空');
+      if (DshEndpoint.modeOf(settings) == 'remote') {
+        throw StateError('公网 DSH 拨不进手机，拾忆 API 走直接注入而非中转');
+      }
+      if (profile.apiKey.trim().isEmpty || modelId.isEmpty) {
+        throw StateError('拾忆配置缺少 API Key 或模型，无法临时中转');
+      }
+
+      final previous = _activeDshRelayLeases[id];
+      if (previous != null) await _releaseDshRelayLeaseLocked(previous);
+
+      await _ensureDshRelayToken();
+      final relaySettings = _relaySettingsForProfile(profile, model: modelId);
+      final relay = ShiyiApiRelay.instance;
+      final port = DshEndpoint.validPort(relaySettings.dshRelayPort);
+      if (!relay.isRunning) {
+        await relay.start(settings: relaySettings, token: '', port: port);
+        _refreshRelayRoutes();
+      } else if (relay.port != port) {
+        throw StateError('手机 Relay 正在使用端口 ${relay.port}，请结束当前回合后再修改端口');
+      }
+
+      String relayBaseUrl;
+      try {
+        relayBaseUrl = await _relayBaseUrl(relaySettings);
+      } catch (_) {
+        if (_activeDshRelayLeases.isEmpty) await _stopShiyiRelay();
+        rethrow;
+      }
+      if (relayBaseUrl.isEmpty) {
+        if (_activeDshRelayLeases.isEmpty) await _stopShiyiRelay();
+        throw StateError('无法确定手机局域网 Relay 地址，请确认手机已连接 Wi-Fi');
+      }
+
+      final api = DshService.instance.apiFor(relaySettings);
+      final scopeKey = DshEndpoint.scopeKeyOf(relaySettings);
+      if (_cleanedDshRelayScopes.add(scopeKey)) {
+        try {
+          await DshModelSync.cleanupRelayProvidersForInstance(
+            api: api,
+            relayInstanceId: _relayInstanceId,
+            scopeKey: scopeKey,
+          );
+        } catch (_) {
+          // 旧版 DSH 可能没有 llm.providers；不阻止本次临时租约创建。
+        }
+      }
+
+      DshModelSelection? previousSelection;
+      try {
+        final models = await api.sessionModels(id);
+        previousSelection = DshModelSync.restorableSelection(
+          models.current,
+          models.groups,
+        );
+      } catch (_) {
+        // 旧版 DSH 没有 session.models 时仍允许临时中转，只是不做回合后恢复。
+      }
+
+      final token = ShiyiApiRelay.newToken();
+      final routeId = ShiyiApiRelay.routeIdForProfile(
+        profile,
+        sessionId: '$scopeKey\n$id',
+      );
+      final provider = relayProviderForProfile(profile, sessionId: id);
+      final lease = DshRelayLease(
+        api: api,
+        sessionId: id,
+        profileId: profile.profileId,
+        model: modelId,
+        provider: provider,
+        credential: DshModelSync.relayCredentialEnvForProvider(provider),
+        routeId: routeId,
+        token: token,
+        scopeKey: scopeKey,
+        previousProvider: previousSelection?.provider ?? '',
+        previousModel: previousSelection?.model ?? '',
+        previousReasoningEffort: previousSelection?.reasoningEffort,
+      );
+      relay.registerLease(
+        routeId: routeId,
+        token: token,
+        settings: relaySettings,
+      );
+      try {
+        await DshModelSync.injectRelayNow(
+          relaySettings,
+          api: api,
+          relayBaseUrl: '$relayBaseUrl/$routeId',
+          relayToken: token,
+          provider: provider,
+          sessionId: id,
+          name: '拾忆临时中转 · ${profile.name}',
+          isRunning: api.rpcPing,
+          scopeKey: scopeKey,
+          setDefault: false,
+        );
+        _activeDshRelayLeases[id] = lease;
+        _syncRelayBackgroundState();
+        return lease;
+      } catch (_) {
+        relay.revokeLease(routeId, token: token);
+        try {
+          await DshModelSync.removeRelayNow(
+            api: api,
+            provider: provider,
+            scopeKey: scopeKey,
+          );
+        } catch (_) {}
+        if (_activeDshRelayLeases.isEmpty) await _stopShiyiRelay();
+        rethrow;
+      }
+    });
+  }
+
+  Future<void> releaseDshRelayLease(DshRelayLease lease) =>
+      _queueDshApiSync(() => _releaseDshRelayLeaseLocked(lease));
+
+  /// 页面退出或 mux 断线时的兜底清理。正常 turn/end 仍由聊天页立即释放；
+  /// 这里观察目标 DSH 的真实 running 状态，避免页面销毁后留下 provider。
+  void monitorDshRelayLease(DshRelayLease lease) {
+    if (!_watchedDshRelayTokens.add(lease.token)) return;
+    unawaited(() async {
+      final started = DateTime.now();
+      var seenRunning = false;
+      try {
+        while (_activeDshRelayLeases[lease.sessionId]?.token == lease.token) {
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+          try {
+            final sessions = await lease.api.listSessions();
+            final session = sessions
+                .where((item) => item.sessionId == lease.sessionId)
+                .firstOrNull;
+            if (session?.running == true) {
+              seenRunning = true;
+              continue;
+            }
+            if (seenRunning ||
+                DateTime.now().difference(started) >
+                    const Duration(seconds: 5)) {
+              await releaseDshRelayLease(lease);
+              break;
+            }
+          } catch (_) {
+            // 短时断线时保留租约；停止、发送失败和 App 重启仍会撤销 token。
+          }
+        }
+      } finally {
+        _watchedDshRelayTokens.remove(lease.token);
+      }
+    }());
+  }
+
+  Future<void> _releaseDshRelayLeaseLocked(DshRelayLease lease) async {
+    final current = _activeDshRelayLeases[lease.sessionId];
+    final ownsCurrent = current?.token == lease.token;
+    if (ownsCurrent) _activeDshRelayLeases.remove(lease.sessionId);
+    try {
+      if (ownsCurrent) {
+        final previousProvider = lease.previousProvider.trim();
+        final previousModel = lease.previousModel.trim();
+        if (previousProvider.isNotEmpty && previousModel.isNotEmpty) {
+          try {
+            await lease.api.selectModel(
+              lease.sessionId,
+              previousProvider,
+              previousModel,
+              reasoningEffort: lease.previousReasoningEffort,
+            );
+            unawaited(
+              RuntimeLogger.instance.info(
+                'Relay',
+                'session_model.restored',
+                sessionId: lease.sessionId,
+                data: {
+                  'provider': previousProvider,
+                  'model': previousModel,
+                  'scopeKey': lease.scopeKey,
+                },
+              ),
+            );
+          } catch (error) {
+            unawaited(
+              RuntimeLogger.instance.warn(
+                'Relay',
+                'session_model.restore_failed',
+                sessionId: lease.sessionId,
+                result: 'failed',
+                data: {
+                  'provider': previousProvider,
+                  'model': previousModel,
+                  'scopeKey': lease.scopeKey,
+                  'error': '$error',
+                },
+              ),
+            );
+          }
+        }
+        await DshModelSync.removeRelayNow(
+          api: lease.api,
+          provider: lease.provider,
+          scopeKey: lease.scopeKey,
+        );
+      }
+    } finally {
+      ShiyiApiRelay.instance.revokeLease(lease.routeId, token: lease.token);
+      if (_activeDshRelayLeases.isEmpty) await _stopShiyiRelay();
+      _syncRelayBackgroundState();
+    }
+  }
+
+  void _syncRelayBackgroundState() {
+    if (!Platform.isAndroid) return;
+    final activeSessions = _sessionRuns.values
+        .where((run) => run.active)
+        .length;
+    unawaited(
+      AndroidBackgroundService.instance.sync(
+        activeSessions: activeSessions,
+        relayEnabled: _activeDshRelayLeases.isNotEmpty,
+      ),
+    );
+  }
+
+  Future<void> _stopShiyiRelay() async {
+    if (_activeDshRelayLeases.isNotEmpty) return;
+    if (ShiyiApiRelay.instance.isRunning) {
+      await ShiyiApiRelay.instance.stop();
+    }
+    if (Platform.isAndroid) {
+      final activeSessions = _sessionRuns.values
+          .where((run) => run.active)
+          .length;
+      unawaited(
+        AndroidBackgroundService.instance.sync(
+          activeSessions: activeSessions,
+          relayEnabled: false,
+        ),
+      );
+    }
+  }
+
+  /// 拾忆 API 配置的串行队列（中转租约 / 注入共用）。
+  Future<T> _queueDshApiSync<T>(Future<T> Function() action) {
+    final result = _dshApiSyncTail.then<T>((_) => action());
+    _dshApiSyncTail = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
   }
 
   /// 按已保存配置的接口地址刷新缓存模型目录。
@@ -536,14 +911,17 @@ class ShiyiState extends ChangeNotifier {
     if (preferred != null && preferred.sessionId == currentSessionId) {
       _syncCurrentRunView(preferred);
     }
-    // Android 前台服务只在确有生成任务时运行；拾忆与 DSH 注入链路共用
-    // 当前 Flutter 进程，因此后台继续沿用现有会话隔离、流式和落库逻辑。
+    // Android 前台服务承载生成任务；手机 Relay 开启时即使没有生成任务也要保活。
     if (Platform.isAndroid) {
       final activeSessions = _sessionRuns.values
           .where((run) => run.active)
           .length;
+      final relayEnabled = ShiyiApiRelay.instance.isRunning;
       unawaited(
-        AndroidBackgroundService.instance.sync(activeSessions: activeSessions),
+        AndroidBackgroundService.instance.sync(
+          activeSessions: activeSessions,
+          relayEnabled: relayEnabled,
+        ),
       );
     }
   }
@@ -638,6 +1016,31 @@ class ShiyiState extends ChangeNotifier {
     // 计划模式只读约束走动尾提示词 + 执行层拦截，不在这里过滤。
     if (planMode) return tools;
     return tools;
+  }
+
+  /// 手机模型驱动远程 DSH 时可用的工具表。
+  ///
+  /// 远程会话不能把本地子代理、提问弹窗或本地终端能力伪装成远端能力；
+  /// 宿主工具由远端 DSH 执行，其余只读/记忆工具仍在手机侧执行。
+  static List<Map<String, dynamic>> remoteToolsJsonForRequest() {
+    const allowed = {
+      'save_memory',
+      'search_sessions',
+      'read_session',
+      'inspect_runtime',
+      'run_terminal',
+      'file_write',
+      'file_read',
+      'web_search',
+      'web_extract',
+    };
+    return [
+      for (final tool in toolsJsonForRequest())
+        if (allowed.contains(
+          ((tool['function'] as Map?)?['name'] ?? '').toString(),
+        ))
+          tool,
+    ];
   }
 
   /// 子代理最终报告裁剪（与 web_extract 同阈值 8000）：
@@ -946,7 +1349,7 @@ class ShiyiState extends ChangeNotifier {
             '不要自己逐文件读或单线程硬扛。'
             '【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如'
             '「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发'
-            '（最多 4 个，同时跑互不阻塞，单个失败不影响其他）；'
+            '（数量由拾忆按任务复杂度自行决定，同时跑互不阻塞，单个失败不影响其他）；'
             '禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。'
             '只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。'
             'tasks 示例：tasks=[{"agent_type":"explore","description":"查A",'
@@ -992,7 +1395,7 @@ class ShiyiState extends ChangeNotifier {
                 },
                 'required': ['agent_type', 'description', 'prompt'],
               },
-              'description': '批量并行派发：数组里的每个任务同时执行（最多 4 个）',
+              'description': '批量并行派发：数组里的每个任务同时执行，数量由拾忆按任务复杂度自行决定',
             },
             'max_turns': {
               'type': 'integer',
@@ -1031,6 +1434,9 @@ class ShiyiState extends ChangeNotifier {
     unawaited(RuntimeLogger.instance.info('App', 'state.init.started'));
     try {
       settings = await _settingsService.load();
+      if (DshModelSync.canUseShiyiRelay(settings)) {
+        await _ensureDshRelayToken();
+      }
       Socks5Proxy.apply(settings);
       DshService.instance.applyConnection(settings);
       apiProfiles = await _settingsService.loadProfiles();
@@ -1150,31 +1556,14 @@ class ShiyiState extends ChangeNotifier {
       }
       // 上次退出时处于 DSH 引擎：冷启动后自动拉起已安装的 DSH；
       // 拾忆退出 / 未安装不自动启动。切换引擎本身不触发，只影响下次启动。
+      // 本机与局域网统一走「手机临时中转」租约（#307），启动不再批量
+      // 注入拾忆配置到 settings.yaml。
       if (settings.agentEngine == 'dsh' && await _lastEngineWasDsh()) {
         DshService.instance.applyConnection(settings);
         if (DshService.instance.managesLocalProcess) {
-          // 先落盘合法配置再启动：上次写入若残留非法 YAML（如 API key
-          // 粘贴带入换行 → .credentials.yaml 解析失败），DSH 启动即崩，
-          // 文件路径同步会清洗重写（DSH 未运行时不走 live）。
-          await DshModelSync.syncFromShiyi(
-            settings,
-            scopeKey: DshService.instance.currentScopeKey,
-          );
-          final ok = await DshService.instance.ensureRunning();
-          if (ok) {
-            await DshModelSync.syncFromShiyi(
-              settings,
-              scopeKey: DshService.instance.currentScopeKey,
-            );
-          }
+          await DshService.instance.ensureRunning();
         } else {
           await DshService.instance.refreshStatus();
-          if (await DshService.instance.isRunning()) {
-            await DshModelSync.syncFromShiyi(
-              settings,
-              scopeKey: DshService.instance.currentScopeKey,
-            );
-          }
         }
       }
     } catch (e) {
@@ -2242,7 +2631,7 @@ class ShiyiState extends ChangeNotifier {
     return parts.map((e) => '【图片：$e】').join('\n');
   }
 
-  Future<void> send(String text, {String? sessionId}) async {
+  Future<void> send(String text, {String? sessionId, ChatMessage? pendingUserMessage}) async {
     final trimText = text.trim();
     if (trimText.isEmpty) return;
     var targetSessionId = sessionId ?? currentSessionId;
@@ -2323,10 +2712,12 @@ class ShiyiState extends ChangeNotifier {
         content: trimText,
         createdAt: now,
       );
-      await _db.insertMessage(userMsg);
-      if (currentSessionId == targetSessionId) {
-        messages.add(userMsg);
-        _bumpMessages();
+      if (pendingUserMessage == null) {
+        await _db.insertMessage(userMsg);
+        if (currentSessionId == targetSessionId) {
+          messages.add(userMsg);
+          _bumpMessages();
+        }
       }
 
       // 发送前检查是否需要自动压缩历史上下文（此时新用户消息已计入统计）。
@@ -2367,6 +2758,41 @@ class ShiyiState extends ChangeNotifier {
       // 用户主动停止不算生成错误；保留已输出内容并立即收口占位消息。
       await _finalizeAbort(run, run.streaming);
       run.status = null;
+      _publishRun(run);
+    } on LlmInterruptedException catch (e) {
+      turnFailed = true;
+      run.status = '回复中断，自动重试失败：${e.message}';
+      await _logError('生成', run.status!);
+      final st = run.streaming;
+      if (st != null) {
+        st.streaming = false;
+        if (st.content.isEmpty) st.content = '(回复中断，已自动重试 1 次)';
+        await _db.updateMessageContent(st.id, st.content);
+      }
+      if (currentSessionId == targetSessionId) _bumpMessages();
+      _publishRun(run);
+    } on LlmHttpException catch (e) {
+      turnFailed = true;
+      run.status = e.message;
+      await _logError('生成', e.message);
+      unawaited(
+        RuntimeLogger.instance.error(
+          '会话',
+          'turn.failed',
+          sessionId: targetSessionId,
+          requestId: sendRequestId,
+          durationMs: DateTime.now().difference(sendStarted).inMilliseconds,
+          result: 'HTTP ${e.statusCode}',
+          data: e.info.toLogData(),
+        ),
+      );
+      final st = run.streaming;
+      if (st != null) {
+        st.streaming = false;
+        if (st.content.isEmpty) st.content = '(请求失败：HTTP ${e.statusCode})';
+        await _db.updateMessageContent(st.id, st.content);
+      }
+      if (currentSessionId == targetSessionId) _bumpMessages();
       _publishRun(run);
     } catch (e) {
       turnFailed = true;
@@ -2527,14 +2953,36 @@ class ShiyiState extends ChangeNotifier {
         completed = true;
         run.status = null;
         _publishRun(run);
-      } on LlmInterruptedException catch (_) {
+      } on LlmInterruptedException catch (e) {
         if (attempt == 0) {
           // 连接被切断（未收到 [DONE]）：清掉半截占位消息，自动重试一次。
-          run.status = '回复中断，正在自动重试…';
+          run.status = '回复中断，正在自动重试（1/1）…';
           await _retryReset(run, firstAsst);
           _publishRun(run);
           continue;
         }
+        run.status = '回复中断，自动重试失败：${e.message}';
+        rethrow;
+      } on LlmHttpException catch (e) {
+        final raw = '${e.message} ${e.rawBody}'.toLowerCase();
+        if (imagesAllowed && raw.contains('image_url')) {
+          imagesAllowed = false;
+          _knownImageUnsupported = true;
+          firstAsst.content = '';
+          firstAsst.toolCalls = [];
+          await _db.updateMessageContent(firstAsst.id, '');
+          run.status = '当前模型不支持图片，已自动切换为纯文本重试';
+          _publishRun(run);
+          continue;
+        }
+        // 400 是请求契约错误，不走通用“网络错误重试”，保留明确错误码和参数。
+        if (attempt == 0 && e.retryable) {
+          run.status = '${e.message}，正在自动重试（1/1）…';
+          await _retryReset(run, firstAsst);
+          _publishRun(run);
+          continue;
+        }
+        run.status = e.message;
         rethrow;
       } on LlmException catch (e) {
         if (imagesAllowed && e.message.contains('image_url')) {
@@ -2592,6 +3040,7 @@ class ShiyiState extends ChangeNotifier {
   /// 偶发网关错误可自动重试：限流、5xx、session 类、超时/连接类。
   static bool _isRetryableLlmError(String msg) {
     final m = msg.toLowerCase();
+    if (m.contains('http 400')) return false;
     if (m.contains('http 429') || m.contains('http 5')) return true;
     if (m.contains('metadata_get') || m.contains('session')) return true;
     if (m.contains('超时') || m.contains('timeout')) return true;
@@ -2615,11 +3064,25 @@ class ShiyiState extends ChangeNotifier {
         _publishRun(run);
         return false;
       }
+      // 立刻把新消息放进 UI，引用旧回合被截断前用户就先看到已送出。
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final pending = ChatMessage(
+        id: 'm${now}_${_rand()}',
+        sessionId: targetSessionId,
+        role: 'user',
+        content: text.trim(),
+        createdAt: now,
+      );
+      if (currentSessionId == targetSessionId) {
+        messages.add(pending);
+        _bumpMessages();
+      }
       run
         ..guideWaiting = true
         ..stopForGuide = true
         ..status = '正在打断当前回复…';
       _publishRun(run);
+      await _db.insertMessage(pending);
       stopSession(targetSessionId);
       final completion = run.completion;
       if (completion != null) {
@@ -2630,6 +3093,8 @@ class ShiyiState extends ChangeNotifier {
         ..stopForGuide = false
         ..status = null;
       _publishRun(run);
+      await send(text, sessionId: targetSessionId, pendingUserMessage: pending);
+      return true;
     }
     await send(text, sessionId: targetSessionId);
     return true;
@@ -3338,6 +3803,12 @@ class ShiyiState extends ChangeNotifier {
     String rollingSummary = '',
   }) => _buildSystemPrompt(userText, rollingSummary: rollingSummary);
 
+  /// 构建手机侧驱动远程 DSH 时使用的基础提示词。
+  Future<String> buildSystemPromptForAgent(
+    String userText, {
+    String rollingSummary = '',
+  }) => _buildSystemPrompt(userText, rollingSummary: rollingSummary);
+
   /// 测试专用：暴露段落注册表（名字唯一性、order 顺序、段落独立性）。
   @visibleForTesting
   List<PromptSection> buildPromptSectionsForTest(
@@ -3574,6 +4045,14 @@ class ShiyiState extends ChangeNotifier {
     }
     return '未知工具';
   }
+
+  /// 供手机侧远程 Agent Loop 执行记忆、会话查阅和联网等手机工具。
+  /// 终端/文件工具由远端 DSH 执行器接管，避免误落到手机本地工作区。
+  Future<String> executeToolForRemoteAgent(
+    String name,
+    String argsJson, {
+    String? sessionId,
+  }) => _executeTool(name, argsJson, sessionId: sessionId);
 
   // ---------------- 各工具执行实现 ----------------
 
@@ -4087,10 +4566,6 @@ class ShiyiState extends ChangeNotifier {
       tasks.addAll(rawTasks.whereType<Map>().cast<Map<String, dynamic>>());
     } else {
       tasks.add(args);
-    }
-    const maxParallel = 4;
-    if (tasks.length > maxParallel) {
-      return '一次最多并行 $maxParallel 个子代理（当前 ${tasks.length} 个），请分批派发。';
     }
     for (final t in tasks) {
       final type = (t['agent_type'] ?? '').toString().trim();
@@ -4959,7 +5434,6 @@ echo "[rc=\$?]"
       final matched = profileMatchingSettings(s, apiProfiles);
       if (matched != null) s.apiProfileId = matched.profileId;
     }
-    final modelChanged = DshModelSync.isModelSettingsChange(settings, s);
     final engineChanged = s.agentEngine != settings.agentEngine;
     if (s.model != settings.model) _knownImageUnsupported = false;
     if (s.model != settings.model ||
@@ -4970,6 +5444,18 @@ echo "[rc=\$?]"
     settings = s;
     Socks5Proxy.apply(s);
     DshService.instance.applyConnection(s);
+    if (Platform.isAndroid) {
+      final relayRunning = ShiyiApiRelay.instance.isRunning;
+      final activeSessions = _sessionRuns.values
+          .where((run) => run.active)
+          .length;
+      unawaited(
+        AndroidBackgroundService.instance.sync(
+          activeSessions: activeSessions,
+          relayEnabled: relayRunning,
+        ),
+      );
+    }
     notifyListeners();
     await _settingsService.save(s);
     final uri = Uri.tryParse(s.baseUrl.trim());
@@ -4989,15 +5475,6 @@ echo "[rc=\$?]"
     );
     if (engineChanged) {
       await _rememberLastEngine(s.agentEngine);
-    }
-    if (modelChanged) {
-      unawaited(
-        DshModelSync.syncFromShiyi(
-          s,
-          allowClear: true,
-          scopeKey: DshService.instance.currentScopeKey,
-        ),
-      );
     }
   }
 

@@ -14,23 +14,29 @@ import '../core/models.dart';
 import '../core/slash_trigger.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_live.dart';
 import '../services/dsh_model_sync.dart';
+import '../services/dsh_provider_config.dart';
 import '../services/dsh_service.dart';
+import '../services/dsh_turn_command_queue.dart';
 import '../services/file_workspace.dart';
 import '../services/image_service.dart';
+import '../services/runtime_logger.dart';
 import '../services/tts_service.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/agent_question_panel.dart';
 import '../widgets/chat_liquid_glass.dart';
+import '../widgets/dsh_directory_picker.dart';
 import '../widgets/dsh_stats_bar.dart';
 import '../widgets/tool_pill.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
 
-/// 先读取本地会话快照，再开始整页淡入。
+/// 本机 DSH 先读取本地会话快照，再开始整页淡入；局域网 / 公网直接请求
+/// 目标 DSH，禁止把手机快照显示成远端当前页面。
 ///
 /// 这样路由动画期间页面内容保持稳定，避免进入后加载态、缓存态和远端历史
 /// 连续换帧，形成明显的“两段感”。
@@ -43,9 +49,11 @@ Future<void> openDshChat(
   ShiyiState? shiyi,
 }) async {
   DshChatSnapshot? snapshot;
-  try {
-    snapshot = await DshChatCache.read(sessionId);
-  } catch (_) {}
+  if (!DshEndpoint.requiresLivePageData(shiyi?.settings)) {
+    try {
+      snapshot = await DshChatCache.read(sessionId);
+    } catch (_) {}
+  }
   if (!context.mounted) return;
   await Navigator.of(context).push<void>(
     MacPageRoute<void>(
@@ -96,15 +104,23 @@ class _DshChatScreenState extends State<DshChatScreen>
   late bool _running = widget.initialSummary?.running ?? false;
   Timer? _pollTimer;
   Timer? _subagentPollTimer;
-  Timer? _subagentStatusTimer;
   bool _refreshingSubagents = false;
   List<DshSubagentEntry> _subagents = [];
-  bool _subagentStatusVisible = false;
-  int _subagentFallbackCount = 0;
+  int _subagentRefreshGeneration = 0;
   final Set<String> _syncedResponseModels = {};
   late String _title = widget.initialTitle;
   late String _model = widget.shiyi?.settings.model.trim() ?? '';
   String _provider = '';
+  String _selectedRelayProfileId = '';
+  DshRelayLease? _activeRelayLease;
+  List<SessionModelOption> _dshModelOptions = const [];
+  List<PermissionPresetOption> _permissionOptions = const [];
+  String _permissionDefault = '';
+
+  /// 当前会话生效的权限预设（permission/preset 事件折叠）；空 = 未显式
+  /// 选过，显示创建时的组合默认（用服务器 defaultPreset 估计）。
+  String _sessionPermission = '';
+  late bool _selectedModelTargetDsh;
   String _reasoningEffort = '';
   String _lastNonOffEffort = '';
   Map<String, String?> _reasoningCapabilities = const {};
@@ -114,6 +130,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   bool _stopping = false;
   bool _ignoreLateRunningStatus = false;
   int _sendGeneration = 0;
+  DateTime? _lastSendAt;
   bool _showToolLog = false;
   String? _speakingId;
   late DshSessionSummary? _summary = widget.initialSummary;
@@ -124,6 +141,53 @@ class _DshChatScreenState extends State<DshChatScreen>
   final DshLiveTurn _live = DshLiveTurn();
   final List<String> _pendingImages = [];
   final List<String> _pendingFiles = [];
+
+  List<SessionModelOption> get _sessionModelOptions {
+    final shiyi = widget.shiyi;
+    // 本机与局域网统一：拾忆 API 走「手机临时中转」租约（本机经回环）；
+    // 公网拨不进手机，拾忆 API 走直接注入。
+    final remoteInject =
+        shiyi != null && DshEndpoint.modeOf(shiyi.settings) == 'remote';
+    final hasShiyi = shiyi != null;
+    final local = [
+      for (final p in shiyi?.apiProfiles ?? const <ApiProfile>[])
+        SessionModelOption(
+          value: hasShiyi ? 'relay:${p.profileId}' : p.name,
+          label: remoteInject ? '拾忆 API · ${p.name}' : '手机临时中转 · ${p.name}',
+          subtitle: p.model,
+          models: shiyi?.cachedModelsForProfile(p) ?? const <String>[],
+          targetDsh: hasShiyi,
+          targetProvider: shiyi != null
+              ? (remoteInject
+                    ? shiyi.relayProviderForProfile(p)
+                    : shiyi.relayProviderForProfile(
+                        p,
+                        sessionId: widget.sessionId,
+                      ))
+              : '',
+          shiyiRelay: hasShiyi,
+        ),
+    ];
+    return [
+      ...local,
+      for (final option in _dshModelOptions)
+        SessionModelOption(
+          value: 'dsh:${option.value}',
+          label: '当前 DSH · ${option.label}',
+          subtitle: option.subtitle,
+          models: option.models,
+          targetDsh: true,
+          targetProvider: option.targetProvider.trim().isEmpty
+              ? option.value
+              : option.targetProvider,
+        ),
+    ];
+  }
+
+  bool get _usesTargetDshApi => widget.shiyi == null;
+
+  bool get _usesLivePageData =>
+      DshEndpoint.requiresLivePageData(widget.shiyi?.settings);
 
   /// 当前会话已加载的 DSH 技能。发送下一条消息时会一起注入调用指令，
   /// 与拾忆会话的“已加载技能”保持同一交互模型。
@@ -147,6 +211,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   bool _turnEndSeen = false;
   bool _suppressDuplicateSubagentTurn = false;
   String? _pendingPromptText;
+  final DshTurnCommandQueue _turnCommands = DshTurnCommandQueue();
   DateTime? _lastSlashTrigger;
   int _pollTicks = 0;
   int _muxGen = 0;
@@ -158,6 +223,10 @@ class _DshChatScreenState extends State<DshChatScreen>
   @override
   void initState() {
     super.initState();
+    final settings = widget.shiyi?.settings;
+    _selectedModelTargetDsh =
+        _usesTargetDshApi ||
+        (settings != null && DshEndpoint.modeOf(settings) == 'remote');
     WidgetsBinding.instance.addObserver(this);
     DshService.instance.status.addListener(_onDshStatus);
     _streamText.addListener(_onStreamTextChanged);
@@ -171,9 +240,10 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (_model.isNotEmpty) {
       _applyReasoningCapabilities(_model);
     }
+    unawaited(_loadPermissionPresets());
     unawaited(_loadContextLimit());
     final snapshot = widget.initialSnapshot;
-    if (snapshot?.hasUiData == true) {
+    if (!_usesLivePageData && snapshot?.hasUiData == true) {
       _restoreSnapshot(snapshot!, notify: false);
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -183,6 +253,10 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   @override
   void dispose() {
+    final relayLease = _activeRelayLease;
+    if (relayLease != null) {
+      widget.shiyi?.monitorDshRelayLease(relayLease);
+    }
     _cacheTimer?.cancel();
     _queueCacheWrite();
     WidgetsBinding.instance.removeObserver(this);
@@ -193,7 +267,6 @@ class _DshChatScreenState extends State<DshChatScreen>
     _input.removeListener(_onInputChanged);
     _pollTimer?.cancel();
     _subagentPollTimer?.cancel();
-    _subagentStatusTimer?.cancel();
     _loadRetryTimer?.cancel();
     _historySettleTimer?.cancel();
     _muxGen = 0;
@@ -253,6 +326,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   void _queueCacheWrite() {
+    if (_usesLivePageData) return;
     final snapshot = _cacheSnapshot();
     _cacheWriteTail = _cacheWriteTail
         .then((_) => DshChatCache.write(widget.sessionId, snapshot))
@@ -388,17 +462,11 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   int get _runningSubagentCount {
-    final actual = _subagents
-        .where((e) => e.kind != 'diagnostic' && e.running)
-        .length;
-    if (actual > _subagentFallbackCount) return actual;
-    return _subagentStatusVisible ? _subagentFallbackCount : actual;
+    return _subagents.where((e) => e.kind != 'diagnostic' && e.running).length;
   }
 
   int get _subagentTotalCount {
-    final total = _subagents.where((e) => e.kind != 'diagnostic').length;
-    final running = _runningSubagentCount;
-    return total > running ? total : running;
+    return _runningSubagentCount;
   }
 
   /// 会话是否仍处于“正在思考/运行”状态。
@@ -468,7 +536,8 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   Future<void> _load({DshChatSnapshot? prefetched}) async {
-    if (prefetched?.hasUiData != true) {
+    final usablePrefetched = _usesLivePageData ? null : prefetched;
+    if (usablePrefetched?.hasUiData != true) {
       setState(() {
         _loading = true;
         _error = null;
@@ -477,8 +546,10 @@ class _DshChatScreenState extends State<DshChatScreen>
       _error = null;
       _waitingService = false;
     }
-    // 先显示本地快照，网络/服务慢时消息、模型和统计栏都不白屏。
-    final cached = prefetched ?? await DshChatCache.read(widget.sessionId);
+    // 只有本机 DSH 使用快照首帧；局域网 / 公网始终等待目标 DSH 返回。
+    final cached = _usesLivePageData
+        ? null
+        : usablePrefetched ?? await DshChatCache.read(widget.sessionId);
     final hasCache = cached?.hasUiData == true;
     if (mounted && hasCache) {
       _restoreSnapshot(cached!, notify: true);
@@ -542,7 +613,7 @@ class _DshChatScreenState extends State<DshChatScreen>
       } else {
         setState(() {
           _loading = false;
-          _error = null;
+          _error = '$e';
           _waitingService = false;
         });
       }
@@ -609,6 +680,10 @@ class _DshChatScreenState extends State<DshChatScreen>
       _reasoningEffort = value;
       if (value != 'off') _lastNonOffEffort = value;
     });
+    if (_selectedRelayProfileId.isNotEmpty) {
+      await _persistRelaySelection();
+      return;
+    }
     try {
       final selected = await _api.selectModel(
         widget.sessionId,
@@ -641,6 +716,20 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   String get _selectedProfileName {
+    if (_selectedRelayProfileId.isNotEmpty) {
+      return 'relay:$_selectedRelayProfileId';
+    }
+    final targetProvider = _provider.trim();
+    if (_selectedModelTargetDsh) {
+      for (final option in _sessionModelOptions) {
+        if (option.targetDsh &&
+            (option.targetProvider == targetProvider ||
+                option.value == 'dsh:$targetProvider')) {
+          return option.value;
+        }
+      }
+    }
+    if (_usesTargetDshApi) return _provider.trim();
     final shiyi = widget.shiyi;
     final profiles = shiyi?.apiProfiles ?? const <ApiProfile>[];
     final provider = _provider.trim();
@@ -661,82 +750,519 @@ class _DshChatScreenState extends State<DshChatScreen>
     return model;
   }
 
+  /// 公网每条消息前重申模型选择——局域网由中转租约每回合自愈，公网在
+  /// 这里补齐同样的保证：下一条消息一定落在所选配置上。
+  /// 拾忆 API：轻量 selectModel 失败（provider 被远端删了等）→ 幂等重注入；
+  /// 原生模型：selectModel 失败仅记审计。任何失败都不阻塞发送。
+  Future<void> _reaffirmRemoteSelection() async {
+    final shiyi = widget.shiyi;
+    if (shiyi == null || DshEndpoint.modeOf(shiyi.settings) != 'remote') return;
+    final provider = _provider.trim();
+    final model = _model.trim();
+    if (provider.isEmpty || model.isEmpty) return;
+    try {
+      await _api
+          .selectModel(widget.sessionId, provider, model)
+          .timeout(const Duration(seconds: 6));
+      return;
+    } catch (e) {
+      unawaited(
+        RuntimeLogger.instance.warn(
+          'DSH',
+          'session_model.reaffirm_failed',
+          sessionId: widget.sessionId,
+          data: {'provider': provider, 'model': model, 'error': '$e'},
+        ),
+      );
+      if (_selectedRelayProfileId.isEmpty) return;
+    }
+    final profile = _selectedRelayProfile();
+    if (profile == null) return;
+    try {
+      await shiyi
+          .injectShiyiProfileForRemote(
+            profile: profile,
+            sessionId: widget.sessionId,
+            model: model,
+          )
+          .timeout(const Duration(seconds: 12));
+      unawaited(
+        RuntimeLogger.instance.info(
+          'DSH',
+          'session_model.reinjected',
+          sessionId: widget.sessionId,
+          data: {'provider': provider, 'model': model},
+        ),
+      );
+    } catch (e) {
+      unawaited(
+        RuntimeLogger.instance.warn(
+          'DSH',
+          'session_model.reinject_failed',
+          sessionId: widget.sessionId,
+          result: 'failed',
+          data: {'provider': provider, 'error': '$e'},
+        ),
+      );
+    }
+  }
+
+  /// 切换模型时的 selectModel：思考档位以目标 provider 的服务端声明为准
+  /// （静态思考目录只是客户端猜测）。被"不支持该档位"拒绝时降级为不带
+  /// 档位重试一次（服务端用该模型默认档位），避免档位参数毁掉整个切换。
+  /// 返回 (选择结果, 是否发生了降级)。
+  Future<(DshModelSelection, bool)> _selectModelWithEffortFallback(
+    String provider,
+    String model,
+    String effort,
+  ) async {
+    try {
+      return (
+        await _api.selectModel(
+          widget.sessionId,
+          provider,
+          model,
+          reasoningEffort: effort,
+        ),
+        false,
+      );
+    } on DshApiException catch (e) {
+      if (!DshApiClient.isReasoningEffortRejection(e.message)) rethrow;
+      final retried = await _api.selectModel(widget.sessionId, provider, model);
+      return (retried, true);
+    }
+  }
+
   Future<void> _selectSessionProfile(SessionModelSelection selection) async {
     if (_compacting || _sending || _running) return;
     final shiyi = widget.shiyi;
-    if (shiyi == null) return;
-    ApiProfile? profile;
-    for (final p in shiyi.apiProfiles) {
-      if (p.name == selection.profile) {
-        profile = p;
-        break;
+    if (selection.shiyiRelay) {
+      if (shiyi == null) return;
+      final remoteInject = DshEndpoint.modeOf(shiyi.settings) == 'remote';
+      ApiProfile? profile;
+      for (final item in shiyi.apiProfiles) {
+        if (shiyi.relayProviderForProfile(item, sessionId: widget.sessionId) ==
+                selection.profile ||
+            shiyi.relayProviderForProfile(item) == selection.profile) {
+          profile = item;
+          break;
+        }
       }
-    }
-    final modelId = selection.model.trim();
-    if (profile == null || modelId.isEmpty) return;
-    final previousModel = _model;
-    final previousProvider = _provider;
-    final providerId = DshModelSync.providerIdForName(profile.name);
-    setState(() {
-      _model = modelId;
-      _provider = providerId;
-      _applyReasoningCapabilities(_model);
-    });
-    try {
-      final selected = await _api.selectModel(
+      final modelId = selection.model.trim();
+      final selectedProfile = profile;
+      if (selectedProfile == null || modelId.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('拾忆中转配置不存在或模型为空')));
+        }
+        return;
+      }
+      setState(() {
+        _model = modelId;
+        _provider = remoteInject
+            ? shiyi.relayProviderForProfile(selectedProfile)
+            : shiyi.relayProviderForProfile(
+                selectedProfile,
+                sessionId: widget.sessionId,
+              );
+        _selectedRelayProfileId = selectedProfile.profileId;
+        _selectedModelTargetDsh = true;
+        _applyReasoningCapabilities(_model);
+      });
+      await DshChatCache.writeRelaySelection(
+        DshEndpoint.scopeKeyOf(shiyi.settings),
         widget.sessionId,
-        providerId,
-        modelId,
-        reasoningEffort: _thinkingOn ? _reasoningEffort : 'off',
+        DshRelaySelection(
+          profileId: selectedProfile.profileId,
+          model: modelId,
+          reasoningEffort: _reasoningEffort,
+        ),
       );
+      _scheduleCacheWrite();
+      if (remoteInject) {
+        // 公网：真实配置直接写入目标 DSH（持久，可在模型数据页手动删除）。
+        try {
+          final provider = await shiyi.injectShiyiProfileForRemote(
+            profile: selectedProfile,
+            sessionId: widget.sessionId,
+            model: modelId,
+          );
+          if (!mounted) return;
+          setState(() => _provider = provider);
+        } catch (e) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('拾忆 API 直接注入失败：$e')));
+        }
+      }
+      return;
+    }
+    if (selection.targetDsh) {
+      await _releaseActiveRelayLease();
+      await _clearRelaySelection();
+      final previousModel = _model;
+      final previousProvider = _provider;
+      final previousTarget = _selectedModelTargetDsh;
+      setState(() {
+        _model = selection.model;
+        _provider = selection.profile;
+        _selectedModelTargetDsh = true;
+        _applyReasoningCapabilities(_model);
+      });
+      try {
+        final (selected, effortDropped) = await _selectModelWithEffortFallback(
+          selection.profile,
+          selection.model,
+          _thinkingOn ? _reasoningEffort : 'off',
+        );
+        if (!mounted) return;
+        final serverEffort = selected.reasoningEffort?.trim() ?? '';
+        setState(() {
+          if (selected.model.isNotEmpty) _model = selected.model;
+          if (selected.provider.isNotEmpty) _provider = selected.provider;
+          _applyReasoningCapabilities(
+            _model,
+            selected: selected.reasoningEffort ?? _reasoningEffort,
+          );
+          // 降级重试成功：以服务端实际档位为准；未回传则视为该模型
+          // 不适用档位（off），_lastNonOffEffort 保留供下次开启。
+          if (serverEffort.isNotEmpty) {
+            _reasoningEffort = serverEffort;
+          } else if (effortDropped) {
+            _reasoningEffort = 'off';
+          }
+          if (_reasoningEffort != 'off') _lastNonOffEffort = _reasoningEffort;
+        });
+        _scheduleCacheWrite();
+        // 公网：回读服务端真值——200 不代表远端会话真的换了模型，
+        // 以 current 为准采纳；不一致时明示远端实际状态。
+        if (widget.shiyi != null &&
+            DshEndpoint.modeOf(widget.shiyi!.settings) == 'remote') {
+          try {
+            final verify = await _api.sessionModels(widget.sessionId);
+            final vp = verify.current.provider.trim();
+            final vm = verify.current.model.trim();
+            if (!mounted) return;
+            if (vp.isNotEmpty &&
+                (vp != _provider.trim() ||
+                    (vm.isNotEmpty && vm != _model.trim()))) {
+              setState(() {
+                _provider = vp;
+                if (vm.isNotEmpty) _model = vm;
+                _applyReasoningCapabilities(_model);
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('远端实际模型：$vp / ${vm.isEmpty ? '?' : vm}'),
+                ),
+              );
+            }
+          } catch (_) {}
+        }
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _model = previousModel;
+          _provider = previousProvider;
+          _selectedModelTargetDsh = previousTarget;
+          _applyReasoningCapabilities(previousModel);
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('切换 DSH 模型失败：$e')));
+      }
+      return;
+    }
+    // 走到这里说明没有拾忆配置可选（shiyi 为空）：模型选择器里只有
+    // 「当前 DSH」项，已在上面 targetDsh 分支处理。
+  }
+
+  ApiProfile? _selectedRelayProfile() {
+    final id = _selectedRelayProfileId.trim();
+    if (id.isEmpty) return null;
+    return widget.shiyi?.apiProfiles
+        .where((item) => item.profileId == id)
+        .firstOrNull;
+  }
+
+  /// Restore the session-scoped relay identity before the first prompt.
+  ///
+  /// The local DSH keeps its page snapshot, but its relay provider is deleted
+  /// after each turn. The selector can therefore still show the cached model
+  /// while the state needed to acquire the next lease has not been restored.
+  Future<ApiProfile?> _restoreRelaySelectionForSend() async {
+    final shiyi = widget.shiyi;
+    if (shiyi == null || DshEndpoint.modeOf(shiyi.settings) == 'remote') {
+      return null;
+    }
+    var profile = _selectedRelayProfile();
+    var selection = await DshChatCache.readRelaySelection(
+      DshEndpoint.scopeKeyOf(shiyi.settings),
+      widget.sessionId,
+    );
+    if (profile == null && selection != null) {
+      profile = shiyi.apiProfiles
+          .where((item) => item.profileId == selection!.profileId)
+          .firstOrNull;
+    }
+    // Migrate sessions created before the session-scoped cache existed. Prefer
+    // the explicit global profile, then the model match used by the old UI.
+    if (profile == null) {
+      final boundId = shiyi.settings.apiProfileId.trim();
+      profile = shiyi.apiProfiles
+          .where((item) => item.profileId == boundId)
+          .firstOrNull;
+    }
+    if (profile == null && _model.trim().isNotEmpty) {
+      profile = shiyi.apiProfiles.where((item) {
+        if (item.model.trim() == _model.trim()) return true;
+        return shiyi.cachedModelsForProfile(item).contains(_model.trim());
+      }).firstOrNull;
+    }
+    if (profile == null || profile.apiKey.trim().isEmpty) return null;
+    final model =
+        (selection?.model.trim().isNotEmpty == true ? selection!.model : _model)
+            .trim();
+    if (model.isEmpty) return null;
+    final effort = selection?.reasoningEffort ?? _reasoningEffort;
+    if (!mounted) return profile;
+    setState(() {
+      _selectedRelayProfileId = profile!.profileId;
+      _model = model;
+      _provider = shiyi.relayProviderForProfile(
+        profile,
+        sessionId: widget.sessionId,
+      );
+      _selectedModelTargetDsh = true;
+    });
+    selection = DshRelaySelection(
+      profileId: profile.profileId,
+      model: model,
+      reasoningEffort: effort,
+    );
+    await DshChatCache.writeRelaySelection(
+      DshEndpoint.scopeKeyOf(shiyi.settings),
+      widget.sessionId,
+      selection,
+    );
+    return profile;
+  }
+
+  Future<void> _persistRelaySelection() async {
+    final shiyi = widget.shiyi;
+    final profile = _selectedRelayProfile();
+    if (shiyi == null || profile == null || _model.trim().isEmpty) return;
+    await DshChatCache.writeRelaySelection(
+      DshEndpoint.scopeKeyOf(shiyi.settings),
+      widget.sessionId,
+      DshRelaySelection(
+        profileId: profile.profileId,
+        model: _model.trim(),
+        reasoningEffort: _reasoningEffort,
+      ),
+    );
+  }
+
+  Future<void> _clearRelaySelection() async {
+    final shiyi = widget.shiyi;
+    if (shiyi == null) return;
+    _selectedRelayProfileId = '';
+    await DshChatCache.clearRelaySelection(
+      DshEndpoint.scopeKeyOf(shiyi.settings),
+      widget.sessionId,
+    );
+  }
+
+  Future<void> _releaseActiveRelayLease() async {
+    final lease = _activeRelayLease;
+    if (lease == null) return;
+    _activeRelayLease = null;
+    final shiyi = widget.shiyi;
+    if (shiyi == null) return;
+    try {
+      await shiyi.releaseDshRelayLease(lease);
+    } catch (error, stack) {
+      unawaited(
+        RuntimeLogger.instance.warn(
+          'Relay',
+          'lease.release_failed',
+          sessionId: widget.sessionId,
+          result: 'failed',
+          data: {
+            'provider': lease.provider,
+            'error': '$error',
+            'stack': '$stack',
+          },
+        ),
+      );
+    }
+  }
+
+  /// 读目标 DSH 的权限预设表（permissionPresets 服务）。未挂服务的旧版
+  /// DSH 拿不到 permission 命名空间，按钮保持隐藏。
+  Future<void> _loadPermissionPresets() async {
+    try {
+      final presets = await _api.describePermissionPresets();
       if (!mounted) return;
       setState(() {
-        if (selected.model.isNotEmpty) _model = selected.model;
-        if (selected.provider.isNotEmpty) _provider = selected.provider;
-        _applyReasoningCapabilities(
-          _model,
-          selected: selected.reasoningEffort ?? _reasoningEffort,
-        );
+        _permissionOptions = presets == null
+            ? const []
+            : [
+                for (final option in presets.options)
+                  PermissionPresetOption(
+                    value: option.key,
+                    label: option.label,
+                  ),
+              ];
+        _permissionDefault = presets?.defaultPreset ?? '';
       });
-      _scheduleCacheWrite();
+    } catch (_) {
+      // 探测失败不打断会话页；按钮隐藏。
+    }
+  }
+
+  /// 实时切换当前会话的权限预设（DSH `/permission <preset>` 命令，与
+  /// 官方输入框弹层同一条链路，立即生效并写入会话事件）。
+  Future<void> _setDefaultPermission(String preset) async {
+    if (preset == _sessionPermission) return;
+    final previous = _sessionPermission;
+    final label = _permissionOptions
+        .where((option) => option.value == preset)
+        .map((option) => option.label)
+        .firstOrNull;
+    setState(() => _sessionPermission = preset);
+    try {
+      await _api.executeSessionCommand(widget.sessionId, '/permission $preset');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('权限预设：${label ?? preset}（当前会话已生效）')),
+      );
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _model = previousModel;
-        _provider = previousProvider;
-        _applyReasoningCapabilities(previousModel);
-      });
+      setState(() => _sessionPermission = previous);
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('切换模型失败：$e')));
+      ).showSnackBar(SnackBar(content: Text('权限切换失败：$e')));
     }
   }
 
   Future<void> _loadMeta() async {
+    DshRelaySelection? savedRelay;
+    ApiProfile? savedRelayProfile;
+    final shiyi = widget.shiyi;
+    // 本机与局域网统一（#307）：中转选择按 scope 缓存恢复，本机不例外。
+    // 漏掉本机会导致冷启动后抽屉显示已选中、发消息却没走租约，
+    // 打在上一个回合残留的（已被释放删除的）relay provider 上直接失败。
+    if (shiyi != null && DshEndpoint.modeOf(shiyi.settings) != 'remote') {
+      savedRelay = await DshChatCache.readRelaySelection(
+        DshEndpoint.scopeKeyOf(shiyi.settings),
+        widget.sessionId,
+      );
+      if (savedRelay != null) {
+        savedRelayProfile = shiyi.apiProfiles
+            .where((item) => item.profileId == savedRelay!.profileId)
+            .firstOrNull;
+      }
+    }
+    DshModelSelection? current;
+    var groups = <DshModelGroup>[];
     try {
-      final models = await _api.sessionModels(widget.sessionId);
-      if (mounted) {
-        final currentModel = models.current.model;
-        final selected = models.current.reasoningEffort ?? '';
-        setState(() {
-          if (currentModel.isNotEmpty) _model = currentModel;
-          _provider = models.current.provider;
-          _applyReasoningCapabilities(
-            currentModel.isNotEmpty ? currentModel : _model,
-            selected: selected,
-          );
-        });
-        _scheduleCacheWrite();
-      }
+      final sessionModels = await _api.sessionModels(widget.sessionId);
+      current = sessionModels.current;
+      groups = sessionModels.groups;
+    } catch (_) {}
+    try {
+      groups = _mergeDshModelGroups(groups, await _api.llmModels());
     } catch (_) {
-      final fallback = widget.shiyi?.settings.model.trim() ?? '';
-      if (mounted && fallback.isNotEmpty) {
-        setState(() {
-          _model = fallback;
-          _applyReasoningCapabilities(fallback);
-        });
-        _scheduleCacheWrite();
+      // 旧版 DSH 没有 llm.models 时保留 session.models。
+    }
+    try {
+      groups = _mergeDshModelGroups(
+        groups,
+        dshModelGroupsFromProviders(await _api.llmProviders()),
+      );
+    } catch (_) {
+      // 旧版 DSH 没有 llm.providers 时不影响会话模型列表。
+    }
+    // 公网直注入是持久的：本地缓存的「拾忆 API」选择必须镜像远端实况。
+    // 目标主机上 provider 已被删除（模型数据页或服务器侧）时，自动清掉
+    // 本地选择，不允许出现“本地有远端没有”的状态。
+    final remoteInject =
+        shiyi != null && DshEndpoint.modeOf(shiyi.settings) == 'remote';
+    if (remoteInject && savedRelayProfile != null) {
+      final injectedProvider = shiyi.relayProviderForProfile(savedRelayProfile);
+      final existsOnRemote = groups.any(
+        (group) => group.id.trim() == injectedProvider,
+      );
+      if (!existsOnRemote) {
+        await _clearRelaySelection();
+        savedRelay = null;
+        savedRelayProfile = null;
       }
+    }
+    if (mounted) {
+      final currentModel = current?.model.trim() ?? '';
+      final selected = current?.reasoningEffort ?? '';
+      final fallback = widget.shiyi?.settings.model.trim() ?? '';
+      setState(() {
+        if (savedRelayProfile != null && savedRelay != null && shiyi != null) {
+          _selectedRelayProfileId = savedRelay.profileId;
+          _model = savedRelay.model;
+          _provider = remoteInject
+              ? shiyi.relayProviderForProfile(savedRelayProfile)
+              : shiyi.relayProviderForProfile(
+                  savedRelayProfile,
+                  sessionId: widget.sessionId,
+                );
+          _selectedModelTargetDsh = true;
+        } else if (currentModel.isNotEmpty) {
+          _model = currentModel;
+        } else if (_model.trim().isEmpty && fallback.isNotEmpty) {
+          _model = fallback;
+        }
+        if (current != null && current.provider.trim().isNotEmpty) {
+          if (savedRelayProfile == null) {
+            _provider = current.provider;
+            final matchesLocal =
+                (widget.shiyi?.apiProfiles ?? const <ApiProfile>[]).any(
+                  (profile) =>
+                      DshModelSync.providerIdForName(profile.name) == _provider,
+                );
+            _selectedModelTargetDsh = _usesTargetDshApi || !matchesLocal;
+          }
+        }
+        _dshModelOptions = [
+          for (final group in groups)
+            if (group.id.trim().isNotEmpty &&
+                group.models.any((model) => model.id.trim().isNotEmpty) &&
+                !DshModelSync.isRelayProvider(group.id) &&
+                // vision-toolkit-* 是 DSH 为视觉调用生成的镜像分组，
+                // 模型与本体重复，模型抽屉不展示（局域网抽屉重复的来源）。
+                !group.id.trim().startsWith('vision-toolkit-'))
+              SessionModelOption(
+                value: group.id,
+                label: group.name.trim().isEmpty ? group.id : group.name,
+                subtitle: group.models.isEmpty
+                    ? ''
+                    : group.models.first.id.trim(),
+                models: [
+                  for (final model in group.models)
+                    if (model.id.trim().isNotEmpty) model.id,
+                ],
+                targetDsh: true,
+                targetProvider: group.id,
+              ),
+        ];
+        _applyReasoningCapabilities(
+          savedRelayProfile != null
+              ? _model
+              : (currentModel.isNotEmpty ? currentModel : _model),
+          selected: savedRelay?.reasoningEffort ?? selected,
+        );
+      });
+      _scheduleCacheWrite();
     }
     try {
       final list = await _api.listSessions();
@@ -755,9 +1281,25 @@ class _DshChatScreenState extends State<DshChatScreen>
         _live.begin();
         _resetLiveNotifiers();
         _ensureLiveBubble();
-      } else if (!me.running && wasRunning && _awaitingFinalReply) {
+      } else if (!me.running && (wasRunning || _awaitingFinalReply)) {
+        // 轮询发现远端已停止（mux 不在时的兜底路径）：与 mux 分支 /
+        // 本地 _stop() 同一套收口，且不再重拉子代理列表（远端对已中止
+        // 回合的条目仍报 running:true，重拉会把状态条灌回来）。
+        // 条件含 _awaitingFinalReply：mux turn/end 抢先把 _running 置 false
+        // 后若收口失手，这里下一拍仍能恢复（清理幂等）。
+        ++_sendGeneration;
+        _resetSubagentStatusForNewTurn();
+        _ignoreLateRunningStatus = true;
+        _sending = false;
+        _awaitingFinalReply = false;
         _turnEndSeen = true;
+        _pendingPromptText = null;
+        _stopPoll();
+        _finalizeSubagentStatus();
+        _clearLiveUi(preserveVisible: true);
+        _syncSubagentPolling();
         unawaited(_refreshHistory(clearLive: true));
+        return;
       }
       _scheduleCacheWrite();
       _syncSubagentPolling();
@@ -877,24 +1419,66 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (mounted) {
       setState(() => _running = false);
       _syncSubagentPolling();
-      if (_subagentStatusVisible) _finalizeSubagentStatus();
     }
+  }
+
+  void _removeOptimisticMessage(ChatMessage optimistic) {
+    if (!mounted) return;
+    setState(() {
+      _messages.removeWhere((m) => m.id == optimistic.id);
+    });
+  }
+
+  void _abortCurrentSend(
+    ChatMessage optimistic,
+    String text,
+    List<String> images,
+    List<String> files,
+  ) {
+    if (!mounted) return;
+    setState(() {
+      _sending = false;
+      _running = false;
+      _awaitingFinalReply = false;
+      _turnEndSeen = false;
+      _pendingPromptText = null;
+      _messages.removeWhere((m) => m.id == optimistic.id);
+      // 发送期间用户若已输入下一条，不覆盖新草稿。
+      if (_input.text.trim().isEmpty &&
+          _pendingImages.isEmpty &&
+          _pendingFiles.isEmpty) {
+        _input.text = text;
+        _input.selection = TextSelection.collapsed(offset: text.length);
+        _pendingImages.addAll(images);
+        _pendingFiles.addAll(files);
+      }
+    });
+    _clearLiveUi();
+    _scheduleCacheWrite();
   }
 
   Future<void> _send() async {
     final text = _input.text.trim();
-    if (text.isEmpty && _pendingImages.isEmpty && _pendingFiles.isEmpty) {
+    final images = List<String>.of(_pendingImages);
+    final files = List<String>.of(_pendingFiles);
+    if (text.isEmpty && images.isEmpty && files.isEmpty) return;
+    final now = DateTime.now();
+    final lastSendAt = _lastSendAt;
+    if (lastSendAt != null &&
+        now.difference(lastSendAt) < const Duration(milliseconds: 200)) {
       return;
     }
-    if (_sending || _running || _awaitingFinalReply) {
-      _interruptLocallyForPrompt();
-    }
+    _lastSendAt = now;
+    final interrupting = _sending || _running || _awaitingFinalReply;
+    // A replacement prompt starts a new DSH turn. Any subagent.list result
+    // from the previous turn must not repaint this turn's status.
+    ++_subagentRefreshGeneration;
     final sendGeneration = ++_sendGeneration;
     final content = StringBuffer();
-    for (final path in _pendingImages) {
+    for (final path in images) {
       content.writeln('![图片]($path)');
     }
-    for (final path in _pendingFiles) {
+    for (final path in files) {
       content.writeln('【附件：${p.basename(path)}】');
       content.writeln('路径：$path');
     }
@@ -905,6 +1489,8 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
     if (text.isNotEmpty) content.write(text);
     final prompt = content.toString().trim();
+    // 先让输入区/附件立即让位并显示乐观消息：租约和取消都不能让界面
+    // 看起来“点了没反应”，同帧第二个发送入口也会因空输入直接退出。
     _input.clear();
     _pendingImages.clear();
     _pendingFiles.clear();
@@ -919,7 +1505,6 @@ class _DshChatScreenState extends State<DshChatScreen>
     _awaitingFinalReply = true;
     _turnEndSeen = false;
     _pendingPromptText = prompt;
-    _ignoreLateRunningStatus = false;
     _live.begin();
     _resetLiveNotifiers();
     setState(() {
@@ -928,14 +1513,84 @@ class _DshChatScreenState extends State<DshChatScreen>
       _messages.add(optimistic);
       _ensureLiveBubble(notify: false);
     });
+    _scrollToBottom();
+    if (interrupting) {
+      // 旧的回合仍在跑：输入区和乐观消息已让位，这里再等串行队列取消。
+      await _interruptLocallyForPrompt();
+      if (!mounted || sendGeneration != _sendGeneration) {
+        _removeOptimisticMessage(optimistic);
+        return;
+      }
+      _awaitingFinalReply = true;
+      _turnEndSeen = false;
+      _pendingPromptText = prompt;
+      _live.begin();
+      _resetLiveNotifiers();
+      setState(() {
+        _sending = true;
+        _running = true;
+        _ensureLiveBubble(notify: false);
+      });
+    }
+    // Do this immediately before acquiring the lease. On a cold local start
+    // the drawer may be painted from a snapshot before _loadMeta completes.
+    await _restoreRelaySelectionForSend();
+    if (!mounted || sendGeneration != _sendGeneration) {
+      _removeOptimisticMessage(optimistic);
+      return;
+    }
+    if (_selectedRelayProfileId.isNotEmpty) {
+      final shiyi = widget.shiyi;
+      final profile = _selectedRelayProfile();
+      if (shiyi == null || profile == null) {
+        _abortCurrentSend(optimistic, text, images, files);
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('选中的手机 API 配置已不存在')));
+        return;
+      }
+      if (DshEndpoint.modeOf(shiyi.settings) != 'remote') {
+        // 局域网：手机安全中转，随回合租约随用随删。
+        // 公网：配置已在选择时直接注入远端（持久），无需租约。
+        setState(() => _sending = true);
+        try {
+          final lease = await shiyi.acquireDshRelayLease(
+            profile: profile,
+            sessionId: widget.sessionId,
+            model: _model,
+          );
+          if (!mounted || sendGeneration != _sendGeneration) {
+            await shiyi.releaseDshRelayLease(lease);
+            _removeOptimisticMessage(optimistic);
+            return;
+          }
+          _activeRelayLease = lease;
+          _provider = lease.provider;
+        } catch (e) {
+          if (mounted && sendGeneration == _sendGeneration) {
+            _abortCurrentSend(optimistic, text, images, files);
+          } else {
+            _removeOptimisticMessage(optimistic);
+          }
+          if (mounted && sendGeneration == _sendGeneration) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('手机临时中转失败：$e')));
+          }
+          return;
+        }
+      }
+    }
     _scheduleCacheWrite();
     _scrollToBottom();
     _maybePoll();
-    try {
-      await DshService.instance.withRecover(
-        () => _api.prompt(widget.sessionId, prompt),
-        recover: true,
-      );
+    await _reaffirmRemoteSelection();
+    Future<void> sendPrompt() => DshService.instance.withRecover(
+      () => _turnCommands.enqueue(() => _api.prompt(widget.sessionId, prompt)),
+      recover: true,
+    );
+    void markAccepted() {
+      _ignoreLateRunningStatus = false;
       if (!mounted || sendGeneration != _sendGeneration) return;
       setState(() {
         _sending = false;
@@ -945,25 +1600,72 @@ class _DshChatScreenState extends State<DshChatScreen>
       _maybePoll();
       _syncSubagentPolling();
       unawaited(_refreshSubagents());
+    }
+
+    try {
+      await sendPrompt();
+      markAccepted();
     } catch (e) {
-      if (!mounted || sendGeneration != _sendGeneration) return;
-      setState(() {
-        _sending = false;
-        _messages.removeWhere((m) => m.id == optimistic.id);
-      });
-      _awaitingFinalReply = false;
-      _turnEndSeen = false;
-      _pendingPromptText = null;
-      _clearLiveUi();
-      _scheduleCacheWrite();
+      await _releaseActiveRelayLease();
+      // 会话的服务端选择可能指向已被删除/失效的 provider（例如清理过的
+      // 旧注入路由）：重新获取一次中转租约（重新注入 + selectModel）后
+      // 重试一次发送，用户无需手动重新选择。
+      final retryable =
+          _selectedRelayProfileId.isNotEmpty &&
+          widget.shiyi != null &&
+          (e.toString().contains('no adapter serves provider') ||
+              e.toString().contains('model-unavailable'));
+      var recovered = false;
+      if (retryable && mounted && sendGeneration == _sendGeneration) {
+        try {
+          final profile = _selectedRelayProfile();
+          final shiyi = widget.shiyi;
+          if (profile != null && shiyi != null) {
+            final lease = await shiyi.acquireDshRelayLease(
+              profile: profile,
+              sessionId: widget.sessionId,
+              model: _model,
+            );
+            if (!mounted || sendGeneration != _sendGeneration) {
+              await shiyi.releaseDshRelayLease(lease);
+              _removeOptimisticMessage(optimistic);
+              return;
+            }
+            _activeRelayLease = lease;
+            _provider = lease.provider;
+            await sendPrompt();
+            recovered = true;
+            markAccepted();
+          }
+        } catch (_) {
+          recovered = false;
+        }
+      }
+      if (recovered) {
+        _scheduleCacheWrite();
+        return;
+      }
+      if (!mounted || sendGeneration != _sendGeneration) {
+        _removeOptimisticMessage(optimistic);
+        return;
+      }
+      _abortCurrentSend(optimistic, text, images, files);
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('发送失败：$e')));
+      // 公网直注入：发送失败时重校验远端实况——provider 已在远端被删的话，
+      // 本地选择自动清掉（跟随远端），下次发送不再打在失效 provider 上。
+      if (_selectedRelayProfileId.isNotEmpty &&
+          widget.shiyi != null &&
+          DshEndpoint.modeOf(widget.shiyi!.settings) == 'remote') {
+        unawaited(_loadMeta());
+      }
     }
   }
 
-  /// 插话时先在本地立刻收口，再异步通知 DSH 取消旧回合，避免等待网络响应。
-  void _interruptLocallyForPrompt() {
+  /// 插话时先在本地立刻收口，再等待串行队列完成 DSH 旧回合取消。
+  Future<void> _interruptLocallyForPrompt() async {
+    _resetSubagentStatusForNewTurn();
     _ignoreLateRunningStatus = true;
     _sending = false;
     _running = false;
@@ -975,12 +1677,22 @@ class _DshChatScreenState extends State<DshChatScreen>
     _finalizeSubagentStatus();
     _clearLiveUi(preserveVisible: true);
     if (mounted) setState(() {});
-    unawaited(_api.cancel(widget.sessionId).catchError((_) {}));
+    try {
+      await _turnCommands.enqueue(
+        () => _api.cancel(widget.sessionId).timeout(const Duration(seconds: 2)),
+      );
+    } catch (_) {
+      // Keep the local UI responsive; the subsequent prompt still gets the
+      // next serialized slot and DSH can report a transport failure normally.
+    } finally {
+      await _releaseActiveRelayLease();
+    }
   }
 
   Future<void> _stop() async {
     if (_stopping) return;
     ++_sendGeneration;
+    _resetSubagentStatusForNewTurn();
     _ignoreLateRunningStatus = true;
     _sending = false;
     _running = false;
@@ -999,7 +1711,9 @@ class _DshChatScreenState extends State<DshChatScreen>
       });
     }
     try {
-      await _api.cancel(widget.sessionId).timeout(const Duration(seconds: 2));
+      await _turnCommands.enqueue(
+        () => _api.cancel(widget.sessionId).timeout(const Duration(seconds: 2)),
+      );
       unawaited(_refreshHistory(clearLive: true));
     } catch (e) {
       if (!mounted) return;
@@ -1007,6 +1721,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         context,
       ).showSnackBar(SnackBar(content: Text('停止失败：$e')));
     } finally {
+      await _releaseActiveRelayLease();
       if (mounted) setState(() => _stopping = false);
     }
   }
@@ -1327,35 +2042,63 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   Future<void> _openWorkspace() async {
-    if (!Platform.isWindows) {
-      try {
-        final selected = await FilePicker.platform.getDirectoryPath();
-        final path = selected?.trim() ?? '';
-        if (path.isEmpty || !mounted) return;
-        await _api.updateSessionCwd(widget.sessionId, path);
-        if (!mounted) return;
-        setState(() => _cwd = path);
-        _scheduleCacheWrite();
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('工作目录已切换：$path')));
-      } catch (e) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('切换工作目录失败：$e')));
-      }
-      return;
-    }
-    if (_cwd.isEmpty) return;
+    // DSH 的 cwd 属于 DSH 主机（本机、局域网或公网电脑）。这里必须用
+    // host API 选择目录并写回 session cwd，不能打开手机本地文件选择器。
     try {
-      await _api.openPath(_cwd);
+      final selected = await pickDshHostDirectory(
+        context,
+        api: _api,
+        initialPath: _cwd.trim(),
+      );
+      final path = selected?.trim() ?? '';
+      if (path.isEmpty || !mounted || path == _cwd.trim()) return;
+      await _api.updateSessionCwd(widget.sessionId, path);
+      if (!mounted) return;
+      setState(() {
+        _cwd = path;
+        _summary = _summary?.withCwd(path);
+      });
+      _scheduleCacheWrite();
+      unawaited(_loadMeta());
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('会话工作目录已切换：$path')));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('无法打开：$e')));
+      ).showSnackBar(SnackBar(content: Text('切换会话工作目录失败：$e')));
     }
+  }
+
+  /// 合并 session.models、llm.models 和带有效模型目录的 llm.providers，
+  /// 避免远端模型缺失，同时不把纯凭据槽显示成模型组。
+  static List<DshModelGroup> _mergeDshModelGroups(
+    List<DshModelGroup> first,
+    List<DshModelGroup> second,
+  ) {
+    final byId = <String, DshModelGroup>{};
+    for (final group in [...first, ...second]) {
+      final id = group.id.trim();
+      if (id.isEmpty) continue;
+      final previous = byId[id];
+      if (previous == null) {
+        byId[id] = group;
+        continue;
+      }
+      final models = <String, DshModelInfo>{
+        for (final model in previous.models)
+          if (model.id.trim().isNotEmpty) model.id: model,
+        for (final model in group.models)
+          if (model.id.trim().isNotEmpty) model.id: model,
+      };
+      byId[id] = DshModelGroup(
+        id: id,
+        name: group.name.trim().isNotEmpty ? group.name : previous.name,
+        models: models.values.toList(),
+      );
+    }
+    return byId.values.toList();
   }
 
   Future<void> _connectDownlink() async {
@@ -1429,9 +2172,28 @@ class _DshChatScreenState extends State<DshChatScreen>
           _live.begin();
           _resetLiveNotifiers();
           _ensureLiveBubble();
-        } else if (!running && wasRunning && _awaitingFinalReply) {
+        } else if (!running && (wasRunning || _awaitingFinalReply)) {
+          // 远端（官方 Web UI / 其他客户端）点了停止：与本地 _stop() 同一套
+          // 收口，否则「思考中」面板和子代理状态条会残留（历史刷新的
+          // allowClose 受 _awaitingFinalReply 阻塞，子代理列表不清空）。
+          // 注意：收口后不能再 _refreshSubagents()——远端 subagent.list 对
+          // 已中止回合的条目仍报 running:true，重拉会把状态条原样灌回来
+          // （#305 首版就是败在这里）。
+          // 条件含 _awaitingFinalReply：mux turn/end 先置 _running=false 后
+          // 若历史刷新失手，轮询仍能在下一拍把状态收回来（清理幂等）。
+          ++_sendGeneration;
+          _resetSubagentStatusForNewTurn();
+          _ignoreLateRunningStatus = true;
+          _sending = false;
+          _awaitingFinalReply = false;
           _turnEndSeen = true;
+          _pendingPromptText = null;
+          _stopPoll();
+          _finalizeSubagentStatus();
+          _clearLiveUi(preserveVisible: true);
+          _syncSubagentPolling();
           unawaited(_refreshHistory(clearLive: true));
+          return;
         }
         _syncSubagentPolling();
         unawaited(_refreshSubagents());
@@ -1465,10 +2227,18 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (ev == null) return;
     final kind = ev['type']?.toString() ?? '';
 
+    // 权限预设切换（本端或官方 Web UI 等其他客户端）实时反映到按钮。
+    if (kind == 'permission/preset') {
+      final preset = (((ev['data'] as Map?)?['preset']) ?? '').toString();
+      if (preset.isNotEmpty && mounted && preset != _sessionPermission) {
+        setState(() => _sessionPermission = preset);
+      }
+      return;
+    }
+
     // 停止/插话后，服务端旧回合可能还有迟到事件；新回合开始前全部丢弃，
     // 防止旧输出把本地 UI 再次点亮或串入新消息。
     if (_ignoreLateRunningStatus) {
-      if (kind == 'turn/end') _finishPendingTurn();
       return;
     }
 
@@ -1511,12 +2281,6 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
     if (kind == 'tool/call') {
       _recordToolCall(ev);
-      final data = (ev['data'] as Map?)?.cast<String, dynamic>() ?? const {};
-      final toolName = (data['name'] ?? data['tool'] ?? '').toString();
-      final toolPayload = '$toolName ${data['arguments'] ?? ''}'.toLowerCase();
-      if (toolPayload.contains('subagent')) {
-        _markSubagentActivity();
-      }
       if (_live.open && changed) {
         _ensureLiveBubble();
         _syncLiveTools();
@@ -1548,7 +2312,6 @@ class _DshChatScreenState extends State<DshChatScreen>
         _turnEndSeen = true;
         setState(() => _running = false);
         _syncSubagentPolling();
-        _scheduleSubagentHide();
         unawaited(_refreshSubagents());
       }
       unawaited(_refreshHistory(clearLive: kind == 'turn/end'));
@@ -1572,6 +2335,10 @@ class _DshChatScreenState extends State<DshChatScreen>
     try {
       final bundle = await _api.historyBundle(widget.sessionId);
       if (!mounted) return;
+      if (bundle.permissionPreset != null &&
+          bundle.permissionPreset != _sessionPermission) {
+        setState(() => _sessionPermission = bundle.permissionPreset!);
+      }
       _rememberResponseModels(bundle);
       _adoptHistoryReasoning(bundle.messages);
       final current = DshChatCache.materializeMessages(
@@ -1648,12 +2415,6 @@ class _DshChatScreenState extends State<DshChatScreen>
     });
     _scheduleCacheWrite();
     _syncSubagentPolling();
-    // 父会话由运行转结束，且整轮确实收口（无进行中子代理、无待收口回复）时，
-    // 子代理/思考指示才随之收尾消失。
-    if (!_isThinkingActive &&
-        (_subagentStatusVisible || _subagentFallbackCount > 0)) {
-      _finalizeSubagentStatus();
-    }
   }
 
   void _rememberResponseModels(DshHistoryBundle bundle) {
@@ -1674,22 +2435,18 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   Future<void> _refreshSubagents() async {
     if (_refreshingSubagents) return;
+    final refreshGeneration = _subagentRefreshGeneration;
     _refreshingSubagents = true;
     try {
       final result = await _api.listSubagents(widget.sessionId);
-      if (!mounted) return;
-      final running = result.entries
-          .where((e) => e.kind != 'diagnostic' && e.running)
-          .length;
-      setState(() => _subagents = result.entries);
-      if (running > 0) {
-        // 子代理确实在跑：立即显示并持续刷新。
-        _markSubagentActivity(count: running);
-      } else if (_subagentStatusVisible) {
-        // 子代理刚落盘，但父会话仍在整轮运行中：指示保留直到整个会话结束，
-        // 否则 worker 返回后主模型继续分析时“子代理 · 运行中”会提前消失。
-        _scheduleSubagentHide();
-      }
+      if (!mounted || refreshGeneration != _subagentRefreshGeneration) return;
+      // 总闸：父回合已收口（本地/远端停止、turn/end、会话重开）时，
+      // subagent.list 里残留的 running 条目不再采信——中止的回合不可能
+      // 还有活着的子代理，采信会让状态条与「思考中」占位永久残留。
+      final turnActive = _running || _sending || _awaitingFinalReply;
+      setState(() {
+        _subagents = turnActive ? result.entries : const [];
+      });
       _syncSubagentPolling();
     } catch (_) {
       // 父会话尚未就绪或服务切换时保留上次状态，下一轮再取。
@@ -1713,50 +2470,17 @@ class _DshChatScreenState extends State<DshChatScreen>
     _subagentPollTimer = null;
   }
 
-  void _markSubagentActivity({int count = 1}) {
-    _subagentStatusTimer?.cancel();
-    final next = count < 1 ? 1 : count;
-    final changed = !_subagentStatusVisible || _subagentFallbackCount != next;
-    _subagentStatusVisible = true;
-    if (next > _subagentFallbackCount) _subagentFallbackCount = next;
-    if (changed && mounted) setState(() {});
-  }
-
-  /// 延迟隐藏“子代理 · 运行中”指示。只要会话整体仍处于思考/运行状态
-  /// （父会话整轮未收口，或仍有子代理在跑），即使当前没有运行中的子代理
-  /// 也保持指示，直到整轮 turn/end 真正收口才消失。
-  void _scheduleSubagentHide() {
-    _subagentStatusTimer?.cancel();
-    _subagentStatusTimer = Timer(const Duration(milliseconds: 900), () {
-      _subagentStatusTimer = null;
-      if (!mounted) return;
-      // 会话仍活跃：保留指示，等 turn/end / 子代理结束后统一收口。
-      if (_isThinkingActive) {
-        setState(() {
-          _subagentStatusVisible = true;
-          if (_subagentFallbackCount < 1) _subagentFallbackCount = 1;
-        });
-        return;
-      }
-      final stillRunning = _subagents.any(
-        (e) => e.kind != 'diagnostic' && e.running,
-      );
-      if (stillRunning) return;
-      setState(() {
-        _subagentStatusVisible = false;
-        _subagentFallbackCount = 0;
-      });
-    });
-  }
-
-  /// 整轮 turn/end 收口时调用：此刻整个会话确实结束了，子代理指示才真正消失。
   void _finalizeSubagentStatus() {
-    _subagentStatusTimer?.cancel();
-    _subagentStatusTimer = null;
-    setState(() {
-      _subagentStatusVisible = false;
-      _subagentFallbackCount = 0;
-    });
+    _subagentRefreshGeneration++;
+    _subagents = [];
+    if (mounted) setState(() {});
+  }
+
+  /// 让旧回合的子代理投影和异步刷新结果彻底失效。
+  void _resetSubagentStatusForNewTurn() {
+    _subagentRefreshGeneration++;
+    _subagents = [];
+    if (mounted) setState(() {});
   }
 
   List<ChatMessage> _mergeHistory(
@@ -1830,6 +2554,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     _historySettleTimer = null;
     _historySettleAttempts = 0;
     _clearLiveUi();
+    unawaited(_releaseActiveRelayLease());
   }
 
   bool _historyConfirmsLive(List<ChatMessage> incoming) {
@@ -2382,44 +3107,31 @@ class _DshChatScreenState extends State<DshChatScreen>
                                 setState(() => _pendingFiles.removeAt(index)),
                             onSend: _send,
                             onStop: _stopping ? () {} : _stop,
-                            modelOptions: [
-                              for (final p
-                                  in widget.shiyi?.apiProfiles ??
-                                      const <ApiProfile>[])
-                                SessionModelOption(
-                                  value: p.name,
-                                  label: p.name,
-                                  subtitle: p.model,
-                                  models:
-                                      widget.shiyi?.cachedModelsForProfile(p) ??
-                                      const <String>[],
-                                ),
-                            ],
+                            modelOptions: _sessionModelOptions,
                             modelValue: _selectedProfileName,
                             modelId: _model,
-                            onModelChanged: _compacting || _sending || _running
-                                ? null
-                                : _selectSessionProfile,
-                            modelEnabled:
-                                !_compacting && !_sending && !_running,
+                            onModelChanged: _selectSessionProfile,
+                            modelEnabled: true,
+                            onModelOpening: () => unawaited(_loadMeta()),
                             thinkingOptions: _thinkingOptions,
                             thinkingValue: _thinkingOn
                                 ? _reasoningEffort
                                 : _lastNonOffEffort,
                             onThinkingChanged: _setReasoningEffort,
-                            thinkingEnabled:
-                                !_compacting && !_sending && !_running,
+                            thinkingEnabled: true,
                             thinkingOn: _thinkingOn,
                             onThinkingToggled: _thinkingOptions.isNotEmpty
                                 ? _setThinkingOn
                                 : null,
-                            onCompress: _compacting || _sending || _running
-                                ? null
-                                : _compactContext,
+                            permissionOptions: _permissionOptions,
+                            permissionValue: _sessionPermission.isNotEmpty
+                                ? _sessionPermission
+                                : _permissionDefault,
+                            onPermissionChanged: _setDefaultPermission,
+                            permissionEnabled: _permissionOptions.isNotEmpty,
+                            onCompress: _compactContext,
                             compressBusy: _compacting,
-                            onContextLimit: _compacting || _sending || _running
-                                ? null
-                                : _editContextLimit,
+                            onContextLimit: _editContextLimit,
                             contextLimitLabel: formatContextLimitLabel(
                               _contextLimit,
                             ),

@@ -51,7 +51,7 @@ Future<void> main() async {
     RuntimeLogger.instance.info(
       'App',
       'startup',
-      data: {'platform': Platform.operatingSystem, 'version': '2.6.0'},
+      data: {'platform': Platform.operatingSystem, 'version': '2.6.1'},
     ),
   );
   runApp(ShiyiAgentApp(initialThemeMode: initialThemeMode));
@@ -72,6 +72,14 @@ Future<String> _readInitialThemeMode() async {
   } catch (_) {
     return 'dark';
   }
+}
+
+bool _focusUsesTextInput(FocusNode? focus) {
+  if (focus == null || !focus.hasFocus) return false;
+  final focusContext = focus.context;
+  if (focusContext == null) return false;
+  return focusContext.widget is EditableText ||
+      focusContext.findAncestorWidgetOfExactType<EditableText>() != null;
 }
 
 class ShiyiAgentApp extends StatefulWidget {
@@ -196,11 +204,31 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
             ],
           );
         }
-        // 小米 HyperOS 小窗会把 viewPadding.top 报成窗口高度，SafeArea 把界面挤没。
-        return MediaQuery(
-          data: sanitizeMediaQuery(MediaQuery.of(context)),
+        // 点击当前输入框之外的位置时释放焦点，避免光标和输入法残留。
+        content = Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: (event) {
+            final focus = FocusManager.instance.primaryFocus;
+            final renderObject = focus?.context?.findRenderObject();
+            if (focus == null || renderObject is! RenderBox) return;
+            final origin = renderObject.localToGlobal(Offset.zero);
+            final rect = origin & renderObject.size;
+            if (!rect.contains(event.position)) {
+              focus.unfocus(disposition: UnfocusDisposition.scope);
+            }
+          },
           child: content,
         );
+        // 小米 HyperOS 小窗会把 viewPadding.top 报成窗口高度，SafeArea 把界面挤没。
+        final media = adaptSmallScreenText(
+          sanitizeMediaQuery(
+            MediaQuery.of(context),
+            keyboardExpected: _focusUsesTextInput(
+              FocusManager.instance.primaryFocus,
+            ),
+          ),
+        );
+        return MediaQuery(data: media, child: content);
       },
       home: WelcomeScreen(shiyi: shiyi),
     );

@@ -89,6 +89,33 @@ void main() {
     );
   });
 
+  test('HTTP 错误：保留远端状态码、错误码和消息', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode({
+          'result': {
+            'ok': false,
+            'error': {'code': 'forbidden', 'message': 'settings are read-only'},
+          },
+        }),
+        403,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    await expectLater(
+      clientWith(mock).listSessions(),
+      throwsA(
+        isA<DshApiException>()
+            .having((e) => e.code, 'code', 'forbidden')
+            .having(
+              (e) => e.message,
+              'message',
+              contains('settings are read-only'),
+            ),
+      ),
+    );
+  });
+
   test('rpcPing：RPC 就绪返回 true，并发探测合并为一次请求', () async {
     var calls = 0;
     final mock = MockClient((req) async {
@@ -111,6 +138,43 @@ void main() {
   test('rpcPing：HTTP 错误返回 false，不抛异常', () async {
     final mock = MockClient((req) async => http.Response('oops', 500));
     expect(await clientWith(mock).rpcPing(), isFalse);
+  });
+
+  test('固定 Host 身份用于普通 RPC、凭据写入和 WebSocket', () async {
+    final requests = <http.Request>[];
+    final mock = MockClient((req) async {
+      requests.add(req);
+      return http.Response(
+        jsonEncode(okValue({'items': []})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = DshApiClient(
+      baseUrl: 'http://192.168.2.175:43120',
+      hostOverride: '127.0.0.1:43120',
+      client: mock,
+    );
+
+    expect(await client.rpcPing(), isTrue);
+    await client.setCredential('SHIYI_RELAY_TOKEN', 'secret');
+
+    expect(
+      requests.map((request) => request.url.host),
+      everyElement('192.168.2.175'),
+    );
+    expect(
+      requests.map((request) => request.headers['host']),
+      everyElement('127.0.0.1:43120'),
+    );
+    expect(
+      requests.map((request) => request.headers['origin']),
+      everyElement('http://127.0.0.1:43120'),
+    );
+    expect(client.debugWebSocketHeaders(), {
+      'Host': '127.0.0.1:43120',
+      'Origin': 'http://127.0.0.1:43120',
+    });
   });
 
   test('远程 403 优先尝试自定义 Host，并记住兼容身份', () async {
@@ -1907,6 +1971,22 @@ void main() {
     });
   });
 
+  test('createSession：带 agentPreset 写入 session.create payload', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
+        jsonEncode(okValue({'sessionId': 'sess-preset'})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final id = await clientWith(mock).createSession(agentPreset: ' code ');
+    expect(id, 'sess-preset');
+    final body = jsonDecode(captured.body) as Map<String, dynamic>;
+    expect(body['method'], 'session.create');
+    expect(body['payload'], {'agentPreset': 'code'});
+  });
   test('createSession：带 workspaceId 时不写 cwd', () async {
     late http.Request captured;
     final mock = MockClient((req) async {
@@ -1991,6 +2071,113 @@ void main() {
       'high',
       'max',
     ]);
+  });
+
+  test('llm.providers：兼容远端把 providers 返回为映射', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'providers': {
+              'remote-provider': {
+                'displayName': '远程接口',
+                'models': [
+                  {'id': 'remote-model'},
+                ],
+              },
+            },
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+
+    final providers = await clientWith(mock).llmProviders();
+    expect(providers, hasLength(1));
+    expect(providers.single['id'], 'remote-provider');
+    expect(providers.single['displayName'], '远程接口');
+  });
+
+  test('settings.describe：保留 llm-pi-ai 的 user/value 配置层', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'writable': true,
+            'hasDocument': true,
+            'namespaces': [
+              {
+                'ns': 'llm-pi-ai',
+                'value': {
+                  'providers': {
+                    'configured-a': {
+                      'models': [
+                        {'id': 'model-a'},
+                      ],
+                    },
+                  },
+                },
+                'base': {'providers': {}},
+                'user': {
+                  'providers': {
+                    'configured-a': {
+                      'models': [
+                        {'id': 'model-a'},
+                      ],
+                    },
+                    'configured-b': {
+                      'models': [
+                        {'id': 'model-b'},
+                      ],
+                    },
+                  },
+                },
+                'secrets': [],
+                'revision': 3,
+              },
+            ],
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    final result = await clientWith(mock).describeSettings();
+    final namespace = result.namespaces.single;
+    expect(result.writable, isTrue);
+    expect(namespace.user['providers'], isA<Map>());
+    expect(
+      (namespace.user['providers'] as Map).keys,
+      containsAll(['configured-a', 'configured-b']),
+    );
+    expect(namespace.base['providers'], isA<Map>());
+  });
+
+  test('llm.models：兼容远端把 groups 返回为映射', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'groups': {
+              'remote-provider': {
+                'name': '远程接口',
+                'models': [
+                  {'id': 'remote-model', 'name': 'Remote Model'},
+                ],
+              },
+            },
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+
+    final groups = await clientWith(mock).llmModels();
+    expect(groups, hasLength(1));
+    expect(groups.single.id, 'remote-provider');
+    expect(groups.single.models.single.id, 'remote-model');
   });
 
   test('compactSession：调用官方 commands/execute 并解析成功结果', () async {
@@ -2155,5 +2342,32 @@ void main() {
       '压缩后回答',
     ]);
     expect(messages.expand((message) => message.toolCalls), isEmpty);
+  });
+
+  _reasoningRejectionTests();
+}
+
+void _reasoningRejectionTests() {
+  test('识别思考档位被拒的服务端文案', () {
+    expect(
+      DshApiClient.isReasoningEffortRejection(
+        'provider "ciyuan" model "Qwen3.8-Max" does not support reasoning effort "high"',
+      ),
+      isTrue,
+    );
+    expect(
+      DshApiClient.isReasoningEffortRejection(
+        'unsupported reasoning effort "max"',
+      ),
+      isTrue,
+    );
+  });
+
+  test('其他错误不命中降级判定', () {
+    expect(
+      DshApiClient.isReasoningEffortRejection('provider "x" not found'),
+      isFalse,
+    );
+    expect(DshApiClient.isReasoningEffortRejection(''), isFalse);
   });
 }

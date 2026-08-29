@@ -14,6 +14,7 @@ class SettingsService {
   static const _socks5ServerPasswordsKey = 'shiyi_socks5_server_passwords';
   static const _dshRemoteTokenKey = 'shiyi_dsh_remote_token';
   static const _dshLanTokenKey = 'shiyi_dsh_lan_token';
+  static const _dshRelayTokenKey = 'shiyi_dsh_relay_token';
   static const _profileKeyPrefix = 'shiyi_profile_api_key_v2_';
   static const _legacyProfileKeyPrefix = 'shiyi_profile_api_key_';
 
@@ -89,6 +90,12 @@ class SettingsService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, jsonEncode(json));
   }
+
+  /// 拾忆 API 中转令牌只放系统安全存储，不进入设置 JSON。
+  Future<String> loadDshRelayToken() => _readKey(_dshRelayTokenKey);
+
+  Future<void> saveDshRelayToken(String token) =>
+      _writeKey(_dshRelayTokenKey, token.trim());
 
   /// API 配置列表（各服务商的接口地址/密钥/模型）单独存储，
   /// 切换配置时自动带出以前保存的 API Key。
@@ -174,6 +181,28 @@ class SettingsService {
           p.copyWith(id: p.profileId).toJson()..remove('apiKey'),
       ]),
     );
+  }
+
+  /// 删除单个已保存配置及其密钥。配置身份只看 profileId，避免相同密钥的
+  /// 多个配置互相影响；内置预设是否恢复初始值由界面层负责。
+  Future<List<ApiProfile>> deleteProfile(ApiProfile profile) async {
+    final profileId = profile.profileId;
+    final profiles = await loadProfiles();
+    final remaining = [
+      for (final item in profiles)
+        if (item.profileId != profileId) item,
+    ];
+    await _secure.delete(key: _profileKey(profileId));
+    await _secure.delete(key: _legacyProfileKey(profile.baseUrl));
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _profilesKey,
+      jsonEncode([
+        for (final item in remaining)
+          item.copyWith(id: item.profileId).toJson()..remove('apiKey'),
+      ]),
+    );
+    return remaining;
   }
 
   static String _profileKey(String profileId) =>

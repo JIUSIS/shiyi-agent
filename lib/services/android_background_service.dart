@@ -20,29 +20,50 @@ class AndroidBackgroundService {
 
   Future<void> _tail = Future<void>.value();
   int? _desiredActiveSessions;
+  bool? _desiredRelayEnabled;
   int? _appliedActiveSessions;
+  bool? _appliedRelayEnabled;
 
-  /// 同步当前活跃会话数。0 会停止服务，>0 会启动/更新常驻通知。
-  Future<void> sync({required int activeSessions}) {
+  /// 同步当前活跃会话数和 Relay 状态。
+  ///
+  /// 没有生成任务但 Relay 开启时，也必须保持前台服务，避免 Android
+  /// 因 Flutter 进程退到后台而回收手机侧中转监听。
+  Future<void> sync({required int activeSessions, bool relayEnabled = false}) {
     if (!Platform.isAndroid) return Future<void>.value();
     final normalized = activeSessions < 0 ? 0 : activeSessions;
+    final normalizedRelay = relayEnabled == true;
     _desiredActiveSessions = normalized;
-    if (_desiredActiveSessions == _appliedActiveSessions) {
+    final desiredKey = '$normalized:$normalizedRelay';
+    final appliedKey = _appliedActiveSessions == null
+        ? null
+        : '$_appliedActiveSessions:${_appliedRelayEnabled == true}';
+    if (desiredKey == appliedKey) {
       return _tail;
     }
+    _desiredRelayEnabled = normalizedRelay;
     _tail = _tail.then((_) async {
       final desired = _desiredActiveSessions;
-      if (desired == null || desired == _appliedActiveSessions) return;
+      final desiredRelay = _desiredRelayEnabled == true;
+      if (desired == null) return;
+      final currentKey = _appliedActiveSessions == null
+          ? null
+          : '$_appliedActiveSessions:${_appliedRelayEnabled == true}';
+      if ('$desired:$desiredRelay' == currentKey) return;
       try {
-        await _channel.invokeMethod<void>('sync', {'activeSessions': desired});
+        await _channel.invokeMethod<void>('sync', {
+          'activeSessions': desired,
+          'relayEnabled': desiredRelay,
+        });
         _appliedActiveSessions = desired;
+        _appliedRelayEnabled = desiredRelay;
         unawaited(
           RuntimeLogger.instance.info(
             '后台',
             'foreground_service.synced',
             data: {
               'activeSessions': desired,
-              'state': desired > 0 ? 'running' : 'stopped',
+              'relayEnabled': desiredRelay,
+              'state': desired > 0 || desiredRelay ? 'running' : 'stopped',
             },
           ),
         );
@@ -55,7 +76,11 @@ class AndroidBackgroundService {
             '后台',
             'foreground_service.sync_failed',
             result: 'failed',
-            data: {'error': e.message ?? e.code, 'activeSessions': desired},
+            data: {
+              'error': e.message ?? e.code,
+              'activeSessions': desired,
+              'relayEnabled': desiredRelay,
+            },
           ),
         );
       }

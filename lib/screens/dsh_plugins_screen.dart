@@ -3,7 +3,10 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import '../core/app_state.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_plugin_store.dart';
+import '../services/dsh_service.dart';
 import '../widgets/context_menu.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
@@ -16,11 +19,14 @@ const _pluginOrange = Color(0xFFFF9F0A);
 /// DS Harness 插件管理页：列出当前 DSH（web profile）已装载的插件——
 /// 内置 bundle 与用户/LLM 通过补丁层新增的插件，统一启停 / 删除 / 改配置。
 ///
-/// 读写 `~/.dsh/profiles/web/cordis.patch.yml`（DshPluginStore），
+/// 本机连接：读写 `~/.dsh/profiles/web/cordis.patch.yml`（DshPluginStore），
 /// 不动 DSH npm 安装目录，DSH 对补丁层热重载生效。
+/// 局域网 / 公网连接：改走 `pluginInventory/list` 实时清单（只读），
+/// 不读本机补丁文件——远端补丁只能登目标服务器修改。
 class DshPluginsScreen extends StatefulWidget {
   final DshPluginStore? store;
-  const DshPluginsScreen({super.key, this.store});
+  final ShiyiState? shiyi;
+  const DshPluginsScreen({super.key, this.store, this.shiyi});
 
   @override
   State<DshPluginsScreen> createState() => _DshPluginsScreenState();
@@ -33,6 +39,10 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
   bool _loading = true;
   String? _error;
   bool _busy = false;
+  bool _remote = false;
+
+  bool get _remoteMode =>
+      widget.shiyi != null && !DshEndpoint.isLocal(widget.shiyi!.settings);
 
   @override
   void initState() {
@@ -46,6 +56,26 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
       _error = null;
     });
     try {
+      if (_remoteMode) {
+        // 局域网 / 公网：实时清单来自目标 DSH，不读本机文件。
+        final api = DshService.instance.apiFor(widget.shiyi!.settings);
+        final entries = await api.pluginInventoryList();
+        if (!mounted) return;
+        setState(() {
+          _remote = true;
+          _items = [
+            for (final e in entries)
+              DshPluginEntry(
+                id: e.entryId.isEmpty ? e.moduleName : e.entryId,
+                name: e.moduleName,
+                disabled: !e.enabled,
+                source: 'remote',
+              ),
+          ];
+          _loading = false;
+        });
+        return;
+      }
       // 未显式注入 store 时，按 DSH home 实际路径解析。
       final store = widget.store != null && widget.store!.homeDir.isNotEmpty
           ? widget.store!
@@ -53,6 +83,7 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
       final items = await store.list();
       if (!mounted) return;
       setState(() {
+        _remote = false;
         _store = store;
         _items = items;
         _loading = false;
@@ -67,20 +98,22 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
   }
 
   Future<void> _refresh() async {
-    try {
-      final items = await _store.list();
-      if (!mounted) return;
-      setState(() {
-        _items = items;
-        _error = null;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = '$e');
-    }
+    await _load();
+  }
+
+  void _readOnlyHint() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('远端插件为实时清单（只读）；启停 / 删除 / 配置需在目标服务器的 cordis.patch.yml 修改'),
+      ),
+    );
   }
 
   Future<void> _toggleDisabled(DshPluginEntry entry, bool disabled) async {
+    if (_remote) {
+      _readOnlyHint();
+      return;
+    }
     if (_busy) return;
     if (entry.builtin) {
       ScaffoldMessenger.of(
@@ -109,6 +142,10 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
   }
 
   Future<void> _delete(DshPluginEntry entry) async {
+    if (_remote) {
+      _readOnlyHint();
+      return;
+    }
     if (entry.builtin) {
       ScaffoldMessenger.of(
         context,
@@ -157,6 +194,10 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
   }
 
   Future<void> _editConfig(DshPluginEntry entry) async {
+    if (_remote) {
+      _readOnlyHint();
+      return;
+    }
     final result = await showIosFadeDialog<Map<String, dynamic>>(
       context: context,
       builder: (ctx) {
@@ -314,6 +355,10 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
   }
 
   void _openMenu(DshPluginEntry entry, Offset globalPosition) {
+    if (_remote) {
+      _readOnlyHint();
+      return;
+    }
     if (entry.builtin) return;
     final items = <DesktopMenuItem>[
       DesktopMenuItem(
@@ -406,12 +451,18 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
       builder: (ctx) => CupertinoAlertDialog(
         title: const Text('关于插件清单'),
         content: Text(
-          '本页合并显示 DSH 的内置组合与持久插件：\n'
-          '· 内置组合：由安装包声明，只读展示；\n'
-          '· 持久插件：来自 profile / home 两层补丁，可启停、删除或改配置。\n\n'
-          '全局补丁：${_store.homePatchPath}\n'
-          'Profile 补丁：${_store.profilePatchPath}\n'
-          'DSH 对补丁层热重载，改动即时生效。',
+          _remote
+              ? '当前连接的是局域网 / 公网 DSH：\n'
+                    '本页展示目标服务器的实时插件清单'
+                    '（pluginInventory，含装载相位），只读。\n'
+                    '启停 / 删除 / 改配置需登录目标服务器修改 '
+                    'cordis.patch.yml。'
+              : '本页合并显示 DSH 的内置组合与持久插件：\n'
+                    '· 内置组合：由安装包声明，只读展示；\n'
+                    '· 持久插件：来自 profile / home 两层补丁，可启停、删除或改配置。\n\n'
+                    '全局补丁：${_store.homePatchPath}\n'
+                    'Profile 补丁：${_store.profilePatchPath}\n'
+                    'DSH 对补丁层热重载，改动即时生效。',
         ),
         actions: [
           CupertinoDialogAction(
@@ -509,6 +560,8 @@ class _PluginTile extends StatelessWidget {
       entry.name ?? entry.id,
       if (entry.builtin)
         '内置组合'
+      else if (entry.source == 'remote')
+        '远端实时清单'
       else if (entry.source == 'home')
         '全局补丁'
       else if (entry.source == 'profile')

@@ -11,6 +11,7 @@ import '../core/reasoning_models.dart';
 import 'dsh_api.dart';
 import 'dsh_endpoint.dart';
 import 'dsh_service.dart';
+import 'shiyi_api_relay.dart';
 import 'runtime_logger.dart';
 
 /// 一份已注入到 DSH 的 API 配置。每份对应 `llm-pi-ai.providers` 下的一个提供商。
@@ -51,6 +52,40 @@ class DshInjectedConfig {
       );
 }
 
+/// 一次 DSH 会话回合使用的手机 Relay 租约。
+///
+/// provider / route 对同一手机、配置和会话保持稳定，保证模型请求前缀不因
+/// 每轮 token 轮换而变化；token 只存在于本回合，结束后立即撤销。
+class DshRelayLease {
+  final DshApiClient api;
+  final String sessionId;
+  final String profileId;
+  final String model;
+  final String provider;
+  final String credential;
+  final String routeId;
+  final String token;
+  final String scopeKey;
+  final String previousProvider;
+  final String previousModel;
+  final String? previousReasoningEffort;
+
+  const DshRelayLease({
+    required this.api,
+    required this.sessionId,
+    required this.profileId,
+    required this.model,
+    required this.provider,
+    required this.credential,
+    required this.routeId,
+    required this.token,
+    required this.scopeKey,
+    this.previousProvider = '',
+    this.previousModel = '',
+    this.previousReasoningEffort,
+  });
+}
+
 /// 把拾忆模型 API 配置同步到 DeepSeek Harness。
 ///
 /// 每份已保存并注入的 API 配置写成独立的 `llm-pi-ai.providers.shiyi_*` 路由：
@@ -64,6 +99,8 @@ class DshModelSync {
   static const settingsNs = 'llm-pi-ai';
   static const defaultModelNs = 'agent-default-model';
   static const officialProvider = 'deepseek-official';
+  static const relayProvider = 'shiyi_relay';
+  static const relayCredentialEnv = 'SHIYI_RELAY_TOKEN';
   static const _responseModelsPrefsPrefix = 'dsh_response_models_v1_';
   static const _modelCatalogPrefsPrefix = 'dsh_model_catalog_v1_';
   static const _injectedPrefsKey = 'dsh_injected_configs_v1';
@@ -75,6 +112,35 @@ class DshModelSync {
   static const legacySearchNs = 'web-search-deepseek';
   static const _defaultModelPatchStart = '# ShiYi agent default model: begin';
   static const _defaultModelPatchEnd = '# ShiYi agent default model: end';
+
+  /// 拾忆 API 统一走手机侧「临时中转」租约：局域网目标经手机局域网地址、
+  /// 本机目标经 127.0.0.1（与 relay 同设备），随用随删。公网拨不进手机，
+  /// 走直接注入（injectShiyiDirectNow）。旧的「批量注入到本机
+  /// settings.yaml」链路已随 API 来源开关一并移除（#307）。
+  static bool canUseShiyiRelay(AppSettings s) =>
+      DshEndpoint.modeOf(s) != 'remote';
+
+  /// 把当前拾忆设置映射为 Relay 路由身份。身份只参与手机内存路由和
+  /// 远端 provider 名称，不包含 API 地址或密钥。
+  static ApiProfile relayProfileForSettings(AppSettings s) => ApiProfile(
+    id: s.apiProfileId.trim(),
+    name: s.apiProfileId.trim().isEmpty ? displayName : s.apiProfileId.trim(),
+    baseUrl: s.baseUrl,
+    apiKey: s.apiKey,
+    model: s.model,
+    apiProtocol: s.apiProtocol,
+  );
+
+  static String relayProviderForSettings(
+    AppSettings s, {
+    String relayInstanceId = '',
+  }) => relayProviderForProfile(
+    relayProfileForSettings(s),
+    relayInstanceId: relayInstanceId,
+  );
+
+  static String relayRouteIdForSettings(AppSettings s) =>
+      ShiyiApiRelay.routeIdForProfile(relayProfileForSettings(s));
 
   // All read/modify/write operations on DSH files share this queue.  Settings
   // changes can originate from several unawaited UI callbacks while DSH is
@@ -99,19 +165,6 @@ class DshModelSync {
     // Do not delete the target first: rename keeps either the old complete
     // document or the new complete document visible to the DSH parser.
     await tmp.rename(target.path);
-  }
-
-  /// A previous interrupted synchronization may have left an invalid document
-  /// behind.  Do not feed that snapshot back through the line-based upserter:
-  /// preserve it for diagnosis and rebuild a clean managed settings document.
-  static bool _isValidYaml(String text) {
-    if (text.trim().isEmpty) return true;
-    try {
-      loadYaml(text);
-      return true;
-    } catch (_) {
-      return false;
-    }
   }
 
   /// 拾忆协议 -> DSH 手写路由协议。
@@ -156,11 +209,6 @@ class DshModelSync {
   static Map<String, String?>? reasoningEffortsForModel(String model) =>
       ReasoningModels.effortsFor(model);
 
-  static bool _isMissingPiAiSettings(Object error) =>
-      error is DshApiException &&
-      error.code == 'settings-rejected' &&
-      error.message.contains('namespace "$settingsNs" is not registered');
-
   static bool canWriteProvider(AppSettings s) =>
       s.baseUrl.trim().isNotEmpty && s.model.trim().isNotEmpty;
 
@@ -197,6 +245,124 @@ class DshModelSync {
         .replaceAll(RegExp(r'^_|_$'), '');
     if (envSuffix.isEmpty) return credentialEnv;
     return '${credentialEnv}_$envSuffix';
+  }
+
+  /// 每份手机 API 配置使用独立的远端 relay provider，避免不同 DSH 会话
+  /// 切换配置时共用 `shiyi_relay` 而互相覆盖。
+  static String relayProviderForProfile(
+    ApiProfile profile, {
+    String relayInstanceId = '',
+  }) {
+    final encoded = base64Url
+        .encode(utf8.encode(profile.profileId))
+        .replaceAll('=', '')
+        .toLowerCase();
+    final profilePart = encoded.substring(0, encoded.length.clamp(0, 16));
+    final normalizedInstance = relayInstanceId.trim().toLowerCase().replaceAll(
+      RegExp(r'[^a-z0-9]+'),
+      '',
+    );
+    final instancePart = normalizedInstance.substring(
+      0,
+      normalizedInstance.length.clamp(0, 12),
+    );
+    final base = '${relayProvider}_$profilePart';
+    return instancePart.isEmpty ? base : '${base}_$instancePart';
+  }
+
+  /// 会话级 provider 身份。每轮复用同一个名字，避免影响模型端缓存前缀；
+  /// 不同 DSH 会话使用不同 provider，清理时不会互相误删。
+  static String relayProviderForSession(
+    ApiProfile profile, {
+    required String sessionId,
+    String relayInstanceId = '',
+  }) {
+    final base = relayProviderForProfile(
+      profile,
+      relayInstanceId: relayInstanceId,
+    );
+    final sessionPart = relayInstanceIdForToken(sessionId.trim());
+    return '${base}_s$sessionPart';
+  }
+
+  /// 从随机 Relay token 派生不可逆的短实例标识，只用于避免多台手机在
+  /// 同一 DSH 上写入同名 provider。真实 token 不进入 provider 或日志。
+  static String relayInstanceIdForToken(String token) {
+    var hash = 0x811c9dc5;
+    for (final byte in utf8.encode(token.trim())) {
+      hash ^= byte;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
+  }
+
+  static String relayCredentialEnvForProvider(String provider) {
+    final id = provider.trim();
+    if (id.isEmpty || id == relayProvider) return relayCredentialEnv;
+    return '${relayCredentialEnv}_${relayInstanceIdForToken(id).toUpperCase()}';
+  }
+
+  static bool isRelayProvider(String provider) {
+    final id = provider.trim();
+    return id == relayProvider || id.startsWith('${relayProvider}_');
+  }
+
+  /// 返回临时 Relay 结束后应恢复的目标 DSH 模型。
+  /// 当前选择若已是旧 Relay 残留，则优先回到官方默认组，再回退首个可用组。
+  static DshModelSelection? restorableSelection(
+    DshModelSelection current,
+    List<DshModelGroup> groups,
+  ) {
+    DshModelSelection? fromGroup(DshModelGroup group) {
+      if (isRelayProvider(group.id) || group.models.isEmpty) return null;
+      final currentModel = current.model.trim();
+      final model = group.models
+          .where((item) => item.id.trim() == currentModel)
+          .firstOrNull;
+      final chosen = model ?? group.models.first;
+      return DshModelSelection(
+        provider: group.id.trim(),
+        model: chosen.id.trim(),
+        reasoningEffort: group.id.trim() == current.provider.trim()
+            ? current.reasoningEffort
+            : null,
+      );
+    }
+
+    final provider = current.provider.trim();
+    final model = current.model.trim();
+    if (provider.isNotEmpty && model.isNotEmpty && !isRelayProvider(provider)) {
+      for (final group in groups) {
+        if (group.id.trim() != provider) continue;
+        final exists = group.models.any((item) => item.id.trim() == model);
+        if (exists) return current;
+      }
+    }
+    for (final group in groups) {
+      if (group.id.trim() == officialProvider) {
+        final selection = fromGroup(group);
+        if (selection != null) return selection;
+      }
+    }
+    for (final group in groups) {
+      final selection = fromGroup(group);
+      if (selection != null) return selection;
+    }
+    return null;
+  }
+
+  static bool isRelayProviderForInstance(
+    String provider,
+    String relayInstanceId,
+  ) {
+    final id = provider.trim().toLowerCase();
+    final instance = relayInstanceId.trim().toLowerCase().replaceAll(
+      RegExp(r'[^a-z0-9]+'),
+      '',
+    );
+    if (!isRelayProvider(id) || instance.isEmpty) return false;
+    final part = instance.substring(0, instance.length.clamp(0, 12));
+    return id.endsWith('_$part') || id.contains('_${part}_s');
   }
 
   static bool isManagedProviderId(String id) {
@@ -375,20 +541,6 @@ class DshModelSync {
       injectedConfigForSettings(s, injected, name: name)?.id ??
       ((name ?? '').trim().isEmpty ? providerId : providerIdForName(name!));
 
-  static Future<({String id, String name, String env})> _targetProvider(
-    AppSettings s, {
-    String? name,
-    String? scopeKey,
-  }) async {
-    final injected = await listInjectedConfigs(scopeKey: scopeKey);
-    final match = injectedConfigForSettings(s, injected, name: name);
-    if (match != null) {
-      return (id: match.id, name: match.name, env: match.credentialEnv);
-    }
-    final fallback = _configFromSettings(s, name: name);
-    return (id: fallback.id, name: fallback.name, env: fallback.credentialEnv);
-  }
-
   /// llm-pi-ai 模型条目。`input` 声明模型能力。注入拾忆 provider 时统一声明
   /// `[text, image]`，这样 DSH 的 `read_image` 工具不会因 provider 条目缺少
   /// image 能力而在调用前被拒绝；是否配置独立视觉模型仍由视觉设置控制。
@@ -551,24 +703,6 @@ class DshModelSync {
     };
   }
 
-  static Future<List<Map<String, dynamic>>> _mutateOpsFor(
-    AppSettings s, {
-    Iterable<String> responseModels = const [],
-    Iterable<String> catalogModels = const [],
-    String? name,
-    String? scopeKey,
-  }) async {
-    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
-    return mutateOps(
-      s,
-      responseModels: responseModels,
-      catalogModels: catalogModels,
-      provider: target.id,
-      name: target.name,
-      apiKeyEnv: target.env,
-    );
-  }
-
   /// 保存一次获取到的全部模型名称，并立即刷新运行中的 DSH 提供商。
   static Future<bool> rememberModelCatalog(
     AppSettings s,
@@ -587,22 +721,6 @@ class DshModelSync {
     final changed = merged.length != stored.length;
     if (changed) {
       await prefs.setStringList(key, merged.toList()..sort());
-    }
-    final client = api;
-    if (client != null && canWriteProvider(s)) {
-      try {
-        await client.mutateSettings(
-          settingsNs,
-          await _mutateOpsFor(
-            s,
-            responseModels: await responseModelsFor(s),
-            catalogModels: merged,
-            scopeKey: scopeKey,
-          ),
-        );
-      } catch (e) {
-        debugPrint('DshModelSync model catalog sync failed: $e');
-      }
     }
     return changed;
   }
@@ -627,18 +745,6 @@ class DshModelSync {
     );
     if (!stored.remove(target)) return false;
     await prefs.setStringList(key, stored.toList()..sort());
-    final client = api;
-    if (client != null && canWriteProvider(s)) {
-      await client.mutateSettings(
-        settingsNs,
-        await _mutateOpsFor(
-          s,
-          responseModels: await responseModelsFor(s),
-          catalogModels: stored,
-          scopeKey: scopeKey,
-        ),
-      );
-    }
     return true;
   }
 
@@ -664,6 +770,7 @@ class DshModelSync {
     }
     await _saveInjectedConfigs(next, scopeKey: scopeKey);
 
+    if (!_isLocalScope(scopeKey)) return false;
     final client = api ?? DshService.instance.api;
     final running = await (isRunning ?? client.rpcPing)();
     if (running) {
@@ -734,22 +841,6 @@ class DshModelSync {
       final ordered = merged.toList()..sort();
       await prefs.setStringList(key, ordered);
     }
-    final client = api;
-    if (client != null && canWriteProvider(s)) {
-      try {
-        await client.mutateSettings(
-          settingsNs,
-          await _mutateOpsFor(
-            s,
-            responseModels: merged,
-            catalogModels: await cachedModelCatalogFor(s),
-            scopeKey: scopeKey,
-          ),
-        );
-      } catch (e) {
-        debugPrint('DshModelSync response model sync failed: $e');
-      }
-    }
     return changed;
   }
 
@@ -802,163 +893,305 @@ class DshModelSync {
     return '';
   }
 
-  /// 手动注入：把当前拾忆模型配置写入 DSH，并把所有已有会话切到当前模型。
-  /// 只追加/更新这一份配置，不会覆盖其它已注入项。
-  static Future<void> injectNow(
+  static Future<void> injectRelayNow(
     AppSettings s, {
-    DshApiClient? api,
-    Future<bool> Function()? isRunning,
-    Future<String> Function()? homeDir,
+    required DshApiClient api,
+    required String relayBaseUrl,
+    required String relayToken,
+    String provider = relayProvider,
+    String? sessionId,
     String? name,
+    Future<bool> Function()? isRunning,
     String? scopeKey,
+    bool setDefault = true,
+    bool selectSessions = true,
   }) async {
-    final started = DateTime.now();
-    final requestId =
-        'dshsync_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    if (!canUseShiyiRelay(s)) {
+      throw StateError('公网 DSH 拨不进手机，拾忆 API 走直接注入而非中转');
+    }
+    if (relayBaseUrl.trim().isEmpty || relayToken.trim().isEmpty) {
+      throw ArgumentError('拾忆 API 中转配置不完整');
+    }
+    final running = await (isRunning ?? api.rpcPing)();
+    if (!running) throw StateError('当前 DSH 未连接');
+    final relaySettings = s.copyWith(baseUrl: relayBaseUrl.trim());
     unawaited(
       RuntimeLogger.instance.info(
-        'DSH',
-        'model_injection.started',
-        requestId: requestId,
+        'Relay',
+        'provider.inject.started',
         data: {
+          'provider': provider,
           'model': s.model,
           'protocol': s.apiProtocol,
-          'baseUrl': _safeBaseUrl(s.baseUrl),
-          'name': name ?? '',
+          'scopeKey': scopeKey ?? '',
+          'relayUrl': _safeBaseUrl(relayBaseUrl),
         },
       ),
     );
-    await rememberInjectedConfig(s, name: name, scopeKey: scopeKey);
-    await syncFromShiyi(
-      s,
-      api: api,
-      isRunning: isRunning,
-      homeDir: homeDir,
-      allowClear: true,
-      name: name,
-      scopeKey: scopeKey,
+    final credential = relayCredentialEnvForProvider(provider);
+    await api.setCredential(credential, relayToken.trim());
+    unawaited(
+      RuntimeLogger.instance.info(
+        'Relay',
+        'credential.synced',
+        data: {
+          'provider': provider,
+          'credential': credential,
+          'scopeKey': scopeKey ?? '',
+        },
+      ),
     );
-    final running = await (isRunning ?? DshService.instance.isRunning)();
-    if (!running) return;
-    final client = api ?? DshService.instance.api;
+    await api.mutateSettings(
+      settingsNs,
+      mutateOps(
+        relaySettings,
+        responseModels: await responseModelsFor(s),
+        catalogModels: await cachedModelCatalogFor(s),
+        provider: provider,
+        name: name ?? '拾忆 API 安全中转',
+        apiKeyEnv: credential,
+      ),
+    );
+    // DSH 的 provider 目录是最终验收点。某些远端部署会返回 settings.mutate
+    // 成功但异步加载配置，切换请求紧接着到达时会暂时看不到 provider；等待
+    // 一次目录确认，避免把“尚未加载”伪装成模型切换失败。
+    await _waitForProvider(api, provider);
     try {
-      for (final sess in await client.listSessions()) {
-        await applyToSessionIfDifferent(
-          client,
-          sess.sessionId,
-          s,
-          name: name,
-          scopeKey: scopeKey,
+      if (setDefault && (sessionId == null || sessionId.trim().isEmpty)) {
+        await api.mutateSettings(
+          defaultModelNs,
+          defaultModelOps(s, provider: provider),
         );
       }
-      unawaited(
-        RuntimeLogger.instance.info(
-          'DSH',
-          'model_injection.completed',
-          requestId: requestId,
-          durationMs: DateTime.now().difference(started).inMilliseconds,
-          result: 'ok',
-          data: {'model': s.model, 'protocol': s.apiProtocol},
-        ),
-      );
-    } catch (e) {
-      debugPrint('DshModelSync inject sessions failed: $e');
-      unawaited(
-        RuntimeLogger.instance.error(
-          'DSH',
-          'model_injection.sessions_failed',
-          requestId: requestId,
-          durationMs: DateTime.now().difference(started).inMilliseconds,
-          result: 'failed',
-          data: {'error': '$e'},
-        ),
-      );
+    } catch (_) {}
+    if (!selectSessions) return;
+    final sessions = sessionId != null && sessionId.trim().isNotEmpty
+        ? [sessionId.trim()]
+        : [for (final session in await api.listSessions()) session.sessionId];
+    for (final id in sessions) {
+      try {
+        await api.selectModel(id, provider, s.model.trim());
+      } catch (_) {}
+    }
+    unawaited(
+      RuntimeLogger.instance.info(
+        'Relay',
+        'provider.injected',
+        data: {
+          'provider': provider,
+          'scopeKey': scopeKey ?? '',
+          'relayUrl': _safeBaseUrl(relayBaseUrl),
+          'apiKeyForwarded': false,
+        },
+      ),
+    );
+  }
+
+  /// 公网 DSH 直接注入拾忆 API：真实 baseUrl + API Key 写进目标主机
+  /// （credentials.set + settings.mutate），持久生效，目标主机的模型数据页
+  /// 可查看、可手动删除。与手机中转不同，这里目标主机能拿到真实密钥——
+  /// 仅在 Relay 地址不可达（公网）时按用户要求使用，调用方保证 mode。
+  static Future<void> injectShiyiDirectNow(
+    AppSettings s, {
+    required DshApiClient api,
+    required String provider,
+    String? name,
+    String? sessionId,
+    Future<bool> Function()? isRunning,
+  }) async {
+    if (s.apiKey.trim().isEmpty) {
+      throw StateError('拾忆配置缺少 API Key，无法直接注入');
+    }
+    final running = await (isRunning ?? api.rpcPing)();
+    if (!running) throw StateError('当前 DSH 未连接');
+    final credential = relayCredentialEnvForProvider(provider);
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'shiyi_direct.started',
+        data: {
+          'provider': provider,
+          'model': s.model,
+          'protocol': s.apiProtocol,
+          'baseUrl': _safeBaseUrl(s.baseUrl),
+        },
+      ),
+    );
+    await api.setCredential(credential, s.apiKey.trim());
+    await api.mutateSettings(
+      settingsNs,
+      mutateOps(
+        s,
+        responseModels: await responseModelsFor(s),
+        catalogModels: await cachedModelCatalogFor(s),
+        provider: provider,
+        name: name ?? '拾忆',
+        apiKeyEnv: credential,
+      ),
+    );
+    await _waitForProvider(api, provider);
+    final session = sessionId?.trim() ?? '';
+    if (session.isNotEmpty) {
+      try {
+        await api.selectModel(session, provider, s.model.trim());
+      } catch (_) {}
+    }
+    unawaited(
+      RuntimeLogger.instance.info(
+        'DSH',
+        'shiyi_direct.injected',
+        data: {'provider': provider, 'apiKeyForwarded': true},
+      ),
+    );
+  }
+
+  /// 删除一个临时 Relay provider 和对应凭据。只接受拾忆 Relay 命名空间，
+  /// 绝不触碰目标 DSH 自有 provider。
+  static Future<void> removeRelayNow({    required DshApiClient api,
+    required String provider,
+    String? scopeKey,
+  }) async {
+    final id = provider.trim();
+    if (!isRelayProvider(id)) {
+      throw ArgumentError('拒绝删除非拾忆 Relay provider：$id');
+    }
+    final credential = relayCredentialEnvForProvider(id);
+    Object? firstError;
+    try {
+      await api.mutateSettings(settingsNs, unsetProviderOps(id));
+    } catch (error) {
+      firstError = error;
+    }
+    try {
+      await api.unsetCredential(credential);
+    } catch (error) {
+      firstError ??= error;
+    }
+    unawaited(
+      RuntimeLogger.instance.info(
+        'Relay',
+        'provider.removed',
+        result: firstError == null ? 'ok' : 'partial',
+        data: {
+          'provider': id,
+          'credential': credential,
+          'scopeKey': scopeKey ?? '',
+          if (firstError != null) 'error': '$firstError',
+        },
+      ),
+    );
+    if (firstError != null) throw firstError;
+  }
+
+  /// App 重启后清理当前手机实例遗留的临时 provider。其它手机以及目标 DSH
+  /// 自有配置都不在匹配范围内。
+  static Future<void> cleanupRelayProvidersForInstance({
+    required DshApiClient api,
+    required String relayInstanceId,
+    String? scopeKey,
+  }) async {
+    await cleanupStaleRelayDefault(api: api, scopeKey: scopeKey);
+    final providers = await api.llmProviders();
+    for (final item in providers) {
+      final id = (item['provider'] ?? item['id'] ?? item['providerId'] ?? '')
+          .toString()
+          .trim();
+      if (!isRelayProviderForInstance(id, relayInstanceId)) continue;
+      try {
+        await removeRelayNow(api: api, provider: id, scopeKey: scopeKey);
+      } catch (_) {
+        // Token 已随 App 进程消失，残留 provider 即使暂时删不掉也无法访问上游。
+      }
     }
   }
 
-  /// 拾忆设置变更后调用。失败只打日志，不挡拾忆保存。
-  /// [allowClear] 为 true 时，拾忆密钥被清空才去卸 DSH 凭据；启动同步不要带这个。
-  static Future<void> syncFromShiyi(
-    AppSettings s, {
-    DshApiClient? api,
-    Future<bool> Function()? isRunning,
-    Future<String> Function()? homeDir,
-    bool allowClear = false,
-    String? name,
+  /// 旧版曾把临时 Relay 写成目标 DSH 的全局默认模型。provider 清掉后，
+  /// `agent-default-model.user` 仍可能指向不存在的 relay，导致公网实例后续
+  /// 新会话无法选择模型。仅当用户层 provider 明确属于拾忆 Relay 时移除
+  /// 覆盖，让 DSH 自己的 base/default 重新生效。
+  @visibleForTesting
+  static Future<bool> cleanupStaleRelayDefault({
+    required DshApiClient api,
     String? scopeKey,
   }) async {
-    final requestId =
-        'dshsync_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
-    unawaited(
-      RuntimeLogger.instance.info(
-        'DSH',
-        'model_sync.started',
-        requestId: requestId,
-        data: {
-          'model': s.model,
-          'protocol': s.apiProtocol,
-          'baseUrl': _safeBaseUrl(s.baseUrl),
-          'allowClear': allowClear,
-          'name': name ?? '',
-        },
-      ),
-    );
     try {
-      final localProcess = DshEndpoint.isLocal(s);
-      final resolveHome = homeDir ?? DshService.instance.homeDir;
-      final client = api ?? DshService.instance.apiFor(s);
-      final running = await (isRunning ?? client.rpcPing)();
-      if (running) {
-        try {
-          await syncLive(
-            s,
-            client,
-            homeDir: resolveHome,
-            allowClear: allowClear,
-            name: name,
-            scopeKey: scopeKey,
-          );
-        } catch (e) {
-          if (!_isMissingPiAiSettings(e)) rethrow;
-          if (!localProcess) return;
-
-          // 非法 llm-pi-ai 配置会让整个命名空间加载失败，此时 live RPC
-          // 已无法自救。先重写合法文件；生产环境再重启一次 DSH 让插件恢复。
-          await syncFiles(
-            s,
-            await resolveHome(),
-            name: name,
-            scopeKey: scopeKey,
-          );
-          final canRestart =
-              api == null && isRunning == null && homeDir == null;
-          if (!canRestart) return;
-          await DshService.instance.stop();
-          if (!await DshService.instance.start()) return;
-          await syncLive(
-            s,
-            client,
-            homeDir: DshService.instance.homeDir,
-            allowClear: allowClear,
-            name: name,
-            scopeKey: scopeKey,
-          );
-        }
-      } else if (localProcess) {
-        await syncFiles(s, await resolveHome(), name: name, scopeKey: scopeKey);
-      }
-    } catch (e, st) {
-      debugPrint('DshModelSync failed: $e\n$st');
+      final described = await api.describeSettings();
+      final namespace = described.namespaces
+          .where((item) => item.ns == defaultModelNs)
+          .firstOrNull;
+      final provider = (namespace?.user['provider'] ?? '').toString().trim();
+      if (!isRelayProvider(provider)) return false;
+      await api.mutateSettings(defaultModelNs, const [
+        {
+          'op': 'unset',
+          'path': ['provider'],
+        },
+        {
+          'op': 'unset',
+          'path': ['model'],
+        },
+        {
+          'op': 'unset',
+          'path': ['reasoningEffort'],
+        },
+      ]);
       unawaited(
-        RuntimeLogger.instance.error(
-          'DSH',
-          'model_sync.failed',
-          requestId: requestId,
-          result: 'failed',
-          data: {'error': '$e'},
+        RuntimeLogger.instance.info(
+          'Relay',
+          'legacy_default.cleaned',
+          data: {'provider': provider, 'scopeKey': scopeKey ?? ''},
         ),
       );
+      return true;
+    } catch (error) {
+      unawaited(
+        RuntimeLogger.instance.warn(
+          'Relay',
+          'legacy_default.cleanup_skipped',
+          result: 'skipped',
+          data: {'scopeKey': scopeKey ?? '', 'error': '$error'},
+        ),
+      );
+      return false;
     }
+  }
+
+  static Future<void> _waitForProvider(
+    DshApiClient api,
+    String provider,
+  ) async {
+    final id = provider.trim();
+    if (id.isEmpty) throw ArgumentError('Relay provider 为空');
+    Object? lastError;
+    for (var attempt = 0; attempt < 8; attempt++) {
+      try {
+        final providers = await api.llmProviders();
+        final found = providers.any((item) {
+          final actual =
+              (item['provider'] ?? item['id'] ?? item['providerId'] ?? '')
+                  .toString()
+                  .trim();
+          return actual == id;
+        });
+        if (found) return;
+        lastError = DshApiException(
+          '远端 DSH provider 目录中未找到 $id',
+          code: 'relay-provider-not-loaded',
+        );
+      } catch (e) {
+        if (e is DshApiException && e.code == 'unsupported') return;
+        lastError = e;
+      }
+      if (attempt < 7) {
+        await Future<void>.delayed(Duration(milliseconds: 120 * (attempt + 1)));
+      }
+    }
+    throw DshApiException(
+      '远端 DSH 未确认中转 provider 已加载：$id',
+      code: lastError is DshApiException
+          ? lastError.code
+          : 'relay-provider-not-loaded',
+    );
   }
 
   static String _safeBaseUrl(String value) {
@@ -968,149 +1201,8 @@ class DshModelSync {
     return '${uri.scheme}://${uri.host}$port${uri.path}';
   }
 
-  @visibleForTesting
-  static Future<void> syncLive(
-    AppSettings s,
-    DshApiClient api, {
-    Future<String> Function()? homeDir,
-    bool allowClear = false,
-    String? name,
-    String? scopeKey,
-  }) async {
-    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
-    String? home;
-    if (DshEndpoint.isLocal(s)) {
-      home = await (homeDir ?? DshService.instance.homeDir)();
-      await writeSearchConfig(home, s);
-      await cleanupLegacySearchSettingsFile(home);
-      await syncAgentDefaultModelPatch(home, s, provider: target.id);
-    }
-    if (canWriteProvider(s)) {
-      final responseModels = await responseModelsFor(s);
-      final catalogModels = await cachedModelCatalogFor(s);
-      await api.mutateSettings(
-        settingsNs,
-        mutateOps(
-          s,
-          responseModels: responseModels,
-          catalogModels: catalogModels,
-          provider: target.id,
-          name: target.name,
-          apiKeyEnv: target.env,
-        ),
-      );
-      try {
-        await api.mutateSettings(
-          defaultModelNs,
-          defaultModelOps(s, provider: target.id),
-        );
-      } catch (_) {
-        // Android 精简预设未必挂 agent-default-model，会话创建时再 selectModel。
-      }
-    }
-    var credentialsOk = true;
-    Future<void> syncCredential(String ref, String value) async {
-      if (value.isEmpty && !allowClear) return;
-      try {
-        if (value.isEmpty) {
-          await api.unsetCredential(ref);
-        } else {
-          await api.setCredential(ref, value);
-        }
-      } catch (e) {
-        credentialsOk = false;
-        debugPrint('DshModelSync credential sync failed ($ref): $e');
-      }
-    }
 
-    await syncCredential(target.env, s.apiKey.trim());
-    await syncCredential(searchCredentialEnv, effectiveSearchKey(s));
-    if (!credentialsOk && home != null) {
-      await writeCredentialsFile(
-        home,
-        s.apiKey.trim(),
-        searchKey: effectiveSearchKey(s),
-        apiKeyEnv: target.env,
-      );
-    }
-  }
 
-  @visibleForTesting
-  static Future<void> syncFiles(
-    AppSettings s,
-    String home, {
-    String? name,
-    String? scopeKey,
-  }) async {
-    await _withFileSyncLock<void>(() async {
-      await Directory(home).create(recursive: true);
-      final file = File('$home/settings.yaml');
-      var yaml = await file.exists() ? await file.readAsString() : '';
-      if (!_isValidYaml(yaml)) {
-        // Keep the bad snapshot outside the file DSH parses so a user can
-        // diagnose the original corruption, then rebuild from a clean root.
-        await File('${file.path}.corrupt').writeAsString(yaml, flush: true);
-        yaml = '';
-      }
-      final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
-      if (canWriteProvider(s)) {
-        final responseModels = await responseModelsFor(s);
-        final catalogModels = await cachedModelCatalogFor(s);
-        yaml = upsertSettingsYaml(
-          yaml,
-          baseUrl: s.baseUrl,
-          model: s.model,
-          apiProtocol: s.apiProtocol,
-          visionEnabled: s.visionEnabled,
-          visionModel: s.visionModel,
-          responseModels: [...responseModels, ...catalogModels],
-          provider: target.id,
-          name: target.name,
-          apiKeyEnv: target.env,
-        );
-        yaml = upsertDefaultModelYaml(yaml, s.model, provider: target.id);
-      }
-      yaml = removeLegacySearchSections(yaml);
-      await _writeAtomically(file, yaml);
-      await writeSearchConfig(home, s);
-      await _writeCredentialsFile(
-        home,
-        s.apiKey.trim(),
-        searchKey: effectiveSearchKey(s),
-        apiKeyEnv: target.env,
-      );
-      await _syncAgentDefaultModelPatch(home, s, provider: target.id);
-    });
-  }
-
-  /// 写入 Cordis 组合层默认模型，spawn/fork 子代理会读取这里而不是
-  /// settings.yaml 的网页 Agent 默认配置。该受管区块不改动用户其他补丁。
-  @visibleForTesting
-  static Future<void> syncAgentDefaultModelPatch(
-    String home,
-    AppSettings s, {
-    String? provider,
-  }) => _withFileSyncLock(
-    () => _syncAgentDefaultModelPatch(home, s, provider: provider),
-  );
-
-  static Future<void> _syncAgentDefaultModelPatch(
-    String home,
-    AppSettings s, {
-    String? provider,
-  }) async {
-    await Directory(home).create(recursive: true);
-    final patch = File('$home/cordis.patch.yml');
-    final existing = await patch.exists() ? await patch.readAsString() : '';
-    final next = canWriteProvider(s)
-        ? upsertAgentDefaultModelPatchYaml(
-            existing,
-            s.model,
-            provider: provider,
-          )
-        : removeAgentDefaultModelPatchYaml(existing);
-    if (next != existing) await patch.writeAsString(next);
-  }
 
   /// 把拾忆默认模型补丁写入 Cordis 组合层。Cordis 会把该配置用于
   /// spawn/fork 的新 Agent，因此不能只写 settings.yaml。
@@ -1455,57 +1547,6 @@ class DshModelSync {
     ]);
   }
 
-  /// 把当前拾忆模型切到指定会话。新建会话后调用。
-  static Future<void> applyToSession(
-    DshApiClient api,
-    String sessionId,
-    AppSettings s, {
-    String? name,
-    String? scopeKey,
-  }) async {
-    if (!canWriteProvider(s) || sessionId.isEmpty) return;
-    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
-    await api.selectModel(sessionId, target.id, s.model.trim());
-  }
-
-  /// 已经是同 provider + 同模型就不打扰。
-  static Future<void> applyToSessionIfDifferent(
-    DshApiClient api,
-    String sessionId,
-    AppSettings s, {
-    String? name,
-    String? scopeKey,
-  }) async {
-    if (!canWriteProvider(s) || sessionId.isEmpty) return;
-    final target = await _targetProvider(s, name: name, scopeKey: scopeKey);
-    try {
-      final models = await api.sessionModels(sessionId);
-      if (models.current.provider == target.id &&
-          models.current.model.trim() == s.model.trim()) {
-        return;
-      }
-    } catch (_) {
-      return;
-    }
-    await applyToSession(api, sessionId, s, name: name, scopeKey: scopeKey);
-  }
-
-  /// 会话已经选过模型时不要覆盖，避免打开旧会话把用户选择冲掉。
-  static Future<void> syncSessionToAppModel(
-    DshApiClient api,
-    String sessionId,
-    AppSettings s, {
-    String? scopeKey,
-  }) async {
-    if (!canWriteProvider(s) || sessionId.isEmpty) return;
-    try {
-      final models = await api.sessionModels(sessionId);
-      if (models.current.model.trim().isNotEmpty) return;
-    } catch (_) {
-      return;
-    }
-    await applyToSession(api, sessionId, s, scopeKey: scopeKey);
-  }
 
   /// DSH 0.1.1 `credentialRef`：POSIX 标识符。顶层只认 version / refs / records。
   static final _credentialRefRe = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');

@@ -19,11 +19,15 @@ import 'dsh_center_screen.dart';
 class DshFilesScreen extends StatefulWidget {
   final bool asTab;
   final ShiyiState? shiyi;
+
+  /// 固定本次文件页所属的 DSH 连接，避免切换连接后误读全局当前客户端。
+  final DshApiClient? api;
   final String? initialPath;
   const DshFilesScreen({
     super.key,
     this.asTab = false,
     this.shiyi,
+    this.api,
     this.initialPath,
   });
 
@@ -40,7 +44,7 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
   String? _error;
   final List<String> _stack = [];
 
-  DshApiClient get _api => DshService.instance.api;
+  DshApiClient get _api => widget.api ?? DshService.instance.api;
 
   @override
   void initState() {

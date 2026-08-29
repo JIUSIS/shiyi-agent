@@ -111,6 +111,29 @@ void main() {
     expect(midH, greaterThan(0));
   });
 
+  testWidgets('拖动快速收起的动画结束后自动收敛回展开目标', (tester) async {
+    Widget build({required bool fastCollapse}) => MaterialApp(
+      home: Align(
+        alignment: Alignment.topCenter,
+        child: StaggeredSessions(
+          expanded: true,
+          unclipped: true,
+          fastCollapse: fastCollapse,
+          children: const [SizedBox(width: 80, height: 40)],
+        ),
+      ),
+    );
+    await tester.pumpWidget(build(fastCollapse: true));
+    await tester.pump(const Duration(milliseconds: 40));
+    await tester.pumpWidget(build(fastCollapse: false));
+    await tester.pumpAndSettle();
+    expect(
+      tester.getSize(find.byType(StaggeredSessions)).height,
+      closeTo(40, 0.5),
+    );
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('StaggeredSessions 里的共享长按手势能开始并结束拖拽', (tester) async {
     var started = false;
     var moved = false;

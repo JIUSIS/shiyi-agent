@@ -125,13 +125,15 @@ class DshService {
 
   void _configureClient(DshApiClient client, AppSettings s) {
     final mode = DshEndpoint.modeOf(s);
+    final url = DshEndpoint.urlOf(s);
     client.configure(
-      baseUrl: DshEndpoint.urlOf(s),
+      baseUrl: url,
       token: mode == 'remote'
           ? s.dshRemoteToken
           : mode == 'lan'
           ? s.dshLanToken
           : '',
+      hostOverride: mode == 'lan' ? _lanLoopbackHost(url) : '',
       customCompatibilityHosts: mode == 'remote'
           ? DshEndpoint.remoteCustomCompatibilityHosts(s)
           : const [],
@@ -139,6 +141,13 @@ class DshService {
           ? DshEndpoint.remotePresetCompatibilityHosts(s)
           : const [],
     );
+  }
+
+  static String _lanLoopbackHost(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return '';
+    final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
+    return '127.0.0.1:$port';
   }
 
   /// 检测可用代理（尊重开关；关闭时返回 null 走直连）。

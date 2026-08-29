@@ -119,6 +119,8 @@ class PromptBuilder {
     PromptSection(
       name: 'workspace',
       order: 200,
+      // 工作目录和会话 ID 按会话变化，不应让不同会话共享缓存时整段失效。
+      cacheTier: PromptCacheTier.tail,
       builder: () async {
         final cwd = await currentWorkspace();
         final sid = currentSessionId?.call()?.trim() ?? '';
@@ -134,6 +136,11 @@ class PromptBuilder {
       name: 'platform',
       order: 250,
       builder: () => _platformSection(),
+    ),
+    const PromptSection(
+      name: 'execution-contract',
+      order: 280,
+      text: _executionContractText,
     ),
     if (settings().enableMemory)
       PromptSection(
@@ -168,6 +175,8 @@ class PromptBuilder {
       PromptSection(
         name: 'skills',
         order: 310,
+        // 技能目录会随安装/删除变化；完整技能仍按需放动尾。
+        cacheTier: PromptCacheTier.tail,
         builder: () async =>
             '【已掌握技能】\n${skills().map((s) => '- ${s.name}${s.description.isEmpty ? '' : ': ${s.description}'}').join('\n')}\n（需要时用 run_skill 获取技能完整内容）',
       ),
@@ -176,9 +185,8 @@ class PromptBuilder {
       PromptSection(
         name: 'loaded-skill:${loaded.name}',
         order: 320,
-        cacheTier: _loadedSkillUsesVolatileVars(loaded)
-            ? PromptCacheTier.tail
-            : PromptCacheTier.frozen,
+        // 当前会话加载的技能属于会话世界状态，即使文本本身静态也不进冻头。
+        cacheTier: PromptCacheTier.tail,
         builder: () async {
           final sb = StringBuffer('【已加载技能：${loaded.name}】\n${loaded.content}');
           for (final e in loaded.files.entries) {
@@ -215,14 +223,6 @@ class PromptBuilder {
   bool _personaUsesVolatileVars() {
     final custom = settings().systemPrompt;
     return custom.isNotEmpty && promptTemplateHasVolatileVars(custom);
-  }
-
-  bool _loadedSkillUsesVolatileVars(Skill loaded) {
-    if (promptTemplateHasVolatileVars(loaded.content)) return true;
-    for (final value in loaded.files.values) {
-      if (promptTemplateHasVolatileVars(value)) return true;
-    }
-    return false;
   }
 
   /// 内置提示词变量：{{model}} / {{cwd}} / {{now}} / {{user_text}}。
@@ -398,7 +398,7 @@ class PromptBuilder {
       '能独立执行且无需用户交互的子任务（写文件/跑命令/批量处理）→ 派 worker；'
       '以上都不太贴合 → general-purpose。'
       '几个互不依赖的方向需要分头查 → 必须用 spawn_agent 的 tasks 数组一次并行派发'
-      '（最多 4 个，同时跑省时间）；禁止分多次调用 spawn_agent、也禁止同一轮发多个'
+      '（数量由拾忆按任务复杂度自行决定，同时跑省时间）；禁止分多次调用 spawn_agent、也禁止同一轮发多个'
       ' spawn_agent 工具调用——一次 tasks 派 N 个，界面会显示「子代理 i/N」进度。'
       '轮数预算动态给：简单小任务 max_turns 给 5~10，复杂任务给 40~60，'
       '不必都用默认值。'
@@ -416,4 +416,16 @@ class PromptBuilder {
       '不得写文件、执行终端命令、保存记忆或创建技能。'
       '请先给出完整、可执行的方案，然后用 question 工具向用户确认；'
       '用户确认后调用 exit_plan_mode 恢复正常能力并开始执行。';
+
+  /// Codex 风格的回合驾驭规则：把“会做什么”与“何时做”写成稳定契约，
+  /// 让模型在工具循环、失败恢复和子代理协作时保持同一套决策顺序。
+  static const String _executionContractText =
+      '【执行闭环】\n'
+      '- 先理解目标、约束和验收标准；用户要求动手时先读取相关文件、配置和运行状态，再决定改哪里。\n'
+      '- 多步骤任务在内部保持「目标 → 当前动作 → 证据 → 下一步」状态；只有确实多步骤时才使用计划，不创建只有一步的计划。\n'
+      '- 每次写入、覆盖、安装或删除前核对目标与用户现有改动；完成后运行最相关的测试、构建或真机验证，并报告真实结果。\n'
+      '- 独立的只读检查可以并行；写入、终端、提问和其他有副作用的操作按依赖顺序执行，工具失败后根据错误调整路径。\n'
+      '- 同一目标连续失败最多重试两次；仍失败就更换关键词、工具或方案，不在失败目标上空转。\n'
+      '- 用户停止或插话后保留已完成结果，明确标记未完成部分，不把中断误当成成功，也不自动重复有副作用的操作。\n'
+      '- 根代理负责全局判断、用户交互和最终整合；子代理只承担边界清晰的专项任务。互不依赖的任务一次批量派发，写入任务声明互不重叠的路径，等待结果后由根代理汇总。';
 }

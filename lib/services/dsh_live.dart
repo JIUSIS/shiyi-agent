@@ -14,11 +14,16 @@ class DshHistoryBundle {
   final DshLiveTurn live;
   final Set<String> responseModels;
   final bool turnEnded;
+
+  /// 会话事件流里最后一次 `permission/preset` 的值；null = 会话未显式
+  /// 选过权限预设（生效值是创建时的组合默认）。
+  final String? permissionPreset;
   const DshHistoryBundle({
     required this.messages,
     required this.live,
     this.responseModels = const <String>{},
     this.turnEnded = false,
+    this.permissionPreset,
   });
 }
 

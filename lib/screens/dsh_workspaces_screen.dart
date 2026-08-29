@@ -7,13 +7,15 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
-import '../services/dsh_model_sync.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
+import '../widgets/dsh_directory_picker.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
 import 'dsh_center_screen.dart';
 import 'dsh_chat_screen.dart';
+import 'dsh_new_session.dart';
 
 /// 工作区页（Apple HIG Inset Grouped）：
 /// 列表（workspace.list）/ 新建采用目录（workspace.create）/
@@ -82,6 +84,32 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
   Future<void> _create() async {
     final ctrl = TextEditingController();
     String? picked;
+    final hostDirectory = widget.shiyi != null
+        ? !DshEndpoint.isLocal(widget.shiyi!.settings)
+        : !DshService.instance.managesLocalProcess;
+    if (hostDirectory) {
+      try {
+        picked = await dshHostDefaultDirectory(_api);
+        ctrl.text = picked;
+      } catch (e) {
+        if (!mounted) {
+          ctrl.dispose();
+          return;
+        }
+        _toast('无法读取远程电脑目录：$e');
+        ctrl.dispose();
+        return;
+      }
+    }
+    if (!mounted) {
+      ctrl.dispose();
+      return;
+    }
+    if (hostDirectory && (picked ?? '').trim().isEmpty) {
+      ctrl.dispose();
+      _toast('远程电脑没有返回有效工作目录');
+      return;
+    }
     final path = await showIosFadeDialog<String>(
       context: context,
       builder: (ctx) => CupertinoAlertDialog(
@@ -94,7 +122,9 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
             children: [
               CupertinoTextField(
                 controller: ctrl,
-                placeholder: '目录路径（如 /storage/emulated/0/Documents）',
+                placeholder: hostDirectory
+                    ? '电脑目录路径（如 C:\\Projects）'
+                    : '目录路径（如 /storage/emulated/0/Documents）',
                 autofocus: true,
                 scrollPadding: const EdgeInsets.only(bottom: 120),
               ),
@@ -102,7 +132,13 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
               CupertinoButton(
                 padding: EdgeInsets.zero,
                 onPressed: () async {
-                  final dir = await FilePicker.platform.getDirectoryPath();
+                  final dir = hostDirectory
+                      ? await pickDshHostDirectory(
+                          context,
+                          api: _api,
+                          initialPath: ctrl.text.trim(),
+                        )
+                      : await FilePicker.platform.getDirectoryPath();
                   if (dir == null || dir.isEmpty) return;
                   ctrl.text = dir;
                   picked = dir;
@@ -126,7 +162,7 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          picked ?? '选择手机文件夹',
+                          picked ?? (hostDirectory ? '选择电脑文件夹' : '选择手机文件夹'),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
@@ -157,6 +193,7 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
         ],
       ),
     );
+    ctrl.dispose();
     if (path == null || path.isEmpty) return;
     setState(() => _busy = true);
     try {
@@ -173,18 +210,14 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
 
   Future<void> _newSession() async {
     try {
-      final id = await _api.createSession();
+      final preset = await pickDshAgentPreset(context);
+      if (preset == null) return;
+      final id = await _api.createSession(
+        agentPreset: preset.isEmpty ? null : preset,
+      );
       if (!mounted || id.isEmpty) return;
       final shiyi = widget.shiyi;
       if (shiyi != null) {
-        try {
-          await DshModelSync.applyToSession(
-            _api,
-            id,
-            shiyi.settings,
-            scopeKey: DshService.instance.currentScopeKey,
-          );
-        } catch (_) {}
         try {
           await DshChatCache.writeContextLimit(
             id,
@@ -396,155 +429,163 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
             : const Text('暂无工作数据，点右上角 + 创建'),
       );
     }
-    return ListView(
-      padding: const EdgeInsets.only(top: 4, bottom: 24),
-      children: [
-        if (_items.isNotEmpty)
-          CupertinoListSection.insetGrouped(
-            header: const Text('工作数据'),
-            margin: iosSectionMargin,
-            decoration: iosSectionDecoration(context),
-            children: [
-              for (final w in _items)
-                CupertinoListTile(
-                  key: ValueKey(w.workspaceId),
-                  leading: const Icon(
-                    CupertinoIcons.folder,
-                    color: CupertinoColors.activeBlue,
-                  ),
-                  title: Text(
-                    w.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        w.path,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      Text(
-                        '${w.sessionIds.length} 个会话',
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                    ],
-                  ),
-                  trailing: CupertinoButton(
-                    padding: EdgeInsets.zero,
-                    onPressed: () => _workspaceActions(w),
-                    child: const Icon(CupertinoIcons.ellipsis),
-                  ),
-                ),
-            ],
-          ),
-        if (_archived.isNotEmpty)
-          CupertinoListSection.insetGrouped(
-            header: const Text('已归档会话'),
-            margin: iosSectionMargin,
-            decoration: iosSectionDecoration(context),
-            children: [
-              for (final id in _archived)
-                CupertinoListTile(
-                  key: ValueKey('arch-$id'),
-                  leading: const Icon(
-                    CupertinoIcons.archivebox,
-                    color: CupertinoColors.systemGrey,
-                  ),
-                  title: Text(id, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  subtitle: const Text('已归档', style: TextStyle(fontSize: 12)),
-                ),
-            ],
-          ),
-        // 主页 tab：追加「会话」section（DS Harness 会话，点击进入聊天）。
-        if (widget.asTab)
-          CupertinoListSection.insetGrouped(
-            header: Row(
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.only(top: 4, bottom: 24),
+        children: [
+          if (_items.isNotEmpty)
+            CupertinoListSection.insetGrouped(
+              header: const Text('工作数据'),
+              margin: iosSectionMargin,
+              decoration: iosSectionDecoration(context),
               children: [
-                const Expanded(child: Text('会话')),
-                CupertinoButton(
-                  padding: EdgeInsets.zero,
-                  onPressed: _newSession,
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(CupertinoIcons.plus, size: 14),
-                      SizedBox(width: 2),
-                      Text('新建', style: TextStyle(fontSize: 14)),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-            margin: iosSectionMargin,
-            decoration: iosSectionDecoration(context),
-            children: [
-              if (_sessions.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 18),
-                  child: Center(
-                    child: Text(
-                      '暂无会话，点右上角「新建」开始对话',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: CupertinoColors.secondaryLabel,
-                      ),
-                    ),
-                  ),
-                )
-              else
-                for (final s in _sessions)
+                for (final w in _items)
                   CupertinoListTile(
-                    key: ValueKey(s.sessionId),
+                    key: ValueKey(w.workspaceId),
                     leading: const Icon(
-                      CupertinoIcons.chat_bubble_2_fill,
+                      CupertinoIcons.folder,
                       color: CupertinoColors.activeBlue,
                     ),
-                    title: Row(
+                    title: Text(
+                      w.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Flexible(
-                          child: Text(
-                            s.title == null || s.title!.isEmpty
-                                ? '未命名会话'
-                                : s.title!,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
+                        Text(
+                          w.path,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        if (s.running) ...[
-                          const SizedBox(width: 8),
-                          Container(
-                            width: 8,
-                            height: 8,
-                            decoration: const BoxDecoration(
-                              color: CupertinoColors.systemGreen,
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                        ],
+                        Text(
+                          '${w.sessionIds.length} 个会话',
+                          style: const TextStyle(fontSize: 12),
+                        ),
                       ],
                     ),
-                    subtitle: Text(
-                      '${s.turnCount > 0 ? '${s.turnCount} 轮' : ''}'
-                      '${s.blank ? ' · 空' : ''}',
+                    trailing: CupertinoButton(
+                      padding: EdgeInsets.zero,
+                      onPressed: () => _workspaceActions(w),
+                      child: const Icon(CupertinoIcons.ellipsis),
                     ),
-                    onTap: () async {
-                      await openDshChat(
-                        context,
-                        sessionId: s.sessionId,
-                        initialTitle: s.title == null || s.title!.isEmpty
-                            ? '会话'
-                            : s.title!,
-                        initialSummary: s,
-                        shiyi: widget.shiyi,
-                      );
-                      if (mounted) await _loadSessions(silent: true);
-                    },
                   ),
-            ],
-          ),
-      ],
+              ],
+            ),
+          if (_archived.isNotEmpty)
+            CupertinoListSection.insetGrouped(
+              header: const Text('已归档会话'),
+              margin: iosSectionMargin,
+              decoration: iosSectionDecoration(context),
+              children: [
+                for (final id in _archived)
+                  CupertinoListTile(
+                    key: ValueKey('arch-$id'),
+                    leading: const Icon(
+                      CupertinoIcons.archivebox,
+                      color: CupertinoColors.systemGrey,
+                    ),
+                    title: Text(
+                      id,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: const Text('已归档', style: TextStyle(fontSize: 12)),
+                  ),
+              ],
+            ),
+          // 主页 tab：追加「会话」section（DS Harness 会话，点击进入聊天）。
+          if (widget.asTab)
+            CupertinoListSection.insetGrouped(
+              header: Row(
+                children: [
+                  const Expanded(child: Text('会话')),
+                  CupertinoButton(
+                    padding: EdgeInsets.zero,
+                    onPressed: _newSession,
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(CupertinoIcons.plus, size: 14),
+                        SizedBox(width: 2),
+                        Text('新建', style: TextStyle(fontSize: 14)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              margin: iosSectionMargin,
+              decoration: iosSectionDecoration(context),
+              children: [
+                if (_sessions.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 18),
+                    child: Center(
+                      child: Text(
+                        '暂无会话，点右上角「新建」开始对话',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: CupertinoColors.secondaryLabel,
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  for (final s in _sessions)
+                    CupertinoListTile(
+                      key: ValueKey(s.sessionId),
+                      leading: const Icon(
+                        CupertinoIcons.chat_bubble_2_fill,
+                        color: CupertinoColors.activeBlue,
+                      ),
+                      title: Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              s.title == null || s.title!.isEmpty
+                                  ? '未命名会话'
+                                  : s.title!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (s.running) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              width: 8,
+                              height: 8,
+                              decoration: const BoxDecoration(
+                                color: CupertinoColors.systemGreen,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      subtitle: Text(
+                        '${s.turnCount > 0 ? '${s.turnCount} 轮' : ''}'
+                        '${s.blank ? ' · 空' : ''}',
+                      ),
+                      onTap: () async {
+                        await openDshChat(
+                          context,
+                          sessionId: s.sessionId,
+                          initialTitle: s.title == null || s.title!.isEmpty
+                              ? '会话'
+                              : s.title!,
+                          initialSummary: s,
+                          shiyi: widget.shiyi,
+                        );
+                        if (mounted) await _loadSessions(silent: true);
+                      },
+                    ),
+              ],
+            ),
+        ],
+      ),
     );
   }
 

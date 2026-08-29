@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
@@ -35,6 +36,88 @@ LiquidGlassStyle chatLiquidGlassStyle(
       chromaticAberration: .001,
     ),
   );
+}
+
+/// 液态玻璃抽屉的弹层路由：透明屏障 + 零过渡，把抽屉放进导航栈。
+///
+/// 系统返回键 / 手势返回会先落在抽屉路由上：这里拦截后先播收合动画再移除，
+/// 不会直接弹出整个页面；抽屉内容仍由各选择器自行构建。选择器内部状态
+/// （如模型抽屉的二级菜单）变化时，调用 [markNeedsBuild] 重建抽屉内容。
+class LiquidGlassPopupRoute<T> extends PopupRoute<T> {
+  LiquidGlassPopupRoute({required this.builder, required this.onDismiss});
+
+  final WidgetBuilder builder;
+  final VoidCallback onDismiss;
+  _LiquidGlassPopupBodyState? _bodyState;
+
+  void markNeedsBuild() => _bodyState?.requestBuild();
+
+  @override
+  Color? get barrierColor => Colors.transparent;
+
+  @override
+  bool get barrierDismissible => false;
+
+  @override
+  String? get barrierLabel => null;
+
+  @override
+  Duration get transitionDuration => Duration.zero;
+
+  @override
+  bool get opaque => false;
+
+  @override
+  Widget buildPage(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+  ) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (bool didPop, Object? result) {
+        if (!didPop) onDismiss();
+      },
+      child: _LiquidGlassPopupBody(
+        builder: builder,
+        onState: (state) => _bodyState = state,
+      ),
+    );
+  }
+}
+
+class _LiquidGlassPopupBody extends StatefulWidget {
+  const _LiquidGlassPopupBody({
+    required this.builder,
+    required this.onState,
+  });
+
+  final WidgetBuilder builder;
+  final ValueChanged<_LiquidGlassPopupBodyState?> onState;
+
+  @override
+  State<_LiquidGlassPopupBody> createState() => _LiquidGlassPopupBodyState();
+}
+
+class _LiquidGlassPopupBodyState extends State<_LiquidGlassPopupBody> {
+  @override
+  void initState() {
+    super.initState();
+    widget.onState(this);
+  }
+
+  @override
+  void dispose() {
+    widget.onState(null);
+    super.dispose();
+  }
+
+  void requestBuild() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.builder(context);
 }
 
 /// 消息列表铺满，底部输入区 / 状态条透明叠在上面。
@@ -128,9 +211,10 @@ class ChatGlassNoticeBar extends StatelessWidget {
           child: Text(
             text,
             textAlign: TextAlign.center,
-            maxLines: 2,
+            maxLines: 4,
             overflow: TextOverflow.ellipsis,
             style: theme.textTheme.bodySmall!.copyWith(
+              fontSize: 12,
               color: foreground ?? theme.colorScheme.onSurfaceVariant,
             ),
           ),
@@ -229,7 +313,7 @@ class ThinkingIntensitySelector extends StatefulWidget {
 class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
     with SingleTickerProviderStateMixin {
   final _buttonKey = GlobalKey();
-  OverlayEntry? _popup;
+  LiquidGlassPopupRoute<void>? _popup;
   Rect _anchor = Rect.zero;
   late final AnimationController _anim;
   late final Animation<double> _reveal;
@@ -265,8 +349,8 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
   }
 
   Future<void> _dismissPopup() async {
-    final entry = _popup;
-    if (entry == null) return;
+    final route = _popup;
+    if (route == null) return;
     _popup = null;
     if (mounted) setState(() {});
     if (_anim.value > 0) {
@@ -274,7 +358,9 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
         await _anim.reverse();
       } catch (_) {}
     }
-    entry.remove();
+    if (route.isActive) {
+      route.navigator?.removeRoute(route);
+    }
   }
 
   void _showPopup() {
@@ -283,8 +369,11 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
     if (box == null || !box.hasSize) return;
     _anchor = box.localToGlobal(Offset.zero) & box.size;
     HapticFeedback.selectionClick();
-    _popup = OverlayEntry(builder: _buildOverlay);
-    Overlay.of(context, rootOverlay: true).insert(_popup!);
+    _popup = LiquidGlassPopupRoute<void>(
+      builder: _buildOverlay,
+      onDismiss: () => unawaited(_dismissPopup()),
+    );
+    Navigator.of(context, rootNavigator: true).push(_popup!);
     _anim.forward(from: 0);
     setState(() {});
   }
@@ -356,7 +445,7 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
             clipBehavior: Clip.antiAlias,
             child: SizeTransition(
               sizeFactor: _reveal,
-              axisAlignment: 1,
+              alignment: Alignment.bottomLeft,
               child: LiquidGlassLens(
                 style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
                 child: Padding(
@@ -386,8 +475,11 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
 
   @override
   void dispose() {
-    _popup?.remove();
+    final route = _popup;
     _popup = null;
+    if (route?.isActive == true) {
+      route!.navigator?.removeRoute(route);
+    }
     _anim.dispose();
     super.dispose();
   }
@@ -482,9 +574,404 @@ class _ThinkingMenuRow extends StatelessWidget {
   }
 }
 
+/// 权限预设可选项（DSH permissionPresets 表；label 来自服务端 schema）。
+class PermissionPresetOption {
+  final String value;
+  final String label;
+  const PermissionPresetOption({required this.value, required this.label});
+}
+
+/// 固定宽度跑马灯标签：文本不超宽时静止左对齐；超宽时停在起点片刻、
+/// 匀速滚到终点、停片刻、再滚回来，循环往复（iOS 状态栏标题风格）。
+/// 用 OverflowBox 让文本按自然宽度绘制，外层 ClipRect 负责裁剪。
+class AutoScrollLabel extends StatefulWidget {
+  final String text;
+  final TextStyle style;
+  final double width;
+  final Alignment alignment;
+
+  const AutoScrollLabel({
+    super.key,
+    required this.text,
+    required this.style,
+    required this.width,
+    this.alignment = Alignment.centerLeft,
+  });
+
+  @override
+  State<AutoScrollLabel> createState() => _AutoScrollLabelState();
+}
+
+class _AutoScrollLabelState extends State<AutoScrollLabel>
+    with SingleTickerProviderStateMixin {
+  static const _hold = Duration(milliseconds: 900);
+  static const _pxPerSecond = 22.0;
+
+  late final AnimationController _controller;
+  double _overflow = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this);
+    _measure();
+  }
+
+  @override
+  void didUpdateWidget(covariant AutoScrollLabel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text || oldWidget.style != widget.style) {
+      _measure();
+    }
+  }
+
+  void _measure() {
+    final painter = TextPainter(
+      text: TextSpan(text: widget.text, style: widget.style),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final overflow = painter.width - widget.width;
+    painter.dispose();
+    _overflow = overflow > 0 ? overflow : 0;
+    if (_overflow <= 0) {
+      _controller.stop();
+      return;
+    }
+    final travel = _travelDuration();
+    _controller
+      ..duration = _hold + travel + _hold + travel
+      ..repeat();
+  }
+
+  Duration _travelDuration() => Duration(
+    milliseconds: (_overflow / _pxPerSecond * 1000).round().clamp(300, 6000),
+  );
+
+  /// 控制器进度 → 位移比例（0=起点，1=终点），两端各停 [hold]。
+  double _offsetFraction() {
+    if (_overflow <= 0) return 0;
+    final travel = _travelDuration();
+    final totalMs = (_hold + travel + _hold + travel).inMilliseconds;
+    final at = Duration(
+      milliseconds: (_controller.value * totalMs).round(),
+    );
+    final holdMs = _hold.inMilliseconds;
+    final travelMs = travel.inMilliseconds;
+    if (at.inMilliseconds <= holdMs) return 0;
+    if (at.inMilliseconds <= holdMs + travelMs) {
+      return Curves.easeInOut.transform(
+        (at.inMilliseconds - holdMs) / travelMs,
+      );
+    }
+    if (at.inMilliseconds <= holdMs + travelMs + holdMs) return 1;
+    return 1 -
+        Curves.easeInOut.transform(
+          (at.inMilliseconds - holdMs - travelMs - holdMs) / travelMs,
+        );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final height = (widget.style.fontSize ?? 14) * 1.25;
+    if (_overflow <= 0) {
+      return SizedBox(
+        width: widget.width,
+        height: height,
+        child: Align(
+          alignment: widget.alignment,
+          child: Text(widget.text, style: widget.style, maxLines: 1),
+        ),
+      );
+    }
+    return SizedBox(
+      width: widget.width,
+      height: height,
+      child: ClipRect(
+        child: OverflowBox(
+          alignment: Alignment.centerLeft,
+          maxWidth: double.infinity,
+          child: AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) => Transform.translate(
+              offset: Offset(-_offsetFraction() * _overflow, 0),
+              child: Text(
+                widget.text,
+                style: widget.style,
+                maxLines: 1,
+                softWrap: false,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// DSH 会话页的权限预设按钮。点击从按钮上沿拉开全量选项抽屉，当前项
+/// 打勾；切换走 `/permission <preset>` 会话命令（typert commands/execute），
+/// 对当前会话实时生效。与思考强度选择器同一套液态玻璃抽屉交互。
+class PermissionPresetSelector extends StatefulWidget {
+  final List<PermissionPresetOption> options;
+  final String value;
+  final ValueChanged<String> onChanged;
+  final bool enabled;
+
+  const PermissionPresetSelector({
+    super.key,
+    required this.options,
+    required this.value,
+    required this.onChanged,
+    this.enabled = true,
+  });
+
+  @override
+  State<PermissionPresetSelector> createState() =>
+      _PermissionPresetSelectorState();
+}
+
+class _PermissionPresetSelectorState extends State<PermissionPresetSelector>
+    with SingleTickerProviderStateMixin {
+  final _buttonKey = GlobalKey();
+  LiquidGlassPopupRoute<void>? _popup;
+  Rect _anchor = Rect.zero;
+  late final AnimationController _anim;
+  late final Animation<double> _reveal;
+
+  static const _gap = 6.0;
+  static const _maxMenuWidth = 260.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+      reverseDuration: const Duration(milliseconds: 160),
+    );
+    _reveal = CurvedAnimation(
+      parent: _anim,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
+
+  bool get _isOpen => _popup != null;
+
+  String get _selectedLabel {
+    for (final item in widget.options) {
+      if (item.value == widget.value) return item.label;
+    }
+    return widget.value.isEmpty ? '权限' : widget.value;
+  }
+
+  void _togglePopup() {
+    if (_isOpen) {
+      _dismissPopup();
+    } else {
+      _showPopup();
+    }
+  }
+
+  Future<void> _dismissPopup() async {
+    final route = _popup;
+    if (route == null) return;
+    _popup = null;
+    if (mounted) setState(() {});
+    if (_anim.value > 0) {
+      try {
+        await _anim.reverse();
+      } catch (_) {}
+    }
+    if (route.isActive) {
+      route.navigator?.removeRoute(route);
+    }
+  }
+
+  void _showPopup() {
+    if (widget.options.isEmpty) return;
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    _anchor = box.localToGlobal(Offset.zero) & box.size;
+    HapticFeedback.selectionClick();
+    _popup = LiquidGlassPopupRoute<void>(
+      builder: _buildOverlay,
+      onDismiss: () => unawaited(_dismissPopup()),
+    );
+    Navigator.of(context, rootNavigator: true).push(_popup!);
+    _anim.forward(from: 0);
+    setState(() {});
+  }
+
+  Widget _buildOverlay(BuildContext overlayContext) {
+    final dark = Theme.of(overlayContext).brightness == Brightness.dark;
+    final mq = MediaQuery.of(overlayContext);
+    final menuWidth = _maxMenuWidth;
+
+    final right = (mq.size.width - _anchor.right).clamp(
+      8.0,
+      (mq.size.width - menuWidth - 8.0).clamp(8.0, mq.size.width),
+    );
+    final bottom = (mq.size.height - _anchor.top + _gap).clamp(
+      mq.padding.bottom + 8.0,
+      mq.size.height - mq.padding.top - 48.0,
+    );
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: _dismissPopup,
+          ),
+        ),
+        Positioned(
+          right: right,
+          bottom: bottom,
+          width: menuWidth,
+          child: Material(
+            color: Colors.transparent,
+            elevation: 12,
+            shadowColor: Colors.black.withValues(alpha: dark ? .36 : .14),
+            borderRadius: BorderRadius.circular(14),
+            clipBehavior: Clip.antiAlias,
+            child: SizeTransition(
+              sizeFactor: _reveal,
+              alignment: Alignment.bottomLeft,
+              child: LiquidGlassLens(
+                style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (final item in widget.options)
+                        _PermissionMenuRow(
+                          label: item.label,
+                          checked: item.value == widget.value,
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            _dismissPopup();
+                            if (item.value != widget.value) {
+                              widget.onChanged(item.value);
+                            }
+                          },
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  void dispose() {
+    final route = _popup;
+    _popup = null;
+    if (route?.isActive == true) {
+      route!.navigator?.removeRoute(route);
+    }
+    _anim.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.options.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final accent = widget.enabled
+        ? (_isOpen ? _iosBlue : theme.colorScheme.onSurfaceVariant)
+        : theme.disabledColor;
+
+    return Tooltip(
+      message: '权限预设 · $_selectedLabel',
+      child: GestureDetector(
+        key: _buttonKey,
+        onTap: widget.enabled ? _togglePopup : null,
+        behavior: HitTestBehavior.opaque,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 160),
+          opacity: widget.enabled ? 1 : 0.38,
+          child: SizedBox(
+            width: 32,
+            height: 32,
+            child: Icon(
+              CupertinoIcons.shield_lefthalf_fill,
+              size: 18,
+              color: accent,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PermissionMenuRow extends StatelessWidget {
+  final String label;
+  final bool checked;
+  final VoidCallback onTap;
+
+  const _PermissionMenuRow({
+    required this.label,
+    required this.checked,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final accent = checked ? _iosBlue : theme.colorScheme.onSurface;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: SizedBox(
+        height: 36,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          child: Row(
+            children: [
+              Icon(
+                checked
+                    ? CupertinoIcons.checkmark
+                    : CupertinoIcons.shield,
+                size: 14,
+                color: checked ? _iosBlue : theme.hintColor,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    fontSize: 15,
+                    fontWeight: checked ? FontWeight.w600 : FontWeight.w400,
+                    color: accent,
+                    letterSpacing: -0.24,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 会话页共用的思考开关；点亮为开，点灭为关。不持有引擎状态。
-class ThinkingToggleButton extends StatelessWidget {
-  final bool on;
+class ThinkingToggleButton extends StatelessWidget {  final bool on;
   final VoidCallback? onPressed;
 
   const ThinkingToggleButton({
@@ -527,19 +1014,38 @@ class SessionModelOption {
   final String subtitle;
   final List<String> models;
 
+  /// true 表示该项来自当前 DSH 主机，选择时走 session.selectModel。
+  final bool targetDsh;
+
+  /// 目标 DSH 的真实 provider id；value 可以是 UI 唯一键。
+  final String targetProvider;
+
+  /// 手机侧拾忆 Relay。选择前需要先把 provider 登记到目标 DSH。
+  final bool shiyiRelay;
+
   const SessionModelOption({
     required this.value,
     required this.label,
     this.subtitle = '',
     this.models = const [],
+    this.targetDsh = false,
+    this.targetProvider = '',
+    this.shiyiRelay = false,
   });
 }
 
 class SessionModelSelection {
   final String profile;
   final String model;
+  final bool targetDsh;
+  final bool shiyiRelay;
 
-  const SessionModelSelection({required this.profile, required this.model});
+  const SessionModelSelection({
+    required this.profile,
+    required this.model,
+    this.targetDsh = false,
+    this.shiyiRelay = false,
+  });
 }
 
 /// 输入区左侧的会话模型抽屉：一级已保存配置，二级缓存模型 ID。
@@ -549,6 +1055,7 @@ class SessionModelSelector extends StatefulWidget {
   final String modelId;
   final ValueChanged<SessionModelSelection> onChanged;
   final bool enabled;
+  final VoidCallback? onOpening;
 
   const SessionModelSelector({
     super.key,
@@ -557,6 +1064,7 @@ class SessionModelSelector extends StatefulWidget {
     required this.onChanged,
     this.modelId = '',
     this.enabled = true,
+    this.onOpening,
   });
 
   @override
@@ -566,7 +1074,7 @@ class SessionModelSelector extends StatefulWidget {
 class _SessionModelSelectorState extends State<SessionModelSelector>
     with SingleTickerProviderStateMixin {
   final _buttonKey = GlobalKey();
-  OverlayEntry? _popup;
+  LiquidGlassPopupRoute<void>? _popup;
   Rect _anchor = Rect.zero;
   late final AnimationController _anim;
   late final Animation<double> _reveal;
@@ -617,8 +1125,8 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
   }
 
   Future<void> _dismissPopup() async {
-    final entry = _popup;
-    if (entry == null) return;
+    final route = _popup;
+    if (route == null) return;
     _popup = null;
     _openProfile = null;
     if (mounted) setState(() {});
@@ -627,7 +1135,34 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
         await _anim.reverse();
       } catch (_) {}
     }
-    entry.remove();
+    if (route.isActive) {
+      route.navigator?.removeRoute(route);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionModelSelector oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final route = _popup;
+    if (route != null &&
+        route.isActive &&
+        oldWidget.options != widget.options) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _popup?.isActive != true) return;
+        _popup!.markNeedsBuild();
+      });
+    }
+  }
+
+  /// 系统返回键：模型抽屉在二级菜单时先回一级，一级时再收抽屉。
+  void _dismissPopupFromBack() {
+    if (_openProfile != null) {
+      HapticFeedback.selectionClick();
+      setState(() => _openProfile = null);
+      _markDirty();
+      return;
+    }
+    unawaited(_dismissPopup());
   }
 
   void _showPopup() {
@@ -636,14 +1171,23 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
     if (box == null || !box.hasSize) return;
     _anchor = box.localToGlobal(Offset.zero) & box.size;
     _openProfile = null;
+    widget.onOpening?.call();
     HapticFeedback.selectionClick();
-    _popup = OverlayEntry(builder: _buildOverlay);
-    Overlay.of(context, rootOverlay: true).insert(_popup!);
+    _popup = LiquidGlassPopupRoute<void>(
+      builder: _buildOverlay,
+      onDismiss: _dismissPopupFromBack,
+    );
+    Navigator.of(context, rootNavigator: true).push(_popup!);
     _anim.forward(from: 0);
     setState(() {});
   }
 
-  void _markDirty() => _popup?.markNeedsBuild();
+  void _markDirty() {
+    final route = _popup;
+    if (route != null && route.isActive) {
+      route.markNeedsBuild();
+    }
+  }
 
   List<String> _modelsFor(SessionModelOption item) {
     final ids = <String>{
@@ -723,10 +1267,11 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
         );
       }
     } else {
+      final selectedOption = nested;
       children.add(
         _SessionModelMenuRow(
           label: '返回',
-          subtitle: nested.label,
+          subtitle: selectedOption.label,
           selected: false,
           leading: true,
           onTap: () {
@@ -736,7 +1281,7 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
           },
         ),
       );
-      final models = _modelsFor(nested);
+      final models = _modelsFor(selectedOption);
       if (models.isEmpty) {
         children.add(
           const _SessionModelMenuRow(
@@ -751,12 +1296,22 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
             _SessionModelMenuRow(
               label: id,
               selected:
-                  nested.value == _selectedValue && id == widget.modelId.trim(),
+                  selectedOption.value == _selectedValue &&
+                  id == widget.modelId.trim(),
               onTap: () {
                 HapticFeedback.selectionClick();
                 _dismissPopup();
                 widget.onChanged(
-                  SessionModelSelection(profile: nested!.value, model: id),
+                  SessionModelSelection(
+                    profile:
+                        selectedOption.targetDsh &&
+                            selectedOption.targetProvider.trim().isNotEmpty
+                        ? selectedOption.targetProvider
+                        : selectedOption.value,
+                    model: id,
+                    targetDsh: selectedOption.targetDsh,
+                    shiyiRelay: selectedOption.shiyiRelay,
+                  ),
                 );
               },
             ),
@@ -785,7 +1340,7 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
             clipBehavior: Clip.antiAlias,
             child: SizeTransition(
               sizeFactor: _reveal,
-              axisAlignment: 1,
+              alignment: Alignment.bottomLeft,
               child: LiquidGlassLens(
                 style: chatLiquidGlassStyle(overlayContext, cornerRadius: 14),
                 child: ConstrainedBox(
@@ -806,8 +1361,11 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
 
   @override
   void dispose() {
-    _popup?.remove();
+    final route = _popup;
     _popup = null;
+    if (route?.isActive == true) {
+      route!.navigator?.removeRoute(route);
+    }
     _anim.dispose();
     super.dispose();
   }
@@ -822,6 +1380,22 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
     final accent = widget.enabled
         ? (_isOpen ? _iosBlue : theme.colorScheme.onSurfaceVariant)
         : theme.disabledColor;
+    final labelStyle = theme.textTheme.labelLarge?.copyWith(
+      color: accent,
+      fontSize: 13,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -0.24,
+    ) ?? const TextStyle(
+      fontSize: 13,
+      fontWeight: FontWeight.w600,
+      letterSpacing: -0.24,
+    );
+    final mimoPainter = TextPainter(
+      text: TextSpan(text: 'mimo-2.5', style: labelStyle),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final mimoWidth = mimoPainter.width;
+    mimoPainter.dispose();
 
     return Tooltip(
       message: '选择模型',
@@ -832,25 +1406,18 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 160),
           opacity: widget.enabled ? 1 : 0.38,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(2, 4, 8, 4),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 168),
+          child: SizedBox(
+            width: mimoWidth + 28,
+            height: 32,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
               child: Row(
-                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Flexible(
-                    child: Text(
-                      label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.labelLarge?.copyWith(
-                        color: accent,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: -0.24,
-                      ),
-                    ),
+                  AutoScrollLabel(
+                    text: label,
+                    width: mimoWidth,
+                    alignment: Alignment.center,
+                    style: labelStyle,
                   ),
                   const SizedBox(width: 1),
                   Icon(
@@ -1056,6 +1623,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final String modelId;
   final ValueChanged<SessionModelSelection>? onModelChanged;
   final bool modelEnabled;
+  final VoidCallback? onModelOpening;
+  final List<PermissionPresetOption> permissionOptions;
+  final String permissionValue;
+  final ValueChanged<String>? onPermissionChanged;
+  final bool permissionEnabled;
 
   const LiquidGlassChatComposer({
     super.key,
@@ -1088,6 +1660,11 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.modelId = '',
     this.onModelChanged,
     this.modelEnabled = true,
+    this.onModelOpening,
+    this.permissionOptions = const [],
+    this.permissionValue = '',
+    this.onPermissionChanged,
+    this.permissionEnabled = true,
   });
 
   bool _handleKey(KeyEvent event) {
@@ -1149,11 +1726,13 @@ class LiquidGlassChatComposer extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (modelOptions.isNotEmpty && onModelChanged != null ||
-                    thinkingOptions.isNotEmpty && onThinkingChanged != null ||
+                if ((modelOptions.isNotEmpty && onModelChanged != null) ||
+                    (thinkingOptions.isNotEmpty && onThinkingChanged != null) ||
                     onThinkingToggled != null ||
                     onCompress != null ||
-                    onContextLimit != null) ...[
+                    onContextLimit != null ||
+                    (permissionOptions.isNotEmpty &&
+                        onPermissionChanged != null)) ...[
                   Row(
                     children: [
                       if (modelOptions.isNotEmpty && onModelChanged != null)
@@ -1166,11 +1745,20 @@ class LiquidGlassChatComposer extends StatelessWidget {
                               modelId: modelId,
                               onChanged: onModelChanged!,
                               enabled: modelEnabled,
+                              onOpening: onModelOpening,
                             ),
                           ),
                         )
                       else
                         const Spacer(),
+                      if (permissionOptions.isNotEmpty &&
+                          onPermissionChanged != null)
+                        PermissionPresetSelector(
+                          options: permissionOptions,
+                          value: permissionValue,
+                          onChanged: onPermissionChanged!,
+                          enabled: permissionEnabled,
+                        ),
                       if (onContextLimit != null)
                         ChatContextLimitButton(
                           onPressed: onContextLimit,

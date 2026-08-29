@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Windows-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.6.0.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.6.0/shiyi-agent-v2.6.0.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.6.1.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.6.1/shiyi-agent-v2.6.1.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -20,7 +20,7 @@
 ### 智能对话
 
 - 双引擎切换：拾忆本地引擎或 DeepSeek Harness，会话数据各自独立
-- 多模型接入：内置 OpenAI / Anthropic / Gemini / DeepSeek 等常见 API 预设，支持自定义接口配置管理、一键获取模型 ID 与测试连接；已保存配置可分别注入 DSH
+- 多模型接入：内置 OpenAI / Anthropic / Gemini / DeepSeek 等常见 API 预设，支持自定义接口配置管理、一键获取模型 ID 与测试连接；本机 DSH 直连使用拾忆 API，局域网 / 公网 DSH 通过手机安全 Relay 使用拾忆 API，远端只保存 Relay provider、地址和独立令牌，不接收真实 API Key
 - 多轮对话与独立会话管理：搜索 / 重命名 / 删除 / 左滑快捷操作（含复制会话 ID）
 - 拾忆跨会话查阅：把会话 ID 发到另一个拾忆会话，模型可用 `search_sessions` / `read_session` 找到并阅读，不走长期记忆或联网搜索
 - 项目分类管理会话：新建项目时选择文件夹，项目横幅点击展开 / 收起，左滑支持新建会话 / 文件夹 / 重命名 / 删除；长按项目 / 会话卡片可拖拽排序，会话可拖到另一项目（停满 1 秒）
@@ -61,7 +61,7 @@
 
 - `spawn_agent`：让 AI 派出专项子代理分头处理子任务，干完交回报告
 - 内置四类：`explore` 只读侦查、`plan` 只读方案设计、`worker` 独立执行、`general-purpose` 兜底
-- **并行派发**：一次 `tasks` 数组派多个子代理（最多 4 个）同时跑，互不阻塞、单个失败不影响其他，界面显示「子代理 i/N」进度
+- **并行派发**：一次 `tasks` 数组派多个子代理，数量由拾忆按任务复杂度自行决定，同时跑、互不阻塞，单个失败不影响其他，界面显示「子代理 i/N」进度
 - **动态轮数预算**：每任务可用 `max_turns`（1~80）按复杂度动态调整（简单 5~10、复杂 40~60），省时省钱
 - **写路径隔离**：并行 `worker` 可各自声明 `write_paths`，越界写入会被执行层拒绝，互不覆盖文件
 - 子代理执行进度实时可见（当前轮次 / 正在调用的工具）

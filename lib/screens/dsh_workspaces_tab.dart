@@ -14,11 +14,12 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
-import '../services/dsh_model_sync.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
 import '../services/file_workspace.dart';
 import '../widgets/home_drag.dart';
 import '../widgets/home_group_header.dart';
+import '../widgets/dsh_directory_picker.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/staggered_sessions.dart';
@@ -27,7 +28,7 @@ import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
 import 'dsh_center_screen.dart';
 import 'dsh_chat_screen.dart';
-import 'dsh_files_screen.dart';
+import 'dsh_new_session.dart';
 
 const _iosBlue = Color(0xFF0A84FF);
 const _iosRed = Color(0xFFFF3B30);
@@ -249,7 +250,8 @@ dshOptimisticMoveSession({
 /// 接口数据为 DeepSeek Harness：
 /// - 项目分组 = DSH 工作区（workspace.list），组下挂其会话；
 /// - 会话 = DSH 会话（session.list），点击进入 DSH agent 聊天；
-/// - 红绿灯「添加项目」→ 添加 DSH 工作区（workspace.create，选手机文件夹）；
+/// - 红绿灯「添加项目」→ 添加 DSH 工作区（workspace.create）；
+///   本机使用手机目录，局域网/公网使用 DSH 主机目录和盘符；
 /// - 左滑：工作区（重命名/删除）、会话（重命名/归档）；
 /// - 标题「DS Harness」点击刷新；右上角设置 = DS Harness 中心。
 class DshWorkspacesTab extends StatefulWidget {
@@ -268,7 +270,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   String? _error;
   bool _busy = false;
   bool _hasCache = false;
-  String? _offlineCacheReason;
+  bool _remoteLoaded = false;
 
   final TextEditingController _searchCtrl = TextEditingController();
   final FocusNode _searchFocus = FocusNode();
@@ -354,8 +356,13 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   void initState() {
     super.initState();
     _restoreExpanded();
-    // 缓存先落位再刷新：有缓存时 _load 不显示加载页，列表直接可见。
-    unawaited(_loadCache().then((_) => _load()));
+    if (_usesLivePageData) {
+      // 局域网 / 公网只显示目标 DSH 的实时列表，不读取手机旧快照。
+      unawaited(_load());
+    } else {
+      // 本机模式保留缓存先落位，再静默刷新。
+      unawaited(_loadCache().then((_) => _load()));
+    }
     DshService.instance.status.addListener(_onDshStatus);
     // 远端列表可能由其他设备修改，空闲时也要同步工作区与会话。
     _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -363,6 +370,9 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       unawaited(_load(quiet: true));
     });
   }
+
+  bool get _usesLivePageData =>
+      DshEndpoint.requiresLivePageData(widget.shiyi.settings);
 
   Future<void> _restoreExpanded() async {
     final saved = await dshLoadExpandedWorkspaceIds();
@@ -376,6 +386,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   /// 先把上次列表显示出来，_load() 再静默刷新（没有缓存才显示加载页）。
   Future<void> _loadCache() async {
+    if (_usesLivePageData) return;
     final raw = await dshReadWorkspaceListCache();
     if (!mounted || raw == null || raw.isEmpty) return;
     try {
@@ -400,7 +411,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _loading = false;
         _hasCache = true;
         _error = null;
-        _offlineCacheReason = null;
         _applyExpandedPrefs();
       });
     } catch (_) {
@@ -467,11 +477,13 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   Future<void> _runLoad({required bool quiet}) async {
     final hasCache =
-        _hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty;
+        !_usesLivePageData &&
+        (_hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty);
+    final hasCurrentData = hasCache || _remoteLoaded;
     // 跨组提交中不要先 setState：本地名单还是旧归属时源槽会被撑开。
-    if (!quiet || !hasCache) {
+    if (!quiet || !hasCurrentData) {
       setState(() {
-        _loading = !hasCache;
+        _loading = !hasCurrentData;
         _error = null;
       });
     }
@@ -483,7 +495,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _loading = false;
         // 有缓存时保留列表，但必须明确标出这是离线快照，不能伪装成已连接。
         _error = hasCache ? null : reason;
-        _offlineCacheReason = hasCache ? reason : null;
       });
       _scheduleServiceRetry();
       return;
@@ -517,19 +528,21 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         _archivedSessionIds = r.archivedSessionIds;
         _sessions = list;
         _loading = false;
-        _hasCache = true;
+        _hasCache = !_usesLivePageData;
+        _remoteLoaded = _usesLivePageData;
         _error = null;
-        _offlineCacheReason = null;
         _applyExpandedPrefs();
         _reapplyPendingMove();
       });
-      unawaited(
-        dshWriteWorkspaceListCache(
-          workspaces: _workspaces,
-          sessions: _sessions,
-          archivedSessionIds: _archivedSessionIds,
-        ),
-      );
+      if (!_usesLivePageData) {
+        unawaited(
+          dshWriteWorkspaceListCache(
+            workspaces: _workspaces,
+            sessions: _sessions,
+            archivedSessionIds: _archivedSessionIds,
+          ),
+        );
+      }
     } catch (e) {
       if (!mounted) return;
       final hint = await DshService.instance.unavailableReason();
@@ -537,7 +550,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       setState(() {
         _loading = false;
         _error = hasCache ? null : (hint ?? '$e');
-        _offlineCacheReason = hasCache ? (hint ?? '$e') : null;
       });
       if (hint != null || hasCache) _scheduleServiceRetry();
     }
@@ -558,13 +570,12 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         // 有缓存时保留列表并标出离线状态；没有缓存才显示错误页。
         setState(() {
           final hasCache =
-              _hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty;
+              !_usesLivePageData &&
+              (_hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty);
           if (hasCache) {
             _error = null;
-            _offlineCacheReason = reason;
           } else {
             _error = reason;
-            _offlineCacheReason = null;
           }
         });
       }
@@ -678,8 +689,31 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   Future<void> _createWorkspace() async {
     final defPath = FileWorkspace.defaultWorkspacePath;
+    final hostDirectory = DshEndpoint.modeOf(widget.shiyi.settings) != 'local';
     final nameCtrl = TextEditingController(text: '默认');
-    var folder = defPath;
+    var folder = hostDirectory ? '' : defPath;
+    if (hostDirectory) {
+      try {
+        folder = await dshHostDefaultDirectory(_api);
+      } catch (e) {
+        if (!mounted) {
+          nameCtrl.dispose();
+          return;
+        }
+        _toast('无法读取远程电脑目录：$e');
+        nameCtrl.dispose();
+        return;
+      }
+    }
+    if (!mounted) {
+      nameCtrl.dispose();
+      return;
+    }
+    if (hostDirectory && folder.trim().isEmpty) {
+      nameCtrl.dispose();
+      _toast('远程电脑没有返回有效工作目录');
+      return;
+    }
     final path = await showIosFadeDialog<String>(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -700,15 +734,25 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                 CupertinoButton(
                   padding: EdgeInsets.zero,
                   onPressed: () async {
-                    final dir = await FilePicker.platform.getDirectoryPath(
-                      initialDirectory: folder,
-                    );
+                    final dir = hostDirectory
+                        ? await pickDshHostDirectory(
+                            context,
+                            api: _api,
+                            initialPath: folder,
+                          )
+                        : await FilePicker.platform.getDirectoryPath(
+                            initialDirectory: folder,
+                          );
                     if (dir == null || dir.isEmpty) return;
-                    final prevName = dshIsDefaultWorkspacePath(folder, defPath)
+                    final prevName =
+                        !hostDirectory &&
+                            dshIsDefaultWorkspacePath(folder, defPath)
                         ? '默认'
                         : _folderName(folder);
                     folder = dir;
-                    final nextName = dshIsDefaultWorkspacePath(dir, defPath)
+                    final nextName =
+                        !hostDirectory &&
+                            dshIsDefaultWorkspacePath(dir, defPath)
                         ? '默认'
                         : _folderName(dir);
                     final cur = nameCtrl.text.trim();
@@ -739,7 +783,9 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                isDef ? '默认' : _folderName(folder),
+                                !hostDirectory && isDef
+                                    ? '默认'
+                                    : _folderName(folder),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(fontSize: 14),
@@ -777,6 +823,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         },
       ),
     );
+    nameCtrl.dispose();
     if (path == null || path.isEmpty || !mounted) return;
     if (dshIsDefaultWorkspacePath(path, defPath)) {
       for (final w in _workspaces) {
@@ -918,15 +965,109 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     _toast('已复制会话 ID');
   }
 
-  void _showWorkspaceFolder(DshWorkspace w) {
+  Future<void> _showWorkspaceFolder(DshWorkspace w) async {
     if (!mounted || w.path.trim().isEmpty) return;
-    Navigator.push(
+    final selected = await pickDshHostDirectory(
       context,
-      MacPageRoute(
-        builder: (_) =>
-            DshFilesScreen(shiyi: widget.shiyi, initialPath: w.path),
-      ),
+      api: _api,
+      initialPath: w.path,
     );
+    final path = selected?.trim() ?? '';
+    if (path.isEmpty || path == w.path.trim() || !mounted) return;
+
+    setState(() => _busy = true);
+    DshWorkspace? target;
+    var created = false;
+    final moved = <String>[];
+    try {
+      // 先创建新工作区，全部会话迁移成功后才删除旧工作区，避免远端失败时
+      // 旧工作区和会话被破坏。
+      for (final existing in _workspaces) {
+        if (dshNormalizedPath(existing.path) == dshNormalizedPath(path)) {
+          target = existing;
+          break;
+        }
+      }
+      created = target == null;
+      target ??= await _api.createWorkspace(path);
+      if (created &&
+          w.title.trim().isNotEmpty &&
+          target.title.trim() != w.title.trim()) {
+        try {
+          await _api.renameWorkspace(target.workspaceId, w.title.trim());
+        } catch (_) {}
+      }
+      String? beforeSessionId;
+      for (final sessionId in w.sessionIds.reversed) {
+        if (DshEndpoint.isLocal(widget.shiyi.settings)) {
+          final result = await _tryPluginMove(
+            sessionId: sessionId,
+            workspaceId: target.workspaceId,
+            workspacePath: path,
+          );
+          if (result == null) {
+            throw DshApiException(
+              '工作区搬家插件未加载，请重启本机 DSH 后再试',
+              code: 'plugin-missing',
+            );
+          }
+        } else {
+          await _api.updateSessionCwd(sessionId, path);
+        }
+        await _attachThenInsert(
+          target.workspaceId,
+          sessionId,
+          beforeSessionId: beforeSessionId,
+        );
+        beforeSessionId = sessionId;
+        moved.add(sessionId);
+      }
+      if (created) {
+        final oldIndex = _workspaces.indexWhere(
+          (item) => item.workspaceId == w.workspaceId,
+        );
+        final nextId = oldIndex >= 0 && oldIndex + 1 < _workspaces.length
+            ? _workspaces[oldIndex + 1].workspaceId
+            : null;
+        try {
+          await _api.insertWorkspaceBefore(
+            target.workspaceId,
+            beforeWorkspaceId: nextId,
+          );
+        } catch (_) {}
+      }
+      await _api.deleteWorkspace(w.workspaceId);
+      if (!mounted) return;
+      _toast('工作区文件夹已切换：$path');
+      await _load();
+    } catch (e) {
+      // 尽量把已迁移的会话恢复到旧目录和旧工作区，避免只迁了一半。
+      for (final sessionId in moved.reversed) {
+        try {
+          if (DshEndpoint.isLocal(widget.shiyi.settings)) {
+            await _tryPluginMove(
+              sessionId: sessionId,
+              workspaceId: w.workspaceId,
+              workspacePath: w.path,
+            );
+          } else {
+            await _api.updateSessionCwd(sessionId, w.path);
+          }
+          await _attachThenInsert(w.workspaceId, sessionId);
+        } catch (_) {}
+      }
+      if (created && target != null) {
+        try {
+          await _api.deleteWorkspace(target.workspaceId);
+        } catch (_) {}
+      }
+      if (mounted) {
+        _toast('切换工作区文件夹失败，原工作区已保留：$e');
+        await _load();
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _moveSession(DshSessionSummary s) async {
@@ -976,16 +1117,13 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     setState(() => _expandedGroups.add(w.workspaceId));
     unawaited(_saveExpanded());
     try {
-      final id = await _api.createSession(workspaceId: w.workspaceId);
+      final preset = await pickDshAgentPreset(context);
+      if (preset == null) return;
+      final id = await _api.createSession(
+        workspaceId: w.workspaceId,
+        agentPreset: preset.isEmpty ? null : preset,
+      );
       if (!mounted || id.isEmpty) return;
-      try {
-        await DshModelSync.applyToSession(
-          _api,
-          id,
-          widget.shiyi.settings,
-          scopeKey: DshService.instance.currentScopeKey,
-        );
-      } catch (_) {}
       try {
         await DshChatCache.writeContextLimit(
           id,
@@ -1137,44 +1275,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                     ],
                   ),
                 ),
-              if (_hasCache && _offlineCacheReason != null)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                  child: Material(
-                    color: CupertinoColors.systemOrange.withValues(alpha: .1),
-                    borderRadius: BorderRadius.circular(8),
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(10, 6, 4, 6),
-                      child: Row(
-                        children: [
-                          const Icon(
-                            CupertinoIcons.wifi_slash,
-                            size: 15,
-                            color: CupertinoColors.systemOrange,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              '正在显示离线缓存 · ${_offlineCacheReason!}',
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Theme.of(context).hintColor,
-                              ),
-                            ),
-                          ),
-                          IconButton(
-                            onPressed: _load,
-                            tooltip: '重新连接',
-                            visualDensity: VisualDensity.compact,
-                            icon: const Icon(CupertinoIcons.refresh, size: 16),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
               Expanded(child: ClipRect(child: _buildBody())),
             ],
           ),
@@ -1272,31 +1372,37 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
     final workspaces = searchMode ? visibleWs : _visibleWorkspaces(visibleWs);
     return _centeredList(
-      ListView(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-        children: [
-          for (var i = 0; i < workspaces.length; i++)
-            _shiftedSlot(
-              key: _keyFor(_workspaceBlockKeys, workspaces[i].workspaceId),
-              dy:
-                  searchMode ||
-                      _workspacePreviewFrom == null ||
-                      _workspacePreviewTo == null
-                  ? 0
-                  : homeDragTranslateY(
-                      index: i,
-                      from: _workspacePreviewFrom!,
-                      to: _workspacePreviewTo!,
-                      heights: _workspaceHeights,
-                    ),
-              child: _workspaceGroup(
-                workspaces[i],
-                _visibleSessionsFor(workspaces[i].workspaceId, byWorkspace),
-                searchMode,
-                workspaceIndex: i,
+      // 下拉刷新：与长按拖拽 / 左滑无竞技场冲突（过冲通知驱动）；
+      // 插在 NotificationListener 内侧保持滚动通知冒泡。
+      RefreshIndicator(
+        onRefresh: _load,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+          children: [
+            for (var i = 0; i < workspaces.length; i++)
+              _shiftedSlot(
+                key: _keyFor(_workspaceBlockKeys, workspaces[i].workspaceId),
+                dy:
+                    searchMode ||
+                        _workspacePreviewFrom == null ||
+                        _workspacePreviewTo == null
+                    ? 0
+                    : homeDragTranslateY(
+                        index: i,
+                        from: _workspacePreviewFrom!,
+                        to: _workspacePreviewTo!,
+                        heights: _workspaceHeights,
+                      ),
+                child: _workspaceGroup(
+                  workspaces[i],
+                  _visibleSessionsFor(workspaces[i].workspaceId, byWorkspace),
+                  searchMode,
+                  workspaceIndex: i,
+                ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }

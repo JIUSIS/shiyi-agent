@@ -59,6 +59,7 @@ class _ChatScreenState extends State<ChatScreen>
   bool _autoScrollScheduled = false;
   final Set<String> _enteredMessageIds = {};
   final Set<String> _enteredUserTexts = {};
+  DateTime? _lastSendAt;
 
   String? get _pageSessionId =>
       widget.sessionId ?? widget.shiyi.currentSessionId;
@@ -238,6 +239,13 @@ class _ChatScreenState extends State<ChatScreen>
         _pendingFiles.isEmpty) {
       return;
     }
+    final now = DateTime.now();
+    final lastSendAt = _lastSendAt;
+    if (lastSendAt != null &&
+        now.difference(lastSendAt) < const Duration(milliseconds: 200)) {
+      return;
+    }
+    _lastSendAt = now;
     final originalImages = List<String>.of(_pendingImages);
     final originalFiles = List<String>.of(_pendingFiles);
     final sb = StringBuffer();
@@ -1472,9 +1480,7 @@ class _ChatScreenState extends State<ChatScreen>
                                     ],
                                     modelValue: sessionProfile?.name ?? '',
                                     modelId: sessionSettings.model,
-                                    onModelChanged: _pageBusy
-                                        ? null
-                                        : (selection) {
+                                    onModelChanged: (selection) {
                                             for (final p
                                                 in widget.shiyi.apiProfiles) {
                                               if (p.name == selection.profile) {
@@ -1490,7 +1496,7 @@ class _ChatScreenState extends State<ChatScreen>
                                               }
                                             }
                                           },
-                                    modelEnabled: !_pageBusy,
+                                    modelEnabled: true,
                                     thinkingOptions: buildReasoningOptions(
                                       thinkingCaps,
                                     ),
@@ -1504,7 +1510,7 @@ class _ChatScreenState extends State<ChatScreen>
                                           _pageSessionId,
                                           value,
                                         ),
-                                    thinkingEnabled: !_pageBusy,
+                                    thinkingEnabled: true,
                                     thinkingOn: widget.shiyi
                                         .thinkingOnForSession(_pageSessionId),
                                     onThinkingToggled:
@@ -1516,12 +1522,12 @@ class _ChatScreenState extends State<ChatScreen>
                                               )
                                         : null,
                                     onCompress:
-                                        _pageBusy || _pageSessionId == null
+                                        _pageSessionId == null
                                         ? null
                                         : _compressContext,
                                     compressBusy: _pageBusy,
                                     onContextLimit:
-                                        _pageBusy || _pageSessionId == null
+                                        _pageSessionId == null
                                         ? null
                                         : _editContextLimit,
                                     contextLimitLabel: formatContextLimitLabel(
@@ -1570,6 +1576,7 @@ class _ChatScreenState extends State<ChatScreen>
     final shiyi = widget.shiyi;
     final sessionId = widget.sessionId ?? shiyi.currentSessionId;
     if (sessionId == null) return;
+    if (_pageBusy) return;
     final tokens = await shiyi.activeContextTokenEstimate(sessionId);
     if (!mounted) return;
     final limit = shiyi.contextLimitForSession(sessionId);

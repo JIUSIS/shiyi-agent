@@ -21,6 +21,13 @@ class DshEndpoint {
 
   static bool isLocal(AppSettings s) => modeOf(s) == 'local';
 
+  /// 所有模式统一使用目标 DSH 的 provider 目录（本机 = 局域网）。
+  static bool usesTargetModelCatalog(AppSettings s) => true;
+
+  /// 局域网 / 公网页面以目标 DSH 实时数据为准；本机 DSH 保留页面缓存
+  /// （cache-first），同设备数据不会“远端已变手机未变”。
+  static bool requiresLivePageData(AppSettings? s) => s != null && !isLocal(s);
+
   /// DSH 实例隔离键：模式本身也参与键值，避免本机和局域网恰好使用
   /// 相同地址时共用探测、Host 覆盖和 RPC 合并状态。
   static String scopeKeyOf(AppSettings s) {

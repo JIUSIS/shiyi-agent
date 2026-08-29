@@ -324,7 +324,7 @@
   },
   "spawn_agent": {
     "readOnly": false,
-    "description": "需要跨多个文件、长链调研或独立执行的任务：派子代理分头处理，不要自己逐文件读或单线程硬扛。【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发（最多 4 个，同时跑互不阻塞，单个失败不影响其他）；禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。tasks 示例：tasks=[{\"agent_type\":\"explore\",\"description\":\"查A\",\"prompt\":\"…\",\"max_turns\":10},{\"agent_type\":\"explore\",\"description\":\"查B\",\"prompt\":\"…\",\"max_turns\":10}]。explore 广网只读侦查（定位文件/搜符号/读多文件，返回精炼答案）；plan 只读方案设计；worker 独立执行（写文件/跑命令）；general-purpose 兜底。子代理完成后报告作为本工具结果返回，你再整合进主任务。简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。可选 max_turns 动态调整轮数预算（默认 explore 15 / plan 15 / worker 40 / general 25）：简单小任务给 5~10 省钱，任务很复杂可给 40~60；1~80 之间。",
+    "description": "需要跨多个文件、长链调研或独立执行的任务：派子代理分头处理，不要自己逐文件读或单线程硬扛。【默认形态=并行派发】当一次请求里有 ≥2 个互不依赖的任务（例如「分三个方向查 XX」）时，必须用一次调用里的 tasks 数组并行派发（数量由拾忆按任务复杂度自行决定，同时跑互不阻塞，单个失败不影响其他）；禁止拆成多次 spawn_agent 调用或同一轮发多个 spawn_agent。只有恰好 1 个任务时才用顶层 agent_type+prompt 单派。tasks 示例：tasks=[{\"agent_type\":\"explore\",\"description\":\"查A\",\"prompt\":\"…\",\"max_turns\":10},{\"agent_type\":\"explore\",\"description\":\"查B\",\"prompt\":\"…\",\"max_turns\":10}]。explore 广网只读侦查（定位文件/搜符号/读多文件，返回精炼答案）；plan 只读方案设计；worker 独立执行（写文件/跑命令）；general-purpose 兜底。子代理完成后报告作为本工具结果返回，你再整合进主任务。简单单点任务（知道确切路径的单个查找）不要派，直接工具更快。可选 max_turns 动态调整轮数预算（默认 explore 15 / plan 15 / worker 40 / general 25）：简单小任务给 5~10 省钱，任务很复杂可给 40~60；1~80 之间。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -384,7 +384,7 @@
               "prompt"
             ]
           },
-          "description": "批量并行派发：数组里的每个任务同时执行（最多 4 个）"
+          "description": "批量并行派发：数组里的每个任务同时执行，数量由拾忆按任务复杂度自行决定"
         },
         "max_turns": {
           "type": "integer",

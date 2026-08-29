@@ -285,6 +285,8 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-08-28 2.6.1**（共享 `lib/`；详见 `docs/fix-log.md` #292-#293）：
+  局域网 / 公网 DSH 可通过手机安全 Relay 使用拾忆 API，目标主机不接收真实上游地址和密钥；目标 DSH 自有 API 仍可在模型数据页独立增删改。模型页合并 settings / provider / model / credential 状态，编辑器支持三协议、拉模型、多选和测试连接。“DSH 高级诊断”只保留底层排错用途。Windows 与 Android 共用配置模型和 UI；Windows 本机 DSH 仍可直接同步拾忆 provider。
 - **2026-08-27 2.6.0**（共享 `lib/`；详见 `docs/fix-log.md` #283-#291）：
   DSH 支持本机 / 局域网 / 公网连接，文件页跟随远端 cwd/home 并扫描盘符；运行审计覆盖 App、LLM、缓存、DSH、工具、终端、文件、会话和 LAAP。
   拾忆与 DSH 的停止先本地收口，拾忆主动关闭 HTTP/SSE，子代理和终端进程可取消；DSH 运行中可直接插话并过滤旧事件。

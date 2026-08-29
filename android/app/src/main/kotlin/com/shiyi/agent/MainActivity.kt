@@ -35,12 +35,16 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 手动启用 edge-to-edge（内容延伸到状态栏/导航栏后面）并强制系统栏透明：
-        // targetSdk 降到 34 后系统不再强制，这里显式开启保持与原版一致的沉浸效果。
+        // 手动启用 edge-to-edge（内容延伸到状态栏/导航栏后面）并强制系统栏透明。
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // 输入法弹出时关闭系统导航栏对比度 scrim，避免键盘上方出现灰色长条。
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
+        }
     }
 
     override fun onPostResume() {
@@ -96,7 +100,12 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "sync" -> {
                         val activeSessions = call.argument<Int>("activeSessions") ?: 0
-                        ShiyiBackgroundService.sync(applicationContext, activeSessions)
+                        val relayEnabled = call.argument<Boolean>("relayEnabled") ?: false
+                        ShiyiBackgroundService.sync(
+                            applicationContext,
+                            activeSessions,
+                            relayEnabled,
+                        )
                         result.success(null)
                     }
                     else -> result.notImplemented()

@@ -16,7 +16,8 @@ import androidx.core.content.ContextCompat
  * 拾忆长任务的 Android 前台承载。
  *
  * Service 不承载第二套 Flutter 引擎，也不重复实现网络请求；它只让当前
- * Flutter 进程在用户明确发起生成后获得前台服务优先级，并显示运行状态。
+ * Flutter 进程在用户明确发起生成或开启手机 Relay 后获得前台服务优先级，
+ * 并显示运行状态。
  */
 class ShiyiBackgroundService : Service() {
     companion object {
@@ -24,13 +25,15 @@ class ShiyiBackgroundService : Service() {
         private const val NOTIFICATION_ID = 43120
         private const val ACTION_SYNC = "com.shiyi.agent.action.SYNC"
         private const val EXTRA_ACTIVE_SESSIONS = "activeSessions"
+        private const val EXTRA_RELAY_ENABLED = "relayEnabled"
 
-        fun sync(context: Context, activeSessions: Int) {
+        fun sync(context: Context, activeSessions: Int, relayEnabled: Boolean) {
             val intent = Intent(context, ShiyiBackgroundService::class.java).apply {
                 action = ACTION_SYNC
                 putExtra(EXTRA_ACTIVE_SESSIONS, activeSessions)
+                putExtra(EXTRA_RELAY_ENABLED, relayEnabled)
             }
-            if (activeSessions > 0) {
+            if (activeSessions > 0 || relayEnabled) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     ContextCompat.startForegroundService(context, intent)
                 } else {
@@ -49,19 +52,26 @@ class ShiyiBackgroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val activeSessions = intent?.getIntExtra(EXTRA_ACTIVE_SESSIONS, 1) ?: 1
-        if (activeSessions <= 0) {
+        val relayEnabled = intent?.getBooleanExtra(EXTRA_RELAY_ENABLED, false) ?: false
+        if (activeSessions <= 0 && !relayEnabled) {
             stopSelf()
             return START_NOT_STICKY
         }
-        startForeground(NOTIFICATION_ID, buildNotification(activeSessions))
+        startForeground(NOTIFICATION_ID, buildNotification(activeSessions, relayEnabled))
         return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun buildNotification(activeSessions: Int): Notification {
+    private fun buildNotification(activeSessions: Int, relayEnabled: Boolean): Notification {
         val title = "拾忆正在后台运行"
-        val body = if (activeSessions == 1) {
+        val body = if (relayEnabled && activeSessions <= 0) {
+            "手机 API 中转服务运行中，网络连接保持中"
+        } else if (relayEnabled && activeSessions == 1) {
+            "API 中转运行中，1 个会话正在生成"
+        } else if (relayEnabled) {
+            "API 中转运行中，$activeSessions 个会话正在生成"
+        } else if (activeSessions == 1) {
             "1 个会话正在生成，网络连接保持中"
         } else {
             "$activeSessions 个会话正在生成，网络连接保持中"

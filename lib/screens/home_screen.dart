@@ -13,6 +13,7 @@ import '../core/home_list_order.dart';
 import '../core/home_tabs.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
 import '../services/update_service.dart';
 import '../widgets/home_drag.dart';
@@ -82,6 +83,7 @@ class _HomeScreenState extends State<HomeScreen>
   final int _sessionsResetRevision = 0;
   // tab 懒缓存：切换过的页面保留不重建（页面切换卡顿根因=每次全量重建+DB重查）。
   final Map<int, Widget> _tabCache = {};
+  String _lastDshPageKey = '';
   // 切换淡入：IndexedStack 常驻全部 tab，切换零构建、立即响应。
   late final AnimationController _fadeController = AnimationController(
     vsync: this,
@@ -97,6 +99,7 @@ class _HomeScreenState extends State<HomeScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _lastAgentEngine = widget.shiyi.settings.agentEngine;
+    _lastDshPageKey = _dshPageKey();
     _fadeController.value = 1;
     _prebuildTabs();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -151,8 +154,12 @@ class _HomeScreenState extends State<HomeScreen>
 
   void _onShiyiEngineChanged() {
     final engine = widget.shiyi.settings.agentEngine;
-    if (engine == _lastAgentEngine) return;
+    final pageKey = _dshPageKey();
+    final engineChanged = engine != _lastAgentEngine;
+    final dshConnectionChanged = pageKey != _lastDshPageKey;
+    if (!engineChanged && !dshConnectionChanged) return;
     _lastAgentEngine = engine;
+    _lastDshPageKey = pageKey;
     final keep = <int, Widget>{};
     for (final i in HomeTabs.keepAcrossEngineSwitch) {
       final w = _tabCache[i];
@@ -184,8 +191,10 @@ class _HomeScreenState extends State<HomeScreen>
     var i = 1;
     void next() {
       if (!mounted || i > HomeTabs.terminalIndex) return;
-      _tabCache[i] = _buildTabFor(i);
-      setState(() {});
+      if (!_usesLiveDshPages) {
+        _tabCache[i] = _buildTabFor(i);
+        setState(() {});
+      }
       i++;
       WidgetsBinding.instance.addPostFrameCallback((_) => next());
     }
@@ -200,10 +209,32 @@ class _HomeScreenState extends State<HomeScreen>
   void _selectTab(int tab) {
     if (tab == _tab) return;
     _dismissKeyboard();
+    if (_usesLiveDshPages) {
+      // 局域网 / 公网每次进入页面都重建，由页面 initState 拉取目标 DSH
+      // 的最新数据，不复用手机内存中的旧页面。
+      _tabCache.remove(tab);
+      _tabCache.remove(_tab);
+    }
     setState(() {
       _tab = tab;
     });
     _fadeController.forward(from: 0);
+  }
+
+  bool get _usesLiveDshPages =>
+      widget.shiyi.settings.agentEngine == 'dsh' &&
+      DshEndpoint.requiresLivePageData(widget.shiyi.settings);
+
+  String _dshPageKey() {
+    final s = widget.shiyi.settings;
+    return [
+      s.agentEngine,
+      DshEndpoint.modeOf(s),
+      DshEndpoint.urlOf(s),
+      s.dshRemoteHost,
+      s.dshRemoteToken,
+      s.dshApiSource,
+    ].join('\u0000');
   }
 
   Future<void> _handleBack() async {
@@ -250,6 +281,12 @@ class _HomeScreenState extends State<HomeScreen>
     // Windows 宽窗口：桌面侧边导航；窄窗口/手机：底部 Tab。
     final desktopNav =
         Platform.isWindows && MediaQuery.sizeOf(context).width >= 720;
+    final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
+    final tabBarGap = desktopNav
+        ? 0.0
+        : (_mobileTabBarHeight - keyboardInset)
+              .clamp(0.0, _mobileTabBarHeight)
+              .toDouble();
     // 引擎决定主页 tab 套件：拾忆（会话/功能/文件/终端）或 DS Harness
     //（工作数据/功能/文件/终端）。终端两端都接内嵌 proot。
     final tabs = shiyi.settings.agentEngine == 'dsh'
@@ -298,7 +335,17 @@ class _HomeScreenState extends State<HomeScreen>
           ),
         );
         // 裁剪在 SafeArea 内侧，会话卡片挤开位移不能画进状态栏。
-        if (!desktopNav) return SafeArea(child: ClipRect(child: stack));
+        // 手机端底部 Tab 悬浮覆盖，内容留出同高空白，避免最后一张卡片被遮。
+        // 键盘弹起时清掉这段空白：内层 Scaffold 已按 viewInsets 垫底，
+        // 再叠 58px 会在输入法上方多出一条空带。
+        if (!desktopNav) {
+          return SafeArea(
+            child: Padding(
+              padding: EdgeInsets.only(bottom: tabBarGap),
+              child: ClipRect(child: stack),
+            ),
+          );
+        }
         return SafeArea(
           child: Center(
             child: ConstrainedBox(
@@ -343,10 +390,22 @@ class _HomeScreenState extends State<HomeScreen>
                     Expanded(child: content),
                   ],
                 )
-              : content,
-          bottomNavigationBar: desktopNav
-              ? null
-              : _IosTabBar(currentIndex: _tab, onTap: _selectTab, tabs: tabs),
+              : Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    content,
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: _IosTabBar(
+                        currentIndex: _tab,
+                        onTap: _selectTab,
+                        tabs: tabs,
+                      ),
+                    ),
+                  ],
+                ),
         ),
       ),
     );
@@ -452,7 +511,9 @@ Widget buildFilesTabForEngine(ShiyiState shiyi) {
       : FilesScreen(shiyi: shiyi);
 }
 
-/// iOS 风格底部 Tab：毛玻璃背景、蓝点选中态、图标+文字。
+/// iOS 风格底部 Tab：毛玻璃背景、选中胶囊、SF 风格图标+文字。
+const double _mobileTabBarHeight = 58;
+
 class _IosTabBar extends StatelessWidget {
   final int currentIndex;
   final ValueChanged<int> onTap;
@@ -481,7 +542,7 @@ class _IosTabBar extends StatelessWidget {
           child: SafeArea(
             top: false,
             child: SizedBox(
-              height: 58,
+              height: _mobileTabBarHeight,
               child: Row(
                 children: [
                   for (var i = 0; i < tabs.length; i++)
@@ -521,19 +582,41 @@ class _IosTabItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
+    final activeColor = dark
+        ? const Color(0xFF0A84FF)
+        : const Color(0xFF007AFF);
     final color = selected
-        ? (dark ? const Color(0xFF0A84FF) : const Color(0xFF007AFF))
+        ? activeColor
         : (dark ? CupertinoColors.systemGrey : CupertinoColors.secondaryLabel);
     return Semantics(
       button: true,
       selected: selected,
       label: label,
-      child: InkWell(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: onTap,
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(selected ? selectedIcon : icon, size: 24, color: color),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOut,
+              width: 50,
+              height: 30,
+              decoration: BoxDecoration(
+                color: selected
+                    ? activeColor.withValues(alpha: 0.14)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(15),
+              ),
+              child: Center(
+                child: Icon(
+                  selected ? selectedIcon : icon,
+                  size: 24,
+                  color: color,
+                ),
+              ),
+            ),
             const SizedBox(height: 4),
             Text(
               label,

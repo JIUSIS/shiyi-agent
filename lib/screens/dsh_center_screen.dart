@@ -162,7 +162,7 @@ class _DshCenterScreenState extends State<DshCenterScreen> {
                         title: '模型',
                         subtitle: shiyi == null
                             ? '提供商 / 模型目录'
-                            : '接口地址 / 密钥 / 模型与预设',
+                            : '拾忆接口地址 / 密钥 / 模型与预设',
                         onTap: () => _open(
                           shiyi == null
                               ? DshModelsScreen(sessionId: sid)
@@ -207,13 +207,6 @@ class _DshCenterScreenState extends State<DshCenterScreen> {
                           onTap: () =>
                               _open(shiyiAppearanceSettingsPage(shiyi)),
                         ),
-                      _navTile(
-                        icon: CupertinoIcons.lock_fill,
-                        color: _iosOrange,
-                        title: '凭据与配置',
-                        subtitle: 'API 密钥 / 命名空间',
-                        onTap: () => _open(const DshSettingsScreen()),
-                      ),
                     ],
                   ),
                   CupertinoListSection.insetGrouped(
@@ -221,6 +214,13 @@ class _DshCenterScreenState extends State<DshCenterScreen> {
                     backgroundColor: _iosGroupedBackground(dark),
                     header: const Text('支持'),
                     children: [
+                      _navTile(
+                        icon: CupertinoIcons.doc_text_search,
+                        color: _iosOrange,
+                        title: 'DSH 高级诊断',
+                        subtitle: '凭据状态 / 原始命名空间',
+                        onTap: () => _open(const DshSettingsScreen()),
+                      ),
                       if (shiyi != null)
                         _navTile(
                           icon: CupertinoIcons.info_circle_fill,

@@ -53,4 +53,48 @@ void main() {
     );
     expect(childHeight, greaterThan(400));
   });
+
+  test('没有文本输入焦点时清掉 HyperOS 僵尸键盘高度', () {
+    const data = MediaQueryData(
+      size: Size(400, 869),
+      viewInsets: EdgeInsets.only(bottom: 273),
+    );
+    final out = sanitizeMediaQuery(data, keyboardExpected: false);
+    expect(out.viewInsets.bottom, 0);
+  });
+
+  test('文本输入仍有焦点时保留正常键盘高度', () {
+    const data = MediaQueryData(
+      size: Size(400, 869),
+      viewInsets: EdgeInsets.only(bottom: 273),
+    );
+    final out = sanitizeMediaQuery(data, keyboardExpected: true);
+    expect(out.viewInsets.bottom, 273);
+    expect(identical(out, data), isTrue);
+  });
+
+  test('窄屏只压住过大的字体缩放，正常小字号原样保留', () {
+    const normal = MediaQueryData(
+      size: Size(360, 640),
+      textScaler: TextScaler.linear(0.8),
+    );
+    expect(identical(adaptSmallScreenText(normal), normal), isTrue);
+
+    const large = MediaQueryData(
+      size: Size(360, 640),
+      textScaler: TextScaler.linear(1.2),
+    );
+    expect(
+      adaptSmallScreenText(large).textScaler.scale(1),
+      closeTo(0.92, 0.001),
+    );
+  });
+
+  test('宽屏不改系统字体缩放', () {
+    const data = MediaQueryData(
+      size: Size(840, 1960),
+      textScaler: TextScaler.linear(1.2),
+    );
+    expect(identical(adaptSmallScreenText(data), data), isTrue);
+  });
 }

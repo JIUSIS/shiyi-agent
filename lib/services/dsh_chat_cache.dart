@@ -7,6 +7,31 @@ import 'dsh_api.dart';
 
 const dshCachedLiveMessageId = 'dsh-cached-live';
 
+class DshRelaySelection {
+  final String profileId;
+  final String model;
+  final String reasoningEffort;
+
+  const DshRelaySelection({
+    required this.profileId,
+    required this.model,
+    this.reasoningEffort = '',
+  });
+
+  Map<String, dynamic> toJson() => {
+    'profileId': profileId,
+    'model': model,
+    'reasoningEffort': reasoningEffort,
+  };
+
+  factory DshRelaySelection.fromJson(Map<String, dynamic> json) =>
+      DshRelaySelection(
+        profileId: (json['profileId'] ?? '').toString().trim(),
+        model: (json['model'] ?? '').toString().trim(),
+        reasoningEffort: (json['reasoningEffort'] ?? '').toString().trim(),
+      );
+}
+
 class DshChatSnapshot {
   final List<ChatMessage> messages;
   final String title;
@@ -62,6 +87,52 @@ class DshChatCache {
   static const _snapshotPrefix = 'dsh_chat_snapshot_cache_v2_';
   static const _legacyPrefix = 'dsh_chat_history_cache_v1_';
   static const _contextLimitPrefix = 'dsh_session_context_limit_v1_';
+  static const _relaySelectionPrefix = 'dsh_relay_selection_v1_';
+
+  static String _relaySelectionKey(String scopeKey, String sessionId) {
+    final identity = '${scopeKey.trim()}\n${sessionId.trim()}';
+    final encoded = base64Url.encode(utf8.encode(identity)).replaceAll('=', '');
+    return '$_relaySelectionPrefix$encoded';
+  }
+
+  /// 远端页面仍然实时加载；这里只保存用户选中的手机 API 身份和模型，
+  /// provider 被随用随清后，下次发送前可按同一身份重建。
+  static Future<DshRelaySelection?> readRelaySelection(
+    String scopeKey,
+    String sessionId,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_relaySelectionKey(scopeKey, sessionId));
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final value = DshRelaySelection.fromJson(
+        (jsonDecode(raw) as Map).cast<String, dynamic>(),
+      );
+      return value.profileId.isEmpty || value.model.isEmpty ? null : value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> writeRelaySelection(
+    String scopeKey,
+    String sessionId,
+    DshRelaySelection selection,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _relaySelectionKey(scopeKey, sessionId),
+      jsonEncode(selection.toJson()),
+    );
+  }
+
+  static Future<void> clearRelaySelection(
+    String scopeKey,
+    String sessionId,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_relaySelectionKey(scopeKey, sessionId));
+  }
 
   /// DSH 会话自定义上下文（token）。0 / 缺失 = 跟随全局新建会话默认。
   static Future<int> readContextLimit(String sessionId) async {
@@ -262,15 +333,29 @@ List<ChatMessage> dshMergeHistoryPreservingProgress({
         .clamp(0, entry.value)
         .toInt();
   }
+  final unmatched = <ChatMessage>[];
   for (final message in pending) {
     final key = message.content.trim();
     final count = newConfirmed[key] ?? 0;
     if (count > 0) {
       newConfirmed[key] = count - 1;
     } else {
-      next.add(message);
+      unmatched.add(message);
     }
   }
+  final hasFinalAssistant =
+      // 回合已结束且 history 带正式助手收尾时，未被确认的乐观占位不再补回，
+      // 否则输出完后又会多出一条 hi。
+      !preserveLocalProgress &&
+      unmatched.isNotEmpty &&
+      incoming.isNotEmpty &&
+      incoming.last.role == 'assistant' &&
+      (incoming.last.content.trim().isNotEmpty ||
+          incoming.last.reasoning.trim().isNotEmpty ||
+          incoming.last.runtimeContext.trim().isNotEmpty ||
+          incoming.last.subagentSummary.trim().isNotEmpty ||
+          incoming.last.toolCalls.isNotEmpty);
+  if (!hasFinalAssistant) next.addAll(unmatched);
   return next;
 }
 

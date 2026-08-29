@@ -30,9 +30,9 @@ class LaapService {
   static const _versionKey = 'laap_local_version';
   static const _readyName = '.shiyi-laap-ready';
   static const _zipUrl =
-      'https://github.com/FLF-MAX/laap-MAX/archive/refs/heads/main.zip';
+      'https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip';
   static const _zipMirror =
-      'https://ghproxy.net/https://github.com/FLF-MAX/laap-MAX/archive/refs/heads/main.zip';
+      'https://ghproxy.net/https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip';
 
   final ValueNotifier<LaapStatus> status = ValueNotifier<LaapStatus>(
     LaapStatus.idle,

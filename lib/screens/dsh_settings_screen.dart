@@ -8,7 +8,7 @@ import '../services/dsh_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 
-/// DSH 凭据与配置页：凭据可更新/清除，命名空间逐项完整展示。
+/// DSH 高级诊断页：供排错时查看凭据状态和原始命名空间。
 class DshSettingsScreen extends StatefulWidget {
   const DshSettingsScreen({super.key});
 
@@ -23,6 +23,7 @@ class _DshSettingsScreenState extends State<DshSettingsScreen> {
   bool _writable = false;
   List<DshSettingsNamespace> _namespaces = [];
   List<DshCredentialSlot> _credentials = [];
+  final Set<String> _expandedNamespaces = {};
 
   DshApiClient get _api => DshService.instance.api;
 
@@ -104,7 +105,7 @@ class _DshSettingsScreenState extends State<DshSettingsScreen> {
           elevation: 0,
           scrolledUnderElevation: 0,
           title: const Text(
-            '凭据与配置',
+            'DSH 高级诊断',
             style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
           ),
           actions: [
@@ -142,9 +143,18 @@ class _DshSettingsScreenState extends State<DshSettingsScreen> {
     return ListView(
       padding: const EdgeInsets.only(top: 4, bottom: 28),
       children: [
+        Container(
+          margin: const EdgeInsets.fromLTRB(16, 6, 16, 4),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: CupertinoColors.activeBlue.withValues(alpha: .10),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: const Text('日常新增、修改和删除模型 API，请使用“模型数据”。这里仅用于排查目标 DSH 的底层状态。'),
+        ),
         if (!_writable) _readOnlyBanner(),
         CupertinoListSection.insetGrouped(
-          header: const Text('凭据'),
+          header: const Text('凭据槽（高级）'),
           margin: iosSectionMargin,
           decoration: iosSectionDecoration(context),
           children: _credentials.isEmpty
@@ -214,29 +224,47 @@ class _DshSettingsScreenState extends State<DshSettingsScreen> {
 
   Widget _namespaceSection(DshSettingsNamespace namespace) {
     final entries = namespace.value.entries.toList();
+    final expanded = _expandedNamespaces.contains(namespace.ns);
     return CupertinoListSection.insetGrouped(
-      header: Text(namespace.ns),
+      header: const Text('原始命名空间'),
       margin: iosSectionMargin,
       decoration: iosSectionDecoration(context),
-      children: entries.isEmpty
-          ? const [CupertinoListTile(title: Text('空命名空间'))]
-          : [
-              for (final entry in entries)
-                CupertinoListTile(
-                  leading: const _SettingsIcon(
-                    icon: CupertinoIcons.slider_horizontal_3,
-                    color: CupertinoColors.systemIndigo,
-                  ),
-                  title: Text(entry.key),
-                  subtitle: SelectableText(
-                    _formatValue(entry.value),
-                    style: const TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 12,
-                    ),
-                  ),
-                ),
-            ],
+      children: [
+        CupertinoListTile(
+          leading: const _SettingsIcon(
+            icon: CupertinoIcons.doc_text_search,
+            color: CupertinoColors.systemIndigo,
+          ),
+          title: Text(namespace.ns),
+          subtitle: Text(
+            entries.isEmpty ? '空命名空间' : '${entries.length} 项，只读查看',
+          ),
+          trailing: Icon(
+            expanded ? CupertinoIcons.chevron_up : CupertinoIcons.chevron_down,
+            size: 18,
+          ),
+          onTap: () => setState(() {
+            if (expanded) {
+              _expandedNamespaces.remove(namespace.ns);
+            } else {
+              _expandedNamespaces.add(namespace.ns);
+            }
+          }),
+        ),
+        if (expanded)
+          for (final entry in entries)
+            CupertinoListTile(
+              leading: const _SettingsIcon(
+                icon: CupertinoIcons.slider_horizontal_3,
+                color: CupertinoColors.systemIndigo,
+              ),
+              title: Text(entry.key),
+              subtitle: SelectableText(
+                _formatValue(entry.value),
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
+            ),
+      ],
     );
   }
 

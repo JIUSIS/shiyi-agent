@@ -7,7 +7,10 @@ import 'package:flutter/widgets.dart';
 /// 看起来像没画面、点不动。
 ///
 /// Flutter issue: https://github.com/flutter/flutter/issues/161086
-MediaQueryData sanitizeMediaQuery(MediaQueryData data) {
+MediaQueryData sanitizeMediaQuery(
+  MediaQueryData data, {
+  bool keyboardExpected = true,
+}) {
   final size = data.size;
   if (size.width <= 1 || size.height <= 1) return data;
 
@@ -45,7 +48,12 @@ MediaQueryData sanitizeMediaQuery(MediaQueryData data) {
   }
 
   final maxInsetBottom = size.height * 0.7;
-  if (viewInsets.bottom > maxInsetBottom) {
+  if (!keyboardExpected && viewInsets.bottom > 0) {
+    // HyperOS 偶尔会在输入法已经隐藏、页面也没有文本焦点时继续上报
+    // 上一次的 IME 高度，Scaffold 因此把底部输入区挤出可视区域。
+    viewInsets = viewInsets.copyWith(bottom: 0);
+    changed = true;
+  } else if (viewInsets.bottom > maxInsetBottom) {
     viewInsets = viewInsets.copyWith(bottom: maxInsetBottom);
     changed = true;
   }
@@ -56,4 +64,13 @@ MediaQueryData sanitizeMediaQuery(MediaQueryData data) {
     viewPadding: viewPadding,
     viewInsets: viewInsets,
   );
+}
+
+/// 窄屏只压住过大的系统字体缩放，正常字号不被主动改小。
+/// 宽屏和已经较小的系统字号原样保留，避免影响无障碍设置。
+MediaQueryData adaptSmallScreenText(MediaQueryData data) {
+  if (data.size.width >= 380) return data;
+  final scale = data.textScaler.scale(1.0);
+  if (scale <= 0.92) return data;
+  return data.copyWith(textScaler: TextScaler.linear(0.92));
 }

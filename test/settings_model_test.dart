@@ -1,9 +1,14 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shiyi_agent_app/core/model_presets.dart';
 import 'package:shiyi_agent_app/core/models.dart';
 import 'package:shiyi_agent_app/services/llm_client.dart';
+import 'package:shiyi_agent_app/services/settings_service.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   test('enablePresence 默认关闭，并随设置 JSON 往返持久化', () {
     expect(AppSettings().enablePresence, isFalse);
     expect(AppSettings.fromJson({}).enablePresence, isFalse);
@@ -75,6 +80,70 @@ void main() {
       AppSettings(apiProfileId: first.profileId).toJson(),
       isNot(contains('apiProfileId')),
     );
+  });
+
+  test('删除配置按 profileId 隔离，相同密钥的另一配置仍保留', () async {
+    SharedPreferences.setMockInitialValues({});
+    FlutterSecureStorage.setMockInitialValues({});
+    final service = SettingsService();
+    final payAsYouGo = ApiProfile(
+      name: 'MiMo 按量付费',
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      apiKey: 'same-key',
+      model: 'wrong-model',
+    );
+    final tokenPlan = ApiProfile(
+      name: 'MiMo 订阅（Token Plan）',
+      baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+      apiKey: 'same-key',
+      model: 'mimo-v2.5-pro',
+    );
+    await service.saveProfiles([payAsYouGo, tokenPlan]);
+
+    final remaining = await service.deleteProfile(payAsYouGo);
+
+    expect(remaining.map((profile) => profile.profileId), [
+      tokenPlan.profileId,
+    ]);
+    final loaded = await service.loadProfiles();
+    expect(loaded, hasLength(1));
+    expect(loaded.single.profileId, tokenPlan.profileId);
+    expect(loaded.single.apiKey, 'same-key');
+    const secure = FlutterSecureStorage();
+    expect(
+      await secure.read(
+        key: 'shiyi_profile_api_key_v2_${payAsYouGo.profileId}',
+      ),
+      isNull,
+    );
+    expect(
+      await secure.read(key: 'shiyi_profile_api_key_v2_${tokenPlan.profileId}'),
+      'same-key',
+    );
+  });
+
+  test('删除内置配置覆盖后，预设恢复初始值且仍保留入口', () async {
+    SharedPreferences.setMockInitialValues({});
+    FlutterSecureStorage.setMockInitialValues({});
+    final service = SettingsService();
+    final saved = ApiProfile(
+      name: 'MiMo 按量付费',
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      apiKey: 'wrong-key',
+      model: 'wrong-model',
+    );
+    await service.saveProfiles([saved]);
+
+    final remaining = await service.deleteProfile(saved);
+    final restored = mergeApiProfiles(
+      remaining,
+    ).singleWhere((profile) => profile.name == saved.name);
+    final preset = modelPresets.singleWhere((item) => item.name == saved.name);
+
+    expect(restored.baseUrl, preset.baseUrl);
+    expect(restored.model, preset.model);
+    expect(restored.apiProtocol, preset.apiProtocol);
+    expect(restored.apiKey, isEmpty);
   });
 
   test('dshStopOnExit 默认开启，并随设置 JSON 往返持久化', () {

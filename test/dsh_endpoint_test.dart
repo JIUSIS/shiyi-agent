@@ -22,6 +22,42 @@ void main() {
     expect(DshEndpoint.urlOf(AppSettings()), DshEndpoint.localUrl);
   });
 
+  test('本机保留页面缓存，局域网 / 公网强制实时加载页面数据', () {
+    expect(DshEndpoint.requiresLivePageData(null), isFalse);
+    expect(DshEndpoint.requiresLivePageData(AppSettings()), isFalse);
+    expect(
+      DshEndpoint.requiresLivePageData(AppSettings(dshConnectionMode: 'lan')),
+      isTrue,
+    );
+    expect(
+      DshEndpoint.requiresLivePageData(
+        AppSettings(dshConnectionMode: 'remote'),
+      ),
+      isTrue,
+    );
+  });
+
+  test('三种模式统一使用目标 DSH 模型目录（本机 = 局域网）', () {
+    expect(
+      DshEndpoint.usesTargetModelCatalog(
+        AppSettings(dshConnectionMode: 'lan', dshApiSource: 'shiyi'),
+      ),
+      isTrue,
+    );
+    expect(
+      DshEndpoint.usesTargetModelCatalog(
+        AppSettings(dshConnectionMode: 'local', dshApiSource: 'dsh'),
+      ),
+      isTrue,
+    );
+    expect(
+      DshEndpoint.usesTargetModelCatalog(
+        AppSettings(dshConnectionMode: 'local', dshApiSource: 'shiyi'),
+      ),
+      isTrue,
+    );
+  });
+
   test('局域网 URL 规范化', () {
     expect(DshEndpoint.lanUrl('', 3080), '');
     expect(DshEndpoint.lanUrl('192.168.1.8', 3080), 'http://192.168.1.8:3080');
@@ -175,6 +211,12 @@ void main() {
     expect(localApi.baseUrl, DshEndpoint.localUrl);
     expect(lanApi.baseUrl, 'http://127.0.0.1:3080');
     expect(remoteApi.baseUrl, 'http://127.0.0.1:3080');
+    expect(localApi.debugWebSocketHeaders(), isEmpty);
+    expect(lanApi.debugWebSocketHeaders(), {
+      'Host': '127.0.0.1:3080',
+      'Origin': 'http://127.0.0.1:3080',
+    });
+    expect(remoteApi.debugWebSocketHeaders(), isEmpty);
 
     service.applyConnection(lan);
     expect(service.api, same(lanApi));
