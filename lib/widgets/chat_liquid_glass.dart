@@ -96,17 +96,34 @@ class _LiquidGlassPopupBody extends StatefulWidget {
   State<_LiquidGlassPopupBody> createState() => _LiquidGlassPopupBodyState();
 }
 
-class _LiquidGlassPopupBodyState extends State<_LiquidGlassPopupBody> {
+class _LiquidGlassPopupBodyState extends State<_LiquidGlassPopupBody>
+    with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     widget.onState(this);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.onState(null);
     super.dispose();
+  }
+
+  @override
+  void didChangeMetrics() {
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
+    Future<void>.delayed(const Duration(milliseconds: 120), () {
+      if (mounted) setState(() {});
+    });
+    Future<void>.delayed(const Duration(milliseconds: 320), () {
+      if (mounted) setState(() {});
+    });
   }
 
   void requestBuild() {
@@ -309,6 +326,12 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
 
   bool get _isOpen => _popup != null;
 
+  Rect get _currentAnchor {
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return _anchor;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
+
   void _togglePopup() {
     if (_isOpen) {
       _dismissPopup();
@@ -383,13 +406,14 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
     final items = _drawerOptions;
     if (items.isEmpty) return const SizedBox.shrink();
     final menuWidth = _menuWidthFor(overlayContext, items);
+    final anchor = _currentAnchor;
 
     // 抽屉贴在按钮上沿，右对齐；空间不够时再夹回安全区内。
-    final right = (mq.size.width - _anchor.right).clamp(
+    final right = (mq.size.width - anchor.right).clamp(
       8.0,
       (mq.size.width - menuWidth - 8.0).clamp(8.0, mq.size.width),
     );
-    final bottom = (mq.size.height - _anchor.top + _gap).clamp(
+    final bottom = (mq.size.height - anchor.top + _gap).clamp(
       mq.padding.bottom + 8.0,
       mq.size.height - mq.padding.top - 48.0,
     );
@@ -731,6 +755,12 @@ class _PermissionPresetSelectorState extends State<PermissionPresetSelector>
 
   bool get _isOpen => _popup != null;
 
+  Rect get _currentAnchor {
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return _anchor;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
+
   String get _selectedLabel {
     for (final item in widget.options) {
       if (item.value == widget.value) return item.label;
@@ -780,12 +810,13 @@ class _PermissionPresetSelectorState extends State<PermissionPresetSelector>
     final dark = Theme.of(overlayContext).brightness == Brightness.dark;
     final mq = MediaQuery.of(overlayContext);
     final menuWidth = _maxMenuWidth;
+    final anchor = _currentAnchor;
 
-    final right = (mq.size.width - _anchor.right).clamp(
+    final right = (mq.size.width - anchor.right).clamp(
       8.0,
       (mq.size.width - menuWidth - 8.0).clamp(8.0, mq.size.width),
     );
-    final bottom = (mq.size.height - _anchor.top + _gap).clamp(
+    final bottom = (mq.size.height - anchor.top + _gap).clamp(
       mq.padding.bottom + 8.0,
       mq.size.height - mq.padding.top - 48.0,
     );
@@ -1068,6 +1099,12 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
 
   bool get _isOpen => _popup != null;
 
+  Rect get _currentAnchor {
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return _anchor;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
+
   String get _selectedValue {
     if (widget.options.any((item) => item.value == widget.value)) {
       return widget.value;
@@ -1210,8 +1247,9 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
       }
     }
     final menuWidth = _menuWidthFor(overlayContext, nested: nested);
-    final left = _anchor.left.clamp(8.0, mq.size.width - menuWidth - 8.0);
-    final bottom = (mq.size.height - _anchor.top + _gap).clamp(
+    final anchor = _currentAnchor;
+    final left = anchor.left.clamp(8.0, mq.size.width - menuWidth - 8.0);
+    final bottom = (mq.size.height - anchor.top + _gap).clamp(
       mq.padding.bottom + 8.0,
       mq.size.height - mq.padding.top - 48.0,
     );
@@ -1726,6 +1764,12 @@ class _ChatStatsChipState extends State<ChatStatsChip>
 
   bool get _isOpen => _popup != null;
 
+  Rect get _currentAnchor {
+    final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return _anchor;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
+
   Future<void> _dismiss() async {
     final route = _popup;
     if (route == null) return;
@@ -1758,13 +1802,14 @@ class _ChatStatsChipState extends State<ChatStatsChip>
   Widget _buildOverlay(BuildContext overlayContext) {
     final dark = Theme.of(overlayContext).brightness == Brightness.dark;
     final mq = MediaQuery.of(overlayContext);
+    final anchor = _currentAnchor;
     final maxWidth = mq.size.width - 24;
     final width = maxWidth <= 200 ? maxWidth.clamp(0.0, 280.0) : 280.0;
     final maxLeft = mq.size.width - width - 12.0;
-    final left = maxLeft < 12 ? 12.0 : _anchor.left.clamp(12.0, maxLeft);
+    final left = maxLeft < 12 ? 12.0 : anchor.left.clamp(12.0, maxLeft);
     final minBottom = mq.padding.bottom + 8.0;
     final maxBottom = mq.size.height - mq.padding.top - 96.0;
-    final rawBottom = mq.size.height - _anchor.top + 6;
+    final rawBottom = mq.size.height - anchor.top + 6;
     final bottom = maxBottom < minBottom
         ? minBottom
         : rawBottom.clamp(minBottom, maxBottom);

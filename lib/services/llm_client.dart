@@ -596,12 +596,22 @@ class LlmClient {
   }) {
     final split = _splitSystems(messages);
     final effortField = _openAiReasoningEffort(reasoningEffort);
+    final chatMessages = _withReasoningContentFallback(
+      split.messages.map(_withoutResponsesOnlyFields).toList(),
+      forceReasoning:
+          ReasoningModels.usesDeepSeekThinkingParam(model) ||
+          split.messages.any(
+            (m) =>
+                m['role'] == 'assistant' &&
+                (m['reasoning_content'] ?? '').toString().trim().isNotEmpty,
+          ),
+    );
     return <String, dynamic>{
       'model': model,
       'messages': [
         if (split.frozen.trim().isNotEmpty)
           {'role': 'system', 'content': split.frozen},
-        ...split.messages.map(_withoutResponsesOnlyFields),
+        ...chatMessages,
         if (split.tail.trim().isNotEmpty)
           {'role': 'system', 'content': split.tail},
       ],
@@ -809,6 +819,25 @@ class LlmClient {
     final copy = Map<String, dynamic>.from(message);
     copy.remove('reasoning_encrypted');
     return copy;
+  }
+
+  /// thinking 模式网关要求历史里的所有 assistant 消息都带
+  /// `reasoning_content`；只要混入了“压缩确认 / 失败占位 / 最终正文”这类
+  /// 没有思考内容的助手消息，上游就会报
+  /// `The reasoning_content in the thinking mode must be passed back to the API`。
+  /// 这里给缺字段的 assistant 补空字符串，避免整轮 400。
+  static List<Map<String, dynamic>> _withReasoningContentFallback(
+    List<Map<String, dynamic>> messages, {
+    required bool forceReasoning,
+  }) {
+    if (!forceReasoning) return messages;
+    return [
+      for (final m in messages)
+        if (m['role'] == 'assistant' && !m.containsKey('reasoning_content'))
+          {...m, 'reasoning_content': ''}
+        else
+          m,
+    ];
   }
 
   /// Chat Completions 多模态是 `{type:image_url, image_url:{url}}`；

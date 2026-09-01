@@ -289,6 +289,8 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-09-02 2.6.5**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #374-#375）：
+  拾忆普通会话修复 thinking 历史里 assistant 缺失 `reasoning_content` 导致的 `LITELLM_ERROR 400`；输入区模型 / 思考强度 / 权限预设 / 缓存抽屉在键盘收起后跟随按钮重新定位。Windows 继续使用本机终端后端，不引入 Android Alpine 路径。
 - **2026-09-02 2.6.4**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #366-#373）：
   群聊成员接入真实工作目录与 `file_read` / `file_write` / `run_terminal` 工具，任务可落成真实文件；群聊按成员独立压缩上下文，历史按点名 / 上下级 / 直属下属过滤，并回传 `reasoning_content`。群聊输入区对齐普通会话（统一 API、附件、项目文件夹、思考开关强度、成员独立压缩）。运行中返回不再打断输出；思考展开后自动追最新；子代理上滑看历史不被拽回。修复长按输入框弹跳、文本菜单英文，以及拾忆引擎误弹「DSH 未安装」。Windows 继续使用本机终端后端，不引入 Android Alpine 路径。
 - **2026-09-01 2.6.3**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #330-#365）：

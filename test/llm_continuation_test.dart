@@ -70,6 +70,62 @@ void main() {
     }
   });
 
+  test('thinking 历史里缺失 reasoning_content 的 assistant 自动补空字段', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    late Map<String, dynamic> requestBody;
+    final handled = () async {
+      final request = await server.first;
+      requestBody =
+          jsonDecode(await utf8.decoder.bind(request).join())
+              as Map<String, dynamic>;
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType(
+          'text',
+          'event-stream',
+          charset: 'utf-8',
+        )
+        ..write(
+          'data: {"choices":[{"delta":{"content":"答案"},'
+          '"finish_reason":"stop"}]}\n\n',
+        )
+        ..write('data: [DONE]\n\n');
+      await request.response.close();
+    }();
+
+    try {
+      final client = LlmClient(
+        baseUrl: 'http://${server.address.host}:${server.port}/v1',
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro-0813',
+        temperature: 0.2,
+        maxTokens: 1024,
+        tools: const [],
+      );
+      await client.send([
+        {'role': 'system', 'content': 'FROZEN'},
+        {'role': 'user', 'content': '开始'},
+        {'role': 'assistant', 'content': '有思考', 'reasoning_content': '思考'},
+        {'role': 'assistant', 'content': '没有思考字段'},
+        {'role': 'user', 'content': '继续'},
+      ]);
+      await handled;
+
+      final messages = (requestBody['messages'] as List).cast<Map>();
+      final assistants = messages
+          .where((m) => m['role'] == 'assistant')
+          .toList();
+      expect(assistants, hasLength(2));
+      for (final assistant in assistants) {
+        expect(assistant.containsKey('reasoning_content'), isTrue);
+      }
+      expect(assistants[0]['reasoning_content'], '思考');
+      expect(assistants[1]['reasoning_content'], '');
+    } finally {
+      await server.close(force: true);
+    }
+  });
+
   test('DeepSeek 官方 API 网关思考模型发送 thinking + reasoning_effort', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     late Map<String, dynamic> requestBody;
