@@ -127,8 +127,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
 
     final now = DateTime.now().millisecondsSinceEpoch;
+    final userMsgId = groupChatNewId('gm');
     final user = GroupMessage(
-      id: groupChatNewId('gm'),
+      id: userMsgId,
       roomId: room.id,
       role: 'user',
       content: text,
@@ -149,6 +150,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       await _store.insertMessage(user);
       _jumpToLatest(force: true);
       final reworkCounts = <String, int>{};
+      // 追踪当前轮的"根消息 ID"——用于设置 Agent 消息的 replyToId
+      // 第一轮指向用户消息，后续轮次指向触发该轮的消息
+      var roundRootId = userMsgId;
       final queue = [...groupChatInitialTargets(text, room.agents)];
       while (queue.isNotEmpty && !_stop && mounted) {
         final batch = <GroupAgent>[];
@@ -157,11 +161,24 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           batch.add(agent);
         }
         if (batch.isEmpty) continue;
+        // 记录这一轮的 Agent 消息 ID，用于下一轮设置 replyToId
+        final batchMsgIds = [
+          for (var i = 0; i < batch.length; i++) groupChatNewId('gm')
+        ];
         final results = await Future.wait([
-          for (final agent in batch) _runAgent(agent),
+          for (var i = 0; i < batch.length; i++)
+            _runAgent(batch[i], replyToId: roundRootId, msgId: batchMsgIds[i]),
         ]);
         if (_stop || !mounted) break;
         if (results.any((result) => result.failed)) break;
+        // 下一轮的根消息：汇总这一批 Agent 消息
+        final nextRootIds = <String>[];
+        for (var i = 0; i < results.length; i++) {
+          if (results[i].message != null) {
+            nextRootIds.add(batchMsgIds[i]);
+          }
+        }
+        roundRootId = nextRootIds.isNotEmpty ? nextRootIds.first : roundRootId;
         final followups = groupChatNextFollowupTargets(
           speakers: batch,
           replies: [for (final result in results) result.message],
@@ -183,7 +200,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
-  Future<_AgentTurnResult> _runAgent(GroupAgent agent) async {
+  Future<_AgentTurnResult> _runAgent(GroupAgent agent, {required String replyToId, required String msgId}) async {
     final room = _room;
     if (room == null) return const _AgentTurnResult();
     final profile = groupChatProfileFor(
@@ -207,7 +224,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       ).showSnackBar(SnackBar(content: Text(message)));
       return _AgentTurnResult(
         failed: true,
-        message: await _failedDraft(room, agent, message),
+        message: await _failedDraft(room, agent, message, replyToId: replyToId, msgId: msgId),
       );
     }
     final model = agent.model.trim().isEmpty ? profile.model : agent.model;
@@ -219,16 +236,17 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       ).showSnackBar(SnackBar(content: Text(message)));
       return _AgentTurnResult(
         failed: true,
-        message: await _failedDraft(room, agent, message),
+        message: await _failedDraft(room, agent, message, replyToId: replyToId, msgId: msgId),
       );
     }
     final draft = GroupMessage(
-      id: groupChatNewId('gm'),
+      id: msgId,
       roomId: room.id,
       role: 'agent',
       agentId: agent.id,
       createdAt: DateTime.now().millisecondsSinceEpoch,
       streaming: true,
+      replyToId: replyToId,
     );
     setState(() => _messages = [..._messages, draft]);
     _jumpToLatest();
@@ -249,7 +267,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         draft.content = turn.text;
         draft.reasoning = turn.reasoning;
         final now = DateTime.now();
-        if (now.difference(lastEmit).inMilliseconds < 50) return;
+        if (now.difference(lastEmit).inMilliseconds < groupChatStreamEmitMinIntervalMs) return;
         lastEmit = now;
         if (mounted) setState(() {});
         _jumpToLatest();
@@ -268,16 +286,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     } on LlmCancelledException {
       // 用户点了停止，保留已经流出来的内容。
     } catch (e) {
-      failure = e.toString();
+      failure = '网络或接口异常';
       final text = draft.content.trim();
-      draft.content = text.isEmpty ? '回复失败：$failure' : '$text\n\n回复失败：$failure';
+      draft.content = text.isEmpty ? '回复失败' : '$text\n\n回复失败';
     } finally {
       _activeClients.remove(client);
     }
     final cached = client.lastCachedTokens;
     final input = client.lastPromptTokens ?? client.lastInputTokens;
     if (mounted && cached != null && input != null && input > 0) {
-      final hit = cached.clamp(0, input).toInt();
+      final hit = cached > input ? input : cached;
       setState(() {
         _roundCachedTokens += hit;
         _roundInputTokens += input;
@@ -317,15 +335,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Future<GroupMessage?> _failedDraft(
     GroupRoom room,
     GroupAgent agent,
-    String message,
-  ) async {
+    String message, {
+    required String replyToId,
+    required String msgId,
+  }) async {
     final draft = GroupMessage(
-      id: groupChatNewId('gm'),
+      id: msgId,
       roomId: room.id,
       role: 'agent',
       agentId: agent.id,
       content: message,
       createdAt: DateTime.now().millisecondsSinceEpoch,
+      replyToId: replyToId,
     );
     await _store.insertMessage(draft);
     if (mounted) {

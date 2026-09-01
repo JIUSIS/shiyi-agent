@@ -250,4 +250,79 @@ void main() {
     expect(groupAgentInitial('  Bob'), 'B');
     expect(groupAgentInitial('   ', '1'), '1');
   });
+
+  // ---- 独立 Agent 可见性测试 ----
+
+  test('用户消息对所有 Agent 可见', () {
+    final msg = user('你好');
+    expect(
+      groupChatMessageVisibleTo(message: msg, agent: lead, agents: org),
+      isTrue,
+    );
+    expect(
+      groupChatMessageVisibleTo(message: msg, agent: dev, agents: org),
+      isTrue,
+    );
+  });
+
+  test('Agent 只能看到自己发的消息', () {
+    final msg = agentMsg('dev', '我来做', id: 'm1');
+    expect(
+      groupChatMessageVisibleTo(message: msg, agent: dev, agents: org),
+      isTrue,
+    );
+    expect(
+      groupChatMessageVisibleTo(message: msg, agent: lead, agents: org),
+      isTrue, // 主编能看到下属的消息
+    );
+    expect(
+      groupChatMessageVisibleTo(message: msg, agent: design, agents: org),
+      isFalse, // 设计看不到开发的独立消息
+    );
+  });
+
+  test('主编能看到所有下属的消息', () {
+    final devMsg = agentMsg('dev', '开发完成', id: 'm1');
+    final designMsg = agentMsg('design', '设计完成', id: 'm2');
+    expect(
+      groupChatMessageVisibleTo(message: devMsg, agent: lead, agents: org),
+      isTrue,
+    );
+    expect(
+      groupChatMessageVisibleTo(message: designMsg, agent: lead, agents: org),
+      isTrue,
+    );
+  });
+
+  test('下属看不到平级同事的消息', () {
+    final devMsg = agentMsg('dev', '开发完成', id: 'm1');
+    expect(
+      groupChatMessageVisibleTo(message: devMsg, agent: design, agents: org),
+      isFalse,
+    );
+  });
+
+  test('过滤后的历史只有该 Agent 可见的消息', () {
+    final history = [
+      user('用户消息'),
+      agentMsg('lead', '主编回复', id: 'm1'),
+      agentMsg('dev', '开发回复', id: 'm2'),
+      agentMsg('design', '设计回复', id: 'm3'),
+    ];
+    // 主编看到：用户 + 主编自己 + 下属的
+    final leadHistory = groupChatAgentHistory(history, lead, org);
+    expect(leadHistory.length, 4); // 所有消息
+
+    // 开发看到：用户 + 自己的
+    final devHistory = groupChatAgentHistory(history, dev, org);
+    expect(devHistory.length, 2); // 用户 + 自己的
+    expect(devHistory.map((m) => m.id), containsAll(['u1', 'm2']));
+    expect(devHistory.map((m) => m.id), isNot(contains('m1')));
+    expect(devHistory.map((m) => m.id), isNot(contains('m3')));
+
+    // 设计看到：用户 + 自己的
+    final designHistory = groupChatAgentHistory(history, design, org);
+    expect(designHistory.length, 2);
+    expect(designHistory.map((m) => m.id), containsAll(['u1', 'm3']));
+  });
 }

@@ -358,6 +358,11 @@ class AppDatabase {
     // v22 -> v23：拾忆群聊（房间 / 独立 Agent / 消息）。
     if (oldV < 23) {
       await GroupChatStore.ensureTables(db);
+      await GroupChatStore.ensureGroupMessagesStreamingColumn(db);
+    }
+    // v23 -> v24：消息隔离，每个 Agent 只看到自己相关的消息（真独立 Agent）。
+    if (oldV < 24) {
+      await GroupChatStore.ensureGroupMessagesReplyToColumn(db);
     }
   }
 
@@ -427,6 +432,8 @@ class AppDatabase {
     }
     await _ensureSortOrderColumns(db);
     await GroupChatStore.ensureTables(db);
+    await GroupChatStore.ensureGroupMessagesStreamingColumn(db);
+    await GroupChatStore.ensureGroupMessagesReplyToColumn(db);
   }
 
   Future<void> _ensureReasoningEncryptedColumn(Database db) async {

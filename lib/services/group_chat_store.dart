@@ -39,6 +39,8 @@ class GroupChatStore {
         agent_id TEXT,
         content TEXT NOT NULL DEFAULT '',
         reasoning TEXT NOT NULL DEFAULT '',
+        streaming INTEGER NOT NULL DEFAULT 0,
+        reply_to TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL
       )
     ''');
@@ -50,6 +52,28 @@ class GroupChatStore {
     );
     await ensureAgentOrgColumns(db);
     await ensureGroupRoomProjectColumn(db);
+    await ensureGroupMessagesStreamingColumn(db);
+    await ensureGroupMessagesReplyToColumn(db);
+  }
+
+  static Future<void> ensureGroupMessagesStreamingColumn(Database db) async {
+    final cols = await db.rawQuery('PRAGMA table_info(group_messages)');
+    final names = {for (final col in cols) '${col['name']}'};
+    if (!names.contains('streaming')) {
+      await db.execute(
+        'ALTER TABLE group_messages ADD COLUMN streaming INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+  }
+
+  static Future<void> ensureGroupMessagesReplyToColumn(Database db) async {
+    final cols = await db.rawQuery('PRAGMA table_info(group_messages)');
+    final names = {for (final col in cols) '${col['name']}'};
+    if (!names.contains('reply_to')) {
+      await db.execute(
+        "ALTER TABLE group_messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''",
+      );
+    }
   }
 
   static Future<void> ensureGroupRoomProjectColumn(Database db) async {

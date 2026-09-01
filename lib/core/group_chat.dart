@@ -2,6 +2,13 @@ import 'package:flutter/material.dart';
 
 import 'models.dart';
 
+String groupChatNewId(String prefix) {
+  final now = DateTime.now();
+  final timestamp = now.microsecondsSinceEpoch;
+  final random = now.hashCode ^ (Object().hashCode);
+  return '$prefix${timestamp}_$random';
+}
+
 const groupAgentPalette = <Color>[
   Color(0xFF0A84FF),
   Color(0xFF34C759),
@@ -15,6 +22,7 @@ const groupAgentPalette = <Color>[
 
 const groupChatMaxParallelAgents = 3;
 const groupChatMaxReworksPerHandoff = 3;
+const groupChatStreamEmitMinIntervalMs = 50;
 
 class GroupChatFollowup {
   final GroupAgent speaker;
@@ -28,13 +36,6 @@ class GroupChatFollowup {
   });
 
   String get handoffKey => '${speaker.id}>${target.id}';
-}
-
-int _groupChatIdSeq = 0;
-
-String groupChatNewId(String prefix) {
-  _groupChatIdSeq += 1;
-  return '$prefix${DateTime.now().microsecondsSinceEpoch}$_groupChatIdSeq';
 }
 
 String groupAgentInitial(String name, [String fallback = 'A']) {
@@ -183,6 +184,11 @@ class GroupMessage {
   final int createdAt;
   bool streaming;
 
+  /// 回复目标。当用户发消息时为空；当 Agent 回复时，
+  /// 指向触发这条消息的"根消息"（用户消息或被 @ 的 Agent 消息）。
+  /// 用于确定消息的可见范围。
+  String replyToId;
+
   GroupMessage({
     required this.id,
     required this.roomId,
@@ -192,6 +198,7 @@ class GroupMessage {
     this.reasoning = '',
     required this.createdAt,
     this.streaming = false,
+    this.replyToId = '',
   });
 
   bool get isUser => role == 'user';
@@ -203,6 +210,7 @@ class GroupMessage {
     'agent_id': agentId,
     'content': content,
     'reasoning': reasoning,
+    'reply_to': replyToId,
     'created_at': createdAt,
   };
 
@@ -213,6 +221,7 @@ class GroupMessage {
     agentId: (m['agent_id'] ?? '').toString(),
     content: (m['content'] ?? '').toString(),
     reasoning: (m['reasoning'] ?? '').toString(),
+    replyToId: (m['reply_to'] ?? '').toString(),
     createdAt: _toInt(m['created_at']),
   );
 }
@@ -463,7 +472,9 @@ List<Map<String, dynamic>> groupChatApiMessages({
   final out = <Map<String, dynamic>>[
     {'role': 'system', 'content': groupChatSystemPrompt(speaker, agents)},
   ];
-  for (final message in history) {
+  // 只取对该 Agent 可见的消息，实现真正的多 Agent 隔离
+  final visible = groupChatAgentHistory(history, speaker, agents);
+  for (final message in visible) {
     if (message.streaming && message.content.trim().isEmpty) continue;
     final text = message.content.trim();
     if (text.isEmpty) continue;
@@ -493,4 +504,47 @@ ApiProfile? groupChatProfileFor(
     }
   }
   return fallback ?? (profiles.isEmpty ? null : profiles.first);
+}
+
+/// 判断某条消息是否对某 Agent 可见。
+///
+/// 可见规则：
+/// - 用户消息 → 所有人可见
+/// - 自己发的 → 可见
+/// - 自己下属发的 → 主编可见（通过 reportsToId 判断上下级）
+bool groupChatMessageVisibleTo({
+  required GroupMessage message,
+  required GroupAgent agent,
+  required List<GroupAgent> agents,
+}) {
+  // 1. 用户消息 → 所有人可见
+  if (message.isUser) return true;
+
+  // 2. 自己发的 → 可见
+  if (message.agentId == agent.id) return true;
+
+  // 3. 自己的下属发的 → 主编可见
+  //    检查消息发送者是否是 agent 的下属
+  final speaker = groupChatAgentById(message.agentId, agents);
+  if (speaker != null && speaker.reportsToId.trim() == agent.id) return true;
+
+  return false;
+}
+
+/// 为某个 Agent 过滤消息历史：只保留他可见的消息。
+/// 这是实现真正独立 Agent 的核心——每个 Agent 只能看到与自己相关的消息。
+List<GroupMessage> groupChatAgentHistory(
+  List<GroupMessage> allMessages,
+  GroupAgent agent,
+  List<GroupAgent> agents,
+) {
+  return [
+    for (final message in allMessages)
+      if (groupChatMessageVisibleTo(
+        message: message,
+        agent: agent,
+        agents: agents,
+      ))
+        message,
+  ];
 }
