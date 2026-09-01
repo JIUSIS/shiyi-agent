@@ -79,7 +79,7 @@
 - 输入框、消息气泡、工具胶囊、状态条、提问面板、附件预览等能共享的部分必须优先抽成共享组件，禁止复制两套后分别维护。
 - 只有协议或引擎能力确实不同的界面允许单独实现，并需在维护文档说明原因。
 - 输入区的液态玻璃抽屉（选择模型 / 权限预设 / 思考强度）必须走 `LiquidGlassPopupRoute`（透明 `PopupRoute`，`PopScope canPop:false` 拦截返回）：按返回键先收抽屉，模型抽屉二级菜单先回一级再收。禁止改回 `OverlayEntry` 直插 root overlay——不进导航栈会让返回键穿透抽屉直接退页。抽屉内容切换（如二级菜单）走路由级 `markNeedsBuild`，关闭走「先播收合动画再 `removeRoute`」。
-- 子代理按钮可点：从按钮上沿浮出 mini 会话，多个子代理左右滑查看。走 `OverlayPortal` + 状态条 `PopScope`，点空白或返回关闭。禁止再 `Navigator.push(PopupRoute)` 挂 rootNavigator——状态条重建会丢旧路由，连续点击会叠多层并红屏。小窗用实心 Material，不要再套 `LiquidGlassLens` / `MessageBubble` 玻璃。拾忆读 live 转写本，DSH 读 `subagent.history`。两端共用 `SubagentStatusBar`。
+- 子代理按钮可点：从按钮上沿浮出 mini 会话，多个子代理左右滑查看。走 `OverlayPortal` + 实心 Material，点空白或返回关闭。禁止再 `Navigator.push(PopupRoute)` 挂 rootNavigator（状态条重建会丢旧路由，连点会叠多层并红屏）。不要套 `LiquidGlassLens` / `MessageBubble` 玻璃。小窗里用户上滑看历史后不要自动跳回底部，只有贴底时才跟随最新。拾忆读 live 转写本，DSH 读 `subagent.history`。两端共用 `SubagentStatusBar`。
 - 输入区项目目录入口收成文件夹图标，放在权限盾牌旁边，只留图标。缓存和子代理做成输入框上方悬浮芯片：共用 `ChatComposerChip`（高 32、字 13、行高 18/13），`ChatComposerFloatChips` 里缓存永远最左、子代理在右边。进度圈强制 10×10。
 - 子代理列表跟 live 任务，不跟主 agent 是否 running。父会话 idle / 等待子代理返回时，状态条和芯片不得清掉；拾忆本轮快照留到下一条用户消息；DSH 跟 `subagent.list`。
 
@@ -98,15 +98,15 @@
 - 会话拖影高度用 `homeDragCardBodyHeight`（槽位减 8px 间距），禁止把列表间距画进卡面，否则首帧会上下涨一截。
 - 会话拖入另一项目：源列表空占位收起，目标列表先插入 `HomeDragInsertGap` 挤开空隙，再从手指飞入；禁止原地缩小后瞬移。拖回原项目后源占位再打开。跨项目飞入不用回弹曲线，已经出现在目标列表里的新卡片不能再收成 0。
 - 提交后位移立刻贴齐再写库，禁止旧位移套在新顺序上反向弹回（换位后第一下会炸）。飞入结束后等源卡片按最终顺序画完一帧，再卸拖影。
-- 会话拖到另一项目/工作区：未展开停满 1 秒自动展开；已展开停满 1 秒显示「松开以移入」。可释放后占位空隙跟手指在目标列表里移动，松手插到该位置，禁止永远钉在第一格。另一指滚动列表时必须按新坐标重测插入下标，不能冻在拖起那一帧的可见卡片上。测槽位必须用不含 Transform 的布局盒，禁止用动画中的位移去减目标位移。会话写入目标项目/工作区的那一帧必须贴齐位移，且不能再套 foreign translate，否则归位会按卡片高度弹一下。跨组提交完成前源槽必须保持收起，且只收被拖的那张；`keepCollapsed` / `homeDragCardSlotFactor` 不能套到源组其它卡片，否则 BCD 会整组消失再出现。源槽高度不能只看 draggingId。DSH 跨工作区飞入结束后先乐观更新本地 `sessionIds` 和会话 cwd，源名单里没有被拖项之后才能清拖拽态；提交中 `_load` / `_loadSessions` 要静默，禁止先 setState 再整表刷新，否则 BCD 会被撑开再弹回。远放不能直接移入别的项目。拖回原项目必须立刻清掉「松开以移入」，松手归位原项目，禁止沿用上一个目标。
+- 会话拖到另一项目/工作区：未展开停满 1 秒自动展开；已展开停满 1 秒显示「松开以移入」。可释放后占位空隙跟手指在目标列表里移动，松手插到该位置，禁止永远钉在第一格。另一指滚动列表时必须按新坐标重测插入下标，不能冻在拖起那一帧的可见卡片上。测槽位必须用不含 Transform 的布局盒，禁止用动画中的位移去减目标位移。会话写入目标项目/工作区的那一帧必须贴齐位移，且不能再套 foreign translate，否则归位会按卡片高度弹一下。跨组提交完成前源槽必须保持收起，且只收被拖的那张；`keepCollapsed` / `homeDragCardSlotFactor` 不能套到源组其它卡片，否则 BCD 会整组消失再出现。源槽高度不能只看 draggingId。拾忆会话拖入另一项目仍走乐观更新。DSH 不开放会话跨工作区移动，悬停其他工作区不得展开或显示「松开以移入」。远放不能直接移入别的项目。拖回原项目必须立刻清掉「松开以移入」，松手归位原项目，禁止沿用上一个目标。
 - 会话在展开列表里拖动时不能被 `SizeTransition` 裁剪命中区；反馈层必须是独立卡片树，不能和列表共用左滑 State。
 - 列表外层必须裁剪：手机 `SafeArea` 内侧 `ClipRect`，搜索栏用不透明 `Material`，`Expanded` 列表再包 `ClipRect`。禁止给会话 ListView 设 `Clip.none` 盖住搜索栏/状态栏。展开列表内部 `unclipped` 只留给长按命中。
 - 顺序写入 `sessions.sort_order` / `projects.sort_order`（缺列由 `_ensureSortOrderColumns` 补，不要误升 DB version 清数据）。
 - 左滑 / 交错展开 / 分组头 / 飞行层抽成共享组件（`lib/widgets/swipe_actions.dart`、`home_drag.dart`、`staggered_sessions.dart`），DSH 工作区页会话级拖拽复用同一套。
 - 左滑必须用 `Listener` 跟手，禁止 `onHorizontalDrag*` 进竞技场；否则会话卡片长按会被抢走。展开列表 `unclipped` 时禁止包 `SizeTransition`。长按计时期间左滑有 300ms 启动窗口，拖中的卡片 `disableSwipe`。
-- DSH 工作区按 `workspace.sessionIds` 显示顺序；重排走 `dshReorderPlanForInsertion` → `workspace.insertSessionBefore`，禁止按 `session.list` 的 `updatedAt` 盖掉服务端顺序。跨工作区提交先乐观更新本地 `sessionIds` 和 cwd，再静默 `_load()`。`insertSessionBefore` 只能动已入账 id；cwd 兜底会话要先 `session.create(workspaceId)` 入账。`session.create` 不能同时带 `workspaceId` 和 `cwd`。
+- DSH 工作区按 `workspace.sessionIds` 显示顺序；重排走 `dshReorderPlanForInsertion` → `workspace.insertSessionBefore`，禁止按 `session.list` 的 `updatedAt` 盖掉服务端顺序。DSH 会话不跨工作区提交。`insertSessionBefore` 只能动已入账 id；cwd 兜底会话要先 `session.create(workspaceId)` 入账。`session.create` 不能同时带 `workspaceId` 和 `cwd`。
 - DSH 工作区卡片长按排序走 `workspace.insertBefore`（`insertWorkspaceBefore`），和拾忆项目拖拽同一套挤开/飞回。工作区展开状态只在首次进入恢复偏好，之后 `_load` 不得整表盖回旧展开集；长按收起时同步写 `_savedExpanded`。
-- 会话拖到另一个工作区或左滑搬家：官方没有改 `header.cwd` 的 RPC，必须走内置插件 `POST /__shiyi/move-session`（改 zstd/jsonl 头、搬日志目录、registry detach/attach）。插件补丁只写 `$DSH_HOME/cordis.patch.yml`，禁止再写 `profiles/web/cordis.patch.yml`，否则 duplicate id 会让 DSH 起不来。启动最前面若 profile overlay 存在但不是顶层 YAML 数组（空文件/纯注释/对象），写成 `[]`，不要绑在插件部署或 `bin.js` 探测上。插件未加载且 cwd 已一致才允许 attach / `insertSessionBefore` 兜底。归属显示也要 cwd 对得上，不能只看 `sessionIds`。
+- DSH 三端关闭会话跨工作区移动（拖卡片 / 左滑搬家都不提供）。会话只能在本工作区内 `insertSessionBefore` 排序。本机搬家插件 `POST /__shiyi/move-session` 只留给工作区文件夹切换（改 zstd/jsonl 头、搬日志目录、registry detach/attach）。插件补丁只写 `$DSH_HOME/cordis.patch.yml`，禁止再写 `profiles/web/cordis.patch.yml`，否则 duplicate id 会让 DSH 起不来。启动最前面若 profile overlay 存在但不是顶层 YAML 数组（空文件/纯注释/对象），写成 `[]`，不要绑在插件部署或 `bin.js` 探测上。插件未加载且 cwd 已一致才允许 attach / `insertSessionBefore` 兜底。归属显示也要 cwd 对得上，不能只看 `sessionIds`。
 - #243「会话长按无拖影」已由 #245 重建关闭。后续视觉/跨项目问题见 `docs/fix-log.md` #246-#273，不要再按 #243 的猜测补丁或重新接系统 Draggable。
 
 ## 拾忆跨会话查阅
@@ -154,13 +154,29 @@
 ## 会话压缩入口
 - 输入区常驻 `ChatCompressionButton` 是唯一手动压缩入口。禁止再在达到阈值时弹出右下角「压缩上下文」胶囊。
 
+## 拾忆群聊
+- 只属于拾忆，DSH 不做群聊。入口在拾忆主页会话 tab 顶部「群聊」条，以及功能页群聊列表。不进底栏第五项，DSH 主页不加。
+- `HomeGroupChats` 不进长按拖拽；切回会话 tab 时刷新群聊列表。主页与功能页共用 `GroupRoomTile`，左滑编辑/删除。卡片必须和会话卡同一套：36 圆角头像、15.5 标题、12.5 副标题、14 圆角玻璃卡；头像用太极八卦 `BaguaAvatar`，禁止再叠成员色块或 `person_2`。
+- 群聊会话页必须走共享聊天 UI：`ChatFloatingComposerScaffold` + `LiquidGlassChatComposer` + `MessageBubble`。禁止再画一套实心底输入框或自定义气泡。输入区不放附件按钮（群聊 `tools: []`）。点名芯片用 `ChatComposerChip`。红绿灯返回、17 号标题、右侧 `FrostedSettingsButton` 进成员设置，禁止用双人 `IconButton`。
+- 群聊所有推入页（列表 / 新建编辑 / Agent / 会话）包 `MacBackFade`，和拾忆会话同一套预测性返回淡出。新消息走 `MessageBubble.animateEnter`。主页群聊展开/收起走 `StaggeredSessions`。从群聊返回主页/列表后等 350ms 再刷新，避免退场动画拆树。
+- 群聊标识一律太极八卦：分组头 / 空态用 `BaguaIcon`，功能页入口和卡片用 `BaguaAvatar`。
+- 功能页群聊空态对齐技能页：56 八卦图标、17 号标题、`CupertinoButton.filled`。新建/编辑/Agent 页红绿灯返回、64 导航栏、17 号标题、右侧 `CupertinoButton` 保存；表单走 `IosLabeledField` / `IosIconTile`，和设置页同一套，禁止 Material `TextButton` 加无标签输入框。
+- 功能页可建多个群聊、可删除（左滑删除 / 编辑）。
+- 每个 Agent 独立：自己的名字、职位、人设提示词、拾忆 API 配置和模型。人设只进该成员的 system，不改全局人设。
+- 新建/编辑可粘贴 mermaid 或字符思维导图：识别角色人数、人设、汇报关系。填入只替换当前编辑中的成员和标题，不自动保存。每人先套当前默认 API 配置（`apiProfiles.first`）和模型，之后可单独改。有起步路线时可选「全部 / 最小 N 人」。
+- 官方会话工具不进群聊（`tools: []`），没有文件 / 终端 / 子代理 / 记忆写入。
+- 组织是公司结构，不是全员抢答：`reports_to` 为空的人对接用户；其他人被 `@名字` 或上级安排后才发言，说完向直接上级汇报。正常推进不设固定轮次/每人次数上限；只有明确「打回」的同一交接环节最多 3 次。
+- 群聊按并行批次调度：同一批最多 3 个 Agent 同时生成；多个成员汇报同一位上级时合并成一次排队，已超限或已在队列里的成员不重复排队。
+- 每个 Agent 的思考过程单独显示在自己的气泡里，禁止把 reasoning 写进正文。
+- 库表 `group_rooms` / `group_agents` / `group_messages`，DB v23 只 `CREATE TABLE IF NOT EXISTS`；`title` / `reports_to` 在 `ensureTables` 里 ALTER，不清数据。
+
 ## DSH 连接
 - 三种并列：`local`（本机 `http://127.0.0.1:3080`，可安装/启停）/ `lan`（主机+端口，默认 3080）/ `remote`（完整 URL，可选 Token）。默认 `local`。
 - API / WS 一律读当前连接 URL，不要写死 `127.0.0.1:3080`。公网 URL 带路径前缀时，WS 必须挂在同一前缀下（`/app/api/events.mux`）。
 - DSH 文件页必须读取当前连接的 `host.describe` / `host.listDirectory`，初始目录取该主机 `cwd`，缺省再取远端 `home`。切换 local / lan / remote 时清掉旧路径、面包屑和在途结果，禁止把手机 `FileWorkspace.defaultWorkspacePath` 发给局域网/公网，也禁止远端失败后回退手机文件系统。`host.createDirectory` 必须发送父目录 `path` + 单段 `name`。当前官方 `host.*` 没有文件读取/写入/删除 RPC，不要用本地 `File` API伪装远端能力。
 - DSH 文件页的路径选择器必须展示当前远端可访问的根目录：Windows 通过 `host.listDirectory` 并发探测 `A:\` 到 `Z:\`，只保留成功盘符；Linux / Alpine 只探测 `/`。根盘扫描不能使用不存在的 `host.listDrives` RPC，也不能扫描手机本地磁盘。
 - 工作区左滑的“工作区文件夹”必须进入应用内 DSH 文件页并用 `host.listDirectory` 浏览工作区路径；不要对局域网 / 公网工作区调用 `host.openPath`，该接口依赖远端系统打开权限，可能返回 `403`。
-- 局域网 / 公网禁止 `ensureRunning()` 拉起本机进程，禁止 `stop()` / `dshStopOnExit` 杀本机 DSH，禁止用远程失败去卸本机包。搬家插件 `POST /__shiyi/move-session` 只存在于本机补丁；远程没有就降级，不要为了补插件去重启本机 DSH。
+- 局域网 / 公网禁止 `ensureRunning()` 拉起本机进程，禁止 `stop()` / `dshStopOnExit` 杀本机 DSH，禁止用远程失败去卸本机包。搬家插件 `POST /__shiyi/move-session` 只存在于本机补丁；局域网 / 公网禁止打这条未知路径。DSH 会话跨工作区移动三端关闭：悬停其他工作区不展开、不显示「松开以移入」，松手飞回本工作区原位；左滑不再提供搬家。同工作区排序仍走 `insertSessionBefore`，手势不得 await RPC。工作区文件夹切换仍可用本机插件（8s，不重启 DSH）；局域网 / 公网禁止打 `/__shiyi/move-session`。远程没有插件不要为了补插件去重启本机 DSH。
 - Token 进 `flutter_secure_storage`，不要写进 prefs JSON。局域网 DSH 需监听 `0.0.0.0`，手机不要填 `127.0.0.1`。
 - `lan` 只连接用户填写的主机与端口，禁止自动扫描。Host/端口候选扫描只在 `remote` 模式启用；远程自定义 `dshRemoteHost` 优先于内置 `127.0.0.1` / `localhost` / `0.0.0.0` 与常用端口组合，命中后 API / WS 共用同一 Host。
 - 内置回环 Host 返回 `200` 但 `session.list` / `workspace.list` 为空时，视为公网来源隔离视图，禁止记成连接成功；用户显式填写的 Host 可以连接空白新实例。

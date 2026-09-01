@@ -55,6 +55,33 @@ bool dshSessionCwdMatchesWorkspace({
   return dshNormalizedPath(sessionCwd) == dshNormalizedPath(workspacePath);
 }
 
+/// 搬家插件只装在本机 DSH。局域网 / 公网不要打 `/__shiyi/move-session`：
+/// 未知路径可能一直等到 HTTP 超时，拖卡片会卡死。
+bool dshCanUseMoveSessionPlugin({required bool isLocal}) => isLocal;
+
+/// DSH 三端都不开放把会话拖到另一个工作区。只能在本工作区内排序。
+const bool kDshCrossWorkspaceSessionMoveEnabled = false;
+
+const kDshCrossWorkspaceMoveDisabledMessage = 'DSH 会话只能在本工作区内排序';
+
+/// cwd 已一致才能直接 insert。本机目录不同走搬家插件。
+/// 远端目录不同：官方没有改 header.cwd 的 RPC，当场拒绝，不打假接口。
+enum DshCrossWorkspaceRelocateKind { insert, plugin, unsupported }
+
+/// 官方 DSH 明确不支持把同一条会话换到另一个工作区。
+const kDshRemoteCrossWorkspaceUnsupportedMessage =
+    '官方 DSH 不能把同一条会话换到另一个工作区。cwd 写死在会话日志头，'
+    'insertSessionBefore 只能重排同一工作区已入账会话。本机可用搬家插件。';
+
+DshCrossWorkspaceRelocateKind dshCrossWorkspaceRelocateKind({
+  required bool isLocal,
+  required bool cwdMatches,
+}) {
+  if (cwdMatches) return DshCrossWorkspaceRelocateKind.insert;
+  if (isLocal) return DshCrossWorkspaceRelocateKind.plugin;
+  return DshCrossWorkspaceRelocateKind.unsupported;
+}
+
 /// 跨工作区移动时，cwd 对不上就必须改 zstd/jsonl 头并搬目录。
 /// 已经一致则返回 null，这时才允许走 attach / insert 兜底。
 String? dshSessionMoveCwd({
@@ -1004,6 +1031,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
             sessionId: sessionId,
             workspaceId: target.workspaceId,
             workspacePath: path,
+            restartIfMissing: true,
           );
           if (result == null) {
             throw DshApiException(
@@ -1070,46 +1098,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     }
   }
 
-  Future<void> _moveSession(DshSessionSummary s) async {
-    if (_workspaces.isEmpty) {
-      _toast('还没有工作区');
-      return;
-    }
-    final chosen = await showIosFadeModalPopup<DshWorkspace>(
-      context: context,
-      builder: (ctx) => CupertinoTheme(
-        data: iosCupertinoTheme(context),
-        child: CupertinoActionSheet(
-          title: Text(
-            '移动「${s.title == null || s.title!.isEmpty ? '未命名会话' : s.title!}」到工作区',
-          ),
-          actions: [
-            for (final w in _workspaces)
-              CupertinoActionSheetAction(
-                onPressed: () => Navigator.pop(ctx, w),
-                child: Text(_displayName(w)),
-              ),
-          ],
-          cancelButton: CupertinoActionSheetAction(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-        ),
-      ),
-    );
-    if (chosen == null || !mounted) return;
-    try {
-      await _relocateSessionToWorkspace(s.sessionId, chosen.workspaceId);
-      if (mounted) {
-        setState(() => _expandedGroups.add(chosen.workspaceId));
-        unawaited(_saveExpanded());
-        await _load();
-      }
-    } catch (e) {
-      _toast('移动失败：$e');
-    }
-  }
-
   /// 在工作区里新建会话（左滑工作区 → 新建会话，拾忆项目同款交互）。
   /// 创建后自动挂到该工作区并进入聊天；空会话不再自动归档，由用户左滑手动归档。
   Future<void> _newSessionInWorkspace(DshWorkspace w) async {
@@ -1155,6 +1143,40 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   void _toast(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  String _moveFailedMessage(Object e) {
+    if (e is DshApiException) return e.message;
+    return '移动失败：$e';
+  }
+
+  DshCrossWorkspaceRelocateKind _relocateKindFor(
+    String sessionId,
+    String workspaceId,
+  ) {
+    DshWorkspace? target;
+    DshSessionSummary? session;
+    for (final w in _workspaces) {
+      if (w.workspaceId == workspaceId) {
+        target = w;
+        break;
+      }
+    }
+    for (final s in _sessions) {
+      if (s.sessionId == sessionId) {
+        session = s;
+        break;
+      }
+    }
+    return dshCrossWorkspaceRelocateKind(
+      isLocal: DshEndpoint.isLocal(widget.shiyi.settings),
+      cwdMatches:
+          target != null &&
+          dshSessionCwdMatchesWorkspace(
+            sessionCwd: session?.cwd,
+            workspacePath: target.path,
+          ),
+    );
   }
 
   String _timeLabel(int ms) {
@@ -1552,7 +1574,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       onOpenRectChanged: _onOpenSwipeRectChanged,
       swipeKey: s.sessionId,
       disableSwipe: disableSwipe,
-      actionWidth: 232,
+      actionWidth: 176,
       actions: [
         CircularSwipeAction(
           icon: CupertinoIcons.pencil,
@@ -1562,16 +1584,6 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
           onTap: () {
             _openSwipeKey.value = null;
             _renameSession(s);
-          },
-        ),
-        CircularSwipeAction(
-          icon: CupertinoIcons.folder_open,
-          label: '工作区',
-          backgroundColor: _iosGray,
-          foregroundColor: Colors.white,
-          onTap: () {
-            _openSwipeKey.value = null;
-            _moveSession(s);
           },
         ),
         CircularSwipeAction(
@@ -1722,7 +1734,9 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     _crossCenters.clear();
   }
 
-  void _clearDragPreview() {
+  void _clearDragPreview() => _endDragVisuals(clearCommit: true);
+
+  void _endDragVisuals({required bool clearCommit}) {
     _hoverTimer?.cancel();
     _hoverTimer = null;
     _hoveringWorkspaceId = null;
@@ -1742,9 +1756,11 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     _dropCommitted = false;
     _flying = false;
     _crossDropCommitting = false;
-    _commitMoveSessionId = null;
-    _commitMoveWorkspaceId = null;
-    _commitMoveIndex = 0;
+    if (clearCommit) {
+      _commitMoveSessionId = null;
+      _commitMoveWorkspaceId = null;
+      _commitMoveIndex = 0;
+    }
     _flyStartTopLeft = null;
   }
 
@@ -2044,6 +2060,15 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       _cancelHover();
     }
     if (crossWorkspace) {
+      if (!kDshCrossWorkspaceSessionMoveEnabled) {
+        if (_hoveringWorkspaceId != null || _dropReadyWorkspaceId != null) {
+          _cancelHover();
+        }
+        if (_sessionPreviewTo != _sessionPreviewFrom) {
+          setState(() => _sessionPreviewTo = _sessionPreviewFrom);
+        }
+        return;
+      }
       final target = hoverWorkspace;
       if (target == null) return;
       _onHoverWorkspace(target, expanded: _expandedGroups.contains(target));
@@ -2081,6 +2106,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   }
 
   void _scheduleHoverTick(String workspaceId, {required bool expanded}) {
+    if (!kDshCrossWorkspaceSessionMoveEnabled) return;
     _hoverTimer?.cancel();
     void fire() {
       if (!mounted || _draggingSessionId == null) return;
@@ -2113,6 +2139,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   void _onHoverWorkspace(String workspaceId, {required bool expanded}) {
     if (_draggingSessionId == null) return;
+    if (!kDshCrossWorkspaceSessionMoveEnabled) return;
     if (_hoveringWorkspaceId == workspaceId) return;
     _hoveringWorkspaceId = workspaceId;
     _hover.onEnter(workspaceId, DateTime.now());
@@ -2268,8 +2295,8 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       }
     }
     if (!mounted) {
-      _removeDragVisuals();
       _flying = false;
+      _removeDragVisuals();
       return;
     }
     if (kHomeDragSnapOnCommit) {
@@ -2279,20 +2306,22 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       setState(() {});
       await WidgetsBinding.instance.endOfFrame;
       if (!mounted) return;
-      await persist();
-      if (!mounted) return;
-      setState(_clearOrderOverride);
-      await WidgetsBinding.instance.endOfFrame;
+      unawaited(_persistAfterFly(persist));
       return;
     }
     applyOverride();
     _clearDragPreview();
     setState(() {});
     await WidgetsBinding.instance.endOfFrame;
-    await persist();
-    if (!mounted) return;
-    setState(_clearOrderOverride);
-    await WidgetsBinding.instance.endOfFrame;
+    unawaited(_persistAfterFly(persist));
+  }
+
+  Future<void> _persistAfterFly(Future<void> Function() persist) async {
+    try {
+      await persist();
+    } finally {
+      if (mounted) setState(_clearOrderOverride);
+    }
   }
 
   Future<void> _commitSessionDrag([Offset? global]) async {
@@ -2310,7 +2339,8 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     if (kHomeDragCrossProjectNeedsDropReady &&
         sessionId != null &&
         dropReady != null &&
-        dropReady != workspaceId) {
+        dropReady != workspaceId &&
+        kDshCrossWorkspaceSessionMoveEnabled) {
       await _flyCrossWorkspaceThenDrop(
         sessionId: sessionId,
         toWorkspaceId: dropReady,
@@ -2491,44 +2521,84 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     required String toWorkspaceId,
     required int toIndex,
   }) async {
-    setState(() {
-      _flying = true;
-      _crossDropCommitting = true;
-    });
-    final landing = _crossWorkspaceLanding(toWorkspaceId, toIndex);
-    if (kHomeDragCrossProjectFliesToSlot &&
-        kHomeDragOwnedOverlay &&
-        _dragOverlay.isShowing &&
-        landing != null) {
-      await _dragOverlay.flyTo(landing, curve: Curves.easeOutCubic);
-    } else if (_dragOverlay.isShowing) {
-      await _dragOverlay.land();
-    }
-    if (!mounted) {
-      _removeDragVisuals();
-      _flying = false;
-      return;
-    }
-    var expandTarget = false;
-    setState(() {
-      _prepareCrossDropCommit();
-      _commitMoveSessionId = sessionId;
-      _commitMoveWorkspaceId = toWorkspaceId;
-      _commitMoveIndex = toIndex;
-      if (!_expandedGroups.contains(toWorkspaceId)) {
-        _expandedGroups.add(toWorkspaceId);
-        expandTarget = true;
+    var persist = false;
+    try {
+      setState(() {
+        _flying = true;
+        _crossDropCommitting = true;
+      });
+      if (!kDshCrossWorkspaceSessionMoveEnabled) {
+        if (kHomeDragOwnedOverlay && _dragOverlay.isShowing) {
+          final origin = homeDragOriginSlot(
+            _keyFor(_sessionCardKeys, sessionId),
+          );
+          if (origin.$2 != Size.zero) {
+            await _dragOverlay.flyTo(origin.$1, curve: Curves.easeOutCubic);
+          } else {
+            await _dragOverlay.land();
+          }
+        }
+        if (mounted) _toast(kDshCrossWorkspaceMoveDisabledMessage);
+        return;
       }
-      _applyOptimisticMove(sessionId, toWorkspaceId, toIndex: toIndex);
-    });
-    if (expandTarget) unawaited(_saveExpanded());
-    await WidgetsBinding.instance.endOfFrame;
-    if (!mounted) return;
-    await _dropSessionOnWorkspace(sessionId, toWorkspaceId, toIndex: toIndex);
-    if (!mounted) return;
-    await WidgetsBinding.instance.endOfFrame;
-    if (!mounted) return;
-    setState(_clearDragPreview);
+      if (_relocateKindFor(sessionId, toWorkspaceId) ==
+          DshCrossWorkspaceRelocateKind.unsupported) {
+        if (kHomeDragOwnedOverlay && _dragOverlay.isShowing) {
+          final origin = homeDragOriginSlot(
+            _keyFor(_sessionCardKeys, sessionId),
+          );
+          if (origin.$2 != Size.zero) {
+            await _dragOverlay.flyTo(origin.$1, curve: Curves.easeOutCubic);
+          } else {
+            await _dragOverlay.land();
+          }
+        }
+        if (mounted) _toast(kDshRemoteCrossWorkspaceUnsupportedMessage);
+        return;
+      }
+      final landing = _crossWorkspaceLanding(toWorkspaceId, toIndex);
+      if (kHomeDragOwnedOverlay && _dragOverlay.isShowing) {
+        if (kHomeDragCrossProjectFliesToSlot && landing != null) {
+          await _dragOverlay.flyTo(landing, curve: Curves.easeOutCubic);
+        } else {
+          await _dragOverlay.land();
+        }
+      }
+      if (!mounted) return;
+      var expandTarget = false;
+      setState(() {
+        _prepareCrossDropCommit();
+        _commitMoveSessionId = sessionId;
+        _commitMoveWorkspaceId = toWorkspaceId;
+        _commitMoveIndex = toIndex;
+        if (!_expandedGroups.contains(toWorkspaceId)) {
+          _expandedGroups.add(toWorkspaceId);
+          expandTarget = true;
+        }
+        _applyOptimisticMove(sessionId, toWorkspaceId, toIndex: toIndex);
+      });
+      if (expandTarget) unawaited(_saveExpanded());
+      await WidgetsBinding.instance.endOfFrame;
+      persist = true;
+    } catch (e) {
+      if (mounted) _toast(_moveFailedMessage(e));
+    } finally {
+      _removeDragVisuals();
+      if (mounted) {
+        setState(() => _endDragVisuals(clearCommit: !persist));
+      } else {
+        _flying = false;
+        _crossDropCommitting = false;
+        _dropCommitted = false;
+      }
+    }
+    if (persist) {
+      unawaited(
+        _dropSessionOnWorkspace(sessionId, toWorkspaceId, toIndex: toIndex),
+      );
+    } else if (mounted) {
+      unawaited(_load(quiet: true));
+    }
   }
 
   Future<void> _dropSessionOnWorkspace(
@@ -2545,10 +2615,23 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       if (!mounted) return;
       await _load(quiet: true);
     } catch (e) {
-      _toast('移动失败：$e');
-      _commitMoveSessionId = null;
-      _commitMoveWorkspaceId = null;
-      if (mounted) await _load(quiet: true);
+      if (mounted) {
+        setState(() {
+          _commitMoveSessionId = null;
+          _commitMoveWorkspaceId = null;
+          _commitMoveIndex = 0;
+        });
+        _toast(_moveFailedMessage(e));
+        await _load(quiet: true);
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _commitMoveSessionId = null;
+          _commitMoveWorkspaceId = null;
+          _commitMoveIndex = 0;
+        });
+      }
     }
   }
 
@@ -2556,7 +2639,13 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     required String sessionId,
     required String workspaceId,
     required String workspacePath,
+    bool restartIfMissing = false,
   }) async {
+    if (!dshCanUseMoveSessionPlugin(
+      isLocal: DshEndpoint.isLocal(widget.shiyi.settings),
+    )) {
+      return null;
+    }
     try {
       return await _api.moveSessionToWorkspace(
         sessionId: sessionId,
@@ -2566,9 +2655,10 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     } on DshApiException catch (e) {
       if (e.code != 'plugin-missing') rethrow;
     }
-    if (DshService.instance.managesLocalProcess) {
-      await DshService.instance.start();
+    if (!restartIfMissing || !DshService.instance.managesLocalProcess) {
+      return null;
     }
+    await DshService.instance.start();
     try {
       return await _api.moveSessionToWorkspace(
         sessionId: sessionId,
@@ -2586,6 +2676,12 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     String workspaceId, {
     int toIndex = 0,
   }) async {
+    if (!kDshCrossWorkspaceSessionMoveEnabled) {
+      throw DshApiException(
+        kDshCrossWorkspaceMoveDisabledMessage,
+        code: 'cwd-immutable',
+      );
+    }
     DshWorkspace? target;
     DshSessionSummary? session;
     for (final w in _workspaces) {
@@ -2611,12 +2707,26 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         ? 0
         : (toIndex > before.length ? before.length : toIndex);
     final beforeId = insertAt >= before.length ? null : before[insertAt];
-    final moved = await _tryPluginMove(
-      sessionId: sessionId,
-      workspaceId: workspaceId,
+    final cwd = dshSessionMoveCwd(
+      sessionCwd: session?.cwd,
       workspacePath: target.path,
     );
-    if (moved != null) {
+    final kind = dshCrossWorkspaceRelocateKind(
+      isLocal: DshEndpoint.isLocal(widget.shiyi.settings),
+      cwdMatches: cwd == null,
+    );
+    if (kind == DshCrossWorkspaceRelocateKind.plugin) {
+      final moved = await _tryPluginMove(
+        sessionId: sessionId,
+        workspaceId: workspaceId,
+        workspacePath: target.path,
+      );
+      if (moved == null) {
+        throw DshApiException(
+          '跨工作区移动需要重启 DSH 后生效，请到引擎页重启服务再试',
+          code: 'plugin-missing',
+        );
+      }
       if (moved['attachError'] != null) {
         await _attachThenInsert(
           workspaceId,
@@ -2636,17 +2746,17 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       }
       return;
     }
-    final cwd = dshSessionMoveCwd(
-      sessionCwd: session?.cwd,
-      workspacePath: target.path,
-    );
-    if (cwd != null) {
+    if (kind == DshCrossWorkspaceRelocateKind.unsupported) {
       throw DshApiException(
-        '跨工作区移动需要重启 DSH 后生效，请到引擎页重启服务再试',
-        code: 'plugin-missing',
+        kDshRemoteCrossWorkspaceUnsupportedMessage,
+        code: 'cwd-immutable',
       );
     }
-    await _attachThenInsert(workspaceId, sessionId, beforeSessionId: beforeId);
+    await _attachThenInsert(
+      workspaceId,
+      sessionId,
+      beforeSessionId: beforeId,
+    ).timeout(const Duration(seconds: 8));
   }
 
   Widget _shiftedSlot({Key? key, required double dy, required Widget child}) {

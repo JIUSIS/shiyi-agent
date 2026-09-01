@@ -303,3 +303,111 @@ const EdgeInsetsDirectional iosSectionMargin = EdgeInsetsDirectional.fromSTEB(
   12,
   10,
 );
+
+/// 设置页左侧 28×28 圆角色块图标，与 CupertinoListTile leading 同尺寸。
+class IosIconTile extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  const IosIconTile({super.key, required this.icon, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(7),
+      ),
+      child: Icon(icon, size: 17, color: CupertinoColors.white),
+    );
+  }
+}
+
+/// 设置页「标题 + 输入框」行，和模型 API 页同一套。
+class IosLabeledField extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  final String title;
+  final TextEditingController controller;
+  final String placeholder;
+  final int minLines;
+  final int maxLines;
+  final VoidCallback? onTap;
+  final bool vertical;
+  const IosLabeledField({
+    super.key,
+    required this.icon,
+    required this.color,
+    required this.title,
+    required this.controller,
+    required this.placeholder,
+    this.minLines = 1,
+    this.maxLines = 1,
+    this.onTap,
+    this.vertical = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = isIosDark(context);
+    final secondary = dark
+        ? CupertinoColors.white.withValues(alpha: 0.58)
+        : CupertinoColors.black.withValues(alpha: 0.52);
+    final fieldFill = dark ? const Color(0xFF2C2C2E) : const Color(0xFFF2F2F7);
+    final label = Text(
+      title,
+      style: TextStyle(
+        fontSize: 16,
+        fontWeight: FontWeight.w600,
+        color: dark ? CupertinoColors.white : CupertinoColors.black,
+      ),
+    );
+    final input = ConstrainedBox(
+      constraints: BoxConstraints(minHeight: minLines > 1 ? 0 : 38),
+      child: CupertinoTextField(
+        controller: controller,
+        placeholder: placeholder,
+        minLines: minLines,
+        maxLines: maxLines,
+        onTap: onTap,
+        textAlign: vertical ? TextAlign.left : TextAlign.right,
+        style: TextStyle(
+          color: dark ? CupertinoColors.white : CupertinoColors.black,
+        ),
+        placeholderStyle: TextStyle(color: secondary),
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+        decoration: BoxDecoration(
+          color: fieldFill,
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+    );
+    if (vertical) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CupertinoListTile(
+            leading: IosIconTile(icon: icon, color: color),
+            title: label,
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+            child: input,
+          ),
+        ],
+      );
+    }
+    return CupertinoListTile(
+      leading: IosIconTile(icon: icon, color: color),
+      title: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          label,
+          const SizedBox(width: 10),
+          Expanded(child: input),
+        ],
+      ),
+    );
+  }
+}

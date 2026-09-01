@@ -5,6 +5,14 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../services/laap_service.dart';
+import 'ios_style.dart';
+
+const _iconBlue = Color(0xFF0A84FF);
+const _iconGreen = Color(0xFF34C759);
+const _iconTeal = Color(0xFF30B0C7);
+const _iconPink = Color(0xFFFF2D55);
+const _iconRed = Color(0xFFFF3B30);
+const _iconOrange = Color(0xFFFF9F0A);
 
 /// 引擎页上的 LAAP 皮层服务卡。不进拾忆/DSH 引擎切换。
 class LaapServicePanel extends StatefulWidget {
@@ -170,10 +178,29 @@ class _LaapServicePanelState extends State<LaapServicePanel> {
             ),
           ),
           children: [
-            _row('本地版本', _localVersion ?? '未安装'),
-            _row('服务状态', _statusLabel),
-            _row('接口', '127.0.0.1:${LaapService.port}'),
+            _row(
+              icon: CupertinoIcons.number,
+              color: _iconBlue,
+              label: '本地版本',
+              value: _localVersion ?? '未安装',
+            ),
+            _row(
+              icon: CupertinoIcons.antenna_radiowaves_left_right,
+              color: _iconGreen,
+              label: '服务状态',
+              value: _statusLabel,
+            ),
+            _row(
+              icon: CupertinoIcons.link,
+              color: _iconTeal,
+              label: '接口',
+              value: '127.0.0.1:${LaapService.port}',
+            ),
             CupertinoListTile(
+              leading: IosIconTile(
+                icon: CupertinoIcons.heart_fill,
+                color: _iconPink,
+              ),
               title: const Text('活人感'),
               subtitle: const Text('按 Hermes 官方接法注入 PSI preamble。关掉或皮层挂了就不注入'),
               trailing: CupertinoSwitch(
@@ -309,6 +336,12 @@ class _LaapServicePanelState extends State<LaapServicePanel> {
           backgroundColor: bg,
           children: [
             CupertinoListTile(
+              leading: IosIconTile(
+                icon: _installed
+                    ? CupertinoIcons.trash_fill
+                    : CupertinoIcons.cloud_download_fill,
+                color: _installed ? _iconRed : _iconGreen,
+              ),
               title: Text(_installed ? '卸载 LAAP' : '立即安装'),
               subtitle: Text(
                 _installed
@@ -324,6 +357,12 @@ class _LaapServicePanelState extends State<LaapServicePanel> {
                   : () => _run(_laap.install),
             ),
             CupertinoListTile(
+              leading: IosIconTile(
+                icon: s == LaapStatus.running
+                    ? CupertinoIcons.stop_circle_fill
+                    : CupertinoIcons.play_circle_fill,
+                color: s == LaapStatus.running ? _iconOrange : _iconGreen,
+              ),
               title: Text(s == LaapStatus.running ? '停止皮层' : '启动皮层'),
               subtitle: Text(
                 _installed
@@ -347,21 +386,21 @@ class _LaapServicePanelState extends State<LaapServicePanel> {
     );
   }
 
-  Widget _row(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      child: Row(
-        children: [
-          Text(label, style: const TextStyle(fontSize: 15)),
-          const Spacer(),
-          Text(
-            value,
-            style: const TextStyle(
-              fontSize: 15,
-              color: CupertinoColors.systemGrey,
-            ),
-          ),
-        ],
+  Widget _row({
+    required IconData icon,
+    required Color color,
+    required String label,
+    required String value,
+  }) {
+    return CupertinoListTile(
+      leading: IosIconTile(icon: icon, color: color),
+      title: Text(label),
+      trailing: Text(
+        value,
+        style: const TextStyle(
+          fontSize: 15,
+          color: CupertinoColors.systemGrey,
+        ),
       ),
     );
   }

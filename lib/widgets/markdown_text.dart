@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'smooth_stream_text.dart';
+
 /// Lightweight Markdown renderer: code blocks, inline code, bold, italic,
 /// headings, bullet/numbered lists, tables, quotes, links, task lists,
 /// strikethrough, nested indentation, images, footnotes, definition lists,
@@ -712,7 +714,7 @@ class AdaptiveMarkdownText extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (isStreaming) {
-      return Text(data, style: style);
+      return SmoothStreamText(data, style: style);
     }
     final footnotes = markdownCollectFootnotes(data);
     final refs = markdownReferenceLinkDefs(data);

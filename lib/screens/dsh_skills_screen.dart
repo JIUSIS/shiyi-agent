@@ -716,8 +716,8 @@ class _DshSkillsScreenState extends State<DshSkillsScreen> {
 
   Widget _coloredIcon(IconData icon, Color color) {
     return Container(
-      width: 32,
-      height: 32,
+      width: 28,
+      height: 28,
       decoration: BoxDecoration(
         color: color,
         borderRadius: BorderRadius.circular(7),

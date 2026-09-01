@@ -339,6 +339,7 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
   final ValueNotifier<String> _streamText = ValueNotifier('');
   final ValueNotifier<String> _streamReasoning = ValueNotifier('');
   final DshLiveTurn _live = DshLiveTurn();
+  bool _followTail = true;
   bool _autoScrollScheduled = false;
   static const _liveId = 'sub-live';
 
@@ -372,7 +373,7 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
     // 键盘弹起时把最新消息顶到输入框上方可见区。
     if (!mounted || !_scroll.hasClients) return;
     final bottom = MediaQuery.viewInsetsOf(context).bottom;
-    if (bottom > 0) _scrollToBottom(animated: false);
+    if (bottom > 0) _scrollToBottom(animated: false, force: true);
   }
 
   List<ChatMessage> get _visible {
@@ -483,19 +484,17 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
             .where((e) => e.sessionId == widget.childSessionId)
             .firstOrNull;
         final running = me?.running ?? false;
-        final prevLast = _messages.isEmpty ? null : _messages.last;
-        final nextLast = bundle.messages.isEmpty ? null : bundle.messages.last;
-        final changed =
-            bundle.messages.length != _messages.length ||
-            nextLast?.content != prevLast?.content ||
-            bundle.summary?.stepCount != _summary?.stepCount;
+        final messageCountChanged = bundle.messages.length != _messages.length;
+        final liveWasOpen = _live.open && _live.hasVisible;
         setState(() {
           _messages = bundle.messages;
           _summary = bundle.summary;
           _running = running;
         });
         _adoptLive(bundle.live, force: true);
-        if (changed || bundle.live.open || bundle.live.hasVisible) {
+        final liveStarted =
+            !liveWasOpen && bundle.live.open && bundle.live.hasVisible;
+        if (messageCountChanged || liveStarted) {
           _scrollToBottom();
         }
         if (!running && !bundle.live.open && !_sending) {
@@ -644,19 +643,37 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
   }
 
   void _onStreamTextChanged() {
+    if (!_followTail) return;
     if (_autoScrollScheduled) return;
     _autoScrollScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _autoScrollScheduled = false;
       if (!mounted || !_scroll.hasClients) return;
       final pos = _scroll.position;
-      if (pos.maxScrollExtent - pos.pixels <= 96) {
+      if (_nearBottom) {
         _scroll.jumpTo(pos.maxScrollExtent);
       }
     });
   }
 
-  void _scrollToBottom({bool animated = true}) {
+  bool get _nearBottom {
+    if (!_scroll.hasClients) return true;
+    final pos = _scroll.position;
+    if (!pos.hasContentDimensions || !pos.maxScrollExtent.isFinite) return true;
+    return pos.maxScrollExtent - pos.pixels <= 96;
+  }
+
+  bool _onScrollNotification(ScrollNotification notification) {
+    if (notification is ScrollEndNotification ||
+        (notification is ScrollUpdateNotification &&
+            notification.dragDetails != null)) {
+      _followTail = _nearBottom;
+    }
+    return false;
+  }
+
+  void _scrollToBottom({bool animated = true, bool force = false}) {
+    if (!force && !_followTail) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
       final target = _scroll.position.maxScrollExtent;
@@ -861,43 +878,47 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
     }
     return ScrollConfiguration(
       behavior: ScrollConfiguration.of(context).copyWith(overscroll: false),
-      child: ListView.builder(
-        controller: _scroll,
-        padding: const EdgeInsets.fromLTRB(
-          messageListSidePadding,
-          12,
-          messageListSidePadding,
-          12,
-        ),
-        itemCount: visible.length,
-        itemBuilder: (context, i) {
-          final m = visible[i];
-          if (m.streaming) {
+      child: NotificationListener<ScrollNotification>(
+        onNotification: _onScrollNotification,
+        child: ListView.builder(
+          controller: _scroll,
+          padding: const EdgeInsets.fromLTRB(
+            messageListSidePadding,
+            12,
+            messageListSidePadding,
+            12,
+          ),
+          itemCount: visible.length,
+          itemBuilder: (context, i) {
+            final m = visible[i];
+            if (m.streaming) {
+              return KeyedSubtree(
+                key: ValueKey(m.id),
+                child: ValueListenableBuilder<String>(
+                  valueListenable: _streamReasoning,
+                  builder: (context, reasoning, _) =>
+                      ValueListenableBuilder<String>(
+                        valueListenable: _streamText,
+                        builder: (context, text, _) => MessageBubble(
+                          message: m,
+                          liveContent: text.isEmpty ? null : text,
+                          liveReasoning: reasoning.isEmpty ? null : reasoning,
+                          busy: true,
+                          smoothHeightAnimation: false,
+                          onCopy: _copy,
+                        ),
+                      ),
+                ),
+              );
+            }
             return KeyedSubtree(
               key: ValueKey(m.id),
-              child: ValueListenableBuilder<String>(
-                valueListenable: _streamReasoning,
-                builder: (context, reasoning, _) =>
-                    ValueListenableBuilder<String>(
-                      valueListenable: _streamText,
-                      builder: (context, text, _) => MessageBubble(
-                        message: m,
-                        liveContent: text.isEmpty ? null : text,
-                        liveReasoning: reasoning.isEmpty ? null : reasoning,
-                        busy: true,
-                        onCopy: _copy,
-                      ),
-                    ),
+              child: RepaintBoundary(
+                child: MessageBubble(message: m, busy: false, onCopy: _copy),
               ),
             );
-          }
-          return KeyedSubtree(
-            key: ValueKey(m.id),
-            child: RepaintBoundary(
-              child: MessageBubble(message: m, busy: false, onCopy: _copy),
-            ),
-          );
-        },
+          },
+        ),
       ),
     );
   }

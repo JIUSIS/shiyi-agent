@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
@@ -232,10 +233,7 @@ class _ToolPillState extends State<ToolPill> {
                 SizedBox(
                   width: 12,
                   height: 12,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: cs.primary,
-                  ),
+                  child: CupertinoActivityIndicator(radius: 6),
                 )
               else
                 Icon(
@@ -372,10 +370,7 @@ class _ToolLogItem extends StatelessWidget {
                 ? SizedBox(
                     width: 14,
                     height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: cs.primary,
-                    ),
+                    child: CupertinoActivityIndicator(radius: 7),
                   )
                 : Icon(
                     event.ok ? Icons.check_circle : Icons.error,

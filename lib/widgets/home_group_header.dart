@@ -10,6 +10,9 @@ class HomeGroupHeader extends StatelessWidget {
   final bool expanded;
   final bool dropReady;
   final VoidCallback onTap;
+  final IconData? leadingIcon;
+  final String? countText;
+  final Widget? leading;
   const HomeGroupHeader({
     super.key,
     required this.name,
@@ -17,6 +20,9 @@ class HomeGroupHeader extends StatelessWidget {
     required this.expanded,
     required this.onTap,
     this.dropReady = false,
+    this.leadingIcon,
+    this.countText,
+    this.leading,
   });
 
   @override
@@ -46,13 +52,15 @@ class HomeGroupHeader extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
               child: Row(
                 children: [
-                  Icon(
-                    expanded
-                        ? CupertinoIcons.folder_open
-                        : CupertinoIcons.folder,
-                    size: 18,
-                    color: kHomeGroupAccent,
-                  ),
+                  leading ??
+                      Icon(
+                        leadingIcon ??
+                            (expanded
+                                ? CupertinoIcons.folder_open
+                                : CupertinoIcons.folder),
+                        size: 18,
+                        color: kHomeGroupAccent,
+                      ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
@@ -65,7 +73,7 @@ class HomeGroupHeader extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    dropReady ? '松开以移入' : '$count 个会话',
+                    dropReady ? '松开以移入' : (countText ?? '$count 个会话'),
                     style: theme.textTheme.labelSmall?.copyWith(
                       color: dropReady
                           ? kHomeGroupAccent

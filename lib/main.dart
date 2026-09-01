@@ -95,6 +95,7 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
   late String _themeModeSetting;
   final GlobalKey<ScaffoldMessengerState> _messengerKey =
       GlobalKey<ScaffoldMessengerState>();
+  final _RuntimeRouteObserver _routeObserver = _RuntimeRouteObserver();
 
   @override
   void initState() {
@@ -188,6 +189,7 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
     return MaterialApp(
       title: '拾忆',
       debugShowCheckedModeBanner: false,
+      navigatorObservers: [_routeObserver],
       scaffoldMessengerKey: _messengerKey,
       theme: MacTheme.light(),
       darkTheme: MacTheme.dark(),
@@ -232,5 +234,34 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
       },
       home: WelcomeScreen(shiyi: shiyi),
     );
+  }
+}
+
+/// 观察根导航器，把当前页面（route）反馈给 RuntimeLogger，让错误日志带上
+/// 「在哪一屏出错」。best-effort：无 name 的路由用运行时类型作标签。
+class _RuntimeRouteObserver extends NavigatorObserver {
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    RuntimeLogger.instance.uiRoute(_labelFor(route));
+  }
+
+  @override
+  void didReplace({
+    Route<dynamic>? newRoute,
+    Route<dynamic>? oldRoute,
+  }) {
+    if (newRoute != null) RuntimeLogger.instance.uiRoute(_labelFor(newRoute));
+  }
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    RuntimeLogger.instance.uiRoute(_labelFor(previousRoute));
+  }
+
+  static String _labelFor(Route<dynamic>? route) {
+    if (route == null) return '';
+    final name = route.settings.name;
+    if (name != null && name.isNotEmpty) return name;
+    return route.runtimeType.toString();
   }
 }

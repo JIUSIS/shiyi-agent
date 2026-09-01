@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../core/models.dart';
 import 'runtime_logger.dart';
+import 'group_chat_store.dart';
 
 class AppDatabase {
   static final AppDatabase _instance = AppDatabase._();
@@ -43,7 +44,7 @@ class AppDatabase {
           : getApplicationDocumentsDirectory());
       final db = await openDatabase(
         join(dir.path, 'shiyi_agent.db'),
-        version: 22,
+        version: 23,
         onCreate: _createBaseTables,
         onUpgrade: _upgrade,
         onOpen: _repairSchema,
@@ -63,7 +64,7 @@ class AppDatabase {
         'database.opened',
         durationMs: DateTime.now().difference(started).inMilliseconds,
         result: 'ok',
-        data: {'version': 22},
+        data: {'version': 23},
       );
       return db;
     } catch (e) {
@@ -167,6 +168,7 @@ class AppDatabase {
       sort_order INTEGER NOT NULL DEFAULT 0
     )
   ''');
+    await GroupChatStore.ensureTables(db);
   }
 
   Future<void> _upgrade(Database db, int oldV, int newV) async {
@@ -353,6 +355,10 @@ class AppDatabase {
         await db.execute('ALTER TABLE sessions ADD COLUMN api_profile_id TEXT');
       }
     }
+    // v22 -> v23：拾忆群聊（房间 / 独立 Agent / 消息）。
+    if (oldV < 23) {
+      await GroupChatStore.ensureTables(db);
+    }
   }
 
   /// 兜底修复：早期/异常创建的库可能在 memories 表漏掉 type 列。
@@ -420,6 +426,7 @@ class AppDatabase {
       await db.execute('ALTER TABLE projects ADD COLUMN workspace_dir TEXT');
     }
     await _ensureSortOrderColumns(db);
+    await GroupChatStore.ensureTables(db);
   }
 
   Future<void> _ensureReasoningEncryptedColumn(Database db) async {
@@ -681,6 +688,12 @@ class AppDatabase {
       await txn.update(
         'sessions',
         {'project_id': null},
+        where: 'project_id = ?',
+        whereArgs: [id],
+      );
+      await txn.update(
+        'group_rooms',
+        {'project_id': ''},
         where: 'project_id = ?',
         whereArgs: [id],
       );

@@ -1145,8 +1145,9 @@ class DshApiClient {
 
   /// 更新会话工作目录。
   ///
-  /// 新版 DSH 提供 `session.update`；旧版曾把工作区选择暴露为独立
-  /// RPC，因此保留两个兼容回退，避免手机端选目录后只更新了 UI。
+  /// 官方 SessionHeader.cwd 创建后不可改，没有 `session.update` /
+  /// `session.setCwd`。这里仍试这两条猜测 RPC，失败再退回
+  /// `insertSessionBefore`；跨工作区搬家不要走这条。
   Future<void> updateSessionCwd(String sessionId, String cwd) async {
     final path = cwd.trim();
     if (path.isEmpty) return;
@@ -1526,7 +1527,9 @@ class DshApiClient {
             headers: _headers(),
             body: jsonEncode(payload),
           )
-          .timeout(const Duration(seconds: 60));
+          .timeout(const Duration(seconds: 8));
+    } on TimeoutException {
+      throw DshApiException("跨工作区移动插件未响应", code: "plugin-missing");
     } catch (e) {
       throw DshApiException("DeepSeek Harness 服务不可达：$e");
     }

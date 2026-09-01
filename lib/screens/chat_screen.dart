@@ -15,9 +15,11 @@ import '../core/slash_trigger.dart';
 import '../services/file_workspace.dart';
 import '../services/image_service.dart';
 import '../services/llm_client.dart';
+import '../services/runtime_logger.dart';
 import '../services/tts_service.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/agent_question_panel.dart';
+import '../widgets/animated_message_list.dart';
 import '../widgets/chat_liquid_glass.dart';
 import '../widgets/subagent_mini_session.dart';
 import '../widgets/mac_action_button.dart';
@@ -164,6 +166,7 @@ class _ChatScreenState extends State<ChatScreen>
     ChatMessage m, {
     String? liveContent,
     String? liveReasoning,
+    bool toolRunning = false,
   }) {
     final enter = _shouldAnimateEnter(m);
     return MessageBubble(
@@ -171,6 +174,7 @@ class _ChatScreenState extends State<ChatScreen>
       liveContent: liveContent,
       liveReasoning: liveReasoning,
       busy: _pageBusy,
+      toolRunning: toolRunning,
       speaking: _speakingId == m.id,
       animateEnter: enter,
       onCopy: _copyMessage,
@@ -229,6 +233,45 @@ class _ChatScreenState extends State<ChatScreen>
     });
   }
 
+  String _messageListItemKey(Object item) {
+    if (item is ChatMessage) return 'message:${item.id}';
+    if (item is _ArchivedDivider) return 'archived:${item.count}';
+    return 'unknown:${identityHashCode(item)}';
+  }
+
+  Widget _buildMessageListItem(BuildContext context, Object item) {
+    if (item is _ArchivedDivider) return item;
+    final m = item as ChatMessage;
+    // 流式结束也保持同一棵包装树，避免切 VLB / RepaintBoundary
+    // 时整段气泡被拆掉再挂上。
+    return KeyedSubtree(
+      key: ValueKey(m.id),
+      child: RepaintBoundary(
+        child: ValueListenableBuilder<String>(
+          valueListenable: widget.shiyi.streamReasoningForSession(
+            _pageSessionId,
+          ),
+          builder: (context, reasoning, _) => ValueListenableBuilder<String>(
+            valueListenable: widget.shiyi.streamTextForSession(_pageSessionId),
+            builder: (context, text, _) => ValueListenableBuilder<int>(
+              valueListenable: widget.shiyi.toolRunningRevisionForSession(
+                _pageSessionId,
+              ),
+              builder: (context, _, child) => _messageItem(
+                m,
+                liveContent: m.streaming ? text : null,
+                liveReasoning: m.streaming ? reasoning : null,
+                toolRunning:
+                    widget.shiyi.toolRunningForSession(_pageSessionId) &&
+                    m.streaming,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _send() async {
     if (_pageQuestion != null) {
       _submitAnswer();
@@ -265,9 +308,11 @@ class _ChatScreenState extends State<ChatScreen>
       _pendingFiles.clear();
     });
     FocusScope.of(context).unfocus();
-    final accepted = await widget.shiyi.guideSend(
-      sb.toString(),
+    final accepted = await RuntimeLogger.instance.uiGuard<bool>(
+      route: 'chat',
+      operation: 'sendMessage',
       sessionId: sessionId,
+      body: () => widget.shiyi.guideSend(sb.toString(), sessionId: sessionId),
     );
     if (!accepted && mounted) {
       _input.text = text;
@@ -1216,55 +1261,17 @@ class _ChatScreenState extends State<ChatScreen>
                                   behavior: ScrollConfiguration.of(
                                     context,
                                   ).copyWith(overscroll: false),
-                                  child: ListView.builder(
+                                  child: AnimatedMessageList(
+                                    items: items,
                                     controller: _scroll,
-                                    reverse: true,
-                                    clipBehavior: Clip.none,
                                     padding: EdgeInsets.fromLTRB(
                                       messageListSidePadding,
                                       12,
                                       messageListSidePadding,
                                       overlayHeight + 12,
                                     ),
-                                    itemCount: items.length,
-                                    itemBuilder: (context, i) {
-                                      final item = items[i];
-                                      if (item is _ArchivedDivider) {
-                                        return item;
-                                      }
-                                      final m = item as ChatMessage;
-                                      // 流式结束也保持同一棵包装树，避免切 VLB / RepaintBoundary
-                                      // 时整段气泡被拆掉再挂上。
-                                      return KeyedSubtree(
-                                        key: ValueKey(m.id),
-                                        child: RepaintBoundary(
-                                          child: ValueListenableBuilder<String>(
-                                            valueListenable: widget.shiyi
-                                                .streamReasoningForSession(
-                                                  _pageSessionId,
-                                                ),
-                                            builder: (context, reasoning, _) =>
-                                                ValueListenableBuilder<String>(
-                                                  valueListenable: widget.shiyi
-                                                      .streamTextForSession(
-                                                        _pageSessionId,
-                                                      ),
-                                                  builder: (context, text, _) =>
-                                                      _messageItem(
-                                                        m,
-                                                        liveContent: m.streaming
-                                                            ? text
-                                                            : null,
-                                                        liveReasoning:
-                                                            m.streaming
-                                                            ? reasoning
-                                                            : null,
-                                                      ),
-                                                ),
-                                          ),
-                                        ),
-                                      );
-                                    },
+                                    keyOf: _messageListItemKey,
+                                    itemBuilder: _buildMessageListItem,
                                   ),
                                 );
                               },

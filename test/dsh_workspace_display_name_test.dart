@@ -236,4 +236,34 @@ void main() {
       expect(await dshLoadExpandedWorkspaceIds(), isEmpty);
     });
   });
+
+  test('只有本机才走搬家插件，局域网/公网不能 POST move-session', () {
+    expect(dshCanUseMoveSessionPlugin(isLocal: true), isTrue);
+    expect(dshCanUseMoveSessionPlugin(isLocal: false), isFalse);
+  });
+
+  test('DSH 三端关闭跨工作区移动；底层仍按官方能力分类', () {
+    expect(kDshCrossWorkspaceSessionMoveEnabled, isFalse);
+    expect(kDshCrossWorkspaceMoveDisabledMessage, 'DSH 会话只能在本工作区内排序');
+    expect(
+      dshCrossWorkspaceRelocateKind(isLocal: true, cwdMatches: true),
+      DshCrossWorkspaceRelocateKind.insert,
+    );
+    expect(
+      dshCrossWorkspaceRelocateKind(isLocal: false, cwdMatches: true),
+      DshCrossWorkspaceRelocateKind.insert,
+    );
+    expect(
+      dshCrossWorkspaceRelocateKind(isLocal: true, cwdMatches: false),
+      DshCrossWorkspaceRelocateKind.plugin,
+    );
+    expect(
+      dshCrossWorkspaceRelocateKind(isLocal: false, cwdMatches: false),
+      DshCrossWorkspaceRelocateKind.unsupported,
+    );
+    expect(
+      kDshRemoteCrossWorkspaceUnsupportedMessage.contains('不能把同一条会话换到另一个工作区'),
+      isTrue,
+    );
+  });
 }

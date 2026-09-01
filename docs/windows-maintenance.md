@@ -193,7 +193,9 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
     松手飞入空隙，远放不瞬移；提交贴齐禁止反向弹回。跨项目须停满 1 秒，
     拖回原项目立刻取消「松开以移入」。列表外层必须裁剪，不能让挤开位移盖住搜索栏/状态栏。
     顺序写 `sort_order`，缺列补列不清库。跨组提交只收被拖项源槽，禁止把同组其它卡片收成 0。
-    DSH 跨工作区先乐观改本地 `sessionIds` 和 cwd，再静默 `_load()`。详见 `docs/fix-log.md` #241-#273。
+    DSH 三端关闭会话跨工作区移动，只允许本工作区内 `insertSessionBefore` 排序；
+    悬停其他工作区不得展开或显示「松开以移入」。拾忆跨项目拖拽仍走乐观更新。
+    详见 `docs/fix-log.md` #241-#273、#327-#329。
     测试：`test/home_list_order_test.dart`、`test/home_sessions_tab_test.dart`、`test/staggered_sessions_test.dart`、`test/dsh_workspace_display_name_test.dart`。
 15. **拾忆 API 三条协议 + 冻头/动尾**：`openai` / `responses` / `anthropic` 并列。
     Responses 可移植子集：冻头 → `instructions`，其余 → `input`，`store: false`。
@@ -267,7 +269,9 @@ DS Harness 引擎验证点（#114，两端共享）：
    分组展开收起写入 `shiyi_project_expanded_v1`，会话左滑含复制 ID；
    无工作区时
    自动链接默认 agent 目录（Android `/storage/emulated/0/agent`、
-   Windows `文档\\agent`）、新建空会话返回后自动归档
+    Windows `文档\\agent`）、新建空会话返回后自动归档。
+   会话长按只在本工作区内排序；拖到其他工作区不展开、不显示「松开以移入」，
+   松手回到原位。三端都不提供跨工作区搬家
 3. 功能页：只显示入口（技能/模型/预设/工作区/文件），不预加载不报错；
    技能入口二级页 = DSH skill.list（DSH 0.1.0-rc.6 起必带 sessionId 且会话
    需已挂载；先用 session.create(sessionId+cwd) 挂载会话再短重试，不再回退
@@ -285,8 +289,12 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
-- **2026-08-30 2.6.2**（共享 `lib/`；详见 `docs/fix-log.md` #318-#322）：
-  拾忆与 DSH 共用子代理 mini 会话和输入区悬浮芯片。子代理小窗走 `OverlayPortal`，不再挂 rootNavigator；主 agent 等待子代理返回时状态保留。Windows 继续使用本机终端后端，不引入 Android Alpine 路径。
+- **2026-09-01 2.6.3**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #330-#365）：
+  拾忆群聊支持并行批次、真实项目文件夹、思维导图导入容错、并行协作与交接级打回上限。主聊天 / DSH / 群聊统一流式文本、高度动画、消息列表动画和工具状态。子代理 mini 会话滚动、展开收起和功能卡 UI 统一；详情页关闭增高动画。缓存日志新增冻头 SHA-256，前端日志新增 UI 路由/步骤上下文。Windows 继续使用本机终端后端与本机 Python LAAP，不引入 Android Alpine 路径。
+- **2026-08-30 2.6.2**（共享 `lib/`；详见 `docs/fix-log.md` #318-#329）：
+  拾忆与 DSH 共用子代理 mini 会话和输入区悬浮芯片。子代理小窗走 `OverlayPortal`，不再挂 rootNavigator；主 agent 等待子代理返回时状态保留。
+  DSH 三端关闭会话跨工作区移动，只保留本工作区内 `insertSessionBefore` 排序；拖影飞入必须 try/finally 卸 overlay。
+  Windows 继续使用本机终端后端，不引入 Android Alpine 路径。
 - **2026-08-28 2.6.1**（共享 `lib/`；详见 `docs/fix-log.md` #292-#293）：
   局域网 / 公网 DSH 可通过手机安全 Relay 使用拾忆 API，目标主机不接收真实上游地址和密钥；目标 DSH 自有 API 仍可在模型数据页独立增删改。模型页合并 settings / provider / model / credential 状态，编辑器支持三协议、拉模型、多选和测试连接。“DSH 高级诊断”只保留底层排错用途。Windows 与 Android 共用配置模型和 UI；Windows 本机 DSH 仍可直接同步拾忆 provider。
 - **2026-08-27 2.6.0**（共享 `lib/`；详见 `docs/fix-log.md` #283-#291）：

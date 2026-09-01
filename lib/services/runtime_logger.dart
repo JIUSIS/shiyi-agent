@@ -64,6 +64,13 @@ class RuntimeLogEntry {
   String get oneLine => jsonEncode(toJson());
 }
 
+/// 前端操作追踪帧：记录当前操作名与该操作推进到的步骤。
+class _UiOp {
+  final String operation;
+  String step;
+  _UiOp(this.operation, this.step);
+}
+
 class RuntimeLogger {
   RuntimeLogger._();
   static final RuntimeLogger instance = RuntimeLogger._();
@@ -78,6 +85,68 @@ class RuntimeLogger {
   String? _path;
 
   String? get path => _path;
+
+  /// 当前页面（前端路由）上下文，给错误日志补「在哪一屏出错」。
+  String _uiRoute = '';
+  /// 当前操作推进到的步骤（如 buildRequest / stream），best-effort 提示。
+  String _uiStep = '';
+  final List<_UiOp> _uiOps = <_UiOp>[];
+
+  /// 前端导航到某页面时调用，让后续日志带上「当前页面」上下文。
+  void uiRoute(String route) => _uiRoute = route;
+
+  /// 前端在操作内推进到某步骤时调用（best-effort，并发会话下提示最近步骤）。
+  void uiStep(String step) {
+    _uiStep = step;
+    if (_uiOps.isNotEmpty) _uiOps.last.step = step;
+  }
+
+  /// 运行一段前端操作：开始记 ui.operation；失败时记 ui.error（带操作名/
+  /// 页面/会话/步骤），再原样抛出。逻辑并发安全：上下文按操作自身记录。
+  Future<T> uiGuard<T>({
+    required String route,
+    required String operation,
+    String? sessionId,
+    required Future<T> Function() body,
+  }) async {
+    final previousRoute = _uiRoute;
+    _uiRoute = route;
+    _uiOps.add(_UiOp(operation, _uiStep));
+    try {
+      unawaited(
+        log(
+          module: 'Ui',
+          event: 'ui.operation',
+          sessionId: sessionId ?? '',
+          data: {'route': route, 'operation': operation, 'action': 'start'},
+        ),
+      );
+      return await body();
+    } catch (e, st) {
+      // ui.error 尽力而为：即使日志落盘失败也不掩盖原始异常。
+      unawaited(
+        log(
+          level: 'error',
+          module: 'Ui',
+          event: 'ui.error',
+          sessionId: sessionId ?? '',
+          result: 'failed',
+          data: {
+            'route': route,
+            'operation': operation,
+            'step': _uiStep,
+            'error': '$e',
+            'stack': '$st',
+          },
+        ),
+      );
+      rethrow;
+    } finally {
+      if (_uiOps.isNotEmpty) _uiOps.removeLast();
+      if (_uiOps.isEmpty) _uiStep = '';
+      _uiRoute = previousRoute;
+    }
+  }
 
   Future<void> info(
     String module,
@@ -145,6 +214,16 @@ class RuntimeLogger {
     String result = '',
     Map<String, dynamic> data = const {},
   }) {
+    final uiActive = _uiRoute.isNotEmpty || _uiStep.isNotEmpty;
+    final finalData = uiActive
+        ? <String, dynamic>{
+            ...data,
+            'ui': <String, dynamic>{
+              if (_uiRoute.isNotEmpty) 'route': _uiRoute,
+              if (_uiStep.isNotEmpty) 'step': _uiStep,
+            },
+          }
+        : data;
     final entry = RuntimeLogEntry(
       timestamp: DateTime.now().toIso8601String(),
       level: level,
@@ -154,7 +233,7 @@ class RuntimeLogger {
       requestId: requestId,
       durationMs: durationMs,
       result: result,
-      data: _redactMap(data),
+      data: _redactMap(finalData),
     );
     _memory.add(entry);
     if (_memory.length > maxMemoryEntries) {

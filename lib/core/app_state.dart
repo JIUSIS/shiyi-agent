@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:crypto/crypto.dart';
 
 import '../core/home_list_order.dart';
 import '../core/model_presets.dart';
@@ -132,10 +133,12 @@ class _SessionRun {
   final Set<Process> activeProcesses = <Process>{};
   ChatMessage? streaming;
   String? status;
+  bool toolRunning = false;
   Map<String, dynamic>? pendingQuestion;
   Completer<String>? questionCompleter;
   final ValueNotifier<String> streamText = ValueNotifier('');
   final ValueNotifier<String> streamReasoning = ValueNotifier('');
+  final ValueNotifier<int> toolRunningRevision = ValueNotifier(0);
   final List<ToolEvent> toolEvents = [];
   final List<SubagentLiveRun> subagents = [];
   List<Skill> loadedSkillsSnapshot = const [];
@@ -198,6 +201,7 @@ class ShiyiState extends ChangeNotifier {
   String? currentSessionId;
   bool isBusy = false;
   String? status;
+  bool toolRunning = false;
 
   /// 当前会话显式思考强度；null 表示使用模型默认值。不含开关状态。
   String? reasoningEffort;
@@ -270,6 +274,9 @@ class ShiyiState extends ChangeNotifier {
   /// 消息列表版本号：聊天列表只监听它，避免 status/token 等变化重建整列。
   final ValueNotifier<int> messagesRevision = ValueNotifier(0);
 
+  /// 工具执行状态版本号：仅流式气泡的重建监听它，工具启停不重建整列。
+  final ValueNotifier<int> toolRunningRevision = ValueNotifier(0);
+
   void _bumpMessages() => messagesRevision.value++;
 
   /// 子代理 mini 会话专用：进度/转写本变化时只刷新状态条，不重建整列气泡。
@@ -318,6 +325,11 @@ class ShiyiState extends ChangeNotifier {
   List<ToolEvent> toolEventsForSession(String? sessionId) =>
       _existingRun(sessionId)?.toolEvents ?? toolEvents;
 
+  ValueNotifier<int> toolRunningRevisionForSession(String? sessionId) {
+    final run = _existingRun(sessionId);
+    return run?.toolRunningRevision ?? toolRunningRevision;
+  }
+
   ValueNotifier<String> streamTextForSession(String? sessionId) =>
       _existingRun(sessionId)?.streamText ?? streamText;
 
@@ -332,6 +344,9 @@ class ShiyiState extends ChangeNotifier {
 
   bool thinkingOnForSession(String? sessionId) =>
       _existingRun(sessionId)?.thinkingOn ?? true;
+
+  bool toolRunningForSession(String? sessionId) =>
+      _existingRun(sessionId)?.toolRunning ?? false;
 
   /// 设置当前会话的拾忆思考强度；空值恢复模型默认值。
   /// 选 `off` 只关开关，不改档位；选其它档位会打开开关。
@@ -941,6 +956,7 @@ class ShiyiState extends ChangeNotifier {
 
   void _syncCurrentRunView(_SessionRun run) {
     status = run.status;
+    toolRunning = run.toolRunning;
     pendingQuestion = run.pendingQuestion;
     toolEvents = run.toolEvents;
     planMode = run.planMode;
@@ -2739,6 +2755,11 @@ class ShiyiState extends ChangeNotifier {
         }
       }
 
+      // 用户气泡先出场，模型气泡稍后进入，避免同帧一起出现。
+      if (pendingUserMessage == null && currentSessionId == targetSessionId) {
+        await Future<void>.delayed(const Duration(milliseconds: 220));
+      }
+
       // 发送前检查是否需要自动压缩历史上下文（此时新用户消息已计入统计）。
       await _maybeAutoCompress(targetSessionId);
 
@@ -3498,15 +3519,22 @@ class ShiyiState extends ChangeNotifier {
     m.streaming = false;
     if (m.content.isEmpty) {
       if (run.stopForGuide) {
-        await _db.deleteMessage(m.id);
-        if (currentSessionId == m.sessionId) {
-          messages.remove(m);
-          _bumpMessages();
+        final keepReasoningOrTools =
+            m.reasoning.isNotEmpty ||
+            m.reasoningEncrypted.isNotEmpty ||
+            m.toolCalls.isNotEmpty;
+        if (!keepReasoningOrTools) {
+          await _db.deleteMessage(m.id);
+          if (currentSessionId == m.sessionId) {
+            messages.remove(m);
+            _bumpMessages();
+          }
+          _publishRun(run);
+          return;
         }
-        _publishRun(run);
-        return;
+      } else {
+        m.content = run.stopRequested ? '(已停止)' : '(生成出错)';
       }
-      m.content = run.stopRequested ? '(已停止)' : '(生成出错)';
     }
     await _db.updateMessageContent(
       m.id,
@@ -3586,12 +3614,26 @@ class ShiyiState extends ChangeNotifier {
     }
   }
 
+  /// 请求里冻头段（客户端 _splitSystems 取的第一条 system）的 SHA-256。
+  /// 用于 cache.usage 日志：逐轮 hitRate + frozenSha256 一起看，能判断
+  /// 「冻头有没有字节漂移」——frozenSha 恒定 = 前缀稳定，命中率低就只能是提供方不回缓存。
+  @visibleForTesting
+  static String? frozenSha256(List<Map<String, dynamic>> msgs) {
+    if (msgs.isEmpty) return null;
+    final first = msgs.first;
+    if (first['role'] != 'system') return null;
+    final c = (first['content'] ?? '').toString().trim();
+    if (c.isEmpty) return null;
+    return sha256.convert(utf8.encode(c)).toString();
+  }
+
   Future<TurnResult?> _streamRound(
     _SessionRun run,
     List<Map<String, dynamic>> msgs,
     ChatMessage asst,
   ) async {
     final sessionId = run.sessionId;
+    RuntimeLogger.instance.uiStep('buildRequest');
     TurnResult? accumulated;
     var lastStreamEmit = DateTime.now();
     var lastStreamLen = 0;
@@ -3656,6 +3698,7 @@ class ShiyiState extends ChangeNotifier {
       },
     );
     run.activeLlmClients.add(client);
+    RuntimeLogger.instance.uiStep('stream');
     try {
       await client.send(msgs);
     } finally {
@@ -3682,6 +3725,8 @@ class ShiyiState extends ChangeNotifier {
     final sessNow = await _db.getSession(sessionId);
     final newTotal = (sessNow?.totalTokens ?? 0) + used;
     await _db.updateSessionTokens(sessionId, newTotal);
+    // 本轮冻头指纹：与 hitRate 同一条日志，证明前缀恒定时命中率低是提供方所致。
+    final frozenSha = frozenSha256(msgs);
     // 缓存命中率按整段会话 Token 加权累计（口径同 DSH：Σ缓存 ÷ Σ输入）。
     final cachedInput = client.lastCachedTokens;
     final promptInput = client.lastPromptTokens ?? client.lastInputTokens;
@@ -3710,6 +3755,7 @@ class ShiyiState extends ChangeNotifier {
             'sessionCachedTokens': run.sessionCachedTokens,
             'sessionInputTokens': run.sessionInputTokens,
             'cacheKnown': true,
+            'frozenSha256': frozenSha,
           },
         ),
       );
@@ -3724,6 +3770,7 @@ class ShiyiState extends ChangeNotifier {
             'inputTokens': promptInput,
             'cacheKnown': false,
             'reason': 'provider_did_not_return_cache_usage',
+            'frozenSha256': frozenSha,
           },
         ),
       );
@@ -3913,6 +3960,8 @@ class ShiyiState extends ChangeNotifier {
       run.toolEvents.add(ev);
       events.add(ev);
     }
+    run.toolRunning = true;
+    run.toolRunningRevision.value++;
     _publishRun(run);
 
     Future<String> execAt(int i) => _executeTool(
@@ -3945,6 +3994,9 @@ class ShiyiState extends ChangeNotifier {
         loopMsgs: loopMsgs,
       );
     }
+    run.toolRunning = false;
+    run.toolRunningRevision.value++;
+    _publishRun(run);
   }
 
   Future<void> _recordToolOutput({

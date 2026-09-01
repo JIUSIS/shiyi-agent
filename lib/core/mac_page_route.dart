@@ -110,3 +110,90 @@ class _MacRouteBackObserver with WidgetsBindingObserver {
     route.backGestureTarget?.onBackGestureCancel();
   }
 }
+
+/// 预测性返回淡出：系统侧滑进度驱动透明度，和拾忆会话页同一套。
+class MacBackFade extends StatefulWidget {
+  final Widget child;
+  final bool Function()? consumeBack;
+  const MacBackFade({super.key, required this.child, this.consumeBack});
+
+  @override
+  State<MacBackFade> createState() => _MacBackFadeState();
+}
+
+class _MacBackFadeState extends State<MacBackFade>
+    with SingleTickerProviderStateMixin
+    implements BackGestureTarget {
+  late final AnimationController _dragCtrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 260),
+    value: 0,
+  );
+  MacPageRoute? _route;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is MacPageRoute) {
+      _route = route;
+      route.backGestureTarget = this;
+    }
+  }
+
+  @override
+  void dispose() {
+    _route?.backGestureTarget = null;
+    _dragCtrl.dispose();
+    super.dispose();
+  }
+
+  void _pop() {
+    if (widget.consumeBack?.call() == true) return;
+    FocusManager.instance.primaryFocus?.unfocus();
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  void onBackGestureProgress(double progress) {
+    if (!mounted) return;
+    _dragCtrl.stop();
+    _dragCtrl.value = progress.clamp(0.0, 1.0);
+  }
+
+  @override
+  void onBackGestureCommit() {
+    if (!mounted) return;
+    _pop();
+  }
+
+  @override
+  void onBackGestureCancel() {
+    if (!mounted) return;
+    _dragCtrl.animateBack(
+      0,
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _pop();
+      },
+      child: AnimatedBuilder(
+        animation: _dragCtrl,
+        builder: (context, child) {
+          final t = _dragCtrl.value;
+          if (t <= 0.001) return child!;
+          return Opacity(opacity: 1.0 - t * 0.45, child: child);
+        },
+        child: widget.child,
+      ),
+    );
+  }
+}

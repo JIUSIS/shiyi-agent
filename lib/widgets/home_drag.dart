@@ -282,10 +282,14 @@ class HomeDragOverlay {
   }
 
   void remove() {
-    _entry?.remove();
+    final entry = _entry;
     _entry = null;
     flying = false;
     lifted = false;
+    if (entry == null) return;
+    try {
+      entry.remove();
+    } catch (_) {}
   }
 }
 

@@ -1,12 +1,15 @@
 import 'dart:async';
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../core/models.dart';
 import '../core/subagent_live.dart';
 import 'chat_liquid_glass.dart';
 import 'markdown_text.dart';
+import 'smooth_stream_text.dart';
 import 'tool_pill.dart';
 
 const Color _iosBlue = Color(0xFF0A84FF);
@@ -45,11 +48,30 @@ class SubagentStatusBar extends StatefulWidget {
   State<SubagentStatusBar> createState() => _SubagentStatusBarState();
 }
 
-class _SubagentStatusBarState extends State<SubagentStatusBar> {
+class _SubagentStatusBarState extends State<SubagentStatusBar>
+    with SingleTickerProviderStateMixin {
   final OverlayPortalController _portal = OverlayPortalController();
   final LayerLink _layerLink = LayerLink();
+  late final AnimationController _anim;
+  late final Animation<double> _reveal;
   List<SubagentLiveSnapshot> _pinned = const [];
   final Map<String, SubagentLiveSnapshot> _resolved = {};
+  bool _closing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 200),
+      reverseDuration: const Duration(milliseconds: 140),
+    );
+    _reveal = CurvedAnimation(
+      parent: _anim,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
 
   List<SubagentLiveSnapshot> get _sourceAgents {
     if (widget.agents.isNotEmpty) return widget.agents;
@@ -106,7 +128,7 @@ class _SubagentStatusBarState extends State<SubagentStatusBar> {
 
   void _togglePopup() {
     if (_portal.isShowing) {
-      _hide();
+      unawaited(_hide());
     } else {
       _show();
     }
@@ -118,15 +140,25 @@ class _SubagentStatusBarState extends State<SubagentStatusBar> {
     _resolved.clear();
     HapticFeedback.selectionClick();
     _portal.show();
+    _anim.forward(from: 0);
     widget.onOpenChanged?.call(true);
     if (mounted) setState(() {});
   }
 
-  void _hide() {
+  Future<void> _hide() async {
     if (!_portal.isShowing) return;
+    if (_closing) return;
+    _closing = true;
+    if (_anim.value > 0) {
+      try {
+        await _anim.reverse();
+      } catch (_) {}
+    }
+    if (!mounted) return;
     _portal.hide();
     _pinned = const [];
     _resolved.clear();
+    _closing = false;
     widget.onOpenChanged?.call(false);
     if (mounted) setState(() {});
   }
@@ -146,9 +178,16 @@ class _SubagentStatusBarState extends State<SubagentStatusBar> {
     return _SubagentMiniOverlay(
       link: _layerLink,
       agents: _agentsForPopup,
+      reveal: _reveal,
       resolveDetail: widget.resolveDetail == null ? null : _loadDetail,
       onDismiss: _hide,
     );
+  }
+
+  @override
+  void dispose() {
+    _anim.dispose();
+    super.dispose();
   }
 
   @override
@@ -158,7 +197,7 @@ class _SubagentStatusBarState extends State<SubagentStatusBar> {
     return PopScope(
       canPop: !_portal.isShowing,
       onPopInvokedWithResult: (bool didPop, Object? result) {
-        if (!didPop) _hide();
+        if (!didPop) unawaited(_hide());
       },
       child: OverlayPortal(
         controller: _portal,
@@ -185,11 +224,7 @@ class _SubagentStatusBarState extends State<SubagentStatusBar> {
                 const SizedBox(
                   width: 10,
                   height: 10,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 1.4,
-                    padding: EdgeInsets.zero,
-                    constraints: BoxConstraints.tightFor(width: 10, height: 10),
-                  ),
+                  child: CupertinoActivityIndicator(radius: 5),
                 ),
               ],
             ],
@@ -203,12 +238,14 @@ class _SubagentStatusBarState extends State<SubagentStatusBar> {
 class _SubagentMiniOverlay extends StatefulWidget {
   final LayerLink link;
   final List<SubagentLiveSnapshot> agents;
+  final Animation<double> reveal;
   final Future<void> Function(SubagentLiveSnapshot agent)? resolveDetail;
   final VoidCallback onDismiss;
 
   const _SubagentMiniOverlay({
     required this.link,
     required this.agents,
+    required this.reveal,
     required this.onDismiss,
     this.resolveDetail,
   });
@@ -217,10 +254,7 @@ class _SubagentMiniOverlay extends StatefulWidget {
   State<_SubagentMiniOverlay> createState() => _SubagentMiniOverlayState();
 }
 
-class _SubagentMiniOverlayState extends State<_SubagentMiniOverlay>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _anim;
-  late final Animation<double> _reveal;
+class _SubagentMiniOverlayState extends State<_SubagentMiniOverlay> {
   late final PageController _page;
   Timer? _detailPoll;
   int _index = 0;
@@ -228,14 +262,8 @@ class _SubagentMiniOverlayState extends State<_SubagentMiniOverlay>
   @override
   void initState() {
     super.initState();
-    _anim = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 160),
-    );
-    _reveal = CurvedAnimation(parent: _anim, curve: Curves.easeOutCubic);
     _index = _initialIndex(widget.agents);
     _page = PageController(initialPage: _index);
-    _anim.forward();
     _startDetailPoll();
     final first = _currentAgent;
     if (first != null) {
@@ -292,13 +320,13 @@ class _SubagentMiniOverlayState extends State<_SubagentMiniOverlay>
   void dispose() {
     _stopDetailPoll();
     _page.dispose();
-    _anim.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
     final mq = MediaQuery.of(context);
     final availW = mq.size.width - 24;
     final minW = availW < 168 ? (availW < 0 ? 0.0 : availW) : 168.0;
@@ -322,39 +350,44 @@ class _SubagentMiniOverlayState extends State<_SubagentMiniOverlay>
           targetAnchor: Alignment.topLeft,
           followerAnchor: Alignment.bottomLeft,
           offset: const Offset(0, -6),
-          child: FadeTransition(
-            opacity: _reveal,
+          child: SizeTransition(
+            sizeFactor: widget.reveal,
+            alignment: Alignment.bottomLeft,
             child: Material(
-              color: theme.colorScheme.surface.withValues(alpha: 0.96),
-              elevation: 16,
-              shadowColor: Colors.black.withValues(alpha: 0.28),
-              borderRadius: BorderRadius.circular(16),
+              color: Colors.transparent,
+              elevation: 12,
+              shadowColor: Colors.black.withValues(alpha: dark ? .36 : .14),
+              borderRadius: BorderRadius.circular(14),
               clipBehavior: Clip.antiAlias,
-              child: SizedBox(
-                width: panelWidth,
-                height: panelHeight,
-                child: agents.isEmpty
-                    ? const Center(child: Text('暂无子代理'))
-                    : Column(
-                        children: [
-                          _header(context),
-                          Expanded(
-                            child: PageView.builder(
-                              key: const ValueKey('subagent-mini-session'),
-                              controller: _page,
-                              itemCount: agents.length,
-                              onPageChanged: (index) {
-                                setState(() => _index = index);
-                                unawaited(_resolve(agents[index]));
-                              },
-                              itemBuilder: (context, index) {
-                                return _MiniSessionPage(agent: agents[index]);
-                              },
+              child: LiquidGlassLens(
+                style: chatLiquidGlassStyle(context, cornerRadius: 14),
+                child: SizedBox(
+                  width: panelWidth,
+                  height: panelHeight,
+                  child: agents.isEmpty
+                      ? const Center(child: Text('暂无子代理'))
+                      : Column(
+                          children: [
+                            _header(context),
+                            Expanded(
+                              child: PageView.builder(
+                                key: const ValueKey('subagent-mini-session'),
+                                controller: _page,
+                                itemCount: agents.length,
+                                onPageChanged: (index) {
+                                  setState(() => _index = index);
+                                  unawaited(_resolve(agents[index]));
+                                },
+                                itemBuilder: (context, index) {
+                                  return _MiniSessionPage(agent: agents[index]);
+                                },
+                              ),
                             ),
-                          ),
-                          if (agents.length > 1) _dots(context, agents.length),
-                        ],
-                      ),
+                            if (agents.length > 1)
+                              _dots(context, agents.length),
+                          ],
+                        ),
+                ),
               ),
             ),
           ),
@@ -439,12 +472,53 @@ class _MiniSessionPage extends StatefulWidget {
 class _MiniSessionPageState extends State<_MiniSessionPage>
     with AutomaticKeepAliveClientMixin {
   final ScrollController _scroll = ScrollController();
+  bool _followTail = true;
 
   @override
   bool get wantKeepAlive => true;
 
+  bool get _nearBottom {
+    if (!_scroll.hasClients) return true;
+    final pos = _scroll.position;
+    if (!pos.hasContentDimensions || !pos.maxScrollExtent.isFinite) {
+      return true;
+    }
+    return pos.maxScrollExtent - pos.pixels <= 64;
+  }
+
+  void _onUserScroll() {
+    if (!_scroll.hasClients) return;
+    _followTail = _nearBottom;
+  }
+
+  void _stickToBottomIfNeeded() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_followTail || !_scroll.hasClients) return;
+      final pos = _scroll.position;
+      if (!pos.hasContentDimensions) return;
+      final extent = pos.maxScrollExtent;
+      if (!extent.isFinite) return;
+      if ((pos.pixels - extent).abs() > 1) {
+        _scroll.jumpTo(extent);
+      }
+    });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onUserScroll);
+  }
+
+  @override
+  void didUpdateWidget(covariant _MiniSessionPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_followTail) _stickToBottomIfNeeded();
+  }
+
   @override
   void dispose() {
+    _scroll.removeListener(_onUserScroll);
     _scroll.dispose();
     super.dispose();
   }
@@ -512,63 +586,59 @@ class _MiniSessionPageState extends State<_MiniSessionPage>
         ),
       );
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      final extent = _scroll.position.maxScrollExtent;
-      if (!extent.isFinite) return;
-      _scroll.jumpTo(extent);
-    });
-    return ListView.builder(
-      controller: _scroll,
-      padding: const EdgeInsets.fromLTRB(8, 0, 8, 10),
-      itemCount: messages.length,
-      itemBuilder: (context, index) {
-        final m = messages[index];
-        final live = m.streaming;
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 6),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              if (!_hideEmptyToolBubble(m))
-                _MiniBubble(
-                  message: m,
-                  liveContent: live ? agent.liveContent : null,
-                  liveReasoning: live ? agent.liveReasoning : null,
-                  busy: live,
-                ),
-              if (m.hasToolCalls) _toolChips(context, m.toolCalls),
-            ],
-          ),
-        );
+    _stickToBottomIfNeeded();
+    return NotificationListener<ScrollNotification>(
+      onNotification: (n) {
+        if (n is ScrollEndNotification ||
+            (n is ScrollUpdateNotification && n.dragDetails != null)) {
+          _followTail = _nearBottom;
+        }
+        return false;
       },
+      child: ListView.builder(
+        key: const ValueKey('subagent-mini-session-scroll'),
+        controller: _scroll,
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+        itemCount: messages.length,
+        itemBuilder: (context, index) {
+          final m = messages[index];
+          final live = m.streaming;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (!_hideEmptyToolBubble(m))
+                  _MiniBubble(
+                    message: m,
+                    liveContent: live ? agent.liveContent : null,
+                    liveReasoning: live ? agent.liveReasoning : null,
+                    busy: live,
+                  ),
+                if (m.hasToolCalls) _toolChips(context, m.toolCalls),
+              ],
+            ),
+          );
+        },
+      ),
     );
   }
 
   Widget _toolChips(BuildContext context, List<ToolCall> calls) {
-    final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(8, 0, 8, 2),
+      padding: const EdgeInsets.only(bottom: 2),
       child: Wrap(
         spacing: 6,
         runSpacing: 4,
         children: [
           for (final call in calls)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest.withValues(
-                  alpha: 0.72,
-                ),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                toolEventLabel(call.name),
-                style: theme.textTheme.labelSmall?.copyWith(
-                  fontSize: 12,
-                  color: _iosBlue,
-                ),
-              ),
+            ChatComposerChip(
+              tooltip: toolEventLabel(call.name),
+              children: [
+                const Icon(CupertinoIcons.wrench),
+                const SizedBox(width: 6),
+                Text(toolEventLabel(call.name)),
+              ],
             ),
         ],
       ),
@@ -615,15 +685,10 @@ class _MiniBubble extends StatelessWidget {
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: bg,
-            borderRadius: BorderRadius.only(
-              topLeft: const Radius.circular(14),
-              topRight: const Radius.circular(14),
-              bottomLeft: Radius.circular(isUser ? 14 : 5),
-              bottomRight: Radius.circular(isUser ? 5 : 14),
-            ),
+            borderRadius: BorderRadius.circular(14),
           ),
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(10, 7, 10, 8),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
@@ -631,7 +696,7 @@ class _MiniBubble extends StatelessWidget {
                 if (reasoning.isNotEmpty)
                   Padding(
                     padding: EdgeInsets.only(bottom: content.isEmpty ? 0 : 4),
-                    child: Text(
+                    child: SmoothStreamText(
                       reasoning,
                       style: theme.textTheme.bodySmall?.copyWith(
                         fontSize: 12,

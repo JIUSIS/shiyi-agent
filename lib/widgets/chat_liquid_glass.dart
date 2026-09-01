@@ -509,7 +509,7 @@ class _ThinkingIntensitySelectorState extends State<ThinkingIntensitySelector>
 
 class _ThinkingMenuRow extends StatelessWidget {
   final String label;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const _ThinkingMenuRow({required this.label, required this.onTap});
 
@@ -887,7 +887,7 @@ class _PermissionPresetSelectorState extends State<PermissionPresetSelector>
 class _PermissionMenuRow extends StatelessWidget {
   final String label;
   final bool checked;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const _PermissionMenuRow({
     required this.label,
@@ -1601,7 +1601,7 @@ class ChatComposerChip extends StatelessWidget {
   static const double radius = 16;
 
   final String tooltip;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
   final List<Widget> children;
   final GlobalKey? anchorKey;
   final Key? chipKey;
@@ -1610,8 +1610,8 @@ class ChatComposerChip extends StatelessWidget {
   const ChatComposerChip({
     super.key,
     required this.tooltip,
-    required this.onTap,
     required this.children,
+    this.onTap,
     this.anchorKey,
     this.chipKey,
     this.color,
@@ -1780,8 +1780,9 @@ class _ChatStatsChipState extends State<ChatStatsChip>
           left: left,
           bottom: bottom,
           width: width,
-          child: FadeTransition(
-            opacity: _reveal,
+          child: SizeTransition(
+            sizeFactor: _reveal,
+            alignment: Alignment.bottomLeft,
             child: Material(
               color: Colors.transparent,
               elevation: 12,
@@ -1882,6 +1883,7 @@ class LiquidGlassChatComposer extends StatelessWidget {
   final bool permissionEnabled;
   final VoidCallback? onWorkspacePressed;
   final String workspaceTooltip;
+  final bool showAttachmentButton;
 
   const LiquidGlassChatComposer({
     super.key,
@@ -1921,6 +1923,7 @@ class LiquidGlassChatComposer extends StatelessWidget {
     this.permissionEnabled = true,
     this.onWorkspacePressed,
     this.workspaceTooltip = '项目目录',
+    this.showAttachmentButton = true,
   });
 
   bool _handleKey(KeyEvent event) {
@@ -2058,21 +2061,24 @@ class LiquidGlassChatComposer extends StatelessWidget {
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
-                    SizedBox(
-                      width: 40,
-                      height: 40,
-                      child: IconButton(
-                        onPressed: onPickAttachment,
-                        icon: const Icon(
-                          CupertinoIcons.plus_circle,
-                          size: 24,
-                          color: _iosBlue,
+                    if (showAttachmentButton) ...[
+                      SizedBox(
+                        width: 40,
+                        height: 40,
+                        child: IconButton(
+                          onPressed: onPickAttachment,
+                          icon: const Icon(
+                            CupertinoIcons.plus_circle,
+                            size: 24,
+                            color: _iosBlue,
+                          ),
+                          tooltip: '添加附件',
+                          padding: EdgeInsets.zero,
                         ),
-                        tooltip: '添加附件',
-                        padding: EdgeInsets.zero,
                       ),
-                    ),
-                    const SizedBox(width: 4),
+                      const SizedBox(width: 4),
+                    ] else
+                      const SizedBox(width: 6),
                     Expanded(
                       child: Container(
                         padding: const EdgeInsets.symmetric(

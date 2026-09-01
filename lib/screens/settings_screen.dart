@@ -2940,16 +2940,30 @@ class AgentEnginePageState extends State<AgentEnginePage> {
             backgroundColor: _iosGroupedBackground(dark),
             header: const Text('DeepSeek Harness 服务'),
             children: [
-              _ServiceRow(label: '本地版本', value: _localVersion ?? '未安装'),
               _ServiceRow(
+                icon: CupertinoIcons.number,
+                color: _iosBlue,
+                label: '本地版本',
+                value: _localVersion ?? '未安装',
+              ),
+              _ServiceRow(
+                icon: CupertinoIcons.arrow_up_circle_fill,
+                color: _iosGreen,
                 label: '最新版本',
                 value: _checking ? '检查中…' : (_latestVersion ?? '未检测'),
               ),
               _ServiceRow(
+                icon: CupertinoIcons.antenna_radiowaves_left_right,
+                color: _iosGreen,
                 label: '服务状态',
                 value: installed ? _statusLabel(dshStatus) : '未安装',
               ),
-              _ServiceRow(label: '网络代理', value: _proxyLabel),
+              _ServiceRow(
+                icon: CupertinoIcons.globe,
+                color: _iosTeal,
+                label: '网络代理',
+                value: _proxyLabel,
+              ),
               if (busy || _workError != null || _showInstallOutput)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
@@ -3196,10 +3210,16 @@ class AgentEnginePageState extends State<AgentEnginePage> {
             header: const Text('连接状态'),
             children: [
               _ServiceRow(
+                icon: CupertinoIcons.link,
+                color: _iosBlue,
                 label: '地址',
                 value: currentHost.isEmpty ? '未填写' : currentHost,
               ),
               _ServiceRow(
+                icon: dshStatus == DshStatus.running
+                    ? CupertinoIcons.checkmark_circle_fill
+                    : CupertinoIcons.xmark_circle_fill,
+                color: dshStatus == DshStatus.running ? _iosGreen : _iosRed,
                 label: '状态',
                 value: dshStatus == DshStatus.running ? '已连接' : '未连接',
               ),
@@ -3241,29 +3261,31 @@ class AgentEnginePageState extends State<AgentEnginePage> {
 
 /// DeepSeek Harness 服务信息行（标签 + 值）。
 class _ServiceRow extends StatelessWidget {
+  final IconData icon;
+  final Color color;
   final String label;
   final String value;
-  const _ServiceRow({required this.label, required this.value});
+  const _ServiceRow({
+    required this.icon,
+    required this.color,
+    required this.label,
+    required this.value,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      child: Row(
-        children: [
-          Text(label, style: const TextStyle(fontSize: 15)),
-          const Spacer(),
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: Theme.of(context).brightness == Brightness.dark
-                  ? CupertinoColors.white.withValues(alpha: .8)
-                  : CupertinoColors.black.withValues(alpha: .7),
-            ),
-          ),
-        ],
+    return CupertinoListTile(
+      leading: IosIconTile(icon: icon, color: color),
+      title: Text(label),
+      trailing: Text(
+        value,
+        style: TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+          color: Theme.of(context).brightness == Brightness.dark
+              ? CupertinoColors.white.withValues(alpha: .8)
+              : CupertinoColors.black.withValues(alpha: .7),
+        ),
       ),
     );
   }
@@ -4211,10 +4233,8 @@ class _IosTextFieldTile extends StatelessWidget {
         : CupertinoColors.black.withValues(alpha: .52);
     final fieldFill = dark ? const Color(0xFF2C2C2E) : const Color(0xFFF2F2F7);
     return CupertinoListTile(
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
       leading: _IosIconTile(icon: icon, color: color),
-      title: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      title: Row(
         children: [
           Text(
             title,
@@ -4224,23 +4244,29 @@ class _IosTextFieldTile extends StatelessWidget {
               color: dark ? CupertinoColors.white : CupertinoColors.black,
             ),
           ),
-          const SizedBox(height: 8),
-          ConstrainedBox(
-            constraints: const BoxConstraints(minHeight: 44),
-            child: CupertinoTextField(
-              controller: controller,
-              placeholder: placeholder,
-              keyboardType: keyboardType,
-              style: TextStyle(
-                color: dark ? CupertinoColors.white : CupertinoColors.black,
+          const SizedBox(width: 10),
+          Expanded(
+            child: SizedBox(
+              height: 38,
+              child: CupertinoTextField(
+                controller: controller,
+                placeholder: placeholder,
+                keyboardType: keyboardType,
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  color: dark ? CupertinoColors.white : CupertinoColors.black,
+                ),
+                placeholderStyle: TextStyle(color: secondary),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: fieldFill,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                onChanged: onChanged,
               ),
-              placeholderStyle: TextStyle(color: secondary),
-              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
-              decoration: BoxDecoration(
-                color: fieldFill,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              onChanged: onChanged,
             ),
           ),
         ],
@@ -4277,10 +4303,8 @@ class _IosSecretFieldTile extends StatelessWidget {
         : CupertinoColors.black.withValues(alpha: .52);
     final fieldFill = dark ? const Color(0xFF2C2C2E) : const Color(0xFFF2F2F7);
     return CupertinoListTile(
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
       leading: _IosIconTile(icon: icon, color: color),
-      title: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      title: Row(
         children: [
           Text(
             title,
@@ -4290,34 +4314,41 @@ class _IosSecretFieldTile extends StatelessWidget {
               color: dark ? CupertinoColors.white : CupertinoColors.black,
             ),
           ),
-          const SizedBox(height: 8),
-          ConstrainedBox(
-            constraints: const BoxConstraints(minHeight: 44),
-            child: CupertinoTextField(
-              controller: controller,
-              placeholder: placeholder,
-              obscureText: obscure,
-              style: TextStyle(
-                color: dark ? CupertinoColors.white : CupertinoColors.black,
-              ),
-              placeholderStyle: TextStyle(color: secondary),
-              padding: const EdgeInsets.fromLTRB(11, 10, 62, 10),
-              decoration: BoxDecoration(
-                color: fieldFill,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              suffix: CupertinoButton(
-                padding: EdgeInsets.zero,
-                onPressed: onToggleVisibility,
-                child: Text(
-                  obscure ? '显示' : '隐藏',
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: CupertinoColors.activeBlue,
+          const SizedBox(width: 10),
+          Expanded(
+            child: SizedBox(
+              height: 38,
+              child: CupertinoTextField(
+                controller: controller,
+                placeholder: placeholder,
+                obscureText: obscure,
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  color: dark ? CupertinoColors.white : CupertinoColors.black,
+                ),
+                placeholderStyle: TextStyle(color: secondary),
+                padding: const EdgeInsets.fromLTRB(11, 8, 6, 8),
+                decoration: BoxDecoration(
+                  color: fieldFill,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                suffix: Padding(
+                  padding: const EdgeInsets.only(left: 4, right: 8),
+                  child: CupertinoButton(
+                    minimumSize: Size.zero,
+                    padding: EdgeInsets.zero,
+                    onPressed: onToggleVisibility,
+                    child: Text(
+                      obscure ? '显示' : '隐藏',
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: CupertinoColors.activeBlue,
+                      ),
+                    ),
                   ),
                 ),
+                onChanged: onChanged,
               ),
-              onChanged: onChanged,
             ),
           ),
         ],
@@ -4417,8 +4448,8 @@ class _IosIconTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 31,
-      height: 31,
+      width: 28,
+      height: 28,
       decoration: BoxDecoration(
         color: color,
         borderRadius: BorderRadius.circular(7),

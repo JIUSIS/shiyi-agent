@@ -284,7 +284,7 @@ Future<void> deleteProjectDialog(
       data: iosCupertinoTheme(context),
       child: CupertinoAlertDialog(
         title: const Text('删除项目'),
-        content: Text('删除项目「${project.name}」？项目下会话会移到「未分类」，不会删除会话。'),
+        content: Text('删除项目「${project.name}」？关联会话和群聊会移到「未分类」，不会删除真实文件夹或文件。'),
         actions: [
           CupertinoDialogAction(
             onPressed: () => Navigator.pop(ctx, false),

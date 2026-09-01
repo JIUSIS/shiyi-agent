@@ -5,8 +5,12 @@ import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
+import '../widgets/bagua_icon.dart';
+import '../widgets/home_group_header.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/traffic_lights_button.dart';
+import '../services/group_chat_store.dart';
+import 'group_chat_list_screen.dart';
 import 'memory_screen.dart';
 import 'skills_screen.dart';
 
@@ -33,10 +37,7 @@ class FeaturesScreen extends StatelessWidget {
                 ? null
                 : Padding(
                     padding: const EdgeInsets.only(left: 12),
-                    child: TrafficLightsButton(
-                      tooltip: '',
-                      busy: shiyi.isBusy,
-                    ),
+                    child: TrafficLightsButton(tooltip: '', busy: shiyi.isBusy),
                   ),
             toolbarHeight: 64,
             centerTitle: true,
@@ -80,6 +81,7 @@ class FeaturesScreen extends StatelessWidget {
                       MacPageRoute(builder: (_) => SkillsScreen(shiyi: shiyi)),
                     ),
                   ),
+                  _GroupChatFeatureTile(shiyi: shiyi),
                 ],
               ),
             ],
@@ -90,16 +92,61 @@ class FeaturesScreen extends StatelessWidget {
   }
 }
 
+class _GroupChatFeatureTile extends StatefulWidget {
+  final ShiyiState shiyi;
+  const _GroupChatFeatureTile({required this.shiyi});
+
+  @override
+  State<_GroupChatFeatureTile> createState() => _GroupChatFeatureTileState();
+}
+
+class _GroupChatFeatureTileState extends State<_GroupChatFeatureTile> {
+  int _count = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final count = await GroupChatStore.instance.roomCount();
+    if (!mounted) return;
+    setState(() => _count = count);
+  }
+
+  Future<void> _open() async {
+    await Navigator.push<void>(
+      context,
+      MacPageRoute(builder: (_) => GroupChatListScreen(shiyi: widget.shiyi)),
+    );
+    if (mounted) await _reload();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _FeatureTile(
+      leading: const BaguaIcon(size: 31, color: kHomeGroupAccent),
+      title: '群聊',
+      subtitle: '主页也能进，可贴导图生成多个独立 Agent',
+      count: _count,
+      onTap: _open,
+    );
+  }
+}
+
 class _FeatureTile extends StatelessWidget {
-  final IconData icon;
-  final Color color;
+  final IconData? icon;
+  final Color? color;
+  final Widget? leading;
   final String title;
   final String subtitle;
   final int count;
   final VoidCallback onTap;
   const _FeatureTile({
-    required this.icon,
-    required this.color,
+    this.icon,
+    this.color,
+    this.leading,
     required this.title,
     required this.subtitle,
     required this.count,
@@ -109,15 +156,21 @@ class _FeatureTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CupertinoListTile(
-      leading: Container(
-        width: 31,
-        height: 31,
-        decoration: BoxDecoration(
-          color: color,
-          borderRadius: BorderRadius.circular(7),
-        ),
-        child: Icon(icon, size: 17, color: CupertinoColors.white),
-      ),
+      leading:
+          leading ??
+          Container(
+            width: 31,
+            height: 31,
+            decoration: BoxDecoration(
+              color: color ?? const Color(0xFF8E8E93),
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Icon(
+              icon ?? CupertinoIcons.circle_fill,
+              size: 17,
+              color: CupertinoColors.white,
+            ),
+          ),
       title: Text(title),
       subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: Row(

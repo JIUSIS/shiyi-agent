@@ -7,7 +7,9 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 import '../core/models.dart';
 import 'context_menu.dart';
 import 'ios_style.dart';
+import 'chat_liquid_glass.dart';
 import 'markdown_text.dart';
+import 'smooth_stream_text.dart';
 
 const _iosBlueLight = Color(0xFF007AFF);
 const _iosBlueDark = Color(0xFF0A84FF);
@@ -30,6 +32,7 @@ class MessageBubble extends StatefulWidget {
   /// 流式实时思考内容（reasoning_content）。
   final String? liveReasoning;
   final bool busy;
+  final bool toolRunning;
   final void Function(ChatMessage msg)? onCopy;
   final void Function(ChatMessage msg)? onDelete;
   final void Function(ChatMessage msg)? onRegenerate;
@@ -43,12 +46,18 @@ class MessageBubble extends StatefulWidget {
   /// 打开历史、滚动回收不要打开。
   final bool animateEnter;
 
+  /// 助手气泡下方署名。空则显示「拾忆」。群聊传入 Agent 名。
+  final String? speakerName;
+  final Color? speakerColor;
+  final bool smoothHeightAnimation;
+
   const MessageBubble({
     super.key,
     required this.message,
     this.liveContent,
     this.liveReasoning,
     this.busy = false,
+    this.toolRunning = false,
     this.onCopy,
     this.onDelete,
     this.onRegenerate,
@@ -58,6 +67,9 @@ class MessageBubble extends StatefulWidget {
     this.onStopSpeak,
     this.speaking = false,
     this.animateEnter = false,
+    this.speakerName,
+    this.speakerColor,
+    this.smoothHeightAnimation = true,
   });
 
   @override
@@ -327,9 +339,17 @@ class _MessageBubbleState extends State<MessageBubble> {
                     // 流式期间与已完成的思考统一为一个可展开面板，不再让
                     // 子代理总结、工具调用或空 live 缓冲把 reasoning 隐藏掉。
                     if (message.streaming || visibleReasoning.isNotEmpty) ...[
-                      _reasoningHeader(theme, streaming: message.streaming),
+                      _reasoningHeader(
+                        theme,
+                        streaming: message.streaming,
+                        toolRunning: widget.toolRunning && message.streaming,
+                      ),
                       if (_showReasoning && visibleReasoning.isNotEmpty)
-                        _reasoningBody(theme, visibleReasoning),
+                        _reasoningBody(
+                          theme,
+                          visibleReasoning,
+                          streaming: message.streaming,
+                        ),
                     ],
                     if (foldedSubagentResult.isNotEmpty) ...[
                       _subagentResultHeader(theme),
@@ -369,6 +389,11 @@ class _MessageBubbleState extends State<MessageBubble> {
       child: body,
     );
 
+    final smoothPadded = SmoothStreamHeight(
+      active: message.streaming && !isUser && widget.smoothHeightAnimation,
+      child: padded,
+    );
+
     return _maybeEnter(
       isUser: isUser,
       child: Column(
@@ -376,7 +401,7 @@ class _MessageBubbleState extends State<MessageBubble> {
             ? CrossAxisAlignment.end
             : CrossAxisAlignment.start,
         children: [
-          padded,
+          smoothPadded,
           _actionBar(theme, isUser),
           Padding(
             padding: EdgeInsets.only(
@@ -385,10 +410,14 @@ class _MessageBubbleState extends State<MessageBubble> {
               top: 4,
             ),
             child: Text(
-              isUser ? '你' : '拾忆',
+              isUser
+                  ? '你'
+                  : (widget.speakerName?.trim().isNotEmpty == true
+                        ? widget.speakerName!.trim()
+                        : '拾忆'),
               style: TextStyle(
                 fontSize: 11,
-                color: theme.hintColor,
+                color: widget.speakerColor ?? theme.hintColor,
                 fontWeight: FontWeight.w500,
               ),
             ),
@@ -417,25 +446,32 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
-  /// 思考内容折叠头：流式期间显示 spinner + “思考中”，结束后显示“思考过程”。
-  Widget _reasoningHeader(ThemeData theme, {required bool streaming}) {
+  /// 思考内容折叠头：工具执行中显示“正在使用工具”，流式显示 spinner +
+  /// “思考中”，结束后显示“思考过程”。
+  Widget _reasoningHeader(
+    ThemeData theme, {
+    required bool streaming,
+    required bool toolRunning,
+  }) {
     final blue = theme.brightness == Brightness.dark
         ? _iosBlueDark
         : _iosBlueLight;
     return InkWell(
-      onTap: () {
-        setState(() => _showReasoning = !_showReasoning);
-        // 展开时直接看到最新思考（而不是顶部）。
-        if (!_showReasoning) return;
-        _scrollReasoningToBottom();
-      },
+      onTap: toolRunning
+          ? null
+          : () {
+              setState(() => _showReasoning = !_showReasoning);
+              // 展开时直接看到最新思考（而不是顶部）。
+              if (!_showReasoning) return;
+              _scrollReasoningToBottom();
+            },
       borderRadius: BorderRadius.circular(6),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 2),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (streaming)
+            if (toolRunning || streaming)
               const SizedBox(
                 width: 15,
                 height: 15,
@@ -449,7 +485,9 @@ class _MessageBubbleState extends State<MessageBubble> {
               ),
             const SizedBox(width: 4),
             Text(
-              _showReasoning ? '收起思考' : (streaming ? '思考中' : '思考过程'),
+              toolRunning
+                  ? '正在使用工具'
+                  : (_showReasoning ? '收起思考' : (streaming ? '思考中' : '思考过程')),
               style: theme.textTheme.bodySmall!.copyWith(
                 color: blue,
                 fontWeight: FontWeight.w600,
@@ -462,7 +500,11 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   /// 思考内容正文：浅色块 + 小字，超高可滚动。
-  Widget _reasoningBody(ThemeData theme, String reasoning) {
+  Widget _reasoningBody(
+    ThemeData theme,
+    String reasoning, {
+    bool streaming = false,
+  }) {
     final dark = theme.brightness == Brightness.dark;
     return Padding(
       padding: const EdgeInsets.only(top: 2, bottom: 6),
@@ -474,15 +516,26 @@ class _MessageBubbleState extends State<MessageBubble> {
             constraints: const BoxConstraints(maxHeight: 220),
             child: SingleChildScrollView(
               controller: _reasoningCtrl,
-              child: SelectableText(
-                reasoning,
-                style: theme.textTheme.bodySmall!.copyWith(
-                  color: dark
-                      ? const Color(0xFFD1D1D6)
-                      : const Color(0xFF3A3A3C),
-                  height: 1.5,
-                ),
-              ),
+              child: streaming
+                  ? SmoothStreamText(
+                      reasoning,
+                      selectable: true,
+                      style: theme.textTheme.bodySmall!.copyWith(
+                        color: dark
+                            ? const Color(0xFFD1D1D6)
+                            : const Color(0xFF3A3A3C),
+                        height: 1.5,
+                      ),
+                    )
+                  : SelectableText(
+                      reasoning,
+                      style: theme.textTheme.bodySmall!.copyWith(
+                        color: dark
+                            ? const Color(0xFFD1D1D6)
+                            : const Color(0xFF3A3A3C),
+                        height: 1.5,
+                      ),
+                    ),
             ),
           ),
         ),
@@ -687,14 +740,15 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// 消息底栏：常用操作直接放出来，随时可用（朗读/停止、复制、重新生成、记忆、技能、删除）。
   Widget _actionBar(ThemeData theme, bool isUser) {
     final canSpeak = !isUser && message.content.trim().isNotEmpty && !busy;
-    final dark = theme.brightness == Brightness.dark;
     final actions = <Widget>[
       if (canSpeak && onSpeak != null)
         _barButton(
           theme: theme,
           icon: speaking ? Icons.stop_circle : Icons.volume_up_outlined,
           tooltip: speaking ? '停止朗读' : '朗读',
-          color: speaking ? theme.colorScheme.primary : theme.hintColor,
+          color: speaking
+              ? theme.colorScheme.primary
+              : theme.colorScheme.onSurface,
           highlight: speaking,
           onTap: () {
             if (speaking) {
@@ -749,26 +803,25 @@ class _MessageBubbleState extends State<MessageBubble> {
         child: DecoratedBox(
           key: const ValueKey('messageActionBar'),
           decoration: BoxDecoration(
-            color: dark
-                ? const Color(0xFF1C1C1E).withValues(alpha: .78)
-                : Colors.white.withValues(alpha: .72),
-            borderRadius: BorderRadius.circular(22),
-            border: Border.all(
-              color: dark
-                  ? Colors.white.withValues(alpha: .08)
-                  : Colors.black.withValues(alpha: .06),
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: dark ? .14 : .05),
-                blurRadius: 8,
-                offset: const Offset(0, 1),
-              ),
-            ],
+            borderRadius: BorderRadius.circular(ChatComposerChip.radius),
           ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
-            child: Row(mainAxisSize: MainAxisSize.min, children: actions),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(ChatComposerChip.radius),
+            clipBehavior: Clip.antiAlias,
+            child: LiquidGlassLens(
+              style: chatLiquidGlassStyle(
+                context,
+                cornerRadius: ChatComposerChip.radius,
+              ),
+              child: SizedBox(
+                height: ChatComposerChip.height,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: actions),
+                ),
+              ),
+            ),
           ),
         ),
       ),
@@ -785,7 +838,7 @@ class _MessageBubbleState extends State<MessageBubble> {
   }) {
     final foreground = highlight
         ? theme.colorScheme.primary
-        : color ?? theme.hintColor;
+        : color ?? theme.colorScheme.onSurface;
     return Tooltip(
       message: tooltip,
       child: Material(
@@ -794,8 +847,8 @@ class _MessageBubbleState extends State<MessageBubble> {
           onTap: onTap,
           customBorder: const CircleBorder(),
           child: Container(
-            width: 34,
-            height: 34,
+            width: 28,
+            height: 24,
             alignment: Alignment.center,
             decoration: BoxDecoration(
               color: highlight
@@ -803,7 +856,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                   : Colors.transparent,
               shape: BoxShape.circle,
             ),
-            child: Icon(icon, size: 17, color: foreground),
+            child: Icon(icon, size: 13, color: foreground),
           ),
         ),
       ),
@@ -1158,36 +1211,26 @@ class _BubbleEnterState extends State<_BubbleEnter>
   late final AnimationController _controller;
   late final Animation<double> _fade;
   late final Animation<double> _scale;
-  late final Animation<double> _stretch;
 
   @override
   void initState() {
     super.initState();
     _controller = AnimationController(
       vsync: this,
-      duration: Duration(milliseconds: widget.isUser ? 560 : 640),
+      duration: Duration(milliseconds: widget.isUser ? 420 : 460),
     );
-    _fade = Tween<double>(begin: widget.isUser ? .55 : .35, end: 1).animate(
+    _fade = Tween<double>(begin: 0, end: 1).animate(
       CurvedAnimation(
         parent: _controller,
-        curve: const Interval(0, .4, curve: Curves.easeOut),
+        curve: const Interval(0, .45, curve: Curves.easeOutCubic),
       ),
     );
-    _scale = Tween<double>(begin: widget.isUser ? .42 : .46, end: 1).animate(
+    _scale = Tween<double>(begin: widget.isUser ? .82 : .78, end: 1).animate(
       CurvedAnimation(
         parent: _controller,
-        curve: widget.isUser
-            ? const Interval(0, .72, curve: Curves.easeOutBack)
-            : const Interval(0, .78, curve: Curves.easeOutBack),
+        curve: const Interval(0, 1, curve: Curves.easeOutCubic),
       ),
     );
-    _stretch = Tween<double>(begin: widget.isUser ? 1.38 : 1.32, end: 1)
-        .animate(
-          CurvedAnimation(
-            parent: _controller,
-            curve: const Interval(.28, 1, curve: Curves.easeOutBack),
-          ),
-        );
     _controller.forward();
   }
 
@@ -1205,19 +1248,15 @@ class _BubbleEnterState extends State<_BubbleEnter>
         animation: _controller,
         builder: (context, child) {
           final t = Curves.easeOutCubic.transform(_controller.value);
-          final dx = widget.isUser ? 14.0 : -18.0;
-          final dy = widget.isUser ? 112.0 : 96.0;
+          final dx = widget.isUser ? 8.0 : -10.0;
+          final dy = widget.isUser ? 96.0 : 72.0;
           return Transform.translate(
             offset: Offset(dx * (1 - t), dy * (1 - t)),
             child: Transform(
               alignment: widget.isUser
                   ? Alignment.bottomRight
                   : Alignment.bottomLeft,
-              transform: Matrix4.diagonal3Values(
-                _scale.value,
-                _stretch.value,
-                1,
-              ),
+              transform: Matrix4.diagonal3Values(_scale.value, _scale.value, 1),
               child: child,
             ),
           );

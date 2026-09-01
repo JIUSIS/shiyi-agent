@@ -586,6 +586,38 @@ void main() {
       expect(msgs.last['content'], contains('目标：改缓存'));
     });
 
+    test('冻头指纹：同冻头稳定、改冻头变化、无冻头返回 null', () {
+      final a = ShiyiState.buildMainRequestMessages(
+        frozen: 'FROZEN_PREFIX',
+        history: [
+          {'role': 'user', 'content': 'hello'},
+        ],
+        tail: 'TAIL_TIME',
+      );
+      final b = ShiyiState.buildMainRequestMessages(
+        frozen: 'FROZEN_PREFIX',
+        history: [
+          {'role': 'user', 'content': 'world'},
+        ],
+        tail: 'TAIL_TIME',
+      );
+      // 冻头相同 → 指纹一致（历史/动尾不影响冻头指纹，供命中率诊断）。
+      expect(ShiyiState.frozenSha256(a), isNotEmpty);
+      expect(ShiyiState.frozenSha256(a), ShiyiState.frozenSha256(b));
+      // 冻头改变 → 指纹变化。
+      final c = ShiyiState.buildMainRequestMessages(
+        frozen: 'DIFFERENT_PREFIX',
+        history: [
+          {'role': 'user', 'content': 'hello'},
+        ],
+        tail: 'TAIL_TIME',
+      );
+      expect(ShiyiState.frozenSha256(c), isNot(ShiyiState.frozenSha256(a)));
+      // 无冻头（首条非 system）→ null。
+      expect(ShiyiState.frozenSha256(const <Map<String, dynamic>>[]), isNull);
+      expect(ShiyiState.frozenSha256([{'role': 'user', 'content': 'hi'}]), isNull);
+    });
+
     test('没有压缩归档时历史紧跟冻头', () {
       final msgs = ShiyiState.buildMainRequestMessages(
         frozen: 'FROZEN_PREFIX',

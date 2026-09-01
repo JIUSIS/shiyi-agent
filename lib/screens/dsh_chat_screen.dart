@@ -27,6 +27,7 @@ import '../services/runtime_logger.dart';
 import '../services/tts_service.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
+import '../widgets/animated_message_list.dart';
 import '../widgets/agent_question_panel.dart';
 import '../widgets/chat_liquid_glass.dart';
 import '../widgets/subagent_mini_session.dart';
@@ -36,6 +37,21 @@ import '../widgets/tool_pill.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/traffic_lights_button.dart';
 import '../widgets/welcome_avatar.dart';
+
+/// DSH 子代理列表按“连接 + 父会话”记忆，避免页面重建或重进时按钮消失。
+final Map<String, List<DshSubagentEntry>> _dshSubagentMemory = {};
+
+String _dshSubagentMemoryKey(String sessionId) =>
+    '${DshService.instance.currentScopeKey}\n$sessionId';
+
+void _rememberDshSubagents(String key, List<DshSubagentEntry> entries) {
+  if (entries.isEmpty) return;
+  _dshSubagentMemory[key] = List<DshSubagentEntry>.of(entries);
+}
+
+void _forgetDshSubagents(String key) {
+  _dshSubagentMemory.remove(key);
+}
 
 /// 本机 DSH 先读取本地会话快照，再开始整页淡入；局域网 / 公网直接请求
 /// 目标 DSH，禁止把手机快照显示成远端当前页面。
@@ -232,6 +248,11 @@ class _DshChatScreenState extends State<DshChatScreen>
         _usesTargetDshApi ||
         (settings != null && DshEndpoint.modeOf(settings) == 'remote');
     WidgetsBinding.instance.addObserver(this);
+    final rememberedSubagents =
+        _dshSubagentMemory[_dshSubagentMemoryKey(widget.sessionId)];
+    if (rememberedSubagents != null) {
+      _subagents = List<DshSubagentEntry>.of(rememberedSubagents);
+    }
     DshService.instance.status.addListener(_onDshStatus);
     _streamText.addListener(_onStreamTextChanged);
     TtsService.instance.speakingId.addListener(_onSpeakingChanged);
@@ -2507,8 +2528,12 @@ class _DshChatScreenState extends State<DshChatScreen>
     try {
       final result = await _api.listSubagents(widget.sessionId);
       if (!mounted || refreshGeneration != _subagentRefreshGeneration) return;
+      _rememberDshSubagents(
+        _dshSubagentMemoryKey(widget.sessionId),
+        result.entries,
+      );
       setState(() {
-        _subagents = result.entries;
+        _subagents = result.entries.isEmpty ? _subagents : result.entries;
       });
       _syncSubagentPolling();
     } catch (_) {
@@ -2535,13 +2560,14 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   void _finalizeSubagentStatus() {
     _subagentRefreshGeneration++;
-    _subagents = [];
+    _syncSubagentPolling();
     if (mounted) setState(() {});
   }
 
   /// 让旧回合的子代理投影和异步刷新结果彻底失效。
   void _resetSubagentStatusForNewTurn() {
     _subagentRefreshGeneration++;
+    _forgetDshSubagents(_dshSubagentMemoryKey(widget.sessionId));
     _subagents = [];
     if (mounted) setState(() {});
   }
@@ -3271,6 +3297,43 @@ class _DshChatScreenState extends State<DshChatScreen>
     );
   }
 
+  String _messageListItemKey(Object item) {
+    if (item is ChatMessage) return _itemKey(item);
+    if (item is _DshThinkingPlaceholder) return 'dsh-thinking-placeholder';
+    return 'unknown:${identityHashCode(item)}';
+  }
+
+  Widget _buildMessageListItem(BuildContext context, Object item) {
+    if (item is _DshThinkingPlaceholder) return _thinkingPlaceholder();
+    final m = item as ChatMessage;
+    return KeyedSubtree(
+      key: ValueKey(_itemKey(m)),
+      child: RepaintBoundary(
+        child: ValueListenableBuilder<String>(
+          valueListenable: _streamReasoning,
+          builder: (context, reasoning, _) => ValueListenableBuilder<String>(
+            valueListenable: _streamText,
+            builder: (context, text, _) => MessageBubble(
+              message: m,
+              liveContent: m.streaming && text.isNotEmpty ? text : null,
+              liveReasoning: m.streaming && reasoning.isNotEmpty
+                  ? reasoning
+                  : null,
+              busy: m.streaming,
+              animateEnter: _shouldAnimateEnter(m),
+              onCopy: _copy,
+              speaking: _speakingId == m.id,
+              onSpeak: _speakMessage,
+              onStopSpeak: _stopSpeak,
+              onSaveMemory: widget.shiyi == null ? null : _saveMemory,
+              onSaveSkill: widget.shiyi == null ? null : _saveSkill,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _composerFloatChips() {
     final showSubagent = _subagentTotalCount > 0 || _subagentPeekOpen;
     final showStats = DshStatsBar.hasContent(_summary);
@@ -3360,65 +3423,35 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
     // reverse 列表：index 0 = 最新消息（offset 0 即视觉底部），
     // 进会话默认直接看到最新，不依赖加载完成后跳转定位。
-    final items = visible.reversed.toList();
-    final hasStreaming = items.any((m) => m.streaming);
+    final visibleItems = visible.reversed.toList();
+    final hasStreaming = visibleItems.any((m) => m.streaming);
     // 会话仍活跃（整轮未完 / 子代理在跑）但没有真实流式气泡时，
     // 在底部补一条“思考中”占位，保证指示常驻；有真实流就不画，避免重复。
     final thinkingNeeded = _isThinkingActive && !hasStreaming;
-    final itemCount = items.length + (thinkingNeeded ? 1 : 0);
+    final items = <Object>[
+      if (thinkingNeeded) const _DshThinkingPlaceholder(),
+      ...visibleItems,
+    ];
     return ScrollConfiguration(
       behavior: ScrollConfiguration.of(context).copyWith(overscroll: false),
-      child: ListView.builder(
+      child: AnimatedMessageList(
         controller: _scroll,
-        reverse: true,
-        clipBehavior: Clip.none,
         padding: EdgeInsets.fromLTRB(
           messageListSidePadding,
           12,
           messageListSidePadding,
           overlayHeight + 12,
         ),
-        itemCount: itemCount,
-        itemBuilder: (context, i) {
-          if (thinkingNeeded && i == 0) {
-            // 视觉底部第一条 = 常驻“思考中”占位。
-            return _thinkingPlaceholder();
-          }
-          final mi = thinkingNeeded ? i - 1 : i;
-          final m = items[mi];
-          return KeyedSubtree(
-            key: ValueKey(_itemKey(m)),
-            child: RepaintBoundary(
-              child: ValueListenableBuilder<String>(
-                valueListenable: _streamReasoning,
-                builder: (context, reasoning, _) =>
-                    ValueListenableBuilder<String>(
-                      valueListenable: _streamText,
-                      builder: (context, text, _) => MessageBubble(
-                        message: m,
-                        liveContent: m.streaming && text.isNotEmpty
-                            ? text
-                            : null,
-                        liveReasoning: m.streaming && reasoning.isNotEmpty
-                            ? reasoning
-                            : null,
-                        busy: m.streaming,
-                        animateEnter: _shouldAnimateEnter(m),
-                        onCopy: _copy,
-                        speaking: _speakingId == m.id,
-                        onSpeak: _speakMessage,
-                        onStopSpeak: _stopSpeak,
-                        onSaveMemory: widget.shiyi == null ? null : _saveMemory,
-                        onSaveSkill: widget.shiyi == null ? null : _saveSkill,
-                      ),
-                    ),
-              ),
-            ),
-          );
-        },
+        items: items,
+        keyOf: _messageListItemKey,
+        itemBuilder: _buildMessageListItem,
       ),
     );
   }
+}
+
+class _DshThinkingPlaceholder {
+  const _DshThinkingPlaceholder();
 }
 
 class _DshWelcome extends StatelessWidget {

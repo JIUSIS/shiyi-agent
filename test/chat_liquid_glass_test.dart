@@ -480,15 +480,103 @@ void main() {
     );
 
     final chip = find.byKey(const ValueKey('subagent-live-chip'));
-    await tester.tap(chip);
+    await tester.tap(chip, warnIfMissed: false);
     await tester.pump();
-    await tester.tap(chip);
+    await tester.tap(chip, warnIfMissed: false);
     await tester.pump();
-    await tester.tap(chip);
+    await tester.tap(chip, warnIfMissed: false);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 200));
     expect(find.byKey(const ValueKey('subagent-mini-session')), findsOneWidget);
     expect(find.text('explore'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('上滑查看历史时不自动跳回底部', (tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final history = [
+      for (var i = 0; i < 16; i++)
+        ChatMessage(
+          id: 'm$i',
+          sessionId: 'a',
+          role: i.isEven ? 'user' : 'assistant',
+          content: '历史消息 $i\n第二行内容用来把列表撑高',
+          createdAt: i,
+        ),
+    ];
+    late StateSetter setPage;
+    var agents = [
+      SubagentLiveSnapshot(
+        id: 'a',
+        title: 'explore',
+        running: true,
+        messages: history,
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              setPage = setState;
+              return Align(
+                alignment: Alignment.bottomCenter,
+                child: SubagentStatusBar(text: '子代理', agents: agents),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('subagent-live-chip')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    final list = find.byKey(const ValueKey('subagent-mini-session-scroll'));
+    expect(list, findsOneWidget);
+    final vertical = find.descendant(
+      of: list,
+      matching: find.byType(Scrollable),
+    );
+    var pos = tester.state<ScrollableState>(vertical).position;
+    expect(pos.pixels, closeTo(pos.maxScrollExtent, 2));
+
+    await tester.drag(list, const Offset(0, 240));
+    await tester.pump();
+    pos = tester.state<ScrollableState>(vertical).position;
+    final afterDrag = pos.pixels;
+    expect(afterDrag, lessThan(pos.maxScrollExtent - 24));
+
+    setPage(() {
+      agents = [
+        SubagentLiveSnapshot(
+          id: 'a',
+          title: 'explore',
+          running: true,
+          messages: [
+            ...history,
+            ChatMessage(
+              id: 'new',
+              sessionId: 'a',
+              role: 'assistant',
+              content: '最新输出不应该把滚动拽回去',
+              createdAt: 99,
+            ),
+          ],
+          liveContent: '最新输出不应该把滚动拽回去',
+        ),
+      ];
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    pos = tester.state<ScrollableState>(vertical).position;
+    expect(pos.pixels, closeTo(afterDrag, 16));
     expect(tester.takeException(), isNull);
   });
 

@@ -17,6 +17,7 @@ import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
 import '../services/update_service.dart';
 import '../widgets/home_drag.dart';
+import '../widgets/home_group_chats.dart';
 import '../widgets/home_group_header.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
@@ -77,6 +78,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   int _tab = 0;
+  int _groupRefresh = 0;
 
   /// 桌面侧边栏宽度（拖拽把手调整，150~300）。
   double _sidebarWidth = 190;
@@ -217,6 +219,7 @@ class _HomeScreenState extends State<HomeScreen>
     }
     setState(() {
       _tab = tab;
+      if (tab == 0) _groupRefresh++;
     });
     _fadeController.forward(from: 0);
   }
@@ -455,6 +458,7 @@ class _HomeScreenState extends State<HomeScreen>
         return _SessionsTab(
           shiyi: shiyi,
           resetRevision: _sessionsResetRevision,
+          groupRefresh: _groupRefresh,
           onOpenSettings: _openSettings,
         );
       case 1:
@@ -794,10 +798,12 @@ class _DesktopNavItem extends StatelessWidget {
 class _SessionsTab extends StatefulWidget {
   final ShiyiState shiyi;
   final int resetRevision;
+  final int groupRefresh;
   final VoidCallback onOpenSettings;
   const _SessionsTab({
     required this.shiyi,
     required this.resetRevision,
+    this.groupRefresh = 0,
     required this.onOpenSettings,
   });
 
@@ -866,6 +872,7 @@ class _SessionsTabState extends State<_SessionsTab> {
   String? _crossGeometryId;
   int _crossInsertIndex = 0;
   Offset? _lastDragGlobal;
+  final GlobalKey<HomeGroupChatsState> _groupChatsKey = GlobalKey();
 
   ShiyiState get shiyi => widget.shiyi;
 
@@ -909,6 +916,9 @@ class _SessionsTabState extends State<_SessionsTab> {
       _dismissSearch();
       _searchCtrl.clear();
       _query = '';
+    }
+    if (oldWidget.groupRefresh != widget.groupRefresh) {
+      _groupChatsKey.currentState?.reload();
     }
   }
 
@@ -1907,14 +1917,34 @@ class _SessionsTabState extends State<_SessionsTab> {
   Widget _buildBody(BuildContext context) {
     final q = _query.trim();
     if (q.isEmpty) {
-      if (shiyi.sessions.isEmpty && shiyi.projects.isEmpty) {
-        return _EmptyState(onCreate: _newProject);
-      }
       final byProject = <String, List<Session>>{};
       for (final s in shiyi.sessions) {
         byProject.putIfAbsent(s.projectId, () => []).add(s);
       }
-      final children = <Widget>[];
+      final children = <Widget>[
+        HomeGroupChats(
+          key: _groupChatsKey,
+          shiyi: shiyi,
+          openSwipeKey: _openSwipeKey,
+          onOpenRectChanged: _onOpenSwipeRectChanged,
+        ),
+      ];
+      if (shiyi.sessions.isEmpty && shiyi.projects.isEmpty) {
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 640),
+                  child: children.first,
+                ),
+              ),
+            ),
+            Expanded(child: _EmptyState(onCreate: _newProject)),
+          ],
+        );
+      }
       final projects = _visibleProjects;
       final projectCount = projects.length;
       for (var projectIndex = 0; projectIndex < projectCount; projectIndex++) {
