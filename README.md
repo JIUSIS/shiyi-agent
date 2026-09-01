@@ -216,5 +216,5 @@ flutter build apk --release
 
 **拾忆 ShiYi** · 让每一次对话，都留下成果。
 
-> 本项目在 [LINUX DO](https://linux.do) 社区交流反馈。
+> 本项目在 [LINUX DO](https://linux.do) 社区交流反馈。我的主页[九思JIUSIS]([https://linux.do](https://linux.do/u/jiusis))
 
