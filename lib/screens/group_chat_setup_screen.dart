@@ -40,6 +40,8 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
   GroupMindmapParse? _parsed;
   bool _useMinimal = false;
   late String _projectId;
+  String _unifiedProfileId = '';
+  String _unifiedModel = '';
 
   bool get _isEdit => widget.room != null;
 
@@ -89,6 +91,23 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
     super.dispose();
   }
 
+  void _showAlert(String title, String message) {
+    if (!mounted) return;
+    showCupertinoDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          CupertinoDialogAction(
+            child: const Text('好'),
+            onPressed: () => Navigator.pop(ctx),
+          ),
+        ],
+      ),
+    );
+  }
+
   GroupAgent _newAgent(String name, int colorIndex, {String? reportsToId}) {
     final profile = _defaultProfile;
     final facing = groupChatUserFacingAgents(_agents);
@@ -125,9 +144,7 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
     });
     if (!mounted) return;
     if (parsed.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('没认出 Agent，检查一下角色区')));
+      _showAlert('没认出 Agent', '检查一下角色区，确保有成员或角色分组。');
     }
   }
 
@@ -145,9 +162,92 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
       const ClipboardData(text: groupMindmapMinimalTemplate),
     );
     if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('已复制最小模板，可粘贴给 Agent 或编辑框')));
+    showCupertinoDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('已复制'),
+        content: const Text('最小模板已复制，可粘贴给 Agent 或编辑框。'),
+        actions: [
+          CupertinoDialogAction(
+            child: const Text('好'),
+            onPressed: () => Navigator.pop(ctx),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _applyUnifiedApi() async {
+    final profiles = widget.shiyi.apiProfiles;
+    if (profiles.isEmpty) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('没有可用配置'),
+          content: const Text('请先在设置页添加至少一个 API 配置。'),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+    final selected = await showCupertinoModalPopup<ApiProfile>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: const Text('选择 API 配置'),
+        actions: [
+          for (final p in profiles)
+            CupertinoActionSheetAction(
+              onPressed: () => Navigator.pop(ctx, p),
+              child: Text('${p.name} · ${p.model}'),
+            ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
+        ),
+      ),
+    );
+    if (selected == null || !mounted) return;
+    var model = selected.model;
+    final models = widget.shiyi.cachedModelsForProfile(selected);
+    if (models.isNotEmpty) {
+      final chosen = await showIosFadeModalPopup<String>(
+        context: context,
+        builder: (ctx) => CupertinoActionSheet(
+          title: Text('选择模型 · ${selected.name}'),
+          actions: [
+            for (final item in models)
+              CupertinoActionSheetAction(
+                onPressed: () => Navigator.pop(ctx, item),
+                child: Text(item),
+              ),
+          ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+        ),
+      );
+      if (chosen == null || !mounted) return;
+      model = chosen;
+    }
+    setState(() {
+      _unifiedProfileId = selected.profileId;
+      _unifiedModel = model;
+      for (var i = 0; i < _agents.length; i++) {
+        _agents[i] = _agents[i].copyWith(
+          apiProfileId: selected.profileId,
+          model: model,
+        );
+      }
+    });
   }
 
   void _fillFromMindmap() {
@@ -157,16 +257,12 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
       setState(() => _parsed = parsed);
     }
     if (parsed.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('没认出 Agent，检查一下角色区')));
+      _showAlert('没认出 Agent', '检查一下角色区，确保有成员或角色分组。');
       return;
     }
     final agents = _agentsFromParse(parsed);
     if (agents.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('没有可填入的 Agent')));
+      _showAlert('没有可填入的 Agent', '先正确识别角色，再点击填入。');
       return;
     }
     setState(() {
@@ -179,9 +275,7 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
     final profileHint = _defaultProfile == null
         ? '还没有默认 API，保存前可给每个人补接口。'
         : '每人先用 ${_defaultProfile!.name} · $_defaultModel，之后可单独改。';
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已填入 ${agents.length} 个 Agent。$profileHint')),
-    );
+    _showAlert('已填入 ${agents.length} 个 Agent', profileHint);
   }
 
   Future<void> _editAgent(GroupAgent agent, int index) async {
@@ -251,16 +345,12 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
         ? _agents.map((a) => a.name.trim()).where((n) => n.isNotEmpty).join('、')
         : _title.text.trim();
     if (_agents.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('至少加一个 Agent')));
+      _showAlert('至少加一个 Agent', '请先添加成员后再保存。');
       return;
     }
     for (final agent in _agents) {
       if (agent.name.trim().isEmpty) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('每个 Agent 都要有名字')));
+        _showAlert('每个 Agent 都要有名字', '请补齐成员名字后再保存。');
         return;
       }
     }
@@ -440,6 +530,30 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
                           groupChatOrgLines(_agents).join('\n'),
                           style: const TextStyle(fontSize: 15, height: 1.55),
                         ),
+                      ),
+                    ],
+                  ),
+                  CupertinoListSection.insetGrouped(
+                    margin: iosSectionMargin,
+                    decoration: iosSectionDecoration(context),
+                    header: const Text('统一 API'),
+                    footer: _sectionFooter(
+                      '一键把选中的 API 配置和模型应用到所有 Agent。单独设置过的 Agent 不受影响。',
+                    ),
+                    children: [
+                      CupertinoListTile(
+                        leading: const IosIconTile(
+                          icon: CupertinoIcons.globe,
+                          color: Color(0xFF0A84FF),
+                        ),
+                        title: const Text('统一 API 配置'),
+                        subtitle: Text(
+                          _unifiedProfileId.isNotEmpty
+                              ? '已应用到全部 Agent · $_unifiedModel'
+                              : '点击选择配置',
+                        ),
+                        trailing: const CupertinoListTileChevron(),
+                        onTap: _applyUnifiedApi,
                       ),
                     ],
                   ),
@@ -739,9 +853,19 @@ class _GroupAgentEditScreenState extends State<_GroupAgentEditScreen> {
 
   Future<void> _pickProfile() async {
     if (widget.shiyi.apiProfiles.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('请先到设置里添加拾忆 API 配置')));
+      showCupertinoDialog<void>(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('没有可用配置'),
+          content: const Text('请先到设置里添加拾忆 API 配置。'),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
       return;
     }
     final chosen = await showIosFadeModalPopup<ApiProfile>(
@@ -773,7 +897,22 @@ class _GroupAgentEditScreenState extends State<_GroupAgentEditScreen> {
     final models = profile == null
         ? const <String>[]
         : widget.shiyi.cachedModelsForProfile(profile);
-    if (models.isEmpty) return;
+    if (models.isEmpty) {
+      showCupertinoDialog<void>(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('没有可用模型'),
+          content: const Text('当前配置还没有模型列表，请先刷新或检查 API 配置。'),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     final chosen = await showIosFadeModalPopup<String>(
       context: context,
       builder: (ctx) => CupertinoActionSheet(

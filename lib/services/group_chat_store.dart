@@ -42,6 +42,15 @@ class GroupChatStore {
         created_at INTEGER NOT NULL
       )
     ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS group_agent_summaries (
+        room_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (room_id, agent_id)
+      )
+    ''');
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_group_agents_room ON group_agents(room_id)',
     );
@@ -217,6 +226,33 @@ class GroupChatStore {
     );
   }
 
+  Future<String> getSummary(String roomId, String agentId) async {
+    final db = await AppDatabase.instance.db;
+    final rows = await db.query(
+      'group_agent_summaries',
+      columns: ['summary'],
+      where: 'room_id = ? AND agent_id = ?',
+      whereArgs: [roomId, agentId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return '';
+    return (rows.first['summary'] ?? '').toString();
+  }
+
+  Future<void> saveSummary(
+    String roomId,
+    String agentId,
+    String summary,
+  ) async {
+    final db = await AppDatabase.instance.db;
+    await db.insert('group_agent_summaries', {
+      'room_id': roomId,
+      'agent_id': agentId,
+      'summary': summary,
+      'updated_at': DateTime.now().millisecondsSinceEpoch,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
   Future<void> deleteMessage(String id) async {
     final db = await AppDatabase.instance.db;
     await db.delete('group_messages', where: 'id = ?', whereArgs: [id]);
@@ -224,6 +260,11 @@ class GroupChatStore {
 
   Future<void> deleteRoom(String id) async {
     final db = await AppDatabase.instance.db;
+    await db.delete(
+      'group_agent_summaries',
+      where: 'room_id = ?',
+      whereArgs: [id],
+    );
     await db.delete('group_messages', where: 'room_id = ?', whereArgs: [id]);
     await db.delete('group_agents', where: 'room_id = ?', whereArgs: [id]);
     await db.delete('group_rooms', where: 'id = ?', whereArgs: [id]);

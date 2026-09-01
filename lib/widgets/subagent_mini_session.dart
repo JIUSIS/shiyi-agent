@@ -477,18 +477,13 @@ class _MiniSessionPageState extends State<_MiniSessionPage>
   @override
   bool get wantKeepAlive => true;
 
-  bool get _nearBottom {
+  bool _nearBottom([double threshold = 8]) {
     if (!_scroll.hasClients) return true;
     final pos = _scroll.position;
     if (!pos.hasContentDimensions || !pos.maxScrollExtent.isFinite) {
       return true;
     }
-    return pos.maxScrollExtent - pos.pixels <= 64;
-  }
-
-  void _onUserScroll() {
-    if (!_scroll.hasClients) return;
-    _followTail = _nearBottom;
+    return pos.maxScrollExtent - pos.pixels <= threshold;
   }
 
   void _stickToBottomIfNeeded() {
@@ -505,12 +500,6 @@ class _MiniSessionPageState extends State<_MiniSessionPage>
   }
 
   @override
-  void initState() {
-    super.initState();
-    _scroll.addListener(_onUserScroll);
-  }
-
-  @override
   void didUpdateWidget(covariant _MiniSessionPage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (_followTail) _stickToBottomIfNeeded();
@@ -518,7 +507,6 @@ class _MiniSessionPageState extends State<_MiniSessionPage>
 
   @override
   void dispose() {
-    _scroll.removeListener(_onUserScroll);
     _scroll.dispose();
     super.dispose();
   }
@@ -589,9 +577,14 @@ class _MiniSessionPageState extends State<_MiniSessionPage>
     _stickToBottomIfNeeded();
     return NotificationListener<ScrollNotification>(
       onNotification: (n) {
-        if (n is ScrollEndNotification ||
-            (n is ScrollUpdateNotification && n.dragDetails != null)) {
-          _followTail = _nearBottom;
+        if (n is ScrollUpdateNotification && n.dragDetails != null) {
+          if ((n.scrollDelta ?? 0) < 0) {
+            _followTail = false;
+          } else if (_nearBottom()) {
+            _followTail = true;
+          }
+        } else if (n is ScrollEndNotification) {
+          _followTail = _nearBottom();
         }
         return false;
       },

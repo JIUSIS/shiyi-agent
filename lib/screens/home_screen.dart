@@ -138,10 +138,9 @@ class _HomeScreenState extends State<HomeScreen>
   /// 打开 app 时自动体检：未安装提示；未开启自动拉起；已开启刷新状态。
   Future<void> _checkDshOnLaunch() async {
     DshService.instance.applyConnection(widget.shiyi.settings);
+    if (widget.shiyi.settings.agentEngine != 'dsh') return;
     if (!DshService.instance.managesLocalProcess) {
-      if (widget.shiyi.settings.agentEngine == 'dsh') {
-        await DshService.instance.refreshStatus();
-      }
+      await DshService.instance.refreshStatus();
       return;
     }
     final ok = await DshService.instance.ensureAvailableOnLaunch();

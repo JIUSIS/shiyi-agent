@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,10 +13,13 @@ import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../core/reasoning_models.dart';
 import '../services/group_chat_store.dart';
+import '../services/file_workspace.dart';
 import '../services/llm_client.dart';
+import '../services/termux_runtime.dart';
 import '../widgets/bagua_icon.dart';
 import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
+import '../widgets/group_project_picker.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/traffic_lights_button.dart';
@@ -36,6 +41,18 @@ class _AgentTurnResult {
   const _AgentTurnResult({this.message, this.failed = false});
 }
 
+class GroupChatActiveRun {
+  final String roomId;
+  final Set<LlmClient> clients = {};
+  bool stopRequested = false;
+  bool active = false;
+  final ValueNotifier<int> revision = ValueNotifier(0);
+  final Map<String, GroupMessage> liveDrafts = {};
+  GroupChatActiveRun(this.roomId);
+}
+
+final Map<String, GroupChatActiveRun> groupChatActiveRuns = {};
+
 class _GroupChatScreenState extends State<GroupChatScreen> {
   final _input = TextEditingController();
   final _scroll = ScrollController();
@@ -45,9 +62,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   List<GroupMessage> _messages = [];
   bool _loading = true;
   bool _busy = false;
-  bool _stop = false;
+  bool _compressingContext = false;
   Completer<void>? _roundCompleter;
-  final Set<LlmClient> _activeClients = {};
   final Set<String> _enteredIds = {};
   int _roundCachedTokens = 0;
   int _roundInputTokens = 0;
@@ -55,25 +71,79 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   int _sessionCachedTokens = 0;
   int _sessionInputTokens = 0;
   bool _sessionCacheKnown = false;
+  bool _thinkingOn = true;
+  String _thinkingEffort = '';
+  String _unifiedProfileName = '';
+  String _unifiedModelId = '';
+  final List<String> _pendingImages = [];
+  final List<String> _pendingFiles = [];
 
   @override
   void initState() {
     super.initState();
     _scroll.addListener(_syncFollowTail);
     _reload();
+    groupChatActiveRuns.putIfAbsent(
+      widget.roomId,
+      () => GroupChatActiveRun(widget.roomId),
+    );
+    final active = groupChatActiveRuns[widget.roomId];
+    if (active != null) {
+      active.revision.addListener(_onActiveRunRevision);
+      if (active.active || active.clients.isNotEmpty) {
+        _busy = true;
+      }
+    }
   }
 
   @override
   void dispose() {
     _scroll.removeListener(_syncFollowTail);
-    _stop = true;
-    for (final client in List.of(_activeClients)) {
-      client.cancel();
-    }
+    groupChatActiveRuns[widget.roomId]?.revision.removeListener(
+      _onActiveRunRevision,
+    );
     _input.dispose();
     _scroll.dispose();
     super.dispose();
   }
+
+  void _onActiveRunRevision() {
+    if (!mounted) return;
+    final active = _activeRun;
+    final busy = active.active || active.clients.isNotEmpty;
+    final wasBusy = _busy;
+    setState(() => _busy = busy);
+    if (wasBusy && !busy) unawaited(_reload());
+  }
+
+  List<GroupMessage> get _visibleMessages {
+    final live = [
+      for (final draft in _activeRun.liveDrafts.values)
+        if (draft.roomId == widget.roomId) draft,
+    ];
+    if (live.isEmpty) return _messages;
+    final liveIds = {for (final draft in live) draft.id};
+    final merged = <GroupMessage>[
+      for (final message in _messages)
+        if (!liveIds.contains(message.id)) message,
+      ...live,
+    ];
+    merged.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return merged;
+  }
+
+  void _markDraftChanged() {
+    if (mounted) {
+      setState(() {});
+    } else {
+      _activeRun.revision.value++;
+    }
+  }
+
+  GroupChatActiveRun get _activeRun => groupChatActiveRuns.putIfAbsent(
+    widget.roomId,
+    () => GroupChatActiveRun(widget.roomId),
+  );
 
   Future<void> _reload() async {
     final room = await _store.getRoom(widget.roomId);
@@ -110,12 +180,27 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Future<void> _send() async {
     final room = _room;
     if (room == null) return;
-    final text = _input.text.trim();
+    final rawText = _input.text.trim();
+    final attachmentBlock = _attachmentContext();
+    final text = [
+      rawText,
+      attachmentBlock,
+    ].where((part) => part.isNotEmpty).join('\n\n');
     if (text.isEmpty) return;
     if (room.agents.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('先去编辑成员，至少加一个 Agent')));
+      showCupertinoDialog(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('提示'),
+          content: const Text('先去编辑成员，至少加一个 Agent'),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
       return;
     }
 
@@ -135,12 +220,15 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       createdAt: now,
     );
     _input.clear();
+    _pendingFiles.clear();
+    _pendingImages.clear();
     final completer = Completer<void>();
     _roundCompleter = completer;
     setState(() {
       _messages = [..._messages, user];
       _busy = true;
-      _stop = false;
+      _activeRun.stopRequested = false;
+      _activeRun.active = true;
       _roundCachedTokens = 0;
       _roundInputTokens = 0;
       _roundCacheKnown = false;
@@ -150,7 +238,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _jumpToLatest(force: true);
       final reworkCounts = <String, int>{};
       final queue = [...groupChatInitialTargets(text, room.agents)];
-      while (queue.isNotEmpty && !_stop && mounted) {
+      var emptySpins = 0;
+      while (queue.isNotEmpty && !_activeRun.stopRequested) {
         final batch = <GroupAgent>[];
         while (batch.length < groupChatMaxParallelAgents && queue.isNotEmpty) {
           final agent = queue.removeAt(0);
@@ -160,13 +249,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         final results = await Future.wait([
           for (final agent in batch) _runAgent(agent),
         ]);
-        if (_stop || !mounted) break;
+        if (_activeRun.stopRequested) break;
         if (results.any((result) => result.failed)) break;
+        final progressed = results.any(
+          (result) =>
+              result.message != null &&
+              (result.message!.content.trim().isNotEmpty ||
+                  result.message!.reasoning.trim().isNotEmpty),
+        );
         final followups = groupChatNextFollowupTargets(
           speakers: batch,
           replies: [for (final result in results) result.message],
           agents: room.agents,
         );
+        if (!progressed && followups.isNotEmpty) {
+          emptySpins++;
+          if (emptySpins >= 3) break;
+        } else if (progressed) {
+          emptySpins = 0;
+        }
         for (final followup in followups) {
           if (followup.isRework) {
             final count = (reworkCounts[followup.handoffKey] ?? 0) + 1;
@@ -178,9 +279,23 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         }
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      _activeRun.active = false;
+      if (mounted) {
+        setState(() => _busy = false);
+      } else {
+        _activeRun.revision.value++;
+      }
       if (!completer.isCompleted) completer.complete();
     }
+  }
+
+  String _attachmentContext() {
+    if (_pendingFiles.isEmpty && _pendingImages.isEmpty) return '';
+    final parts = <String>[
+      for (final path in _pendingFiles) path,
+      for (final path in _pendingImages) path,
+    ];
+    return '已附加文件，可用 file_read 或 run_terminal 读取：\n${parts.join('\n')}';
   }
 
   Future<_AgentTurnResult> _runAgent(GroupAgent agent) async {
@@ -200,11 +315,22 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           : null,
     );
     if (profile == null || profile.baseUrl.trim().isEmpty) {
-      if (!mounted) return const _AgentTurnResult(failed: true);
       final message = '${agent.name} 还没有可用的 API 配置';
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
+      if (mounted) {
+        showCupertinoDialog(
+          context: context,
+          builder: (ctx) => CupertinoAlertDialog(
+            title: Text(agent.name),
+            content: Text(message),
+            actions: [
+              CupertinoDialogAction(
+                child: const Text('好'),
+                onPressed: () => Navigator.pop(ctx),
+              ),
+            ],
+          ),
+        );
+      }
       return _AgentTurnResult(
         failed: true,
         message: await _failedDraft(room, agent, message),
@@ -212,16 +338,36 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
     final model = agent.model.trim().isEmpty ? profile.model : agent.model;
     if (model.trim().isEmpty) {
-      if (!mounted) return const _AgentTurnResult(failed: true);
       final message = '${agent.name} 还没有模型 ID';
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
+      if (mounted) {
+        showCupertinoDialog(
+          context: context,
+          builder: (ctx) => CupertinoAlertDialog(
+            title: Text(agent.name),
+            content: Text(message),
+            actions: [
+              CupertinoDialogAction(
+                child: const Text('好'),
+                onPressed: () => Navigator.pop(ctx),
+              ),
+            ],
+          ),
+        );
+      }
       return _AgentTurnResult(
         failed: true,
         message: await _failedDraft(room, agent, message),
       );
     }
+    return _runAgentWithTools(room, agent, profile, model);
+  }
+
+  Future<_AgentTurnResult> _runAgentWithTools(
+    GroupRoom room,
+    GroupAgent agent,
+    ApiProfile profile,
+    String model,
+  ) async {
     final draft = GroupMessage(
       id: groupChatNewId('gm'),
       roomId: room.id,
@@ -230,63 +376,112 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       createdAt: DateTime.now().millisecondsSinceEpoch,
       streaming: true,
     );
-    setState(() => _messages = [..._messages, draft]);
+    _activeRun.liveDrafts[draft.id] = draft;
+    _markDraftChanged();
     _jumpToLatest();
     final settings = widget.shiyi.settings;
-    var lastEmit = DateTime.now();
-    final client = LlmClient(
-      baseUrl: profile.baseUrl,
-      apiKey: profile.apiKey,
-      model: model,
-      protocol: profile.apiProtocol,
-      sessionId: room.id,
-      temperature: settings.temperature,
-      maxTokens: settings.maxOutputTokens,
-      tools: const [],
-      reasoningEffortOverride: ReasoningModels.defaultEffort(model),
-      shouldStop: () => _stop,
-      onTurn: (turn) {
-        draft.content = turn.text;
-        draft.reasoning = turn.reasoning;
-        final now = DateTime.now();
-        if (now.difference(lastEmit).inMilliseconds < 50) return;
-        lastEmit = now;
-        if (mounted) setState(() {});
-        _jumpToLatest();
-      },
-    );
-    _activeClients.add(client);
+    final workingDir = await _projectWorkingDir(room.projectId);
+    final tools = _groupChatTools();
+    final contextSummary = await _store.getSummary(room.id, agent.id);
     String? failure;
+    final loopMsgs = groupChatApiMessages(
+      speaker: agent,
+      agents: room.agents,
+      history: _messages.where((m) => m.id != draft.id).toList(),
+      contextSummary: contextSummary,
+    );
+    const maxToolRounds = 8;
+    var roundCached = 0;
+    var roundInput = 0;
     try {
-      await client.send(
-        groupChatApiMessages(
-          speaker: agent,
-          agents: room.agents,
-          history: _messages.where((m) => m.id != draft.id).toList(),
-        ),
-      );
+      for (var round = 0; round < maxToolRounds; round++) {
+        TurnResult? lastTurn;
+        final client = LlmClient(
+          baseUrl: profile.baseUrl,
+          apiKey: profile.apiKey,
+          model: model,
+          protocol: profile.apiProtocol,
+          sessionId: room.id,
+          temperature: settings.temperature,
+          maxTokens: settings.maxOutputTokens,
+          tools: tools,
+          reasoningEffortOverride: _thinkingOn
+              ? ReasoningModels.defaultEffort(model)
+              : 'off',
+          shouldStop: () => _activeRun.stopRequested,
+          onTurn: (turn) {
+            lastTurn = turn;
+            draft.content = turn.text;
+            draft.reasoning = turn.reasoning;
+            _markDraftChanged();
+            _jumpToLatest();
+          },
+        );
+        _activeRun.clients.add(client);
+        try {
+          await client.send(loopMsgs);
+          final c = client.lastCachedTokens ?? 0;
+          final i = client.lastPromptTokens ?? client.lastInputTokens ?? 0;
+          roundCached += c.clamp(0, i).toInt();
+          roundInput += i;
+        } finally {
+          _activeRun.clients.remove(client);
+        }
+
+        final result = lastTurn;
+        if (result == null) break;
+        draft.content = result.text;
+        draft.reasoning = result.reasoning;
+        _markDraftChanged();
+
+        final hasTools = result.toolCalls.isNotEmpty;
+        if (!hasTools) break;
+
+        // Record tool_calls in the assistant message.
+        loopMsgs.add({
+          'role': 'assistant',
+          'content': result.text,
+          if (result.reasoning.isNotEmpty)
+            'reasoning_content': result.reasoning,
+          'tool_calls': [
+            for (final tc in result.toolCalls)
+              {
+                'id': tc['id'] ?? 'call_${groupChatNewId('tc')}',
+                'type': 'function',
+                'function': {'name': tc['name'], 'arguments': tc['arguments']},
+              },
+          ],
+        });
+
+        // Execute each tool call.
+        for (final tc in result.toolCalls) {
+          final toolId = tc['id'] ?? 'call_${groupChatNewId('tc')}';
+          final output = await _executeGroupTool(
+            tc['name'] ?? '',
+            tc['arguments'] ?? '{}',
+            workingDir: workingDir,
+          );
+          loopMsgs.add({
+            'role': 'tool',
+            'content': output,
+            'tool_call_id': toolId,
+          });
+        }
+      }
     } on LlmCancelledException {
       // 用户点了停止，保留已经流出来的内容。
     } catch (e) {
       failure = e.toString();
       final text = draft.content.trim();
       draft.content = text.isEmpty ? '回复失败：$failure' : '$text\n\n回复失败：$failure';
-    } finally {
-      _activeClients.remove(client);
     }
-    final cached = client.lastCachedTokens;
-    final input = client.lastPromptTokens ?? client.lastInputTokens;
-    if (mounted && cached != null && input != null && input > 0) {
-      final hit = cached.clamp(0, input).toInt();
-      setState(() {
-        _roundCachedTokens += hit;
-        _roundInputTokens += input;
-        _roundCacheKnown = true;
-        _sessionCachedTokens += hit;
-        _sessionInputTokens += input;
-        _sessionCacheKnown = true;
-      });
-    }
+    _roundCachedTokens += roundCached;
+    _roundInputTokens += roundInput;
+    if (roundInput > 0) _roundCacheKnown = true;
+    _sessionCachedTokens += roundCached;
+    _sessionInputTokens += roundInput;
+    if (roundInput > 0) _sessionCacheKnown = true;
+    _markDraftChanged();
     draft.streaming = false;
     if (failure == null &&
         draft.content.trim().isEmpty &&
@@ -300,16 +495,20 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (failure == null &&
         draft.content.trim().isEmpty &&
         draft.reasoning.trim().isEmpty) {
-      setState(() {
-        _messages = [
-          for (final item in _messages)
-            if (item.id != draft.id) item,
-        ];
-      });
+      _activeRun.liveDrafts.remove(draft.id);
+      _markDraftChanged();
       return const _AgentTurnResult(failed: true);
     }
     await _store.insertMessage(draft);
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {
+        _activeRun.liveDrafts.remove(draft.id);
+        _messages = [..._messages, draft];
+      });
+    } else {
+      _activeRun.liveDrafts.remove(draft.id);
+      _activeRun.revision.value++;
+    }
     _jumpToLatest();
     return _AgentTurnResult(message: draft, failed: failure != null);
   }
@@ -331,15 +530,496 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (mounted) {
       setState(() => _messages = [..._messages, draft]);
       _jumpToLatest();
+    } else {
+      _activeRun.revision.value++;
     }
     return draft;
   }
 
+  Future<String> _projectWorkingDir(String projectId) async {
+    if (projectId.isNotEmpty) {
+      for (final project in widget.shiyi.projects) {
+        if (project.id == projectId && project.workspaceDir.trim().isNotEmpty) {
+          return project.workspaceDir;
+        }
+      }
+    }
+    return FileWorkspace.ensure();
+  }
+
+  List<Map<String, dynamic>> _groupChatTools() {
+    return [
+      {
+        'type': 'function',
+        'function': {
+          'name': 'file_read',
+          'description': '读取文本文件内容（最大200KB）。相对路径基于项目工作目录。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string', 'description': '文件路径'},
+            },
+            'required': ['path'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'file_write',
+          'description': '把文本内容写入文件（自动创建父目录）。用于保存生成的内容。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string', 'description': '文件路径'},
+              'content': {'type': 'string', 'description': '完整内容'},
+            },
+            'required': ['path', 'content'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'run_terminal',
+          'description':
+              '执行 shell 命令并返回输出。默认工作目录是项目目录。'
+              '你可以用这个工具运行脚本、查看文件列表、安装依赖等。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'command': {'type': 'string', 'description': '要执行的 shell 命令'},
+            },
+            'required': ['command'],
+          },
+        },
+      },
+    ];
+  }
+
+  Future<String> _executeGroupTool(
+    String name,
+    String argsJson, {
+    required String workingDir,
+  }) async {
+    Map<String, dynamic> args = {};
+    try {
+      args = jsonDecode(argsJson) as Map<String, dynamic>;
+    } catch (_) {}
+    try {
+      switch (name) {
+        case 'file_read':
+          final path = args['path']?.toString() ?? '';
+          if (path.isEmpty) return '错误：path 不能为空';
+          final file = File(
+            path.startsWith('/') || path.contains(':')
+                ? path
+                : workingDir.isEmpty
+                ? path
+                : '$workingDir/$path',
+          );
+          if (!file.existsSync()) return '文件不存在: $path';
+          final content = await file.readAsString();
+          if (content.length > 200 * 1024) {
+            return content.substring(0, 200 * 1024) + '\n（截断，超过200KB）';
+          }
+          return content;
+        case 'file_write':
+          final path = args['path']?.toString() ?? '';
+          final content = args['content']?.toString() ?? '';
+          if (path.isEmpty) return '错误：path 不能为空';
+          final file = File(
+            path.startsWith('/') || path.contains(':')
+                ? path
+                : workingDir.isEmpty
+                ? path
+                : '$workingDir/$path',
+          );
+          await file.parent.create(recursive: true);
+          await file.writeAsString(content);
+          return '已写入: ${file.path} (${content.length} chars)';
+        case 'run_terminal':
+          final command = args['command']?.toString() ?? '';
+          if (command.isEmpty) return '错误：command 不能为空';
+          return _runGroupTerminal(command, workingDir);
+        default:
+          return '未知工具: $name';
+      }
+    } catch (e) {
+      return '工具 $name 执行失败: $e';
+    }
+  }
+
+  Future<String> _runGroupTerminal(String command, String workingDir) async {
+    try {
+      final settings = widget.shiyi.settings;
+      final cwd = workingDir.trim().isEmpty ? null : workingDir.trim();
+      final String shell;
+      final List<String> args;
+      Map<String, String>? environment;
+      var backendWarn = '';
+      if (TermuxRuntime.isWindows) {
+        final backend = await TermuxRuntime.resolveWindowsBackend(
+          settings.terminalBackend,
+        );
+        switch (backend) {
+          case 'wsl2':
+            shell = 'wsl.exe';
+            args = ['-e', 'bash', '-lc', command];
+            environment = const {'WSL_UTF8': '1'};
+          case 'gitbash':
+            shell =
+                await TermuxRuntime.gitBashPath() ??
+                r'C:\Program Files\Git\bin\bash.exe';
+            args = ['--login', '-c', command];
+          case 'cmd':
+            shell = 'cmd';
+            args = ['/c', command];
+          default:
+            shell = 'pwsh';
+            args = [
+              '-NoProfile',
+              '-NoLogo',
+              '-NonInteractive',
+              '-Command',
+              command,
+            ];
+        }
+        if (settings.terminalBackend == 'wsl2' && backend != 'wsl2') {
+          backendWarn = '（你选择了 WSL2，但当前不可用，已回退 $backend）';
+        } else if (settings.terminalBackend == 'gitbash' &&
+            backend != 'gitbash') {
+          backendWarn = '（你选择了 Git Bash，但当前不可用，已回退 $backend）';
+        }
+      } else {
+        await TermuxRuntime.ensureInstalled();
+        final argv = await TermuxRuntime.shellCommand(['-c', command]);
+        shell = argv.first;
+        args = argv.sublist(1);
+        environment = await TermuxRuntime.environment();
+      }
+      final proc = await Process.start(
+        shell,
+        args,
+        workingDirectory: cwd,
+        environment: environment,
+      );
+      final stdoutFuture = proc.stdout.transform(utf8.decoder).join();
+      final stderrFuture = proc.stderr.transform(utf8.decoder).join();
+      int? exitCode;
+      try {
+        exitCode = await proc.exitCode.timeout(const Duration(seconds: 60));
+      } on TimeoutException {
+        proc.kill();
+        return '终端执行超时（已强制终止）：命令超过 60 秒未完成。';
+      }
+      final stdout = (await stdoutFuture).trim();
+      final stderr = (await stderrFuture).trim();
+      final buf = StringBuffer();
+      if (stdout.isNotEmpty) buf.write(stdout);
+      if (stderr.isNotEmpty) {
+        if (buf.isNotEmpty) buf.write('\n');
+        buf.write(stderr);
+      }
+      if (backendWarn.isNotEmpty) {
+        if (buf.isNotEmpty) buf.write('\n');
+        buf.write(backendWarn);
+      }
+      return buf.isEmpty ? '命令执行完成（无输出），退出码 $exitCode' : '退出码 $exitCode\n$buf';
+    } on ProcessException catch (e) {
+      return '终端执行异常: ${e.message}';
+    } catch (e) {
+      return '终端执行失败: $e';
+    }
+  }
+
   void _stopRun() {
-    _stop = true;
-    for (final client in List.of(_activeClients)) {
+    _activeRun.stopRequested = true;
+    _activeRun.active = false;
+    for (final client in List.of(_activeRun.clients)) {
       client.cancel();
     }
+    if (mounted) setState(() => _busy = false);
+  }
+
+  Future<void> _pickAttachment() async {
+    if (!mounted) return;
+    showIosFadeModalPopup<void>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: const Text('添加附件'),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _pickGroupFile();
+            },
+            child: const Text('发送文件'),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickGroupFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+      if (result == null || result.files.isEmpty) return;
+      final room = _room;
+      if (room == null) return;
+      final workingDir = await _projectWorkingDir(room.projectId);
+      var added = 0;
+      for (final file in result.files) {
+        final src = file.path;
+        if (src == null || !mounted) return;
+        final dest = await FileWorkspace.copyToAttachments(
+          src,
+          workspacePath: workingDir,
+        );
+        if (dest == null) continue;
+        setState(() => _pendingFiles.add(dest));
+        added++;
+      }
+      if (added == 0 && mounted) {
+        showCupertinoDialog(
+          context: context,
+          builder: (ctx) => CupertinoAlertDialog(
+            title: const Text('添加附件失败'),
+            content: const Text('文件复制到项目目录失败，请检查项目文件夹。'),
+            actions: [
+              CupertinoDialogAction(
+                child: const Text('好'),
+                onPressed: () => Navigator.pop(ctx),
+              ),
+            ],
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('添加附件失败'),
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  void _onUnifiedModelChanged(SessionModelSelection selection) {
+    setState(() {
+      _unifiedProfileName = selection.profile;
+      _unifiedModelId = selection.model;
+    });
+    final room = _room;
+    if (room == null) return;
+    for (final p in widget.shiyi.apiProfiles) {
+      if (p.name == selection.profile) {
+        setState(() {
+          for (var i = 0; i < room.agents.length; i++) {
+            room.agents[i] = room.agents[i].copyWith(
+              apiProfileId: p.profileId,
+              model: selection.model,
+            );
+          }
+        });
+        unawaited(_store.saveAgents(widget.roomId, room.agents));
+        break;
+      }
+    }
+  }
+
+  int _estimateTokens(String text) => (text.trim().length / 4).ceil();
+
+  int _agentContextTokens(GroupAgent agent) {
+    final room = _room;
+    if (room == null) return 0;
+    final messages = groupChatApiMessages(
+      speaker: agent,
+      agents: room.agents,
+      history: _messages,
+    );
+    return messages.fold(
+      0,
+      (sum, message) => sum + _estimateTokens('${message['content'] ?? ''}'),
+    );
+  }
+
+  String get _contextLabel => '${_visibleMessages.length}条';
+
+  Future<void> _openAgentContext() async {
+    final room = _room;
+    if (room == null || room.agents.isEmpty) return;
+    final selected = await showIosFadeModalPopup<GroupAgent>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: const Text('选择要压缩上下文的成员'),
+        actions: [
+          for (final agent in room.agents)
+            CupertinoActionSheetAction(
+              onPressed: () => Navigator.pop(ctx, agent),
+              child: Text(
+                '${agent.name} · 约 ${_agentContextTokens(agent)} tokens',
+              ),
+            ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('取消'),
+        ),
+      ),
+    );
+    if (selected == null || !mounted) return;
+    final ok = await showIosConfirmDialog(
+      context: context,
+      title: '压缩 ${selected.name} 的上下文？',
+      message: '会用这个成员自己的 API，把早期历史整理成摘要。原始消息仍保留在本地。',
+      confirmLabel: '压缩',
+    );
+    if (ok == true && mounted) await _compressAgentContext(selected);
+  }
+
+  Future<void> _compressAgentContext(GroupAgent agent) async {
+    if (_compressingContext) return;
+    final room = _room;
+    if (room == null) return;
+    final profile = groupChatProfileFor(
+      agent,
+      widget.shiyi.apiProfiles,
+      fallback: widget.shiyi.apiProfiles.isEmpty
+          ? ApiProfile(
+              name: '当前',
+              baseUrl: widget.shiyi.settings.baseUrl,
+              apiKey: widget.shiyi.settings.apiKey,
+              model: widget.shiyi.settings.model,
+              apiProtocol: widget.shiyi.settings.apiProtocol,
+            )
+          : null,
+    );
+    final model = agent.model.trim().isEmpty
+        ? profile?.model ?? ''
+        : agent.model;
+    if (profile == null ||
+        profile.baseUrl.trim().isEmpty ||
+        model.trim().isEmpty) {
+      showCupertinoDialog(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: Text(agent.name),
+          content: const Text('这个成员还没有可用的 API 配置，无法压缩。'),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    setState(() => _compressingContext = true);
+    try {
+      final summary = await _summarizeAgentHistory(room, agent, profile, model);
+      await _store.saveSummary(room.id, agent.id, summary);
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('已压缩'),
+          content: Text('${agent.name} 的早期历史已整理成摘要，下次发言会自动带上。'),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('压缩失败'),
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('好'),
+              onPressed: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _compressingContext = false);
+    }
+  }
+
+  Future<String> _summarizeAgentHistory(
+    GroupRoom room,
+    GroupAgent agent,
+    ApiProfile profile,
+    String model,
+  ) async {
+    final messages = groupChatApiMessages(
+      speaker: agent,
+      agents: room.agents,
+      history: _messages,
+    );
+    messages.add({
+      'role': 'user',
+      'content':
+          '请把以上对话历史压缩成一份简洁中文摘要。只保留：目标任务、已做决定、'
+          '产出物路径、未完成事项、关键约束。不要回答问题，直接输出摘要。',
+    });
+    var summary = '';
+    final client = LlmClient(
+      baseUrl: profile.baseUrl,
+      apiKey: profile.apiKey,
+      model: model,
+      protocol: profile.apiProtocol,
+      sessionId: room.id,
+      temperature: widget.shiyi.settings.temperature,
+      maxTokens: widget.shiyi.settings.maxOutputTokens,
+      tools: const [],
+      reasoningEffortOverride: 'off',
+      shouldStop: () => _activeRun.stopRequested,
+      onTurn: (turn) => summary = turn.text,
+    );
+    _activeRun.clients.add(client);
+    try {
+      await client.send(messages);
+    } finally {
+      _activeRun.clients.remove(client);
+    }
+    final text = summary.trim();
+    if (text.isEmpty) throw Exception('模型未返回摘要');
+    return text;
+  }
+
+  Future<void> _openProjectPicker() async {
+    final room = _room;
+    if (room == null || !mounted) return;
+    final result = await showGroupProjectPicker(
+      context,
+      widget.shiyi,
+      currentProjectId: room.projectId,
+    );
+    if (result == null || !mounted) return;
+    await _store.setRoomProject(room.id, result);
+    room.projectId = result;
+    setState(() {});
   }
 
   bool _shouldAnimateEnter(GroupMessage message) {
@@ -356,6 +1036,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   void _jumpToLatest({bool force = false}) {
+    if (!mounted) return;
     if (force) _followTail = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
@@ -399,10 +1080,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   Future<void> _copyMessage(ChatMessage message) async {
     await Clipboard.setData(ClipboardData(text: message.content));
-    if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('已复制')));
   }
 
   Future<void> _deleteMessage(ChatMessage message) async {
@@ -495,7 +1172,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                     ? const Center(child: CupertinoActivityIndicator())
                     : ChatFloatingComposerScaffold(
                         messages: (context, overlayHeight) {
-                          if (_messages.isEmpty) {
+                          if (_visibleMessages.isEmpty) {
                             return Padding(
                               padding: EdgeInsets.only(bottom: overlayHeight),
                               child: const _GroupEmpty(),
@@ -515,13 +1192,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                 messageListSidePadding,
                                 overlayHeight + 12,
                               ),
-                              itemCount: _messages.length,
+                              itemCount: _visibleMessages.length,
                               itemBuilder: (context, index) {
                                 final message =
-                                    _messages[_messages.length - 1 - index];
+                                    _visibleMessages[_visibleMessages.length - 1 - index];
                                 return MessageBubble(
                                   key: ValueKey(message.id),
                                   message: _asChat(message),
+                                  liveReasoning:
+                                      message.streaming &&
+                                          message.reasoning.isNotEmpty
+                                      ? message.reasoning
+                                      : null,
                                   busy: _busy,
                                   animateEnter: _shouldAnimateEnter(message),
                                   speakerName: _speakerName(message, room),
@@ -542,16 +1224,51 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                               busy: _busy,
                               allowSendWhileBusy: true,
                               enterToSend: widget.shiyi.settings.enterToSend,
-                              pendingImages: const [],
-                              pendingFiles: const [],
-                              onPickAttachment: () {},
-                              onRemoveImage: (_) {},
-                              onRemoveFile: (_) {},
+                              pendingImages: _pendingImages,
+                              pendingFiles: _pendingFiles,
+                              onPickAttachment: _pickAttachment,
+                              onRemoveImage: (i) =>
+                                  setState(() => _pendingImages.removeAt(i)),
+                              onRemoveFile: (i) =>
+                                  setState(() => _pendingFiles.removeAt(i)),
                               onSend: _send,
                               onStop: _stopRun,
                               idleHint: '发给对接人，或点名字 @Ta',
                               busyHint: 'Agent 回复中…',
-                              showAttachmentButton: false,
+                              showAttachmentButton: true,
+                              thinkingOn: _thinkingOn,
+                              onThinkingToggled: (v) =>
+                                  setState(() => _thinkingOn = v),
+                              thinkingOptions: const [
+                                ThinkingIntensityOption('', 'Default'),
+                                ThinkingIntensityOption('low', 'Low'),
+                                ThinkingIntensityOption('medium', 'Medium'),
+                                ThinkingIntensityOption('high', 'High'),
+                                ThinkingIntensityOption('max', 'Max'),
+                              ],
+                              thinkingValue: _thinkingEffort,
+                              onThinkingChanged: (v) =>
+                                  setState(() => _thinkingEffort = v),
+                              onContextLimit: _openAgentContext,
+                              contextLimitLabel: _contextLabel,
+                              compressBusy: _compressingContext,
+                              modelOptions: [
+                                for (final p in widget.shiyi.apiProfiles)
+                                  SessionModelOption(
+                                    value: p.name,
+                                    label: p.name,
+                                    subtitle: p.model,
+                                    models: widget.shiyi.cachedModelsForProfile(
+                                      p,
+                                    ),
+                                  ),
+                              ],
+                              modelValue: _unifiedProfileName,
+                              modelId: _unifiedModelId,
+                              onModelChanged: _onUnifiedModelChanged,
+                              modelEnabled: true,
+                              onWorkspacePressed: _openProjectPicker,
+                              workspaceTooltip: '项目文件夹',
                             ),
                           ],
                         ),

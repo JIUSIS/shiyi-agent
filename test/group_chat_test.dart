@@ -192,6 +192,27 @@ void main() {
     expect(messages[3], {'role': 'user', 'content': '[开发]: 可以做'});
   });
 
+  test('自己的历史里有思考时，随请求回传 reasoning_content', () {
+    final history = [
+      GroupMessage(
+        id: 'm1',
+        roomId: 'g1',
+        role: 'agent',
+        agentId: 'lead',
+        content: '我让开发看',
+        reasoning: '先分派给开发',
+        createdAt: 2,
+      ),
+    ];
+    final messages = groupChatApiMessages(
+      speaker: lead,
+      agents: org,
+      history: history,
+    );
+    expect(messages[1]['role'], 'assistant');
+    expect(messages[1]['reasoning_content'], '先分派给开发');
+  });
+
   test('空的流式草稿不进请求', () {
     final history = [
       user('hi'),

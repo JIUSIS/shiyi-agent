@@ -458,10 +458,22 @@ List<Map<String, dynamic>> groupChatApiMessages({
   required GroupAgent speaker,
   required List<GroupAgent> agents,
   required List<GroupMessage> history,
+  String contextSummary = '',
 }) {
   final names = {for (final agent in agents) agent.id: agent.name};
+  final speakerName = speaker.name.trim().toLowerCase();
+  final supervisorId = speaker.reportsToId.trim();
+  final directReportIds = [
+    for (final a in agents)
+      if (a.reportsToId.trim() == speaker.id) a.id,
+  ].toSet();
+  final system = groupChatSystemPrompt(speaker, agents);
+  final summary = contextSummary.trim();
   final out = <Map<String, dynamic>>[
-    {'role': 'system', 'content': groupChatSystemPrompt(speaker, agents)},
+    {
+      'role': 'system',
+      'content': summary.isEmpty ? system : '$system\n\n【你的早期历史摘要】\n$summary',
+    },
   ];
   for (final message in history) {
     if (message.streaming && message.content.trim().isEmpty) continue;
@@ -472,9 +484,20 @@ List<Map<String, dynamic>> groupChatApiMessages({
       continue;
     }
     if (message.agentId == speaker.id) {
-      out.add({'role': 'assistant', 'content': text});
+      out.add({
+        'role': 'assistant',
+        'content': text,
+        if (message.reasoning.trim().isNotEmpty)
+          'reasoning_content': message.reasoning.trim(),
+      });
       continue;
     }
+    // Independent context: only include messages relevant to this speaker.
+    final senderId = message.agentId;
+    final isMentioned = text.toLowerCase().contains('@$speakerName');
+    final isFromSupervisor = senderId == supervisorId;
+    final isFromReport = directReportIds.contains(senderId);
+    if (!isMentioned && !isFromSupervisor && !isFromReport) continue;
     final name = names[message.agentId] ?? '成员';
     out.add({'role': 'user', 'content': '[$name]: $text'});
   }

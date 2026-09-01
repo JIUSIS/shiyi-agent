@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Windows-3DDC84)](https://github.com/JIUSIS/shiyi-agent/releases)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-02569B)](https://flutter.dev)
 
-📦 **下载安装**：[shiyi-agent-v2.6.3.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.6.3/shiyi-agent-v2.6.3.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
+📦 **下载安装**：[shiyi-agent-v2.6.4.apk](https://github.com/JIUSIS/shiyi-agent/releases/download/v2.6.4/shiyi-agent-v2.6.4.apk) · [更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/JIUSIS/shiyi-agent/releases)
 
 ---
 
@@ -211,6 +211,10 @@ flutter build apk --release
 ## 开源许可证
 
 本项目基于 [GPL-3.0](LICENSE) 协议开源。使用、修改与分发请遵守 GPL-3.0 条款。
+
+## 社区
+
+本项目在 [LINUX DO](https://linux.do) 社区交流反馈，感谢佬友们的支持。
 
 ---
 

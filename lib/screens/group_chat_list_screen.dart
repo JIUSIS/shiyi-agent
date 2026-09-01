@@ -89,8 +89,17 @@ class _GroupChatListScreenState extends State<GroupChatListScreen> {
     );
     await _reload();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(selected.isEmpty ? '已移动到未分类' : '已移动到项目')),
+    showCupertinoDialog<void>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: Text(selected.isEmpty ? '已移动到未分类' : '已移动到项目'),
+        actions: [
+          CupertinoDialogAction(
+            child: const Text('好'),
+            onPressed: () => Navigator.pop(ctx),
+          ),
+        ],
+      ),
     );
   }
 
