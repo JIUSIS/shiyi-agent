@@ -13,6 +13,7 @@
 - 完成 DSH rc.2 的 `session/list`、`session/follow`、`remote.mux`、Cookie 和提问回答协议适配。
 - 修复 DSH 本地服务启动竞态，避免首轮探活早于认证 Cookie 换取。
 - 修复 Android release APK 中 Flutter 引擎发布产物异常导致的启动闪退，并保持 arm64 包体处于正常体积。
+- 修复群聊 Agent 绕过 LAAP 认知注入的问题；每个成员现在都会携带独立的 PSI 认知快照，并在回复后完成回合反思。
 
 ### 新增
 
@@ -23,6 +24,7 @@
 ### 验证
 
 - DSH、LAAP 定向测试通过。
+- 群聊认知注入回归测试通过。
 - Android arm64 release APK 构建成功，版本号为 `2.6.6 (31)`。
 - 发布包使用标准 Flutter release 产物，APK 大小约 19.3 MiB。
 

@@ -459,6 +459,7 @@ List<Map<String, dynamic>> groupChatApiMessages({
   required List<GroupAgent> agents,
   required List<GroupMessage> history,
   String contextSummary = '',
+  String presencePrompt = '',
 }) {
   final names = {for (final agent in agents) agent.id: agent.name};
   final speakerName = speaker.name.trim().toLowerCase();
@@ -469,10 +470,15 @@ List<Map<String, dynamic>> groupChatApiMessages({
   ].toSet();
   final system = groupChatSystemPrompt(speaker, agents);
   final summary = contextSummary.trim();
+  final presence = presencePrompt.trim();
+  final systemContent = [
+    summary.isEmpty ? system : '$system\n\n【你的早期历史摘要】\n$summary',
+    if (presence.isNotEmpty) presence,
+  ].join('\n\n');
   final out = <Map<String, dynamic>>[
     {
       'role': 'system',
-      'content': summary.isEmpty ? system : '$system\n\n【你的早期历史摘要】\n$summary',
+      'content': systemContent,
     },
   ];
   for (final message in history) {

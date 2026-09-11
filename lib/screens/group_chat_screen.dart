@@ -383,12 +383,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final workingDir = await _projectWorkingDir(room.projectId);
     final tools = _groupChatTools();
     final contextSummary = await _store.getSummary(room.id, agent.id);
+    final latestUserText = _messages.lastWhere(
+      (message) => message.isUser,
+      orElse: () => GroupMessage(
+        id: '',
+        roomId: '',
+        role: 'user',
+        createdAt: 0,
+      ),
+    );
+    final presencePrompt = await widget.shiyi.cognitivePromptFor(
+      '群聊成员「${agent.name}」正在处理：${latestUserText.content}',
+    );
     String? failure;
     final loopMsgs = groupChatApiMessages(
       speaker: agent,
       agents: room.agents,
       history: _messages.where((m) => m.id != draft.id).toList(),
       contextSummary: contextSummary,
+      presencePrompt: presencePrompt,
     );
     const maxToolRounds = 8;
     var roundCached = 0;
@@ -491,6 +504,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
     if (failure != null && draft.content.trim().isEmpty) {
       draft.content = '回复失败：$failure';
+    }
+    if (failure == null && draft.content.trim().isNotEmpty) {
+      unawaited(widget.shiyi.reflectCognitiveOutput(draft.content));
     }
     if (failure == null &&
         draft.content.trim().isEmpty &&

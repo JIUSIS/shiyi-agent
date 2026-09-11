@@ -5663,6 +5663,18 @@ echo "[rc=\$?]"
     }
   }
 
+  /// 为独立 Agent 取一份当前回合的 LAAP 认知快照。
+  ///
+  /// 群聊不走普通会话的 PromptBuilder，因此由群聊页面显式请求这段
+  /// 官方 PSI 动态提示词，再拼进该成员自己的 system 消息。
+  Future<String> cognitivePromptFor(String text) async {
+    if (!settings.enablePresence || text.trim().isEmpty) return '';
+    await _syncPresenceWithLaap(text);
+    return presence.promptSection();
+  }
+
+  Future<void> reflectCognitiveOutput(String output) => _reflectLaap(output);
+
   Future<void> _reflectLaap(String output) async {
     try {
       final laap = LaapService.instance;

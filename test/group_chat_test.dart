@@ -213,6 +213,17 @@ void main() {
     expect(messages[1]['reasoning_content'], '先分派给开发');
   });
 
+  test('群聊 Agent 的 system 会带入 LAAP 认知快照', () {
+    final messages = groupChatApiMessages(
+      speaker: lead,
+      agents: org,
+      history: [user('制定发布计划')],
+      presencePrompt: '## PSI Cognitive State (Live)\n当前认知状态：专注',
+    );
+    expect(messages.first['content'], contains('## PSI Cognitive State (Live)'));
+    expect(messages.first['content'], contains('当前认知状态：专注'));
+  });
+
   test('空的流式草稿不进请求', () {
     final history = [
       user('hi'),
