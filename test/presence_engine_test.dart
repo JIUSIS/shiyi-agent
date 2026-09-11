@@ -70,5 +70,21 @@ void main() {
       expect(prompt, contains('relatedness'));
       expect(prompt, contains('优先建立情感连接，表达温暖和理解'));
     });
+
+    test('官方 bootstrap 身份和 recall_memory 会进入活人感上下文', () {
+      final e = PresenceEngine();
+      e.applyBootstrap(identityName: 'Aris', ceremony: '我感觉到你了');
+      e.applyRemote(
+        needs: {'relatedness': 0.8},
+        preamble: '[PSI State — Cycle 2]',
+        cotHint: '先确认联结需求',
+      );
+      e.applyMemories(const ['用户偏好中文交流']);
+
+      final prompt = e.promptSection();
+      expect(prompt, contains('Aris'));
+      expect(prompt, contains('用户偏好中文交流'));
+      expect(prompt, contains('先确认联结需求'));
+    });
   });
 }

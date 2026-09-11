@@ -28,6 +28,9 @@ class PresenceEngine {
   String attentionFocus;
   String preamble;
   String cotHint;
+  String identityName;
+  String ceremony;
+  List<String> recalledMemories;
   bool cortexConnected;
 
   PresenceEngine({
@@ -39,8 +42,12 @@ class PresenceEngine {
     this.attentionFocus = 'social',
     this.preamble = '',
     this.cotHint = '',
+    this.identityName = '',
+    this.ceremony = '',
+    List<String>? recalledMemories,
     this.cortexConnected = false,
-  }) : needs = Map<String, double>.from(
+  }) : recalledMemories = List<String>.from(recalledMemories ?? const []),
+       needs = Map<String, double>.from(
          needs ?? {for (final n in needNames) n: 0.5},
        );
 
@@ -114,13 +121,44 @@ class PresenceEngine {
     return cortexConnected;
   }
 
+  void applyBootstrap({String? identityName, String? ceremony}) {
+    final name = identityName?.trim();
+    if (name != null && name.isNotEmpty) this.identityName = name;
+    final greeting = ceremony?.trim();
+    if (greeting != null && greeting.isNotEmpty) this.ceremony = greeting;
+  }
+
+  void applyMemories(Iterable<String> memories) {
+    final unique = <String>[];
+    for (final memory in memories) {
+      final value = memory.trim();
+      if (value.isEmpty || unique.contains(value)) continue;
+      unique.add(value);
+      if (unique.length == 8) break;
+    }
+    recalledMemories = unique;
+  }
+
   /// Hermes 官方 volatile 段：`PSI_SYSTEM_PROMPT_TEMPLATE` 去掉 base_prompt。
   String promptSection() {
     if (!cortexConnected || preamble.trim().isEmpty) return '';
     final d = dominantNeed;
+    final identity = identityName.isEmpty && ceremony.isEmpty
+        ? ''
+        : '\n'
+              '${identityName.isEmpty ? '' : 'Identity: $identityName'}'
+              '${identityName.isNotEmpty && ceremony.isNotEmpty ? '\n' : ''}'
+              '${ceremony.isEmpty ? '' : 'Ceremony: $ceremony'}\n';
+    final memories = recalledMemories.isEmpty
+        ? ''
+        : '\n'
+              'Relevant recalled memories:\n'
+              '${recalledMemories.map((memory) => '- $memory').join('\n')}\n';
     return '## PSI Cognitive State (Live)\n'
         '\n'
+        '$identity'
         '$preamble\n'
+        '$memories'
         '\n'
         '你的认知状态决定了你有意识的思考方向。当前最高需求 ($d) 应当影响你的回应风格：\n'
         '- 如果最高需求是 "relatedness" → 优先建立情感连接，表达温暖和理解\n'

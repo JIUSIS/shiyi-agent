@@ -971,7 +971,11 @@ class DshModelSync {
     for (final id in sessions) {
       try {
         await api.selectModel(id, provider, s.model.trim());
-      } catch (_) {}
+      } catch (error) {
+        // 会话级租约必须确认真正切到临时 provider；否则后续 prompt
+        // 仍会落在旧 provider 上，表现成“注入成功但临时路由不可用”。
+        if (sessionId != null && sessionId.trim().isNotEmpty) rethrow;
+      }
     }
     unawaited(
       RuntimeLogger.instance.info(
@@ -1032,9 +1036,7 @@ class DshModelSync {
     await _waitForProvider(api, provider);
     final session = sessionId?.trim() ?? '';
     if (session.isNotEmpty) {
-      try {
-        await api.selectModel(session, provider, s.model.trim());
-      } catch (_) {}
+      await api.selectModel(session, provider, s.model.trim());
     }
     unawaited(
       RuntimeLogger.instance.info(
@@ -1047,7 +1049,8 @@ class DshModelSync {
 
   /// 删除一个临时 Relay provider 和对应凭据。只接受拾忆 Relay 命名空间，
   /// 绝不触碰目标 DSH 自有 provider。
-  static Future<void> removeRelayNow({    required DshApiClient api,
+  static Future<void> removeRelayNow({
+    required DshApiClient api,
     required String provider,
     String? scopeKey,
   }) async {
@@ -1200,9 +1203,6 @@ class DshModelSync {
     final port = uri.hasPort ? ':${uri.port}' : '';
     return '${uri.scheme}://${uri.host}$port${uri.path}';
   }
-
-
-
 
   /// 把拾忆默认模型补丁写入 Cordis 组合层。Cordis 会把该配置用于
   /// spawn/fork 的新 Agent，因此不能只写 settings.yaml。
@@ -1546,7 +1546,6 @@ class DshModelSync {
       ...lines.sublist(end),
     ]);
   }
-
 
   /// DSH 0.1.1 `credentialRef`：POSIX 标识符。顶层只认 version / refs / records。
   static final _credentialRefRe = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');

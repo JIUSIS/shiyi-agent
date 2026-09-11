@@ -92,6 +92,55 @@ class LaapCognitiveState {
   }
 }
 
+class LaapBootstrapResult {
+  final String identityName;
+  final String ceremony;
+  final Map<String, dynamic> identity;
+  final Map<String, dynamic> personality;
+  final Map<String, dynamic> bond;
+
+  const LaapBootstrapResult({
+    this.identityName = '',
+    this.ceremony = '',
+    this.identity = const {},
+    this.personality = const {},
+    this.bond = const {},
+  });
+
+  factory LaapBootstrapResult.fromJson(Map<String, dynamic> json) {
+    final identity = json['identity'] is Map
+        ? Map<String, dynamic>.from(json['identity'] as Map)
+        : const <String, dynamic>{};
+    return LaapBootstrapResult(
+      identityName: (identity['name'] ?? '').toString().trim(),
+      ceremony: (json['ceremony'] ?? '').toString().trim(),
+      identity: identity,
+      personality: json['personality'] is Map
+          ? Map<String, dynamic>.from(json['personality'] as Map)
+          : const {},
+      bond: json['bond'] is Map
+          ? Map<String, dynamic>.from(json['bond'] as Map)
+          : const {},
+    );
+  }
+}
+
+class LaapMemory {
+  final String content;
+  final Map<String, dynamic> raw;
+
+  const LaapMemory(this.content, {this.raw = const {}});
+
+  factory LaapMemory.fromJson(Map<String, dynamic> json) {
+    return LaapMemory(
+      (json['content'] ?? json['text'] ?? json['memory'] ?? '')
+          .toString()
+          .trim(),
+      raw: json,
+    );
+  }
+}
+
 class LaapApiClient {
   LaapApiClient({this.baseUrl = 'http://127.0.0.1:11546', http.Client? client})
     : _client = client ?? http.Client();
@@ -138,6 +187,65 @@ class LaapApiClient {
     return LaapCognitiveState.parseResponse(Map<String, dynamic>.from(decoded));
   }
 
+  Future<LaapBootstrapResult> bootstrap({
+    required String userName,
+    String? preset,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final body = <String, dynamic>{'user_name': userName};
+    if (preset != null && preset.trim().isNotEmpty) {
+      body['preset'] = preset.trim();
+    }
+    final resp = await _client
+        .post(
+          _uri('/v1/bootstrap'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode(body),
+        )
+        .timeout(timeout);
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw LaapApiException('bootstrap 失败', statusCode: resp.statusCode);
+    }
+    final decoded = jsonDecode(resp.body);
+    if (decoded is! Map) {
+      throw LaapApiException('bootstrap 返回不是对象');
+    }
+    final result = LaapBootstrapResult.fromJson(
+      Map<String, dynamic>.from(decoded),
+    );
+    if (result.identityName.isEmpty && result.ceremony.isEmpty) {
+      throw LaapApiException('bootstrap 未返回身份或觉醒信息');
+    }
+    return result;
+  }
+
+  Future<List<LaapMemory>> recallMemory(
+    String query, {
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final resp = await _client
+        .post(
+          _uri('/v1/recall_memory'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({'query': query}),
+        )
+        .timeout(timeout);
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw LaapApiException('recall_memory 失败', statusCode: resp.statusCode);
+    }
+    final decoded = jsonDecode(resp.body);
+    if (decoded is! Map) {
+      throw LaapApiException('recall_memory 返回不是对象');
+    }
+    final raw = decoded['memories'];
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((item) => LaapMemory.fromJson(Map<String, dynamic>.from(item)))
+        .where((item) => item.content.isNotEmpty)
+        .toList();
+  }
+
   Future<bool> cortexReady({
     Duration timeout = const Duration(seconds: 5),
   }) async {
@@ -152,13 +260,19 @@ class LaapApiClient {
   Future<void> reflect(
     String output, {
     bool success = true,
+    Map<String, dynamic>? feedback,
     Duration timeout = const Duration(seconds: 5),
   }) async {
+    final body = <String, dynamic>{
+      'output': output,
+      'success': success,
+      if (feedback != null) 'feedback': feedback,
+    };
     final resp = await _client
         .post(
           _uri('/v1/reflect'),
           headers: const {'Content-Type': 'application/json'},
-          body: jsonEncode({'output': output, 'success': success}),
+          body: jsonEncode(body),
         )
         .timeout(timeout);
     if (resp.statusCode < 200 || resp.statusCode >= 300) {

@@ -180,6 +180,8 @@ class ShiyiState extends ChangeNotifier {
 
   /// 活人感：只叠 LAAP 皮层状态。开关在 Agent 引擎页。
   PresenceEngine presence = PresenceEngine();
+  static const String _laapBootstrappedKey = 'laap_bootstrapped_v1';
+  Future<void>? _laapBootstrapInFlight;
 
   /// 用户已保存的 API 配置（不含未保存的内置预设），供会话级模型选择。
   List<ApiProfile> apiProfiles = [];
@@ -3268,6 +3270,7 @@ class ShiyiState extends ChangeNotifier {
     // 工具历史按会话持续展示，不在每轮对话清空。
     // 每轮工具调用时模型输出的文字都作为独立消息保留（像多发了几条消息），不合并。
     var asst = firstAsst;
+    var emptyRetried = false;
     run.streaming = asst;
     for (var round = 0; round < _maxToolRounds; round++) {
       // 每轮裁剪本轮累积消息（工具结果可能很大，防单轮 payload 超预算）；
@@ -3291,6 +3294,21 @@ class ShiyiState extends ChangeNotifier {
       );
       final result = await _streamRound(run, loopMsgs, asst);
       if (result == null) {
+        // 模型可能返回 HTTP 200 但没有任何正文/思考/工具调用的空响应
+        // （长会话、工具轮之后偶发）。直接结束会表现为「没有红字就停了」，
+        // 这里先补一条提示自动重试一次；仍为空才收口并记录错误日志。
+        if (!emptyRetried) {
+          emptyRetried = true;
+          loopMsgs.add({
+            'role': 'user',
+            'content':
+                '你刚才没有输出任何内容。请直接给出针对用户请求的回复，'
+                '或调用当前需要的工具完成任务，不要重复说明、不要输出空内容。',
+          });
+          continue;
+        }
+        run.status = '模型返回了空回复，自动重试后仍无输出，请重试';
+        await _logError('生成', '空回复：连续两次请求均无正文/思考/工具调用');
         await _finalizeAbort(run, asst);
         break;
       }
@@ -5600,6 +5618,7 @@ echo "[rc=\$?]"
         if (!await laap.isRunning()) return;
         laap.status.value = LaapStatus.running;
       }
+      await _ensureLaapBootstrap();
       final remote = await LaapApiClient.instance.cognitiveState(text);
       final applied = presence.applyRemote(
         needs: remote.needs,
@@ -5624,6 +5643,20 @@ echo "[rc=\$?]"
           ),
         );
       }
+      try {
+        final memories = await LaapApiClient.instance.recallMemory(text);
+        presence.applyMemories(memories.map((memory) => memory.content));
+        unawaited(
+          RuntimeLogger.instance.info(
+            'LAAP',
+            'recall_memory.applied',
+            data: {'count': presence.recalledMemories.length},
+          ),
+        );
+      } catch (e) {
+        presence.applyMemories(const []);
+        unawaited(_logError('LAAP', 'recall_memory: $e'));
+      }
     } catch (e) {
       presence.cortexConnected = false;
       unawaited(_logError('LAAP', '$e'));
@@ -5637,8 +5670,65 @@ echo "[rc=\$?]"
         if (!await laap.isRunning()) return;
         laap.status.value = LaapStatus.running;
       }
-      await LaapApiClient.instance.reflect(output);
-    } catch (_) {}
+      await LaapApiClient.instance.reflect(
+        output,
+        success: output.trim().isNotEmpty,
+        feedback: const {'success': true},
+      );
+      unawaited(
+        RuntimeLogger.instance.info(
+          'LAAP',
+          'reflect.completed',
+          data: {'length': output.length},
+        ),
+      );
+    } catch (e) {
+      unawaited(_logError('LAAP', 'reflect: $e'));
+    }
+  }
+
+  Future<void> _ensureLaapBootstrap() async {
+    final running = _laapBootstrapInFlight;
+    if (running != null) {
+      await running;
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_laapBootstrappedKey) == true) return;
+
+    final future = () async {
+      try {
+        final result = await LaapApiClient.instance.bootstrap(
+          userName: '用户',
+          preset: 'playful_spirit',
+        );
+        presence.applyBootstrap(
+          identityName: result.identityName,
+          ceremony: result.ceremony,
+        );
+        await prefs.setBool(_laapBootstrappedKey, true);
+        unawaited(
+          RuntimeLogger.instance.info(
+            'LAAP',
+            'bootstrap.completed',
+            data: {
+              'identity': result.identityName,
+              'hasCeremony': result.ceremony.isNotEmpty,
+            },
+          ),
+        );
+      } catch (e) {
+        unawaited(_logError('LAAP', 'bootstrap: $e'));
+      }
+    }();
+    _laapBootstrapInFlight = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_laapBootstrapInFlight, future)) {
+        _laapBootstrapInFlight = null;
+      }
+    }
   }
 
   Future<void> _rememberLastEngine(String engine) async {

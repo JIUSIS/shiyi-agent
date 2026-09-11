@@ -90,6 +90,9 @@ class DshService {
       compareSemver(latestVersion!, _localVersion!) > 0;
 
   Process? _serverProcess;
+  Future<void>? _launchAuthExchange;
+  String _serverAuthBuffer = '';
+  String? _lastLaunchToken;
   Future<void> _serverLogWriteTail = Future<void>.value();
 
   /// 安装互斥：防止并发 npm 安装（arborist Tracker 冲突 / 互相删文件）。
@@ -485,12 +488,13 @@ class DshService {
     String version, {
     bool isUpdate = false,
   }) async {
+    final wasRunning = await isRunning();
+    final portInUse = await _localWebPortInUse();
     await _appendServiceLog(
       'installOrUpdate 触发 version=$version isUpdate=$isUpdate '
-      'wasRunning=${await isRunning()}',
+      'wasRunning=$wasRunning portInUse=$portInUse',
     );
-    final wasRunning = await isRunning();
-    if (wasRunning) await stop();
+    if (wasRunning || portInUse) await stop();
     status.value = isUpdate ? DshStatus.updating : DshStatus.installing;
     statusMessage.value = isUpdate
         ? '正在更新 DeepSeek Harness 到 $version …'
@@ -658,6 +662,7 @@ class DshService {
     void capture(Stream<List<int>> stream) {
       stream.transform(const Utf8Decoder(allowMalformed: true)).listen((chunk) {
         _appendRuntimeOutput(chunk);
+        _captureLaunchToken(chunk);
         _serverLogWriteTail = _serverLogWriteTail
             .then<void>((_) async {
               await logFile.writeAsString(
@@ -672,6 +677,48 @@ class DshService {
 
     capture(process.stdout);
     capture(process.stderr);
+  }
+
+  /// 启动日志可能把 URL 和 Token 分块写入；缓存尾部直到完整行出现。
+  void _captureLaunchToken(String chunk) {
+    if (!managesLocalProcess) return;
+    _serverAuthBuffer = '$_serverAuthBuffer$chunk';
+    if (_serverAuthBuffer.length > 8192) {
+      _serverAuthBuffer = _serverAuthBuffer.substring(
+        _serverAuthBuffer.length - 8192,
+      );
+    }
+    final token = webLaunchTokenFromOutput(_serverAuthBuffer);
+    if (token == null || token == _lastLaunchToken) return;
+    _lastLaunchToken = token;
+    _serverAuthBuffer = '';
+    _launchAuthExchange = _exchangeLaunchToken(token);
+    unawaited(_launchAuthExchange!);
+  }
+
+  Future<void> _exchangeLaunchToken(String token) async {
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (await api.authenticateWithLaunchToken(token)) {
+          await _appendServiceLog('已换取 DSH 本机浏览器会话 Cookie');
+          return;
+        }
+      } catch (e) {
+        if (attempt == 2) {
+          await _appendServiceLog('DSH 浏览器会话 Cookie 换取失败：$e');
+          return;
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    }
+    await _appendServiceLog('DSH 浏览器会话 Cookie 换取失败：响应未返回 303/Set-Cookie');
+  }
+
+  /// 从 `dsh web:` 启动行提取 rc.2 进程 Token（仅作鉴权输入，不对外发送）。
+  @visibleForTesting
+  static String? webLaunchTokenFromOutput(String output) {
+    final match = RegExp(r'[?&]token=([A-Za-z0-9_-]{20,})').firstMatch(output);
+    return match?.group(1);
   }
 
   /// 卸载 DSH npm 全局包（保留 ~/.dsh 数据目录）。
@@ -1289,6 +1336,12 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
 
   static const String _searchPatchStart = '# ShiYi built-in free search: begin';
   static const String _searchPatchEnd = '# ShiYi built-in free search: end';
+  static const Set<String> _searchPluginIds = {'web-search-shiyi-free'};
+  static const Set<String> _movePluginIds = {'shiyi-session-move'};
+  static const Set<String> _allShiyiPluginIds = {
+    ..._searchPluginIds,
+    ..._movePluginIds,
+  };
   static const String _searchPatchBody = '''
 - insert:
     - id: web-search-shiyi-free
@@ -1328,6 +1381,89 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
   static String builtInSessionMovePluginDir(String home) =>
       '$home/profiles/web/plugins/shiyi-session-move';
 
+  /// 冗余部署位置：cordis 官方约定插件目录（$DSH_HOME/plugins）。
+  /// 若 DSH 插件管理页把 patch 引用重写为 `../plugins/...` 或历史残留
+  /// 绝对路径（指向 home 根），这里仍能找到插件实体，不会整树崩溃。
+  @visibleForTesting
+  static String builtInSearchPluginHomeDir(String home) =>
+      '$home/plugins/shiyi-free-search';
+
+  @visibleForTesting
+  static String builtInSessionMovePluginHomeDir(String home) =>
+      '$home/plugins/shiyi-session-move';
+
+  /// 移除 cordis.patch.yml 中指定拾忆插件的顶层条目（按 id 识别，
+  /// 不依赖 begin/end 注释标记）。兼容旧版本 / DSH 管理页写入的任何路径
+  /// 写法（`./plugins/...`、`../plugins/...`、绝对路径），用于自愈残留条目。
+  @visibleForTesting
+  static String stripShiyiPluginEntries(
+    String yaml, {
+    Set<String>? ids,
+    Set<String> contentMarkers = const {},
+  }) {
+    final targetIds = ids ?? _allShiyiPluginIds;
+    final out = <String>[];
+    var buf = <String>[];
+    var drop = false;
+    var inMarkedBlock = false;
+
+    bool shouldDrop(List<String> lines) {
+      return lines.any((line) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty || trimmed.startsWith('#')) return false;
+        return targetIds.any(
+              (id) =>
+                  trimmed == 'id: $id' ||
+                  trimmed == '- id: $id' ||
+                  trimmed.startsWith('id: $id #') ||
+                  trimmed.startsWith('- id: $id #'),
+            ) ||
+            contentMarkers.any(trimmed.contains);
+      });
+    }
+
+    void flush() {
+      if (!drop && buf.isNotEmpty) out.addAll(buf);
+      buf = <String>[];
+      drop = false;
+    }
+
+    for (final line in yaml.split('\n')) {
+      final trimmed = line.trimLeft();
+      if (inMarkedBlock) {
+        if (trimmed.startsWith(_searchPatchEnd) ||
+            trimmed.startsWith(_movePatchEnd)) {
+          inMarkedBlock = false;
+        }
+        continue;
+      }
+      final startsSearchBlock =
+          targetIds.contains('web-search-shiyi-free') &&
+          trimmed.startsWith(_searchPatchStart);
+      final startsMoveBlock =
+          targetIds.contains('shiyi-session-move') &&
+          trimmed.startsWith(_movePatchStart);
+      if (startsSearchBlock || startsMoveBlock) {
+        flush();
+        inMarkedBlock = true;
+        continue;
+      }
+      final isTopLevel =
+          trimmed.isNotEmpty &&
+          !trimmed.startsWith('#') &&
+          !line.startsWith(' ') &&
+          !line.startsWith('\t');
+      if (isTopLevel && buf.isNotEmpty) {
+        if (shouldDrop(buf)) drop = true;
+        flush();
+      }
+      buf.add(line);
+    }
+    if (shouldDrop(buf)) drop = true;
+    flush();
+    return out.join('\n');
+  }
+
   /// 把 sandbox 放行补丁 upsert 进 cordis.patch.yml（幂等）：
   /// 已含标记原样返回；`[]` 空列表模板替换为补丁条目；其余情况末尾追加。
   @visibleForTesting
@@ -1349,15 +1485,12 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
 
   @visibleForTesting
   static String upsertBuiltInSearchPatchYaml(String existing) {
-    var base = existing;
-    final start = base.indexOf(_searchPatchStart);
-    if (start >= 0) {
-      final end = base.indexOf(_searchPatchEnd, start);
-      base = end >= 0
-          ? '${base.substring(0, start)}${base.substring(end + _searchPatchEnd.length)}'
-          : base.substring(0, start);
-    }
-    final trimmed = base.trimRight();
+    // 先按 id 清理历史条目（含无标记的旧写法），再写入规范 block。
+    final trimmed = stripShiyiPluginEntries(
+      existing,
+      ids: _searchPluginIds,
+      contentMarkers: const {'searchProvider: shiyi-free'},
+    ).trimRight();
     final block = '$_searchPatchStart\n$_searchPatchBody$_searchPatchEnd';
     if (trimmed.endsWith('[]')) {
       final head = trimmed.substring(0, trimmed.length - 2).trimRight();
@@ -1368,15 +1501,7 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
 
   @visibleForTesting
   static String stripSessionMovePatchYaml(String existing) {
-    var base = existing;
-    while (true) {
-      final start = base.indexOf(_movePatchStart);
-      if (start < 0) break;
-      final end = base.indexOf(_movePatchEnd, start);
-      base = end >= 0
-          ? '${base.substring(0, start)}${base.substring(end + _movePatchEnd.length)}'
-          : base.substring(0, start);
-    }
+    final base = stripShiyiPluginEntries(existing, ids: _movePluginIds);
     final trimmed = base.trim();
     if (trimmed.isEmpty) return _emptyOverlayPatch;
     return base.trimRight();
@@ -1392,6 +1517,8 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
         sawList = true;
         continue;
       }
+      final indented = raw.isNotEmpty && (raw[0] == ' ' || raw[0] == '\t');
+      if (indented) continue;
       return false;
     }
     return sawList;
@@ -1399,20 +1526,96 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
 
   @visibleForTesting
   static String repairProfilePatchYaml(String existing) {
-    final stripped = stripSessionMovePatchYaml(existing);
-    if (isYamlPatchArray(stripped)) return stripped;
+    final stripped = stripShiyiPluginEntries(
+      existing,
+      ids: _allShiyiPluginIds,
+      contentMarkers: const {'searchProvider: shiyi-free'},
+    ).trim();
+    final legal = stripped.isEmpty ? _emptyOverlayPatch : stripped;
+    if (isYamlPatchArray(legal)) return legal;
     return _emptyOverlayPatch;
   }
 
   @visibleForTesting
   static String upsertSessionMovePatchYaml(String existing) {
-    final trimmed = stripSessionMovePatchYaml(existing).trimRight();
+    final trimmed = stripShiyiPluginEntries(
+      existing,
+      ids: _movePluginIds,
+    ).trimRight();
     final block = '$_movePatchStart\n$_movePatchBody$_movePatchEnd';
     if (trimmed.endsWith('[]')) {
       final head = trimmed.substring(0, trimmed.length - 2).trimRight();
       return head.isEmpty ? block : '$head\n$block';
     }
     return trimmed.isEmpty ? block : '$trimmed\n$block';
+  }
+
+  /// 把插件资产写入多个目录（主位置 profile 内 + 冗余位置 $DSH_HOME/plugins）。
+  Future<bool> _deployPluginAssets(
+    Map<String, String> assets,
+    List<String> dirs,
+  ) async {
+    var changed = false;
+    for (var index = 0; index < dirs.length; index++) {
+      try {
+        final pluginDir = Directory(dirs[index]);
+        await pluginDir.create(recursive: true);
+        for (final entry in assets.entries) {
+          final target = File('${pluginDir.path}/${entry.key}');
+          await target.parent.create(recursive: true);
+          final content = await rootBundle.loadString(entry.value);
+          final current = await target.exists()
+              ? await target.readAsString()
+              : '';
+          if (current == content) continue;
+          await target.writeAsString(content);
+          changed = true;
+        }
+      } catch (e) {
+        // 主位置是 patch 相对路径的落点，失败必须阻断；冗余位置失败只降级。
+        if (index == 0) rethrow;
+        debugPrint('DshService redundant plugin deployment failed: $e');
+      }
+    }
+    return changed;
+  }
+
+  Future<bool> _pluginAssetsReady(
+    Map<String, String> assets,
+    String dir,
+  ) async {
+    for (final entry in assets.entries) {
+      final target = File('$dir/${entry.key}');
+      if (!await target.exists() || await target.length() == 0) return false;
+    }
+    return true;
+  }
+
+  Future<void> _removeBuiltInPluginPatches({
+    required Set<String> ids,
+    required Set<String> contentMarkers,
+  }) async {
+    final home = await homeDir();
+    final homePatch = File('$home/cordis.patch.yml');
+    if (await homePatch.exists()) {
+      final existing = await homePatch.readAsString();
+      final stripped = stripShiyiPluginEntries(
+        existing,
+        ids: ids,
+        contentMarkers: contentMarkers,
+      ).trim();
+      final next = stripped.isEmpty ? _emptyOverlayPatch : stripped;
+      if (next != existing) await homePatch.writeAsString(next, flush: true);
+    }
+
+    final profilePatch = File('$home/profiles/web/cordis.patch.yml');
+    if (await profilePatch.exists()) {
+      final existing = await profilePatch.readAsString();
+      final next = repairProfilePatchYaml(existing);
+      if (next != existing) {
+        await profilePatch.writeAsString(next, flush: true);
+      }
+    }
   }
 
   Future<bool> _ensureBuiltInPlugins() async {
@@ -1430,19 +1633,22 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
       var changed = false;
       final home = await homeDir();
       // Cordis 对 cordis.patch.yml 中的相对插件路径以当前 profile 根目录
-      //（~/.dsh/profiles/web）解析，因此插件必须部署在 profile 内。
-      final pluginDir = Directory(builtInSearchPluginDir(home));
-      await pluginDir.create(recursive: true);
-      for (final entry in _searchPluginAssets.entries) {
-        final target = File('${pluginDir.path}/${entry.key}');
-        await target.parent.create(recursive: true);
-        final content = await rootBundle.loadString(entry.value);
-        final current = await target.exists()
-            ? await target.readAsString()
-            : '';
-        if (current == content) continue;
-        await target.writeAsString(content);
-        changed = true;
+      //（~/.dsh/profiles/web）解析，因此主位置必须在 profile 内；
+      // 同时冗余部署到 $DSH_HOME/plugins（cordis 官方约定），防御
+      // DSH 插件管理页或历史残留把引用写成 ../plugins/... / 绝对路径。
+      changed |= await _deployPluginAssets(_searchPluginAssets, [
+        builtInSearchPluginDir(home),
+        builtInSearchPluginHomeDir(home),
+      ]);
+      if (!await _pluginAssetsReady(
+        _searchPluginAssets,
+        builtInSearchPluginDir(home),
+      )) {
+        await _removeBuiltInPluginPatches(
+          ids: _searchPluginIds,
+          contentMarkers: const {'searchProvider: shiyi-free'},
+        );
+        throw StateError('built-in search plugin assets are incomplete');
       }
       final patch = File('$home/cordis.patch.yml');
       await patch.parent.create(recursive: true);
@@ -1486,18 +1692,19 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
         return changed;
       }
       final home = await homeDir();
-      final pluginDir = Directory(builtInSessionMovePluginDir(home));
-      await pluginDir.create(recursive: true);
-      for (final entry in _movePluginAssets.entries) {
-        final target = File('${pluginDir.path}/${entry.key}');
-        await target.parent.create(recursive: true);
-        final content = await rootBundle.loadString(entry.value);
-        final current = await target.exists()
-            ? await target.readAsString()
-            : '';
-        if (current == content) continue;
-        await target.writeAsString(content);
-        changed = true;
+      changed |= await _deployPluginAssets(_movePluginAssets, [
+        builtInSessionMovePluginDir(home),
+        builtInSessionMovePluginHomeDir(home),
+      ]);
+      if (!await _pluginAssetsReady(
+        _movePluginAssets,
+        builtInSessionMovePluginDir(home),
+      )) {
+        await _removeBuiltInPluginPatches(
+          ids: _movePluginIds,
+          contentMarkers: const {},
+        );
+        throw StateError('built-in session-move plugin assets are incomplete');
       }
       // 只写 home 层。home + profile 两层同时 insert 同一 id
       // 会让 DSH 启动直接炸：duplicate loader entry id。
@@ -2260,6 +2467,34 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   /// 服务是否在运行（RPC 就绪探测，端口通了但 API 未初始化也算未就绪）。
   Future<bool> isRunning() => api.rpcPing();
 
+  /// 本机端口是否已监听。rc.2 鉴权失配时 RPC 会返回 401，
+  /// 但端口仍被旧进程占用；不能只靠 RPC 判断能否直接启动。
+  Future<bool> _localWebPortInUse() async {
+    final uri = Uri.tryParse(api.baseUrl);
+    if (uri == null || uri.host.isEmpty) return false;
+    final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
+    try {
+      final socket = await ServerSocket.bind(
+        InternetAddress.loopbackIPv4,
+        port,
+        shared: false,
+      );
+      await socket.close();
+      return false;
+    } on SocketException {
+      return true;
+    }
+  }
+
+  Future<bool> _waitForLocalWebPortRelease(Duration timeout) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (!await _localWebPortInUse()) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    return !await _localWebPortInUse();
+  }
+
   /// 连接失败 / 超时 / 假死：VPN 切换后 socket 仍 LISTEN 但握手失败（#113）。
   static bool looksUnreachable(Object error) {
     final s = '$error'.toLowerCase();
@@ -2271,6 +2506,20 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
         s.contains('connection reset') ||
         s.contains('failed host lookup') ||
         s.contains('network is unreachable');
+  }
+
+  @visibleForTesting
+  static bool isBuiltInPluginLoadFailure(String output) {
+    final lower = output.toLowerCase();
+    final failedTree =
+        lower.contains('plugin tree failed to load') ||
+        lower.contains('failed to import loader entry');
+    final mentionsBuiltIn =
+        lower.contains('web-search-shiyi-free') ||
+        lower.contains('shiyi-session-move') ||
+        lower.contains('/plugins/shiyi-free-search') ||
+        lower.contains('/plugins/shiyi-session-move');
+    return failedTree && mentionsBuiltIn;
   }
 
   /// 已安装则拉起服务；已在跑则直接成功。未安装不自动 npm 安装。
@@ -2353,7 +2602,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     return done;
   }
 
-  Future<bool> _start() async {
+  Future<bool> _start({bool retryPluginLoad = false}) async {
     if (!managesLocalProcess) {
       final ok = await isRunning();
       status.value = ok ? DshStatus.running : DshStatus.error;
@@ -2388,6 +2637,10 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
         return true;
       }
     }
+    if (await _localWebPortInUse()) {
+      await _appendServiceLog('本机 3080 端口被旧进程占用但 RPC 未就绪，先清理再启动');
+      await stop();
+    }
     status.value = DshStatus.starting;
     statusMessage.value = '正在启动 DeepSeek Harness 服务…';
     progress.value = .04;
@@ -2403,11 +2656,12 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     progress.value = .12;
     _appendRuntimeOutput('沙箱与权限配置已就绪。\n');
     await _repairDshPatchOverlays();
-    await _ensureBuiltInPlugins();
+    if (!retryPluginLoad) await _ensureBuiltInPlugins();
     try {
       // 工作目录 = 软件默认 agent 目录：dsh 的 cwd（host.describe）与
       // 文件入口默认位置都落在 FileWorkspace.defaultWorkspacePath。
       final agentDir = await FileWorkspace.ensure();
+      api.setPreferredCwd(agentDir);
       final webLogFile = File('$agentDir/logs/dsh-web.log');
       await webLogFile.create(recursive: true);
       await webLogFile.writeAsString(
@@ -2435,10 +2689,14 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
         final bin = await _dshBinPath();
         final env = await TermuxRuntime.environment();
         env.addAll({'SHIYI_AGENT_DIR': agentDir, 'SHIYI_DSH_BIN': bin});
+        _serverAuthBuffer = '';
+        _lastLaunchToken = null;
+        _launchAuthExchange = null;
+        api.clearAuthentication();
         final full = await TermuxRuntime.shellCommand([
           '-c',
           'cd "\$SHIYI_AGENT_DIR" && exec node --expose-internals '
-              '"\$SHIYI_DSH_BIN" web',
+              '"\$SHIYI_DSH_BIN" web --no-open',
         ]);
         _serverProcess = await Process.start(
           full.first,
@@ -2448,6 +2706,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
       } else {
         _serverProcess = await Process.start('dsh', [
           'web',
+          '--no-open',
         ], workingDirectory: agentDir);
       }
       final serverProcess = _serverProcess!;
@@ -2470,12 +2729,26 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
       while (DateTime.now().isBefore(readyDeadline)) {
         await Future<void>.delayed(const Duration(milliseconds: 500));
         if (serverExited) {
+          if (!retryPluginLoad &&
+              isBuiltInPluginLoadFailure(installOutput.value)) {
+            await _removeBuiltInPluginPatches(
+              ids: _allShiyiPluginIds,
+              contentMarkers: const {'searchProvider: shiyi-free'},
+            );
+            await _appendServiceLog(
+              'DeepSeek Harness 内置插件加载失败，已移除残留 patch 并重试一次',
+            );
+            _appendRuntimeOutput('\n检测到内置插件加载失败，正在清理残留并重试…\n');
+            return _start(retryPluginLoad: true);
+          }
           status.value = DshStatus.error;
           statusMessage.value =
               'DeepSeek Harness 启动失败（退出码 ${serverExitCode ?? -1}）';
           await _appendServiceLog(statusMessage.value);
           return false;
         }
+        final authExchange = _launchAuthExchange;
+        if (authExchange != null) await authExchange;
         if (await isRunning()) {
           progress.value = 1;
           status.value = DshStatus.running;
@@ -2521,23 +2794,38 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     if (!managesLocalProcess) return;
     status.value = DshStatus.stopping;
     statusMessage.value = '正在停止 DeepSeek Harness 服务…';
+    final proc = _serverProcess;
+    _serverProcess = null;
+    _serverAuthBuffer = '';
+    _lastLaunchToken = null;
+    _launchAuthExchange = null;
+    api.clearAuthentication();
+
     if (Platform.isAndroid) {
-      // rootfs 内 dsh 是 nohup 常驻：按进程名精确杀 node（不能用
-      // `pkill -f 'dsh/lib/bin.js'`——proot 宿主命令行也含该串，会误杀
-      // proot 并连带整个 rootfs 进程树）。
+      // 先让 rootfs 精确杀 node，再杀掉当前 proot。不能使用 pkill -f：
+      // 宿主 proot 命令行也含 dsh/bin.js，会误杀整个 rootfs 进程树。
       try {
         await _runCommand(['pkill', '-x', 'node']);
       } catch (_) {}
-    } else {
-      final proc = _serverProcess;
-      if (proc != null) {
+      try {
+        proc?.kill();
+      } catch (_) {}
+      if (!await _waitForLocalWebPortRelease(const Duration(seconds: 5))) {
         try {
-          proc.kill();
+          proc?.kill(ProcessSignal.sigkill);
         } catch (_) {}
-        _serverProcess = null;
+        try {
+          await _runCommand(['pkill', '-9', '-x', 'node']);
+        } catch (_) {}
+        await _waitForLocalWebPortRelease(const Duration(seconds: 3));
       }
+    } else {
+      try {
+        proc?.kill();
+      } catch (_) {}
+      await _waitForLocalWebPortRelease(const Duration(seconds: 2));
     }
-    await Future<void>.delayed(const Duration(milliseconds: 300));
+
     status.value = DshStatus.idle;
     statusMessage.value = 'DeepSeek Harness 服务已停止';
   }

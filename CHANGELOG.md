@@ -2,6 +2,28 @@
 
 详细开发修复记录保存在本地 `docs/fix-log.md`（仅本地维护，不随仓库发布），此处记录对外发布版本的变化。
 
+## [2.6.6] - 2026-09-11
+
+相对 2.6.5：修复 DSH rc.2 协议适配、手机临时路由未真正生效，以及补齐 LAAP 官方认知皮层接入。
+
+### 修复
+
+- 修复已知问题：DSH 本地使用手机临时路由时，provider 注入成功但会话未必真正切换到该模型。
+- 会话级临时路由现在必须确认 `session.selectModel` 成功；失败会清理半成品并触发重试。
+- 修复 DSH rc.2 的 `session/list`、`session/follow`、`remote.mux`、Cookie 与提问回答协议。
+- 修复 DSH 本地服务启动竞态，避免首轮请求在 Cookie 换取完成前发送。
+
+### 新增
+
+- 按官方流程接入 LAAP：`bootstrap`、`cognitive_state`、`recall_memory`、`reflect`。
+- LAAP 身份、相关记忆和回合反思进入拾忆动态认知上下文。
+
+### 验证
+
+- DSH、LAAP 定向测试通过。
+- Android debug APK 构建成功。
+- 真机使用 `adb install -r` 覆盖安装成功，未卸载、未清除数据。
+
 ## [2.6.5] - 2026-09-02
 
 相对 2.6.4：修复拾忆普通会话在思考型模型下偶发 `LITELLM_ERROR 400`，以及输入法收起后输入框抽屉悬空的问题。

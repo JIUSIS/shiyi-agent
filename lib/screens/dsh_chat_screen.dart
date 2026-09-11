@@ -2207,30 +2207,23 @@ class _DshChatScreenState extends State<DshChatScreen>
     _muxSub = null;
     _hostSub = null;
     try {
-      _muxSub = _api.watchMux().listen(
-        (frame) {
-          if (gen == _muxGen) _onDownlinkFrame(frame);
-        },
-        onError: (_) {
-          if (gen == _muxGen) _onMuxLost();
-        },
-        onDone: () {
-          if (gen == _muxGen) _onMuxLost();
-        },
-        cancelOnError: true,
-      );
+      _muxSub = _api
+          .watchMux(sessionId: widget.sessionId)
+          .listen(
+            (frame) {
+              if (gen == _muxGen) _onDownlinkFrame(frame);
+            },
+            onError: (_) {
+              if (gen == _muxGen) _onMuxLost();
+            },
+            onDone: () {
+              if (gen == _muxGen) _onMuxLost();
+            },
+            cancelOnError: true,
+          );
     } catch (_) {
       if (gen == _muxGen) _onMuxLost();
     }
-    try {
-      _hostSub = _api.watchHost().listen(
-        (frame) {
-          if (gen == _muxGen) _onDownlinkFrame(frame);
-        },
-        onError: (_) {},
-        cancelOnError: true,
-      );
-    } catch (_) {}
   }
 
   void _onMuxLost() {

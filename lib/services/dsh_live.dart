@@ -1,6 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-
+import 'dart:math';
 import '../core/models.dart';
 
 /// DSH 下行帧与 live token 组装。不改 DSH 源码，只消费官方 mux/host。
@@ -276,6 +277,85 @@ class DshWsDownlink {
   ) => frame['rpcId'] == null
       ? map
       : <String, dynamic>{'rpcId': frame['rpcId'], ...map};
+
+  /// Open one rc.2 Gateway logical stream and yield its raw `item.value`.
+  ///
+  /// The WebSocket itself stays shared by the official browser client. This
+  /// small carrier only owns one logical stream id and cancels it on unsubscribe.
+  static Stream<dynamic> openRemoteStream(
+    String httpBase,
+    String endpoint,
+    Map<String, dynamic> args, {
+    Future<WebSocket> Function(Uri uri)? open,
+    Map<String, dynamic>? headers,
+  }) async* {
+    final uri = uriFor(httpBase, 'remote.mux');
+    final httpScheme = uri.scheme == 'wss' ? 'https' : 'http';
+    final origin = '$httpScheme://${uri.authority}';
+    final merged = <String, dynamic>{'Origin': origin, ...?headers};
+    final ws = open != null
+        ? await open(uri)
+        : await WebSocket.connect(uri.toString(), headers: merged);
+    final streamId = _randomStreamId();
+    var terminal = false;
+    try {
+      ws.add(
+        jsonEncode({
+          'type': 'open',
+          'streamId': streamId,
+          'endpoint': endpoint,
+          'payload': {'args': args},
+        }),
+      );
+      await for (final raw in ws) {
+        if (raw is! String) continue;
+        final frame = decodeRemoteFrame(raw);
+        if (frame == null || frame['streamId'] != streamId) continue;
+        final type = frame['type']?.toString() ?? '';
+        if (type == 'item') {
+          if (frame.containsKey('value')) yield frame['value'];
+          continue;
+        }
+        terminal = true;
+        if (type == 'error') {
+          final error = (frame['error'] as Map?)?.cast<String, dynamic>();
+          throw StateError(
+            '${error?['code'] ?? 'remote-stream-error'}: '
+            '${error?['message'] ?? endpoint}',
+          );
+        }
+        return;
+      }
+    } finally {
+      if (!terminal) {
+        try {
+          ws.add(jsonEncode({'type': 'cancel', 'streamId': streamId}));
+        } catch (_) {}
+      }
+      try {
+        await ws.close();
+      } catch (_) {}
+    }
+  }
+
+  /// Decode one rc.2 Gateway stream envelope.
+  static Map<String, dynamic>? decodeRemoteFrame(String raw) {
+    final src = raw.trim();
+    if (src.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(src);
+      if (decoded is Map) return decoded.cast<String, dynamic>();
+    } catch (_) {}
+    return null;
+  }
+
+  static String _randomStreamId() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+        '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  }
 
   static Stream<Map<String, dynamic>> connect(
     String httpBase,

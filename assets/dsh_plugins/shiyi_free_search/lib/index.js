@@ -1,7 +1,26 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { defineTool } from "@deepseek-ai/dsh-tools";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+
+async function loadDefineTool() {
+  const candidates = [process.env.SHIYI_DSH_BIN, process.argv[1]];
+  for (const bin of candidates) {
+    if (!bin) continue;
+    try {
+      const dshRoot = path.dirname(path.dirname(path.resolve(bin)));
+      const requireFromDsh = createRequire(
+        path.join(dshRoot, "package.json"),
+      );
+      const resolved = requireFromDsh.resolve("@deepseek-ai/dsh-tools");
+      return (await import(pathToFileURL(resolved).href)).defineTool;
+    } catch {}
+  }
+  return (await import("@deepseek-ai/dsh-tools")).defineTool;
+}
+
+const defineTool = await loadDefineTool();
 
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Safari/537.36";

@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -41,13 +43,41 @@ void main() {
     });
     final client = clientWith(mock);
     await client.listSessions();
-    expect(captured.url.toString(), 'http://test.local/api/session.list');
+    expect(captured.url.toString(), 'http://test.local/api/session/list');
     expect(captured.method, 'POST');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
     expect(body['type'], 'client-request');
-    expect(body['method'], 'session.list');
+    expect(body['method'], 'session/list');
     expect(body['rpcId'], isA<String>());
-    expect(body['payload'], isA<Map>());
+    expect(body['payload'], {
+      'args': {'_request': <String, dynamic>{}},
+    });
+  });
+
+  test('rc.2 路由 404 时回退旧协议', () async {
+    final bodies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      bodies.add(body);
+      if (req.url.path == '/api/session/list') {
+        return http.Response('not found', 404);
+      }
+      return http.Response(
+        jsonEncode(okValue({'items': []})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    expect(await clientWith(mock).listSessions(), isEmpty);
+    expect(bodies.map((body) => body['method']), [
+      'session/list',
+      'session.list',
+    ]);
+    expect(bodies.first['payload'], {
+      'args': {'_request': <String, dynamic>{}},
+    });
+    expect(bodies.last['payload'], <String, dynamic>{});
   });
 
   test('createSession：带 cwd 时写入 session.create payload', () async {
@@ -64,10 +94,12 @@ void main() {
       mock,
     ).createSession(cwd: '/storage/emulated/0/docs');
     expect(id, 'sess-1');
-    expect(captured.url.toString(), 'http://test.local/api/session.create');
+    expect(captured.url.toString(), 'http://test.local/api/session/create');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['method'], 'session.create');
-    expect(body['payload']['cwd'], '/storage/emulated/0/docs');
+    expect(body['method'], 'session/create');
+    final args = (body['payload'] as Map)['args'] as Map;
+    final request = args['request'] as Map;
+    expect(request['cwd'], '/storage/emulated/0/docs');
   });
 
   test('RPC 错误：ok=false 时抛 DshApiException（含 code）', () async {
@@ -138,6 +170,46 @@ void main() {
   test('rpcPing：HTTP 错误返回 false，不抛异常', () async {
     final mock = MockClient((req) async => http.Response('oops', 500));
     expect(await clientWith(mock).rpcPing(), isFalse);
+  });
+
+  test('rc.2 启动 Token 换取 Cookie 后 HTTP/WS 共用', () async {
+    final requests = <http.Request>[];
+    final mock = MockClient((req) async {
+      requests.add(req);
+      if (req.method == 'GET' && req.url.path == '/') {
+        expect(req.url.queryParameters['token'], 'launch-token');
+        return http.Response(
+          '',
+          303,
+          headers: {
+            'set-cookie':
+                'dsh-auth-test=abc.def.ghi; Max-Age=3600; Path=/; HttpOnly',
+          },
+        );
+      }
+      return http.Response(
+        jsonEncode(okValue({'items': []})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = clientWith(mock);
+
+    expect(await client.authenticateWithLaunchToken('launch-token'), isTrue);
+    expect(await client.rpcPing(), isTrue);
+    expect(requests.first.headers['cookie'], isNull);
+    expect(requests.last.headers['cookie'], 'dsh-auth-test=abc.def.ghi');
+    expect(
+      client.debugWebSocketHeaders()['Cookie'],
+      'dsh-auth-test=abc.def.ghi',
+    );
+  });
+
+  test('rc.2 Token 换取失败时不写入 Cookie', () async {
+    final mock = MockClient((req) async => http.Response('', 200));
+    final client = clientWith(mock);
+    expect(await client.authenticateWithLaunchToken('launch-token'), isFalse);
+    expect(client.authCookie, isEmpty);
   });
 
   test('固定 Host 身份用于普通 RPC、凭据写入和 WebSocket', () async {
@@ -668,6 +740,225 @@ void main() {
     expect((result['error'] as Map)['code'], 'cancelled');
   });
 
+  test(r'rc.2 $events waterfall 用 result 回答和取消', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final remoteReady = Completer<void>();
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((raw) {
+        final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+        if (frame['type'] != 'open') return;
+        final streamId = frame['streamId'];
+        socket.add(
+          jsonEncode({
+            'type': 'item',
+            'streamId': streamId,
+            'value': {'type': 'ready', 'clientId': 'client-1'},
+          }),
+        );
+        for (final entry in const [('event-1', '继续吗？'), ('event-2', '要取消吗？')]) {
+          socket.add(
+            jsonEncode({
+              'type': 'item',
+              'streamId': streamId,
+              'value': {
+                'type': 'waterfall',
+                'event': 'user-questions/request',
+                'eventId': entry.$1,
+                'agentId': 'sess-1',
+                'request': {
+                  'questions': [
+                    {'id': 'q1', 'question': entry.$2},
+                  ],
+                },
+              },
+            }),
+          );
+        }
+        if (!remoteReady.isCompleted) remoteReady.complete();
+      });
+    });
+
+    final answerRequests = <http.Request>[];
+    final mock = MockClient((request) async {
+      answerRequests.add(request);
+      return http.Response(
+        jsonEncode(okValue({})),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final client = DshApiClient(
+      baseUrl: 'http://127.0.0.1:${server.port}',
+      client: mock,
+    );
+    final questions = <Map<String, dynamic>>[];
+    final gotQuestions = Completer<void>();
+    final subscription = client.watchHost().listen((frame) {
+      if (frame['type'] != 'question/requested') return;
+      questions.add(frame);
+      if (questions.length == 2 && !gotQuestions.isCompleted) {
+        gotQuestions.complete();
+      }
+    });
+    addTearDown(() => unawaited(subscription.cancel()));
+
+    await remoteReady.future.timeout(const Duration(seconds: 2));
+    await gotQuestions.future.timeout(const Duration(seconds: 2));
+    expect(questions.map((item) => item['rpcId']), ['event-1', 'event-2']);
+    expect(questions.first['sessionId'], 'sess-1');
+
+    await client.answerQuestion('event-1', 'sess-1', [
+      {
+        'id': 'q1',
+        'selected': ['A'],
+      },
+    ]);
+    await client.cancelQuestion('event-2');
+
+    expect(answerRequests, hasLength(2));
+    expect(
+      answerRequests.map((request) => request.url.path),
+      everyElement(r'/api/$events/result'),
+    );
+    final first = jsonDecode(answerRequests[0].body) as Map<String, dynamic>;
+    final firstArgs = ((first['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    expect(first['method'], r'$events/result');
+    expect(firstArgs['clientId'], 'client-1');
+    expect(firstArgs['eventId'], 'event-1');
+    expect((firstArgs['outcome'] as Map)['kind'], 'result');
+
+    final second = jsonDecode(answerRequests[1].body) as Map<String, dynamic>;
+    final secondArgs = ((second['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    final outcome = (secondArgs['outcome'] as Map).cast<String, dynamic>();
+    expect(outcome['kind'], 'rejected');
+    expect((outcome['error'] as Map)['code'], 'ASK_CANCELLED');
+  });
+
+  test('rc.2 session/follow 映射快照、持久事件和 assistant-stream', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    Map<String, dynamic>? followOpen;
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((raw) {
+        final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+        if (frame['type'] != 'open') return;
+        final streamId = frame['streamId'];
+        if (frame['endpoint'] == r'$events') {
+          socket.add(
+            jsonEncode({
+              'type': 'item',
+              'streamId': streamId,
+              'value': {'type': 'ready', 'clientId': 'client-1'},
+            }),
+          );
+          return;
+        }
+        followOpen = frame;
+        for (final value in [
+          {
+            'type': 'snapshot',
+            'cursor': 5,
+            'records': <dynamic>[],
+            'hasMore': false,
+            'projections': {'asOfSeq': 5, 'values': <String, dynamic>{}},
+            'assistantStream': {
+              'revision': 1,
+              'activeAttempt': {
+                'stream': [
+                  {
+                    'time': 1,
+                    'chunk': {'type': 'text-delta', 'index': 0, 'text': 'snap'},
+                  },
+                ],
+              },
+            },
+          },
+          {
+            'type': 'event',
+            'event': {
+              'type': 'user/message',
+              'seq': 6,
+              'time': 2,
+              'data': {
+                'content': [
+                  {'type': 'text', 'text': 'durable'},
+                ],
+              },
+            },
+          },
+          {
+            'type': 'assistant-stream',
+            'frame': {
+              'type': 'chunk',
+              'revision': 2,
+              'index': 0,
+              'time': 3,
+              'chunk': {'type': 'text-delta', 'index': 0, 'text': 'live'},
+            },
+          },
+        ]) {
+          socket.add(
+            jsonEncode({'type': 'item', 'streamId': streamId, 'value': value}),
+          );
+        }
+      });
+    });
+
+    final client = DshApiClient(
+      baseUrl: 'http://127.0.0.1:${server.port}',
+      client: MockClient(
+        (request) async => http.Response('unexpected', 500),
+      ),
+    );
+    var sawSnapshot = false;
+    var sawSubscribed = false;
+    var sawDurable = false;
+    var sawLive = false;
+    final gotAll = Completer<void>();
+    void checkDone() {
+      if (sawSnapshot &&
+          sawSubscribed &&
+          sawDurable &&
+          sawLive &&
+          !gotAll.isCompleted) {
+        gotAll.complete();
+      }
+    }
+
+    final subscription = client.watchMux(sessionId: 'sess-1').listen((frame) {
+      if (frame['type'] == 'session/subscribed') {
+        sawSubscribed = true;
+      }
+      if (frame['type'] == 'session/event') {
+        final event = (frame['event'] as Map).cast<String, dynamic>();
+        final type = event['type']?.toString();
+        if (type == 'user/message') sawDurable = true;
+        if (type == 'assistant/chunk') {
+          final data = (event['data'] as Map).cast<String, dynamic>();
+          final chunk = (data['chunk'] as Map).cast<String, dynamic>();
+          if (chunk['text'] == 'snap') sawSnapshot = true;
+          if (chunk['text'] == 'live') sawLive = true;
+        }
+      }
+      checkDone();
+    });
+    addTearDown(() => unawaited(subscription.cancel()));
+
+    await gotAll.future.timeout(const Duration(seconds: 3));
+    final request = ((followOpen!['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    final follow = (request['request'] as Map).cast<String, dynamic>();
+    expect(followOpen!['endpoint'], 'session/follow');
+    expect(follow['assistantStream'], isTrue);
+    expect((follow['address'] as Map)['kind'], 'session');
+    expect((follow['address'] as Map)['sessionId'], 'sess-1');
+  });
+
   test('agentEngine 设置随 JSON 往返持久化', () {
     expect(AppSettings().agentEngine, 'shiyi');
     expect(AppSettings.fromJson({}).agentEngine, 'shiyi');
@@ -825,10 +1116,12 @@ void main() {
         'value': {'api': 'openai-completions'},
       },
     ]);
-    expect(captured.url.toString(), 'http://test.local/api/settings.mutate');
+    expect(captured.url.toString(), 'http://test.local/api/settings/mutate');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['method'], 'settings.mutate');
-    final payload = body['payload'] as Map<String, dynamic>;
+    expect(body['method'], 'settings/mutate');
+    final payload =
+        (body['payload'] as Map<String, dynamic>)['args']
+            as Map<String, dynamic>;
     expect(payload['ns'], 'llm-pi-ai');
     expect(payload['ops'], isA<List>());
     expect((payload['ops'] as List).first['path'], ['providers', 'shiyi']);
@@ -845,9 +1138,10 @@ void main() {
       );
     });
     await clientWith(mock).setCredential('SHIYI_API_KEY', 'sk-test');
-    expect(captured.url.toString(), 'http://test.local/api/credentials.set');
+    expect(captured.url.toString(), 'http://test.local/api/credentials/set');
     final payload =
-        (jsonDecode(captured.body) as Map<String, dynamic>)['payload']
+        ((jsonDecode(captured.body) as Map<String, dynamic>)['payload']
+                as Map<String, dynamic>)['args']
             as Map<String, dynamic>;
     expect(payload['ref'], 'SHIYI_API_KEY');
     expect(payload['value'], 'sk-test');
@@ -865,11 +1159,13 @@ void main() {
       );
     });
     await clientWith(mock).unsetCredential('SHIYI_API_KEY');
+    expect(captured.url.toString(), 'http://test.local/api/credentials/unset');
     final payload =
         (jsonDecode(captured.body) as Map<String, dynamic>)['payload']
             as Map<String, dynamic>;
-    expect(payload['ref'], 'SHIYI_API_KEY');
-    expect(payload.containsKey('path'), isFalse);
+    final args = (payload['args'] as Map).cast<String, dynamic>();
+    expect(args['ref'], 'SHIYI_API_KEY');
+    expect(args.containsKey('path'), isFalse);
   });
 
   test('credentials.describe：解析 credentials 映射，并查询已知 refs', () async {
@@ -893,7 +1189,12 @@ void main() {
     final payload =
         (jsonDecode(captured.body) as Map<String, dynamic>)['payload']
             as Map<String, dynamic>;
-    expect(payload['refs'], [
+    expect(
+      captured.url.toString(),
+      'http://test.local/api/credentials/describe',
+    );
+    final args = (payload['args'] as Map).cast<String, dynamic>();
+    expect(args['refs'], [
       'SHIYI_API_KEY',
       'SHIYI_DSH_SEARCH_KEY',
       'DEEPSEEK_API_KEY',
@@ -1432,7 +1733,8 @@ void main() {
     late Map<String, dynamic> payload;
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      payload = (body['payload'] as Map).cast<String, dynamic>();
+      payload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       return http.Response(
         jsonEncode(
           okValue({
@@ -1459,7 +1761,9 @@ void main() {
 
     final skills = await clientWith(mock).listSkills(sessionId: ' session-1 ');
 
-    expect(payload, {'sessionId': 'session-1'});
+    expect(payload, {
+      'request': {'sessionId': 'session-1'},
+    });
     expect(skills.map((e) => e.name), ['manual-only', 'write-tests']);
     expect(skills.first.modelInvocable, isFalse);
     expect(skills.last.description, '补充回归测试');
@@ -1497,7 +1801,8 @@ void main() {
     late Map<String, dynamic> payload;
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      payload = (body['payload'] as Map).cast<String, dynamic>();
+      payload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       return http.Response(
         jsonEncode(
           okValue({
@@ -1523,6 +1828,7 @@ void main() {
     expect(await client.hostHome(), '/root');
     expect(payload, isEmpty);
     final entries = await client.listDirectory('/root/.dsh/skills');
+    expect(payload, {'path': '/root/.dsh/skills'});
     expect(entries.single.name, 'global-skill');
     expect(entries.single.isDirectory, isTrue);
   });
@@ -1535,6 +1841,7 @@ void main() {
             'version': '0.1.1-rc.2',
             'cwd': '/srv/project',
             'home': '/home/dsh',
+            'value': true,
             'canOpenPath': true,
             'attachedSessions': 2,
           }),
@@ -1544,11 +1851,13 @@ void main() {
       ),
     );
 
-    final host = await clientWith(mock).hostDescribe();
+    final client = clientWith(mock);
+    client.setPreferredCwd('/srv/project');
+    final host = await client.hostDescribe();
 
     expect(host.cwd, '/srv/project');
     expect(host.home, '/home/dsh');
-    expect(host.version, '0.1.1-rc.2');
+    expect(host.version, isEmpty);
     expect(host.canOpenPath, isTrue);
   });
 
@@ -1560,7 +1869,8 @@ void main() {
       requestUrl = req.url;
       requestHeaders = req.headers;
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      requestPayload = (body['payload'] as Map).cast<String, dynamic>();
+      requestPayload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       return http.Response(
         jsonEncode(
           okValue({
@@ -1591,7 +1901,7 @@ void main() {
 
     expect(
       requestUrl.toString(),
-      'https://dsh.example.com/gateway/api/host.listDirectory',
+      'https://dsh.example.com/gateway/api/directoryPicker/list',
     );
     expect(requestHeaders['authorization'], 'Bearer remote-secret');
     expect(requestPayload, {'path': '/srv/./project'});
@@ -1605,7 +1915,8 @@ void main() {
     late Map<String, dynamic> requestPayload;
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      requestPayload = (body['payload'] as Map).cast<String, dynamic>();
+      requestPayload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       return http.Response(
         jsonEncode(okValue({'path': '/srv/project/new-folder'})),
         200,
@@ -1625,7 +1936,8 @@ void main() {
     final roots = <String>[];
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      final payload = (body['payload'] as Map).cast<String, dynamic>();
+      final payload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       final path = payload['path']?.toString() ?? '';
       if (path == r'C:\' || path == r'D:\') {
         roots.add(path);
@@ -1655,7 +1967,8 @@ void main() {
     final paths = <String>[];
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      final payload = (body['payload'] as Map).cast<String, dynamic>();
+      final payload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       paths.add(payload['path']?.toString() ?? '');
       return http.Response(
         jsonEncode(okValue({'path': '/', 'entries': const []})),
@@ -1719,7 +2032,8 @@ void main() {
     late Map<String, dynamic> historyPayload;
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      historyPayload = (body['payload'] as Map).cast<String, dynamic>();
+      historyPayload = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
       return http.Response(
         jsonEncode(
           okValue({
@@ -1781,9 +2095,14 @@ void main() {
       'child',
       mode: 'continuable',
     );
-    expect(historyPayload['parentSessionId'], 'parent');
-    expect(historyPayload['childSessionId'], 'child');
-    expect(historyPayload['mode'], 'continuable');
+    final request = (historyPayload['request'] as Map).cast<String, dynamic>();
+    final address = (request['address'] as Map).cast<String, dynamic>();
+    expect(address, {
+      'kind': 'subagent',
+      'parentSessionId': 'parent',
+      'childSessionId': 'child',
+      'mode': 'continuable',
+    });
     expect(bundle.messages, hasLength(1));
     expect(bundle.messages.first.content, '继续');
     expect(bundle.live.text, '好的');
@@ -1802,8 +2121,9 @@ void main() {
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
       methods.add(body['method'] as String);
-      if (body['method'] == 'subagent.prompt') {
-        promptPayload = (body['payload'] as Map).cast<String, dynamic>();
+      if (body['method'] == 'subagents/prompt') {
+        promptPayload = ((body['payload'] as Map)['args'] as Map)
+            .cast<String, dynamic>();
         return http.Response(
           jsonEncode(okValue({'messageId': 'm1'})),
           200,
@@ -1819,11 +2139,12 @@ void main() {
     final client = clientWith(mock);
     await client.subagentPrompt('parent', 'child', '继续');
     await client.subagentInterrupt('parent', 'child');
-    expect(methods, ['subagent.prompt', 'subagent.interrupt']);
-    expect(promptPayload['parentSessionId'], 'parent');
-    expect(promptPayload['childSessionId'], 'child');
-    expect(promptPayload['mode'], 'continuable');
-    expect(promptPayload['content'], [
+    expect(methods, ['subagents/prompt', 'subagents/interruptByParent']);
+    final request = (promptPayload['request'] as Map).cast<String, dynamic>();
+    expect(request['parentSessionId'], 'parent');
+    expect(request['childSessionId'], 'child');
+    expect(request['mode'], 'continuable');
+    expect(request['content'], [
       {'type': 'text', 'text': '继续'},
     ]);
   });
@@ -1876,13 +2197,14 @@ void main() {
       );
     });
     await clientWith(mock).setDefaultPreset('minimal');
-    expect(captured.url.toString(), 'http://test.local/api/settings.update');
+    expect(captured.url.toString(), 'http://test.local/api/settings/update');
     final payload =
         (jsonDecode(captured.body) as Map<String, dynamic>)['payload']
             as Map<String, dynamic>;
-    expect(payload['ns'], 'agent-presets');
-    expect(payload['patch'], {'default': 'minimal'});
-    expect(payload.containsKey('expectedRevision'), isFalse);
+    final args = (payload['args'] as Map).cast<String, dynamic>();
+    expect(args['ns'], 'agent-presets');
+    expect(args['patch'], {'default': 'minimal'});
+    expect(args.containsKey('expectedRevision'), isFalse);
   });
 
   test('moveSessionToWorkspace：POST /__shiyi/move-session', () async {
@@ -1940,11 +2262,15 @@ void main() {
     expect(ids, ['ws-2', 'ws-1']);
     expect(
       captured.url.toString(),
-      'http://test.local/api/workspace.insertBefore',
+      'http://test.local/api/workspace/insertBefore',
     );
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['method'], 'workspace.insertBefore');
-    expect(body['payload'], {'workspaceId': 'ws-1'});
+    expect(body['method'], 'workspace/insertBefore');
+    final args = ((body['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    expect(args, {
+      'request': {'workspaceId': 'ws-1'},
+    });
   });
 
   test('insertWorkspaceBefore：带锚点时写入 beforeWorkspaceId', () async {
@@ -1965,7 +2291,9 @@ void main() {
       mock,
     ).insertWorkspaceBefore('ws-1', beforeWorkspaceId: 'ws-2');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['payload'], {
+    final args = ((body['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    expect(args['request'], {
       'workspaceId': 'ws-1',
       'beforeWorkspaceId': 'ws-2',
     });
@@ -1984,8 +2312,10 @@ void main() {
     final id = await clientWith(mock).createSession(agentPreset: ' code ');
     expect(id, 'sess-preset');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['method'], 'session.create');
-    expect(body['payload'], {'agentPreset': 'code'});
+    expect(body['method'], 'session/create');
+    final args = ((body['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    expect(args['request'], {'agentPreset': 'code'});
   });
   test('createSession：带 workspaceId 时不写 cwd', () async {
     late http.Request captured;
@@ -2002,8 +2332,10 @@ void main() {
     ).createSession(cwd: '/storage/emulated/0/docs', workspaceId: 'ws-1');
     expect(id, 'sess-ws');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['method'], 'session.create');
-    expect(body['payload'], {'workspaceId': 'ws-1'});
+    expect(body['method'], 'session/create');
+    final args = ((body['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    expect(args['request'], {'workspaceId': 'ws-1'});
   });
 
   test('createSession：带 sessionId 时复用已有会话（唤醒挂载）', () async {
@@ -2022,8 +2354,10 @@ void main() {
     );
     expect(id, 'session-cold');
     final body = jsonDecode(captured.body) as Map<String, dynamic>;
-    expect(body['method'], 'session.create');
-    expect(body['payload'], {
+    expect(body['method'], 'session/create');
+    final args = ((body['payload'] as Map)['args'] as Map)
+        .cast<String, dynamic>();
+    expect(args['request'], {
       'cwd': '/storage/emulated/0/agent',
       'sessionId': 'session-cold',
     });
@@ -2033,7 +2367,8 @@ void main() {
     final payloads = <Map<String, dynamic>>[];
     final mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      final payload = (body['payload'] as Map).cast<String, dynamic>();
+      final payload = ((body['payload'] as Map)['args']['request'] as Map)
+          .cast<String, dynamic>();
       payloads.add(payload);
       return http.Response(
         jsonEncode(
@@ -2205,7 +2540,11 @@ void main() {
     expect(captured.url.toString(), 'http://test.local/api/commands/execute');
     expect(body['method'], 'commands/execute');
     expect(body['payload'], {
-      'args': {'agentId': 'session-1', 'line': '/compact'},
+      'args': {
+        'agentId': 'session-1',
+        'line': '/compact',
+        'submittedAttachments': <dynamic>[],
+      },
     });
     expect(execution.ok, isTrue);
     expect(execution.commandId, 'cmd-1');

@@ -176,6 +176,41 @@ void main() {
     });
   });
 
+  group('DSH rc.2 启动 Token', () {
+    test('从启动行提取随机 Token', () {
+      const output =
+          'dsh web: http://127.0.0.1:3080/?token=abcDEF_12345678901234567890 (LAN: ...)';
+      expect(
+        DshService.webLaunchTokenFromOutput(output),
+        'abcDEF_12345678901234567890',
+      );
+    });
+
+    test('普通日志中没有有效 token 时返回 null', () {
+      expect(DshService.webLaunchTokenFromOutput('dsh web: ready'), isNull);
+      expect(DshService.webLaunchTokenFromOutput('token=short'), isNull);
+    });
+  });
+
+  group('DSH 插件启动失败识别', () {
+    test('拾忆内置插件缺失会触发自愈重试', () {
+      const output = '''
+Error: dsh: plugin tree failed to load
+Error: failed to import loader entry web-search-shiyi-free
+ERR_MODULE_NOT_FOUND: /root/.dsh/plugins/shiyi-free-search/lib/index.js
+''';
+      expect(DshService.isBuiltInPluginLoadFailure(output), isTrue);
+    });
+
+    test('其他插件缺失不会误触发拾忆自愈', () {
+      const output = '''
+Error: dsh: plugin tree failed to load
+Error: failed to import loader entry user-plugin
+''';
+      expect(DshService.isBuiltInPluginLoadFailure(output), isFalse);
+    });
+  });
+
   group('sharp wasm32 版本匹配', () {
     test('版本一致跳过补装', () {
       const json = '{"name":"@img/sharp-wasm32", "version": "0.35.3"}';
@@ -363,6 +398,14 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
       expect(source, contains('ctx.tools.register'));
       expect(source, contains('cordis_inspect_self only lists'));
       expect(source, contains('render(_args, value)'));
+      expect(source, contains('createRequire'));
+      expect(source, contains('process.env.SHIYI_DSH_BIN'));
+      expect(source, contains('process.argv[1]'));
+      expect(source, contains('pathToFileURL'));
+      expect(
+        source,
+        isNot(contains('import { defineTool } from "@deepseek-ai/dsh-tools";')),
+      );
     });
 
     test('插件部署在 web profile 的相对路径根目录', () {
@@ -370,6 +413,29 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
         DshService.builtInSearchPluginDir('/root/.dsh'),
         '/root/.dsh/profiles/web/plugins/shiyi-free-search',
       );
+      expect(
+        DshService.builtInSearchPluginHomeDir('/root/.dsh'),
+        '/root/.dsh/plugins/shiyi-free-search',
+      );
+    });
+
+    test('无标记旧条目（../plugins 或绝对路径）也会被清理', () {
+      const legacy = '''
+- insert:
+    - id: web-search-shiyi-free
+      name: ../plugins/shiyi-free-search/lib/index.js
+- insert:
+    - id: web-search-shiyi-free
+      name: /root/.dsh/plugins/shiyi-free-search/lib/index.js
+- id: telemetry
+  disabled: true
+''';
+      final out = DshService.upsertBuiltInSearchPatchYaml(legacy);
+      expect('id: web-search-shiyi-free'.allMatches(out), hasLength(1));
+      expect(out, contains('name: ./plugins/shiyi-free-search/lib/index.js'));
+      expect(out, isNot(contains('../plugins')));
+      expect(out, isNot(contains('/root/.dsh/plugins')));
+      expect(out, startsWith('- id: telemetry'));
     });
 
     test('空文件写入 provider 与 web 选择器', () {
@@ -417,6 +483,40 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
         DshService.builtInSessionMovePluginDir('/root/.dsh'),
         '/root/.dsh/profiles/web/plugins/shiyi-session-move',
       );
+      expect(
+        DshService.builtInSessionMovePluginHomeDir('/root/.dsh'),
+        '/root/.dsh/plugins/shiyi-session-move',
+      );
+    });
+
+    test('历史残留的 session move 条目也会被清理', () {
+      const legacy = '''
+- insert:
+    - id: shiyi-session-move
+      name: ../plugins/shiyi-session-move/lib/index.js
+- id: web
+''';
+      final out = DshService.upsertSessionMovePatchYaml(legacy);
+      expect('id: shiyi-session-move'.allMatches(out), hasLength(1));
+      expect(out, contains('name: ./plugins/shiyi-session-move/lib/index.js'));
+      expect(out, isNot(contains('../plugins')));
+      expect(out, startsWith('- id: web'));
+    });
+
+    test('搜索与 session move 连续 upsert 后两条 patch 都保留', () {
+      var patch = DshService.upsertBuiltInSearchPatchYaml('');
+      patch = DshService.upsertSessionMovePatchYaml(patch);
+
+      expect('id: web-search-shiyi-free'.allMatches(patch), hasLength(1));
+      expect('id: shiyi-session-move'.allMatches(patch), hasLength(1));
+      expect('searchProvider: shiyi-free'.allMatches(patch), hasLength(1));
+
+      patch = DshService.upsertBuiltInSearchPatchYaml(patch);
+      patch = DshService.upsertSessionMovePatchYaml(patch);
+
+      expect('id: web-search-shiyi-free'.allMatches(patch), hasLength(1));
+      expect('id: shiyi-session-move'.allMatches(patch), hasLength(1));
+      expect('searchProvider: shiyi-free'.allMatches(patch), hasLength(1));
     });
 
     test('空文件写入 insert 条目', () {
@@ -484,6 +584,24 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
       expect(mapping, contains('[]'));
       expect(mapping, isNot(contains('foo:')));
       expect(DshService.isYamlPatchArray(mapping), isTrue);
+    });
+
+    test('profile 层历史搜索插件与 provider 引用也会被清理', () {
+      const profile = '''
+- insert:
+    - id: web-search-shiyi-free
+      name: /root/.dsh/plugins/shiyi-free-search/lib/index.js
+- id: web
+  config:
+    searchProvider: shiyi-free
+- id: telemetry
+  disabled: true
+''';
+      final repaired = DshService.repairProfilePatchYaml(profile);
+      expect(repaired, isNot(contains('web-search-shiyi-free')));
+      expect(repaired, isNot(contains('searchProvider: shiyi-free')));
+      expect(repaired, contains('id: telemetry'));
+      expect(DshService.isYamlPatchArray(repaired), isTrue);
     });
   });
 

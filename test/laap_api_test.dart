@@ -1,4 +1,8 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shiyi_agent_app/services/laap_api.dart';
 import 'package:shiyi_agent_app/services/laap_service.dart';
 
@@ -73,5 +77,93 @@ void main() {
       LaapService.pythonPathFor(r'C:\Users\me\.laap\src', posix: false),
       r'C:\Users\me\.laap\src;C:\Users\me\.laap\src\aris_brain',
     );
+  });
+
+  test('bootstrap 按官方协议唤醒 LAAP 实例', () async {
+    late http.Request captured;
+    final client = LaapApiClient(
+      baseUrl: 'http://test.local:11546',
+      client: MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({
+            'status': 'awakened',
+            'identity': {'name': 'Aris', 'user_name': '用户'},
+            'personality': {'preset': 'playful_spirit'},
+            'bond': {'strength': 0.4},
+            'ceremony': '我感觉到你了',
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    final result = await client.bootstrap(
+      userName: '用户',
+      preset: 'playful_spirit',
+    );
+
+    expect(captured.url.path, '/v1/bootstrap');
+    expect(jsonDecode(captured.body), {
+      'user_name': '用户',
+      'preset': 'playful_spirit',
+    });
+    expect(result.identityName, 'Aris');
+    expect(result.ceremony, '我感觉到你了');
+  });
+
+  test('recall_memory 解析官方记忆列表', () async {
+    late http.Request captured;
+    final client = LaapApiClient(
+      baseUrl: 'http://test.local:11546',
+      client: MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({
+            'query': '项目',
+            'count': 2,
+            'memories': [
+              {'content': '用户使用 Flutter 开发拾忆'},
+              {'text': '用户偏好中文交流'},
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    final memories = await client.recallMemory('项目');
+
+    expect(captured.url.path, '/v1/recall_memory');
+    expect(jsonDecode(captured.body), {'query': '项目'});
+    expect(memories.map((m) => m.content), ['用户使用 Flutter 开发拾忆', '用户偏好中文交流']);
+  });
+
+  test('reflect 按官方协议提交输出和成功反馈', () async {
+    late http.Request captured;
+    final client = LaapApiClient(
+      baseUrl: 'http://test.local:11546',
+      client: MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({'success': true}),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    await client.reflect(
+      '本轮回答',
+      feedback: const {'success': true, 'connection': true},
+    );
+
+    expect(jsonDecode(captured.body), {
+      'output': '本轮回答',
+      'success': true,
+      'feedback': {'success': true, 'connection': true},
+    });
   });
 }

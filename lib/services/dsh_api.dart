@@ -698,6 +698,13 @@ class DshToolCallInfo {
   });
 }
 
+class _DshRpcCall {
+  final String endpoint;
+  final String method;
+  final Map<String, dynamic> payload;
+  const _DshRpcCall(this.endpoint, this.method, this.payload);
+}
+
 /// DSH 会话客户端：会话列表 / 历史 / 发消息 / 新建。
 /// 默认地址本机 http://127.0.0.1:3080；局域网 / 公网由 [configure] 切换。
 class DshApiClient {
@@ -725,6 +732,10 @@ class DshApiClient {
   String _baseUrl;
   final String _scopeKey;
   String _token;
+  String _authCookie = '';
+  String _remoteEventClientId = '';
+  final Map<String, String> _remoteEventClientIds = {};
+  String _preferredCwd = '';
   String _configuredHostOverride;
   List<String> _customHostCandidates;
   List<String> _compatHostCandidates;
@@ -734,6 +745,7 @@ class DshApiClient {
 
   String get baseUrl => _baseUrl;
   String get token => _token;
+  String get authCookie => _authCookie;
   String get scopeKey => _scopeKey;
 
   /// 切换当前连接。空地址表示尚未填好，RPC 会直接失败。
@@ -759,12 +771,21 @@ class DshApiClient {
           !_sameStrings(nextCompatibilityHosts, _compatHostCandidates)) {
         _compatHostOverride = null;
       }
+      if (next != _baseUrl || nextHostOverride != _configuredHostOverride) {
+        _authCookie = '';
+        _remoteEventClientId = '';
+        _remoteEventClientIds.clear();
+      }
       _baseUrl = next;
     }
     _configuredHostOverride = nextHostOverride;
     _customHostCandidates = nextCustomHosts;
     _compatHostCandidates = nextCompatibilityHosts;
-    if (token != null) _token = token;
+    if (token != null) {
+      final nextToken = token.trim();
+      if (nextToken != _token) _authCookie = '';
+      _token = nextToken;
+    }
   }
 
   static List<String> _normalizeCompatibilityHosts(Iterable<String> values) {
@@ -793,6 +814,7 @@ class DshApiClient {
       headers['host'] = host;
       headers['origin'] = _originForHost(host);
     }
+    if (_authCookie.isNotEmpty) headers['cookie'] = _authCookie;
     final raw = _token.trim();
     if (raw.isNotEmpty) {
       headers['authorization'] = raw.toLowerCase().startsWith('bearer ')
@@ -809,6 +831,7 @@ class DshApiClient {
       headers['Host'] = host;
       headers['Origin'] = _originForHost(host);
     }
+    if (_authCookie.isNotEmpty) headers['Cookie'] = _authCookie;
     final raw = _token.trim();
     if (raw.isNotEmpty) {
       headers['Authorization'] = raw.toLowerCase().startsWith('bearer ')
@@ -833,6 +856,47 @@ class DshApiClient {
 
   /// 仅供协议回归测试确认 WS 与 HTTP 使用同一身份头。
   Map<String, dynamic> debugWebSocketHeaders() => _wsHeaders();
+
+  /// rc.2 起 Web 端发布进程级随机 Token，客户端先用根路径换取
+  /// 签名 Cookie；HTTP RPC 与 WebSocket 共用该 Cookie。
+  Future<bool> authenticateWithLaunchToken(String launchToken) async {
+    final token = launchToken.trim();
+    if (_baseUrl.isEmpty || token.isEmpty) return false;
+    final base = Uri.parse(_baseUrl);
+    var path = base.path;
+    if (path.isEmpty) {
+      path = '/';
+    } else if (!path.endsWith('/')) {
+      path = '$path/';
+    }
+    final exchange = base.replace(
+      path: path,
+      queryParameters: {'token': token},
+    );
+    final request = http.Request('GET', exchange)
+      ..followRedirects = false
+      ..headers.addAll(_headers());
+    final response = await _client.send(request).timeout(_timeout);
+    final rawCookie = response.headers['set-cookie'] ?? '';
+    final cookie = parseDshAuthCookie(rawCookie);
+    await response.stream.drain<void>();
+    if (response.statusCode != 303 || cookie == null) return false;
+    _authCookie = cookie;
+    return true;
+  }
+
+  /// 从 Set-Cookie 头中只取 dsh-auth-* 的 name=value 对。
+  static String? parseDshAuthCookie(String raw) {
+    final match = RegExp(
+      r'(?:^|,\s*)(dsh-auth-[A-Za-z0-9_-]+=[^;,\s]+)',
+    ).firstMatch(raw);
+    return match?.group(1);
+  }
+
+  /// 连接切换或主动停止时丢弃旧进程的浏览器会话。
+  void clearAuthentication() {
+    _authCookie = '';
+  }
 
   static String _newRpcId() {
     final r = Random.secure();
@@ -868,11 +932,35 @@ class DshApiClient {
     }
   }
 
+  /// Local DSH is launched with the app workspace as cwd; rc.2's directory
+  /// picker lists home, so retain the launch cwd for file/default-path UI.
+  void setPreferredCwd(String path) {
+    _preferredCwd = path.trim();
+  }
+
   /// 执行一次 RPC，返回 value（已断言 ok）。
+  ///
+  /// rc.2 的 Typert Remote 路由改成 `namespace/method`，参数走
+  /// `payload.args`；这里集中做新协议优先、404 回退旧协议，业务层不需要
+  /// 感知 DSH 版本。
   Future<Map<String, dynamic>> _rpc(
     String method,
-    Map<String, dynamic> payload,
-  ) async {
+    Map<String, dynamic> payload, {
+    bool forceLegacy = false,
+  }) async {
+    final legacy = _legacyRpcCall(method, payload);
+    final modern = forceLegacy ? null : _modernRpcCall(method, payload);
+    if (modern != null && !_sameRpcCall(modern, legacy)) {
+      try {
+        return await _rpcOnce(modern, method);
+      } on DshApiException catch (error) {
+        if (error.code != 'http-404') rethrow;
+      }
+    }
+    return _rpcOnce(legacy, method);
+  }
+
+  Future<Map<String, dynamic>> _rpcOnce(_DshRpcCall call, String method) async {
     final started = DateTime.now();
     final requestId =
         'dshrpc_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
@@ -883,21 +971,22 @@ class DshApiClient {
         requestId: requestId,
         data: {
           'method': method,
-          'endpoint': _safeEndpoint('$_baseUrl/api/$method'),
+          'wireMethod': call.method,
+          'endpoint': _safeEndpoint('$_baseUrl/api/${call.endpoint}'),
         },
       ),
     );
     final encoded = jsonEncode({
       'type': 'client-request',
       'rpcId': _newRpcId(),
-      'method': method,
-      'payload': payload,
+      'method': call.method,
+      'payload': call.payload,
     });
     http.Response res;
     try {
       res = await _client
           .post(
-            Uri.parse('$_baseUrl/api/$method'),
+            Uri.parse('$_baseUrl/api/${call.endpoint}'),
             headers: _headers(),
             body: encoded,
           )
@@ -912,6 +1001,7 @@ class DshApiClient {
               _compatHostCandidates.isNotEmpty)) {
         final custom = await _scanCompatibilityHosts(
           method: method,
+          endpoint: call.endpoint,
           encoded: encoded,
           candidates: _customHostCandidates,
           allowEmpty: true,
@@ -920,6 +1010,7 @@ class DshApiClient {
             custom ??
             await _scanCompatibilityHosts(
               method: method,
+              endpoint: call.endpoint,
               encoded: encoded,
               candidates: _compatHostCandidates,
               allowEmpty: false,
@@ -1017,7 +1108,200 @@ class DshApiClient {
         data: {'method': method, 'statusCode': res.statusCode},
       ),
     );
-    return (result['value'] as Map?)?.cast<String, dynamic>() ?? const {};
+    return _normalizeRpcValue(method, result['value']);
+  }
+
+  static bool _sameRpcCall(_DshRpcCall a, _DshRpcCall b) {
+    return a.endpoint == b.endpoint &&
+        a.method == b.method &&
+        jsonEncode(a.payload) == jsonEncode(b.payload);
+  }
+
+  static _DshRpcCall _legacyRpcCall(
+    String method,
+    Map<String, dynamic> payload,
+  ) {
+    if (method.contains('/')) {
+      return _DshRpcCall(method, method, {'args': payload});
+    }
+    return _DshRpcCall(method, method, payload);
+  }
+
+  static _DshRpcCall? _modernRpcCall(
+    String method,
+    Map<String, dynamic> payload,
+  ) {
+    if (method.contains('/')) return null;
+    _DshRpcCall call(String endpoint, Map<String, dynamic> args) =>
+        _DshRpcCall(endpoint, endpoint, {'args': args});
+    switch (method) {
+      case 'session.list':
+        return call('session/list', {'_request': payload});
+      case 'session.create':
+      case 'session.prompt':
+      case 'session.rename':
+      case 'session.search':
+      case 'session.selectModel':
+      case 'session.cancel':
+        return call('session/${method.substring('session.'.length)}', {
+          'request': payload,
+        });
+      case 'session.history':
+        return call('session/page', {
+          'request': _sessionPageRequest(
+            address: {
+              'kind': 'session',
+              'sessionId': (payload['sessionId'] ?? '').toString(),
+            },
+            beforeSeq: (payload['beforeSeq'] as num?)?.toInt(),
+            maxMessages: (payload['maxMessages'] as num?)?.toInt(),
+          ),
+        });
+      case 'session.models':
+      case 'llm.models':
+        return call('session/modelCatalog', const {});
+      case 'llm.providers':
+        return call('llm/listConfigurableProviders', const {});
+      case 'agentPreset.list':
+        return call('agentPresets/list', const {});
+      case 'agentPreset.select':
+        return call('agentPresets/select', {
+          'agentId': (payload['sessionId'] ?? '').toString(),
+          'agentPreset': (payload['agentPreset'] ?? '').toString(),
+        });
+      case 'agentPreset.read':
+        return call('agentPresets/read', {
+          'agentPreset': (payload['agentPreset'] ?? '').toString(),
+        });
+      case 'agentPreset.copy':
+        return call('agentPresets/copy', {
+          'from': (payload['from'] ?? '').toString(),
+          'id': (payload['agentPreset'] ?? '').toString(),
+          if (payload['name'] != null) 'name': payload['name'],
+        });
+      case 'agentPreset.remove':
+        return call('agentPresets/deletePreset', {
+          'id': (payload['agentPreset'] ?? '').toString(),
+        });
+      case 'workspace.create':
+      case 'workspace.rename':
+      case 'workspace.delete':
+      case 'workspace.insertBefore':
+      case 'workspace.archiveSession':
+      case 'workspace.insertSessionBefore':
+        return call('workspace/${method.substring('workspace.'.length)}', {
+          'request': payload,
+        });
+      case 'subagent.list':
+        return call('subagents/list', {
+          'parentSessionId': (payload['parentSessionId'] ?? '').toString(),
+        });
+      case 'subagent.history':
+        return call('session/page', {
+          'request': _sessionPageRequest(
+            address: {
+              'kind': 'subagent',
+              'parentSessionId': (payload['parentSessionId'] ?? '').toString(),
+              'childSessionId': (payload['childSessionId'] ?? '').toString(),
+              'mode': (payload['mode'] ?? 'one-shot').toString(),
+            },
+            beforeSeq: (payload['beforeSeq'] as num?)?.toInt(),
+            maxMessages: (payload['maxMessages'] as num?)?.toInt(),
+          ),
+        });
+      case 'subagent.prompt':
+        return call('subagents/prompt', {'request': payload});
+      case 'subagent.interrupt':
+        return call('subagents/interruptByParent', {
+          'childSessionId': (payload['childSessionId'] ?? '').toString(),
+          'parentSessionId': (payload['parentSessionId'] ?? '').toString(),
+          'mode': (payload['mode'] ?? 'continuable').toString(),
+        });
+      case 'skill.list':
+        return call('skills/list', {'request': payload});
+      case 'credentials.describe':
+      case 'credentials.set':
+      case 'credentials.unset':
+        return call(
+          'credentials/${method.substring('credentials.'.length)}',
+          payload,
+        );
+      case 'settings.describe':
+        return call('settings/describe', const {});
+      case 'settings.update':
+        return call('settings/update', payload);
+      case 'settings.mutate':
+        return call('settings/mutate', payload);
+      case 'host.listDirectory':
+        final path = payload['path']?.toString().trim() ?? '';
+        return call('directoryPicker/list', {
+          if (path.isNotEmpty) 'path': path,
+        });
+      case 'host.pickDirectory':
+        return call('directoryPicker/pick', const {});
+      case 'host.createDirectory':
+        return call('directoryPicker/createDirectory', {
+          'path': (payload['path'] ?? '').toString(),
+          'name': (payload['name'] ?? '').toString(),
+        });
+      case 'host.openPath':
+        return call('session/openWorkspacePath', {
+          'path': (payload['path'] ?? '').toString(),
+        });
+      case 'goal.create':
+        return call('goals/create', {
+          'agentId': (payload['sessionId'] ?? '').toString(),
+          'request': {
+            'objective': payload['objective'],
+            if (payload['maxGoalRounds'] != null)
+              'maxGoalRounds': payload['maxGoalRounds'],
+          },
+        });
+      case 'goal.edit':
+        return call('goals/edit', {
+          'agentId': (payload['sessionId'] ?? '').toString(),
+          'ref': (payload['ref'] ?? '').toString(),
+          'request': {
+            'objective': payload['objective'],
+            if (payload['maxGoalRounds'] != null)
+              'maxGoalRounds': payload['maxGoalRounds'],
+          },
+        });
+      case 'goal.pause':
+      case 'goal.resume':
+      case 'goal.complete':
+      case 'goal.clear':
+        return call('goals/${method.substring('goal.'.length)}', {
+          'agentId': (payload['sessionId'] ?? '').toString(),
+          'ref': (payload['ref'] ?? '').toString(),
+        });
+      default:
+        return null;
+    }
+  }
+
+  static Map<String, dynamic> _sessionPageRequest({
+    required Map<String, dynamic> address,
+    int? beforeSeq,
+    int? maxMessages,
+  }) {
+    return {
+      'address': address,
+      'throughSeq': beforeSeq ?? -1,
+      if (beforeSeq != null) 'beforeSeq': beforeSeq,
+      if (maxMessages != null && maxMessages > 0) 'maxMessages': maxMessages,
+    };
+  }
+
+  static Map<String, dynamic> _normalizeRpcValue(String method, dynamic value) {
+    if (value is Map) return value.cast<String, dynamic>();
+    if (value is List) {
+      if (method == 'llm.providers') return {'providers': value};
+      return {'items': value};
+    }
+    if (value == null) return const {};
+    if (value is String) return {'value': value, 'path': value};
+    return {'value': value};
   }
 
   static String _safeEndpoint(String value) {
@@ -1029,6 +1313,7 @@ class DshApiClient {
 
   Future<http.Response?> _scanCompatibilityHosts({
     required String method,
+    required String endpoint,
     required String encoded,
     required List<String> candidates,
     required bool allowEmpty,
@@ -1037,7 +1322,7 @@ class DshApiClient {
       try {
         final retry = await _client
             .post(
-              Uri.parse('$_baseUrl/api/$method'),
+              Uri.parse('$_baseUrl/api/$endpoint'),
               headers: _headers(hostOverride: host),
               body: encoded,
             )
@@ -1170,6 +1455,7 @@ class DshApiClient {
   /// 发送消息（非阻塞：立即返回，agent 后台运行，轮询 history 收结果）。
   Future<void> prompt(String sessionId, String text) async {
     await _rpc('session.prompt', {
+      'requestId': _newRpcId(),
       'sessionId': sessionId,
       'mode': 'queue',
       'content': [
@@ -1185,7 +1471,9 @@ class DshApiClient {
     required String line,
   }) async {
     final value = await _rpc('commands/execute', {
-      'args': {'agentId': sessionId, 'line': line},
+      'agentId': sessionId,
+      'line': line,
+      'submittedAttachments': const <dynamic>[],
     });
     return DshCommandExecution.fromJson(value);
   }
@@ -1198,12 +1486,27 @@ class DshApiClient {
     await _rpc('session.cancel', {'sessionId': sessionId});
   }
 
-  /// 应答 DSH 下行的 question/requested（client-response 走 POST /api/respond）。
+  /// 应答 DSH 下行的 question/requested。
+  ///
+  /// rc.2 waterfall 事件用 `$events/result`；旧版仍走 `POST /api/respond`。
   Future<void> answerQuestion(
     String rpcId,
     String sessionId,
     List<Map<String, dynamic>> answers,
   ) async {
+    final clientId = _remoteEventClientIds[rpcId];
+    if (clientId != null && clientId.isNotEmpty) {
+      await _rpc(r'$events/result', {
+        'clientId': clientId,
+        'eventId': rpcId,
+        'outcome': {
+          'kind': 'result',
+          'value': {'answers': answers},
+        },
+      });
+      _remoteEventClientIds.remove(rpcId);
+      return;
+    }
     await _respond(rpcId, {
       'ok': true,
       'value': {
@@ -1215,6 +1518,15 @@ class DshApiClient {
 
   /// 取消 DSH 提问（result.ok=false，error code=cancelled）。
   Future<void> cancelQuestion(String rpcId) async {
+    final answered = await _respondRemoteEvent(rpcId, {
+      'kind': 'rejected',
+      'error': {
+        'name': 'Error',
+        'code': 'ASK_CANCELLED',
+        'message': 'the user cancelled ask_user_question',
+      },
+    });
+    if (answered) return;
     await _respond(rpcId, {
       'ok': false,
       'error': {
@@ -1223,6 +1535,21 @@ class DshApiClient {
         'details': <String, dynamic>{},
       },
     });
+  }
+
+  Future<bool> _respondRemoteEvent(
+    String rpcId,
+    Map<String, dynamic> outcome,
+  ) async {
+    final clientId = _remoteEventClientIds[rpcId];
+    if (clientId == null || clientId.isEmpty) return false;
+    await _rpc(r'$events/result', {
+      'clientId': clientId,
+      'eventId': rpcId,
+      'outcome': outcome,
+    });
+    _remoteEventClientIds.remove(rpcId);
+    return true;
   }
 
   Future<void> _respond(String rpcId, Map<String, dynamic> result) async {
@@ -1265,12 +1592,34 @@ class DshApiClient {
   Future<({DshModelSelection current, List<DshModelGroup> groups})>
   sessionModels(String sessionId) async {
     final v = await _rpc('session.models', {'sessionId': sessionId});
-    return (
-      current: DshModelSelection.fromJson(
-        (v['current'] as Map?)?.cast<String, dynamic>() ?? const {},
-      ),
-      groups: _parseModelGroups(v['groups']),
-    );
+    final selected = (v['current'] as Map?)?.cast<String, dynamic>();
+    if (selected != null) {
+      return (
+        current: DshModelSelection.fromJson(selected),
+        groups: _parseModelGroups(v['groups']),
+      );
+    }
+    final fallback = (v['default'] as Map?)?.cast<String, dynamic>();
+    var current = DshModelSelection.fromJson(fallback ?? const {});
+    try {
+      final list = await _rpc('session.list', const {});
+      for (final raw in (list['items'] as List?) ?? const []) {
+        final item = (raw as Map).cast<String, dynamic>();
+        if (item['sessionId']?.toString() != sessionId) continue;
+        final projections = (item['projections'] as Map?)
+            ?.cast<String, dynamic>();
+        final values = (projections?['values'] as Map?)
+            ?.cast<String, dynamic>();
+        final model = (values?['modelSelection'] as Map?)
+            ?.cast<String, dynamic>();
+        final next = (model?['next'] ?? model?['lastUsed']);
+        if (next is Map) {
+          current = DshModelSelection.fromJson(next.cast<String, dynamic>());
+        }
+        break;
+      }
+    } catch (_) {}
+    return (current: current, groups: _parseModelGroups(v['groups']));
   }
 
   /// 切换会话模型。
@@ -1330,10 +1679,16 @@ class DshApiClient {
     }
     final raw = v['providers'];
     if (raw is List) {
-      return raw
-          .whereType<Map>()
-          .map((e) => e.cast<String, dynamic>())
-          .toList();
+      return raw.whereType<Map>().map((e) {
+        final item = e.cast<String, dynamic>();
+        final provider = item['provider']?.toString() ?? '';
+        return {
+          ...item,
+          if (!item.containsKey('id') && provider.isNotEmpty) 'id': provider,
+          if (!item.containsKey('name') && item['displayName'] != null)
+            'name': item['displayName'],
+        };
+      }).toList();
     }
     if (raw is Map) {
       return [
@@ -1446,7 +1801,34 @@ class DshApiClient {
   /// 工作区列表（workspace.list）。
   Future<({List<DshWorkspace> items, List<String> archivedSessionIds})>
   listWorkspaces() async {
-    final v = await _rpc('workspace.list', {});
+    try {
+      final baseline =
+          await DshWsDownlink.openRemoteStream(
+                _baseUrl,
+                'workspace/follow',
+                const {},
+                headers: _wsHeaders(),
+              )
+              .firstWhere((value) {
+                return value is Map && value['type'] == 'baseline';
+              })
+              .timeout(const Duration(seconds: 10));
+      final raw = (baseline as Map)['value'];
+      final v = raw is Map
+          ? raw.cast<String, dynamic>()
+          : const <String, dynamic>{};
+      return (
+        items: ((v['items'] as List?) ?? const [])
+            .map(
+              (e) => DshWorkspace.fromJson((e as Map).cast<String, dynamic>()),
+            )
+            .toList(),
+        archivedSessionIds: ((v['archivedSessionIds'] as List?) ?? const [])
+            .map((e) => e.toString())
+            .toList(),
+      );
+    } catch (_) {}
+    final v = await _rpc('workspace.list', {}, forceLegacy: true);
     return (
       items: ((v['items'] as List?) ?? const [])
           .map((e) => DshWorkspace.fromJson((e as Map).cast<String, dynamic>()))
@@ -1588,14 +1970,16 @@ class DshApiClient {
     int? beforeSeq,
     int? maxMessages,
   }) async {
-    final v = await _rpc('subagent.history', {
-      'parentSessionId': parentSessionId,
-      'childSessionId': childSessionId,
-      'mode': mode,
-      'beforeSeq': ?beforeSeq,
-      'maxMessages': ?maxMessages,
-    });
-    final projections = (v['projections'] as Map?)?.cast<String, dynamic>();
+    final value = _normalizeHistoryValue(
+      await _rpc('subagent.history', {
+        'parentSessionId': parentSessionId,
+        'childSessionId': childSessionId,
+        'mode': mode,
+        'beforeSeq': ?beforeSeq,
+        'maxMessages': ?maxMessages,
+      }),
+    );
+    final projections = (value['projections'] as Map?)?.cast<String, dynamic>();
     DshSessionSummary? summary;
     if (projections != null) {
       summary = DshSessionSummary.fromJson({
@@ -1607,8 +1991,8 @@ class DshApiClient {
       });
     }
     return DshSubagentHistoryBundle(
-      messages: _historyFromValue(v, isSubagentHistory: true),
-      live: DshLiveTurn.fromHistoryValue(v),
+      messages: _historyFromValue(value, isSubagentHistory: true),
+      live: DshLiveTurn.fromHistoryValue(value),
       summary: summary,
     );
   }
@@ -1637,9 +2021,11 @@ class DshApiClient {
     String text,
   ) async {
     await _rpc('subagent.prompt', {
+      'requestId': _newRpcId(),
       'parentSessionId': parentSessionId,
       'childSessionId': childSessionId,
       'mode': 'continuable',
+      'delivery': 'queue',
       'content': [
         {'type': 'text', 'text': text},
       ],
@@ -1714,8 +2100,27 @@ class DshApiClient {
 
   /// 主机信息（host.describe）。
   Future<DshHostInfo> hostDescribe() async {
-    final v = await _rpc('host.describe', {});
-    return DshHostInfo.fromJson(v);
+    try {
+      final listing = await directoryListing();
+      var canOpenPath = false;
+      try {
+        final value = await _rpc('session/canOpenWorkspacePath', const {});
+        canOpenPath = value['value'] == true;
+      } catch (_) {}
+      final hint = listing.path.isNotEmpty ? listing.path : listing.home;
+      final windows =
+          hint.contains('\\') || RegExp(r'^[A-Za-z]:').hasMatch(hint);
+      return DshHostInfo(
+        platform: windows ? 'win32' : 'linux',
+        arch: '',
+        cwd: _preferredCwd.isNotEmpty ? _preferredCwd : hint,
+        home: listing.home,
+        canOpenPath: canOpenPath,
+      );
+    } catch (_) {
+      final v = await _rpc('host.describe', {}, forceLegacy: true);
+      return DshHostInfo.fromJson(v);
+    }
   }
 
   /// 完整目录快照（host.listDirectory）；省略 path 时由远端列出其 home。
@@ -1741,7 +2146,8 @@ class DshApiClient {
   /// 选择目录（host.pickDirectory）。
   Future<String?> pickDirectory() async {
     final v = await _rpc('host.pickDirectory', {});
-    return (v['path'] ?? v['directory'] ?? v['selected'] ?? '').toString();
+    return (v['path'] ?? v['value'] ?? v['directory'] ?? v['selected'] ?? '')
+        .toString();
   }
 
   /// 打开路径（host.openPath）。
@@ -1842,7 +2248,9 @@ class DshApiClient {
   /// `images` 缺键会被网关以 "missing images" 拒绝，必须显式传空数组。
   Future<String> executeSessionCommand(String sessionId, String line) async {
     final value = await _rpc('commands/execute', {
-      'args': {'agentId': sessionId, 'line': line, 'images': <dynamic>[]},
+      'agentId': sessionId,
+      'line': line,
+      'submittedAttachments': const <dynamic>[],
     });
     final outcome = (value['result'] as Map?)?.cast<String, dynamic>();
     final kind = (outcome?['kind'] ?? '').toString();
@@ -1903,9 +2311,7 @@ class DshApiClient {
   /// 目标 DSH 当前装载的插件实时清单（含 fiber 装载相位）。
   /// 远端连接的插件页用这条 RPC，不读本机补丁文件。
   Future<List<DshPluginInventoryEntry>> pluginInventoryList() async {
-    final value = await _rpc('pluginInventory/list', {
-      'args': <String, dynamic>{},
-    });
+    final value = await _rpc('pluginInventory/list', const {});
     final entries = (value['entries'] as List?) ?? const [];
     return entries
         .map(
@@ -1993,7 +2399,9 @@ class DshApiClient {
 
   /// 历史消息 + 末尾未收口的 live token（打开会话时补种流式气泡）。
   Future<DshHistoryBundle> historyBundle(String sessionId) async {
-    final value = await _rpc('session.history', {'sessionId': sessionId});
+    final value = _normalizeHistoryValue(
+      await _rpc('session.history', {'sessionId': sessionId}),
+    );
     return DshHistoryBundle(
       messages: _historyFromValue(value),
       live: DshLiveTurn.fromHistoryValue(value),
@@ -2024,13 +2432,202 @@ class DshApiClient {
     return ended;
   }
 
-  /// 全会话 mux 下行。调用方按 sessionId 过滤。
-  Stream<Map<String, dynamic>> watchMux() =>
-      DshWsDownlink.connect(_baseUrl, 'events.mux', headers: _wsHeaders());
+  /// 当前会话 mux 下行。rc.2 用 `$events` + `session/follow`，旧版回退 events.mux。
+  Stream<Map<String, dynamic>> watchMux({String sessionId = ''}) async* {
+    final sid = sessionId.trim();
+    if (sid.isNotEmpty) {
+      try {
+        await for (final frame in _mergeStreams([
+          _watchRemoteEvents(),
+          _watchSessionFollow(sid),
+        ])) {
+          yield frame;
+        }
+        return;
+      } catch (_) {
+        // 旧版没有 Gateway Remote stream 时回退到 events.mux。
+      }
+    }
+    yield* DshWsDownlink.connect(_baseUrl, 'events.mux', headers: _wsHeaders());
+  }
 
-  /// 主机级下行：running 翻转、会话增删。
-  Stream<Map<String, dynamic>> watchHost() =>
-      DshWsDownlink.connect(_baseUrl, 'events.host', headers: _wsHeaders());
+  /// 主机级下行：rc.2 用 `$events`，旧版回退 events.host。
+  Stream<Map<String, dynamic>> watchHost() async* {
+    try {
+      await for (final frame in _watchRemoteEvents()) {
+        yield frame;
+      }
+      return;
+    } catch (_) {}
+    yield* DshWsDownlink.connect(
+      _baseUrl,
+      'events.host',
+      headers: _wsHeaders(),
+    );
+  }
+
+  Stream<Map<String, dynamic>> _watchRemoteEvents() async* {
+    await for (final value in DshWsDownlink.openRemoteStream(
+      _baseUrl,
+      r'$events',
+      const {},
+      headers: _wsHeaders(),
+    )) {
+      if (value is! Map) continue;
+      final mapped = _mapRemoteEventFrame(value.cast<String, dynamic>());
+      if (mapped != null) yield mapped;
+    }
+  }
+
+  Stream<Map<String, dynamic>> _watchSessionFollow(String sessionId) async* {
+    await for (final value in DshWsDownlink.openRemoteStream(
+      _baseUrl,
+      'session/follow',
+      {
+        'request': {
+          'address': {'kind': 'session', 'sessionId': sessionId},
+          'assistantStream': true,
+        },
+      },
+      headers: _wsHeaders(),
+    )) {
+      if (value is! Map) continue;
+      final frame = value.cast<String, dynamic>();
+      switch (frame['type']?.toString() ?? '') {
+        case 'snapshot':
+          final assistant = (frame['assistantStream'] as Map?)
+              ?.cast<String, dynamic>();
+          final activeAttempt = (assistant?['activeAttempt'] as Map?)
+              ?.cast<String, dynamic>();
+          for (final entry in (activeAttempt?['stream'] as List?) ?? const []) {
+            if (entry is Map) {
+              final chunk = _assistantChunkFrame(
+                sessionId,
+                entry.cast<String, dynamic>(),
+              );
+              if (chunk != null) yield chunk;
+            }
+          }
+          yield {
+            'type': 'session/subscribed',
+            'sessionId': sessionId,
+            'lastSeq': (frame['cursor'] as num?)?.toInt() ?? -1,
+          };
+        case 'event':
+          final event = frame['event'];
+          if (event is Map) {
+            yield {
+              'type': 'session/event',
+              'sessionId': sessionId,
+              'event': event.cast<String, dynamic>(),
+            };
+          }
+        case 'assistant-stream':
+          final assistantFrame = (frame['frame'] as Map?)
+              ?.cast<String, dynamic>();
+          if (assistantFrame != null && assistantFrame['type'] == 'chunk') {
+            final chunk = _assistantChunkFrame(sessionId, assistantFrame);
+            if (chunk != null) yield chunk;
+          }
+      }
+    }
+  }
+
+  Map<String, dynamic>? _mapRemoteEventFrame(Map<String, dynamic> frame) {
+    final type = frame['type']?.toString() ?? '';
+    if (type == 'ready') {
+      final clientId = frame['clientId']?.toString() ?? '';
+      if (clientId.isNotEmpty) _remoteEventClientId = clientId;
+      final host = (frame['host'] as Map?)?.cast<String, dynamic>();
+      return {
+        'type': 'host/ready',
+        if (host?['home'] != null) 'home': host!['home'],
+      };
+    }
+    if (type == 'emit') {
+      final event = frame['event']?.toString() ?? '';
+      final args = (frame['args'] as List?) ?? const [];
+      if (event == 'api-session/status' && args.length >= 2) {
+        return {
+          'type': 'host/session-status',
+          'sessionId': args[0].toString(),
+          'running': args[1] == true,
+        };
+      }
+      return {'type': 'host/remote-event', 'event': event, 'args': args};
+    }
+    if (type == 'waterfall') {
+      final event = frame['event']?.toString() ?? '';
+      final eventId = frame['eventId']?.toString() ?? '';
+      if (event != 'user-questions/request') return null;
+      if (eventId.isNotEmpty && _remoteEventClientId.isNotEmpty) {
+        _remoteEventClientIds[eventId] = _remoteEventClientId;
+      }
+      final request = (frame['request'] as Map?)?.cast<String, dynamic>();
+      return {
+        'type': 'question/requested',
+        'rpcId': eventId,
+        'sessionId': frame['agentId']?.toString() ?? '',
+        'questions': (request?['questions'] as List?) ?? const [],
+      };
+    }
+    if (type == 'cancel') {
+      final eventId = frame['eventId']?.toString() ?? '';
+      _remoteEventClientIds.remove(eventId);
+      return {'type': 'question/resolved', 'questionRpcId': eventId};
+    }
+    return null;
+  }
+
+  static Map<String, dynamic>? _assistantChunkFrame(
+    String sessionId,
+    Map<String, dynamic> frame,
+  ) {
+    final chunk = frame['chunk'];
+    if (chunk is! Map) return null;
+    return {
+      'type': 'session/event',
+      'sessionId': sessionId,
+      'event': {
+        'type': 'assistant/chunk',
+        if (frame['time'] != null) 'time': frame['time'],
+        'data': {'chunk': chunk.cast<String, dynamic>()},
+      },
+    };
+  }
+
+  static Stream<T> _mergeStreams<T>(Iterable<Stream<T>> streams) {
+    final inputs = streams.toList(growable: false);
+    late final StreamController<T> controller;
+    final subscriptions = <StreamSubscription<T>>[];
+    var done = 0;
+    void completeOne() {
+      done++;
+      if (done == inputs.length && !controller.isClosed) {
+        controller.close();
+      }
+    }
+
+    controller = StreamController<T>(
+      onListen: () {
+        for (final input in inputs) {
+          subscriptions.add(
+            input.listen(
+              controller.add,
+              onError: controller.addError,
+              onDone: completeOne,
+            ),
+          );
+        }
+      },
+      onCancel: () async {
+        for (final subscription in subscriptions) {
+          await subscription.cancel();
+        }
+      },
+    );
+    return controller.stream;
+  }
 
   /// DSH 把运行时沙箱快照写成 sourced user/message。这是官方注入，不改 DSH；
   /// 拾忆把它挂到相邻真实气泡上，做成可展开组件，默认收起。
@@ -2054,6 +2651,21 @@ class DshApiClient {
         ) ||
         t.contains('<available_skills>') ||
         t.contains('The available skill catalog changed');
+  }
+
+  /// Normalize rc.2 `session/page` into the legacy `events` shape consumed
+  /// by the message/live reconstruction below.
+  static Map<String, dynamic> _normalizeHistoryValue(
+    Map<String, dynamic> value,
+  ) {
+    if (value['events'] is List) return value;
+    final records = value['records'];
+    if (records is! List) return value;
+    return {
+      'events': records,
+      if (value['hasMore'] != null) 'hasMore': value['hasMore'],
+      if (value['projections'] != null) 'projections': value['projections'],
+    };
   }
 
   /// 从 history 响应 value 重建消息列表（session.history / subagent.history 共用）。

@@ -1,3 +1,7 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shiyi_agent_app/services/dsh_live.dart';
 
@@ -462,5 +466,50 @@ void main() {
       isTrue,
     );
     expect(live.text, 'hi');
+  });
+
+  test('openRemoteStream: 解包 item.value，取消时发送 cancel', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final opened = Completer<Map<String, dynamic>>();
+    final cancelled = Completer<Map<String, dynamic>>();
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((raw) {
+        final frame = DshWsDownlink.decodeRemoteFrame(raw as String);
+        if (frame == null) return;
+        if (frame['type'] == 'open') {
+          if (!opened.isCompleted) opened.complete(frame);
+          socket.add(
+            jsonEncode({
+              'type': 'item',
+              'streamId': frame['streamId'],
+              'value': {'type': 'snapshot', 'cursor': 7},
+            }),
+          );
+        } else if (frame['type'] == 'cancel' && !cancelled.isCompleted) {
+          cancelled.complete(frame);
+        }
+      });
+    });
+
+    final iterator = StreamIterator(
+      DshWsDownlink.openRemoteStream(
+        'http://127.0.0.1:${server.port}',
+        r'$events',
+        const {},
+      ),
+    );
+    expect(await iterator.moveNext(), isTrue);
+    expect(iterator.current, {'type': 'snapshot', 'cursor': 7});
+    await iterator.cancel();
+
+    final openFrame = await opened.future.timeout(const Duration(seconds: 2));
+    expect(openFrame['endpoint'], r'$events');
+    expect(openFrame['payload'], {'args': <String, dynamic>{}});
+    final cancelFrame = await cancelled.future.timeout(
+      const Duration(seconds: 2),
+    );
+    expect(cancelFrame['streamId'], openFrame['streamId']);
   });
 }

@@ -262,7 +262,7 @@ void main() {
     expect(captured, isNotNull);
     expect(
       captured!.url.toString(),
-      'https://dsh.example.com/app/api/session.list',
+      'https://dsh.example.com/app/api/session/list',
     );
     expect(captured!.headers['authorization'], 'Bearer abc');
   });
