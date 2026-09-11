@@ -26,7 +26,7 @@
 - DSH、LAAP 定向测试通过。
 - 群聊认知注入回归测试通过。
 - Android arm64 release APK 构建成功，版本号为 `2.6.6 (31)`。
-- 发布包使用标准 Flutter release 产物，APK 大小约 19.3 MiB。
+- 发布包使用标准 Flutter release 产物，APK 大小约 18.7 MB。
 
 ## [2.6.5] - 2026-09-02
 
