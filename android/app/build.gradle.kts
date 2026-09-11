@@ -36,6 +36,10 @@ android {
         // 无 root 设备才能 execve）。extractNativeLibs=false 时该目录是空的，
         // PROOT_LOADER 指向不存在的文件，proot 直接起不来。
         jniLibs.useLegacyPackaging = true
+        // Flutter release engine must remain byte-for-byte intact. AGP's native
+        // symbol stripping can corrupt the engine snapshot on some Android 16
+        // builds and causes VM snapshot bootstrap to crash before Dart starts.
+        jniLibs.keepDebugSymbols += setOf("**/libflutter.so")
     }
 
     compileOptions {
