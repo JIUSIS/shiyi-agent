@@ -4,25 +4,27 @@
 
 ## [2.6.6] - 2026-09-11
 
-相对 2.6.5：修复 DSH rc.2 协议适配、手机临时路由未真正生效，以及补齐 LAAP 官方认知皮层接入。
+相对 2.6.5：完成 DSH rc.2 协议升级，修复 DSH 本地手机临时路由未真正切换模型的问题，并将 LAAP 认知皮层正式接入拾忆。
 
 ### 修复
 
-- 修复已知问题：DSH 本地使用手机临时路由时，provider 注入成功但会话未必真正切换到该模型。
-- 会话级临时路由现在必须确认 `session.selectModel` 成功；失败会清理半成品并触发重试。
-- 修复 DSH rc.2 的 `session/list`、`session/follow`、`remote.mux`、Cookie 与提问回答协议。
-- 修复 DSH 本地服务启动竞态，避免首轮请求在 Cookie 换取完成前发送。
+- 修复 DSH 本地使用手机临时路由时，provider 已注入但会话仍使用旧模型的问题。
+- 会话级临时路由现在会确认 `session.selectModel` 的结果；切换失败会清理临时配置并自动重试一次。
+- 完成 DSH rc.2 的 `session/list`、`session/follow`、`remote.mux`、Cookie 和提问回答协议适配。
+- 修复 DSH 本地服务启动竞态，避免首轮探活早于认证 Cookie 换取。
+- 修复 Android release APK 中 Flutter 引擎发布产物异常导致的启动闪退，并保持 arm64 包体处于正常体积。
 
 ### 新增
 
-- 按官方流程接入 LAAP：`bootstrap`、`cognitive_state`、`recall_memory`、`reflect`。
-- LAAP 身份、相关记忆和回合反思进入拾忆动态认知上下文。
+- **活人感**：接入 [LAAP（Living Agent Application Protocol）意识工程](https://github.com/lorryjovens-hub/laap-AGI)，将 Zero-LLM 认知架构作为拾忆的本地认知皮层。
+- **官方认知流程**：接入 `bootstrap`、`cognitive_state`、`recall_memory` 和 `reflect`，让认知状态、相关记忆与回合反思进入动态对话上下文。
+- **独立开关**：活人感默认关闭，用户可在 Agent 引擎页单独启用；LAAP 未就绪时不会注入伪造状态。
 
 ### 验证
 
 - DSH、LAAP 定向测试通过。
-- Android debug APK 构建成功。
-- 真机使用 `adb install -r` 覆盖安装成功，未卸载、未清除数据。
+- Android arm64 release APK 构建成功，版本号为 `2.6.6 (31)`。
+- 发布包使用标准 Flutter release 产物，APK 大小约 19.3 MiB。
 
 ## [2.6.5] - 2026-09-02
 
