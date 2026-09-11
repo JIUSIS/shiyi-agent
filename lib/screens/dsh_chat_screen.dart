@@ -118,6 +118,7 @@ class _DshChatScreenState extends State<DshChatScreen>
   String? _error;
   bool _waitingService = false;
   Timer? _loadRetryTimer;
+  bool _historyRefreshPending = false;
   bool _sending = false;
   late bool _running = widget.initialSummary?.running ?? false;
   Timer? _pollTimer;
@@ -215,10 +216,12 @@ class _DshChatScreenState extends State<DshChatScreen>
   final Map<String, ToolEvent> _timedToolEvents = {};
   StreamSubscription<Map<String, dynamic>>? _muxSub;
   StreamSubscription<Map<String, dynamic>>? _hostSub;
+  StreamSubscription<Map<String, dynamic>>? _controlSub;
   Timer? _muxRetry;
   Timer? _cacheTimer;
   Timer? _historySettleTimer;
   int _historySettleAttempts = 0;
+  int _historyReadGeneration = 0;
   Future<void> _cacheWriteTail = Future<void>.value();
   bool _muxUp = false;
   DateTime _lastStreamEmit = DateTime.fromMillisecondsSinceEpoch(0);
@@ -298,6 +301,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     _muxRetry?.cancel();
     unawaited(_muxSub?.cancel());
     unawaited(_hostSub?.cancel());
+    unawaited(_controlSub?.cancel());
     _streamText.dispose();
     _streamReasoning.dispose();
     _input.dispose();
@@ -307,6 +311,11 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   void _onDshStatus() {
     if (mounted) setState(() {});
+    if (DshService.instance.status.value == DshStatus.running &&
+        _historyRefreshPending) {
+      _historyRefreshPending = false;
+      unawaited(_refreshHistory(clearLive: false));
+    }
   }
 
   @override
@@ -718,6 +727,9 @@ class _DshChatScreenState extends State<DshChatScreen>
           _waitingService = false;
         });
       } else {
+        // 缓存页首帧可以先展示，但 DSH 启动竞态期间的历史读取不能
+        // 被静默丢掉；服务恢复 running 后由状态监听补读一次权威历史。
+        if (!_usesLivePageData) _historyRefreshPending = true;
         setState(() {
           _loading = false;
           _error = '$e';
@@ -1420,19 +1432,20 @@ class _DshChatScreenState extends State<DshChatScreen>
           await _refreshMeta();
           return;
         }
+        final readGeneration = ++_historyReadGeneration;
         if (wantFast) {
           final results = await Future.wait([
             _api.historyBundle(widget.sessionId),
             _api.listSessions(),
           ]);
-          if (!mounted) return;
+          if (!mounted || readGeneration != _historyReadGeneration) return;
           final bundle = results[0] as DshHistoryBundle;
           final list = results[1] as List<DshSessionSummary>;
           final historyConfirmsLive = _historyConfirmsLive(bundle.messages);
           _rememberResponseModels(bundle);
           _adoptHistoryReasoning(bundle.messages);
           _applySessionMeta(list);
-          final finalizesTurn = _historyFinalizesPendingTurn(bundle);
+          final finalizesTurn = _shouldFinalizeHistory(bundle);
           _replaceMessages(
             _mergeHistory(
               bundle.messages,
@@ -1463,7 +1476,7 @@ class _DshChatScreenState extends State<DshChatScreen>
           _api.historyBundle(widget.sessionId),
           _api.listSessions(),
         ]);
-        if (!mounted) return;
+        if (!mounted || readGeneration != _historyReadGeneration) return;
         final bundle = results[0] as DshHistoryBundle;
         final list = results[1] as List<DshSessionSummary>;
         final historyConfirmsLive = _historyConfirmsLive(bundle.messages);
@@ -1475,7 +1488,7 @@ class _DshChatScreenState extends State<DshChatScreen>
             bundle.messages.length != _messages.length ||
             nextLast?.content != prevLast?.content;
         _applySessionMeta(list);
-        final finalizesTurn = _historyFinalizesPendingTurn(bundle);
+        final finalizesTurn = _shouldFinalizeHistory(bundle);
         _replaceMessages(
           _mergeHistory(
             bundle.messages,
@@ -2204,8 +2217,10 @@ class _DshChatScreenState extends State<DshChatScreen>
     _muxRetry?.cancel();
     await _muxSub?.cancel();
     await _hostSub?.cancel();
+    await _controlSub?.cancel();
     _muxSub = null;
     _hostSub = null;
+    _controlSub = null;
     try {
       _muxSub = _api
           .watchMux(sessionId: widget.sessionId)
@@ -2221,8 +2236,47 @@ class _DshChatScreenState extends State<DshChatScreen>
             },
             cancelOnError: true,
           );
+      _controlSub = _api
+          .watchSessionControl(sessionId: widget.sessionId)
+          .listen(
+            (frame) {
+              if (gen == _muxGen) _onControlFrame(frame);
+            },
+            onError: (_) {},
+            cancelOnError: true,
+          );
     } catch (_) {
       if (gen == _muxGen) _onMuxLost();
+    }
+  }
+
+  void _onControlFrame(Map<String, dynamic> frame) {
+    final type = frame['type']?.toString() ?? '';
+    if (type == 'projection') {
+      final key = frame['key']?.toString() ?? '';
+      final value = frame['value'];
+      if ((key == 'running' || key == 'isRunning') && value is bool) {
+        _applyControlRunning(value);
+      }
+      return;
+    }
+    if (type == 'queue') {
+      final items = frame['items'];
+      if (items is List && items.isNotEmpty) _applyControlRunning(true);
+      return;
+    }
+    if (type == 'jobs') {
+      final jobs = frame['jobs'];
+      if (jobs is List && jobs.isNotEmpty) _applyControlRunning(true);
+    }
+  }
+
+  void _applyControlRunning(bool running) {
+    if (!mounted || running == _running) return;
+    setState(() => _running = running);
+    if (running) {
+      _syncSubagentPolling();
+      _maybePoll();
     }
   }
 
@@ -2250,6 +2304,16 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
     if (type == 'stream/error') {
       _muxUp = false;
+      return;
+    }
+    if (type == 'session/assistant-stream-end') {
+      if (frame['outcome'] == 'abandoned') {
+        _turnEndSeen = true;
+        _finishOpenToolEvents(ok: false);
+        if (mounted) setState(() => _running = false);
+        _syncSubagentPolling();
+        unawaited(_refreshHistory(clearLive: true));
+      }
       return;
     }
     if (type == 'host/session-status') {
@@ -2382,7 +2446,9 @@ class _DshChatScreenState extends State<DshChatScreen>
         _ensureLiveBubble();
         _publishLive(force: true);
       }
-      unawaited(_refreshHistory(clearLive: false));
+      // rc.2 可能先发 assistant/message，再把 turn/end 和正式历史落盘。
+      // 进入收口重试，避免正文已经显示但思考层永远留着。
+      unawaited(_refreshHistory(clearLive: _awaitingFinalReply));
       return;
     }
     if (kind == 'turn/end' ||
@@ -2413,9 +2479,11 @@ class _DshChatScreenState extends State<DshChatScreen>
     bool authoritative = false,
     bool throwOnError = false,
   }) async {
+    final readGeneration = ++_historyReadGeneration;
     try {
       final bundle = await _api.historyBundle(widget.sessionId);
-      if (!mounted) return;
+      if (!mounted || readGeneration != _historyReadGeneration) return;
+      _historyRefreshPending = false;
       if (bundle.permissionPreset != null &&
           bundle.permissionPreset != _sessionPermission) {
         setState(() => _sessionPermission = bundle.permissionPreset!);
@@ -2433,18 +2501,17 @@ class _DshChatScreenState extends State<DshChatScreen>
         current: current,
         incoming: bundle.messages,
       );
-      final finalizesTurn = _historyFinalizesPendingTurn(bundle);
+      final finalizesTurn = _shouldFinalizeHistory(bundle);
       final preserveLocalProgress =
           !authoritative &&
           !finalizesTurn &&
           (_shouldPreserveLocalProgress(bundle) || !historyConfirmsLive);
-      _replaceMessages(
-        _mergeHistory(
-          bundle.messages,
-          live: bundle.live,
-          preserveLocalProgress: preserveLocalProgress,
-        ),
+      final nextMessages = _mergeHistory(
+        bundle.messages,
+        live: bundle.live,
+        preserveLocalProgress: preserveLocalProgress,
       );
+      _replaceMessages(nextMessages);
       if (finalizesTurn) {
         _finishPendingTurn();
       } else {
@@ -2471,6 +2538,15 @@ class _DshChatScreenState extends State<DshChatScreen>
     } catch (e) {
       // 不自动拉起服务：刷新失败等用户手动启动。手动压缩需要把失败
       // 交给调用方，避免在权威历史尚未重载时误报成功。
+      if (!throwOnError && !_usesLivePageData) {
+        _historyRefreshPending = true;
+        if (DshService.instance.status.value == DshStatus.running) {
+          _historyRefreshPending = false;
+          Future<void>.delayed(const Duration(milliseconds: 500), () {
+            if (mounted) unawaited(_refreshHistory(clearLive: false));
+          });
+        }
+      }
       if (throwOnError) rethrow;
     }
   }
@@ -2605,10 +2681,15 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (!_awaitingFinalReply || !(_turnEndSeen || bundle.turnEnded)) {
       return false;
     }
+    return _historyHasAssistantAfterPending(bundle.messages);
+  }
+
+  bool _historyHasAssistantAfterPending(List<ChatMessage> messages) {
+    if (!_awaitingFinalReply) return false;
     final prompt = _pendingPromptText?.trim() ?? '';
     var userIndex = -1;
-    for (var i = bundle.messages.length - 1; i >= 0; i--) {
-      final message = bundle.messages[i];
+    for (var i = messages.length - 1; i >= 0; i--) {
+      final message = messages[i];
       if (message.role != 'user') continue;
       if (prompt.isEmpty || message.content.trim() == prompt) {
         userIndex = i;
@@ -2616,8 +2697,8 @@ class _DshChatScreenState extends State<DshChatScreen>
       }
     }
     if (userIndex < 0) return false;
-    for (var i = userIndex + 1; i < bundle.messages.length; i++) {
-      final message = bundle.messages[i];
+    for (var i = userIndex + 1; i < messages.length; i++) {
+      final message = messages[i];
       if (message.role == 'assistant' &&
           (message.content.trim().isNotEmpty ||
               message.reasoning.trim().isNotEmpty ||
@@ -2626,6 +2707,17 @@ class _DshChatScreenState extends State<DshChatScreen>
       }
     }
     return false;
+  }
+
+  bool _shouldFinalizeHistory(DshHistoryBundle bundle) {
+    if (_historyFinalizesPendingTurn(bundle)) return true;
+    // 某些 rc.2 回合不会把 turn/end 转发给手机客户端，但 session.list
+    // 已经报告 stopped，且正式 assistant/message 已经落盘。此时不能再
+    // 继续保留本地 thinking 占位。
+    return _awaitingFinalReply &&
+        !_running &&
+        !bundle.live.open &&
+        _historyHasAssistantAfterPending(bundle.messages);
   }
 
   void _finishPendingTurn() {

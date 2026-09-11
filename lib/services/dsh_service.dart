@@ -62,6 +62,9 @@ class DshService {
   /// 安装、修复和服务启动的实时命令输出（UI 展开查看），只保留尾部防膨胀。
   final ValueNotifier<String> installOutput = ValueNotifier<String>('');
 
+  /// 当前本机 DSH WebUI 的完整认证地址。每次 dsh web 重启都会更新。
+  final ValueNotifier<String> webUiUrl = ValueNotifier<String>('');
+
   /// 当前进度阶段区间（start, end）；null = 无阶段划分。
   (double, double)? _phase;
 
@@ -691,9 +694,23 @@ class DshService {
     final token = webLaunchTokenFromOutput(_serverAuthBuffer);
     if (token == null || token == _lastLaunchToken) return;
     _lastLaunchToken = token;
+    webUiUrl.value = _webUiUrlForToken(token);
     _serverAuthBuffer = '';
     _launchAuthExchange = _exchangeLaunchToken(token);
     unawaited(_launchAuthExchange!);
+  }
+
+  String _webUiUrlForToken(String token) {
+    final base = Uri.parse(api.baseUrl);
+    var path = base.path;
+    if (path.isEmpty) {
+      path = '/';
+    } else if (!path.endsWith('/')) {
+      path = '$path/';
+    }
+    return base
+        .replace(path: path, queryParameters: {'token': token})
+        .toString();
   }
 
   Future<void> _exchangeLaunchToken(String token) async {
@@ -775,6 +792,7 @@ class DshService {
     }
     final running = await isRunning();
     status.value = running ? DshStatus.running : DshStatus.idle;
+    if (running) await _restoreWebUiAuthFromLog();
     return status.value;
   }
 
@@ -2467,6 +2485,29 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   /// 服务是否在运行（RPC 就绪探测，端口通了但 API 未初始化也算未就绪）。
   Future<bool> isRunning() => api.rpcPing();
 
+  Future<void> _restoreWebUiAuthFromLog() async {
+    if (!managesLocalProcess || api.baseUrl.isEmpty) return;
+    try {
+      final agentDir = await FileWorkspace.current();
+      final log = File('$agentDir/logs/dsh-web.log');
+      if (!await log.exists()) return;
+      final raw = await log.readAsString();
+      final matches = RegExp(
+        r'dsh web:\s*([^\r\n]+[?&]token=([A-Za-z0-9_-]{20,}))',
+      ).allMatches(raw).toList();
+      if (matches.isEmpty) return;
+      final match = matches.last;
+      final token = match.group(2);
+      if (token == null || token == _lastLaunchToken) return;
+      _lastLaunchToken = token;
+      webUiUrl.value = _webUiUrlForToken(token);
+      if (api.authCookie.isEmpty) {
+        _launchAuthExchange = _exchangeLaunchToken(token);
+        await _launchAuthExchange;
+      }
+    } catch (_) {}
+  }
+
   /// 本机端口是否已监听。rc.2 鉴权失配时 RPC 会返回 401，
   /// 但端口仍被旧进程占用；不能只靠 RPC 判断能否直接启动。
   Future<bool> _localWebPortInUse() async {
@@ -2691,6 +2732,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
         env.addAll({'SHIYI_AGENT_DIR': agentDir, 'SHIYI_DSH_BIN': bin});
         _serverAuthBuffer = '';
         _lastLaunchToken = null;
+        webUiUrl.value = '';
         _launchAuthExchange = null;
         api.clearAuthentication();
         final full = await TermuxRuntime.shellCommand([
@@ -2798,6 +2840,7 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     _serverProcess = null;
     _serverAuthBuffer = '';
     _lastLaunchToken = null;
+    webUiUrl.value = '';
     _launchAuthExchange = null;
     api.clearAuthentication();
 

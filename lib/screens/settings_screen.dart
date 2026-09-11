@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
@@ -2342,6 +2343,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     _dsh.progress.addListener(_onDshTick);
     _dsh.statusMessage.addListener(_onDshTick);
     _dsh.installOutput.addListener(_onDshTick);
+    _dsh.webUiUrl.addListener(_onDshTick);
     // 引擎切换落盘后刷新本页（开关读的是 shiyi.settings）。
     // 返回路径不动：主页（HomeScreen）自己监听引擎变化切换 tab 套件。
     widget.shiyi.addListener(_onShiyiEngineChanged);
@@ -2355,6 +2357,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     _dsh.progress.removeListener(_onDshTick);
     _dsh.statusMessage.removeListener(_onDshTick);
     _dsh.installOutput.removeListener(_onDshTick);
+    _dsh.webUiUrl.removeListener(_onDshTick);
     _installOutputScroll.dispose();
     final pending = _save.hasPending ? _draftSettings() : null;
     _save.dispose();
@@ -2394,6 +2397,13 @@ class AgentEnginePageState extends State<AgentEnginePage> {
         unawaited(_refreshFullRuntimeStatus());
       }
     } catch (_) {}
+  }
+
+  Future<void> _copyDshWebUiUrl() async {
+    final url = _dsh.webUiUrl.value.trim();
+    if (url.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: url));
+    if (mounted) _showInfo('当前 WebUI 认证地址已复制，请用新地址打开浏览器');
   }
 
   /// 任意设置变更都要刷新本页（开关读的是 shiyi.settings）。
@@ -2958,6 +2968,18 @@ class AgentEnginePageState extends State<AgentEnginePage> {
                 label: '服务状态',
                 value: installed ? _statusLabel(dshStatus) : '未安装',
               ),
+              if (dshStatus == DshStatus.running &&
+                  _dsh.webUiUrl.value.isNotEmpty)
+                CupertinoListTile(
+                  leading: _IosIconTile(
+                    icon: CupertinoIcons.globe,
+                    color: _iosTeal,
+                  ),
+                  title: const Text('复制 WebUI 认证地址'),
+                  subtitle: const Text('每次重启 DSH 后都要使用新的地址'),
+                  trailing: const Icon(CupertinoIcons.doc_on_clipboard),
+                  onTap: _copyDshWebUiUrl,
+                ),
               _ServiceRow(
                 icon: CupertinoIcons.globe,
                 color: _iosTeal,

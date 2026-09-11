@@ -1154,6 +1154,7 @@ class DshApiClient {
               'sessionId': (payload['sessionId'] ?? '').toString(),
             },
             beforeSeq: (payload['beforeSeq'] as num?)?.toInt(),
+            throughSeq: (payload['throughSeq'] as num?)?.toInt(),
             maxMessages: (payload['maxMessages'] as num?)?.toInt(),
           ),
         });
@@ -1206,6 +1207,7 @@ class DshApiClient {
               'mode': (payload['mode'] ?? 'one-shot').toString(),
             },
             beforeSeq: (payload['beforeSeq'] as num?)?.toInt(),
+            throughSeq: (payload['throughSeq'] as num?)?.toInt(),
             maxMessages: (payload['maxMessages'] as num?)?.toInt(),
           ),
         });
@@ -1283,11 +1285,14 @@ class DshApiClient {
   static Map<String, dynamic> _sessionPageRequest({
     required Map<String, dynamic> address,
     int? beforeSeq,
+    int? throughSeq,
     int? maxMessages,
   }) {
     return {
       'address': address,
-      'throughSeq': beforeSeq ?? -1,
+      // throughSeq is the fixed tail cursor for the whole pagination walk.
+      // beforeSeq alone moves the upper bound and must not move this cursor.
+      'throughSeq': throughSeq ?? -1,
       if (beforeSeq != null) 'beforeSeq': beforeSeq,
       if (maxMessages != null && maxMessages > 0) 'maxMessages': maxMessages,
     };
@@ -2399,9 +2404,9 @@ class DshApiClient {
 
   /// 历史消息 + 末尾未收口的 live token（打开会话时补种流式气泡）。
   Future<DshHistoryBundle> historyBundle(String sessionId) async {
-    final value = _normalizeHistoryValue(
-      await _rpc('session.history', {'sessionId': sessionId}),
-    );
+    final value = await _readCompleteHistory('session.history', {
+      'sessionId': sessionId,
+    });
     return DshHistoryBundle(
       messages: _historyFromValue(value),
       live: DshLiveTurn.fromHistoryValue(value),
@@ -2409,6 +2414,105 @@ class DshApiClient {
       turnEnded: _historyTurnEnded(value),
       permissionPreset: permissionPresetFromValue(value),
     );
+  }
+
+  /// 读取 DSH 官方 SessionEventStream 的完整历史。
+  ///
+  /// rc.2 的 session/page 是“尾页 + hasMore”，官方客户端通过
+  /// `prepend(request, currentCursor)` 持续向旧 seq 翻页。拾忆没有独立的
+  /// 上拉分页入口，所以打开会话时把所有页合并成一份稳定的时间线，避免
+  /// live 气泡和不完整历史互相覆盖。
+  Future<Map<String, dynamic>> _readCompleteHistory(
+    String method,
+    Map<String, dynamic> payload,
+  ) async {
+    var value = _normalizeHistoryValue(await _rpc(method, payload));
+    if ((value['events'] as List?)?.isEmpty == true &&
+        (method == 'session.history' || method == 'subagent.history')) {
+      final cursor = await _historyCursor(payload);
+      if (cursor != null && cursor >= 0) {
+        value = _normalizeHistoryValue(
+          await _rpc(method, {...payload, 'throughSeq': cursor}),
+        );
+      }
+    }
+    final all = <dynamic>[...((value['events'] as List?) ?? const <dynamic>[])];
+    var hasMore = value['hasMore'] == true;
+    final throughSeq = _lastHistorySeq(all);
+    var beforeSeq = _firstHistorySeq(all);
+    var pages = 0;
+    while (hasMore && beforeSeq != null && beforeSeq > 0 && pages < 200) {
+      final next = _normalizeHistoryValue(
+        await _rpc(method, {
+          ...payload,
+          'beforeSeq': beforeSeq - 1,
+          if (throughSeq != null) 'throughSeq': throughSeq,
+        }),
+      );
+      final older = (next['events'] as List?) ?? const <dynamic>[];
+      if (older.isEmpty) break;
+      final nextBefore = _firstHistorySeq(older);
+      if (nextBefore == null || nextBefore >= beforeSeq) break;
+      all.insertAll(0, older);
+      beforeSeq = nextBefore;
+      hasMore = next['hasMore'] == true;
+      pages++;
+    }
+    return {...value, 'events': all, 'hasMore': hasMore};
+  }
+
+  Future<int?> _historyCursor(Map<String, dynamic> payload) async {
+    final sessionId = (payload['sessionId'] ?? '').toString().trim();
+    final parentSessionId = (payload['parentSessionId'] ?? '')
+        .toString()
+        .trim();
+    final childSessionId = (payload['childSessionId'] ?? '').toString().trim();
+    final address = sessionId.isNotEmpty
+        ? <String, dynamic>{'kind': 'session', 'sessionId': sessionId}
+        : <String, dynamic>{
+            'kind': 'subagent',
+            'parentSessionId': parentSessionId,
+            'childSessionId': childSessionId,
+            'mode': (payload['mode'] ?? 'one-shot').toString(),
+          };
+    try {
+      await for (final value in DshWsDownlink.openRemoteStream(
+        _baseUrl,
+        'session/follow',
+        {
+          'request': {'address': address},
+        },
+        headers: _wsHeaders(),
+      )) {
+        if (value is! Map || value['type']?.toString() != 'snapshot') {
+          continue;
+        }
+        return (value['cursor'] as num?)?.toInt();
+      }
+    } catch (_) {
+      // 旧版 DSH 没有 session/follow 时，保留原有 page 读取路径。
+    }
+    return null;
+  }
+
+  static int? _firstHistorySeq(List<dynamic> entries) {
+    var first = 1 << 62;
+    for (final entry in entries) {
+      final event = entry is Map ? entry['event'] : null;
+      final seq = event is Map ? (event['seq'] as num?)?.toInt() : null;
+      if (seq != null && seq < first) first = seq;
+    }
+    return first == 1 << 62 ? null : first;
+  }
+
+  static int? _lastHistorySeq(List<dynamic> entries) {
+    var last = -1;
+    for (final entry in entries) {
+      final event = entry is Map ? entry['event'] : null;
+      final seq = event is Map ? (event['seq'] as num?)?.toInt() : null;
+      if (seq != null && seq > last) last = seq;
+    }
+    return last < 0 ? null : last;
   }
 
   static bool _historyTurnEnded(Map<String, dynamic> value) {
@@ -2466,6 +2570,42 @@ class DshApiClient {
     );
   }
 
+  /// rc.2 官方会话控制流。它是全局流，提供 baseline、queue、jobs、
+  /// projection 三类状态，不要把它当成旧版 host 事件流。
+  Stream<Map<String, dynamic>> watchSessionControl({
+    String sessionId = '',
+  }) async* {
+    final sid = sessionId.trim();
+    await for (final value in DshWsDownlink.openRemoteStream(
+      _baseUrl,
+      'session/control',
+      const {},
+      headers: _wsHeaders(),
+    )) {
+      if (value is! Map) continue;
+      final frame = value.cast<String, dynamic>();
+      if (sid.isEmpty || _controlFrameContainsSession(frame, sid)) {
+        yield frame;
+      }
+    }
+  }
+
+  static bool _controlFrameContainsSession(
+    Map<String, dynamic> frame,
+    String sessionId,
+  ) {
+    final direct = frame['sessionId']?.toString();
+    if (direct == sessionId) return true;
+    if (frame['type']?.toString() != 'baseline') return false;
+    final value = (frame['value'] as Map?)?.cast<String, dynamic>();
+    if (value == null) return false;
+    for (final key in const ['queues', 'jobs', 'projections']) {
+      final entries = value[key];
+      if (entries is Map && entries.containsKey(sessionId)) return true;
+    }
+    return false;
+  }
+
   Stream<Map<String, dynamic>> _watchRemoteEvents() async* {
     await for (final value in DshWsDownlink.openRemoteStream(
       _baseUrl,
@@ -2501,11 +2641,12 @@ class DshApiClient {
               ?.cast<String, dynamic>();
           for (final entry in (activeAttempt?['stream'] as List?) ?? const []) {
             if (entry is Map) {
-              final chunk = _assistantChunkFrame(
+              for (final chunk in _assistantStreamFrames(
                 sessionId,
                 entry.cast<String, dynamic>(),
-              );
-              if (chunk != null) yield chunk;
+              )) {
+                yield chunk;
+              }
             }
           }
           yield {
@@ -2525,9 +2666,19 @@ class DshApiClient {
         case 'assistant-stream':
           final assistantFrame = (frame['frame'] as Map?)
               ?.cast<String, dynamic>();
-          if (assistantFrame != null && assistantFrame['type'] == 'chunk') {
-            final chunk = _assistantChunkFrame(sessionId, assistantFrame);
-            if (chunk != null) yield chunk;
+          if (assistantFrame != null) {
+            final type = assistantFrame['type']?.toString() ?? '';
+            if (type == 'chunk') {
+              final chunk = _assistantChunkFrame(sessionId, assistantFrame);
+              if (chunk != null) yield chunk;
+            } else if (type == 'end' &&
+                (assistantFrame['outcome'] as Map?)?['kind'] == 'abandoned') {
+              yield {
+                'type': 'session/assistant-stream-end',
+                'sessionId': sessionId,
+                'outcome': 'abandoned',
+              };
+            }
           }
       }
     }
@@ -2596,6 +2747,50 @@ class DshApiClient {
     };
   }
 
+  static Iterable<Map<String, dynamic>> _assistantStreamFrames(
+    String sessionId,
+    Map<String, dynamic> record,
+  ) sync* {
+    final type = record['type']?.toString() ?? '';
+    if (type == 'chunk' || record['chunk'] is Map) {
+      final frame = _assistantChunkFrame(sessionId, record);
+      if (frame != null) yield frame;
+      return;
+    }
+    final texts = (record['texts'] as List?)?.whereType<String>() ?? const [];
+    if (type == 'text-chunks') {
+      for (final text in texts) {
+        if (text.isEmpty) continue;
+        yield {
+          'type': 'session/event',
+          'sessionId': sessionId,
+          'event': {
+            'type': 'assistant/chunk',
+            'time': record['time0'],
+            'data': {
+              'chunk': {'type': 'text-delta', 'text': text},
+            },
+          },
+        };
+      }
+    } else if (type == 'reasoning-chunks') {
+      for (final text in texts) {
+        if (text.isEmpty) continue;
+        yield {
+          'type': 'session/event',
+          'sessionId': sessionId,
+          'event': {
+            'type': 'assistant/chunk',
+            'time': record['time0'],
+            'data': {
+              'chunk': {'type': 'reasoning-delta', 'text': text},
+            },
+          },
+        };
+      }
+    }
+  }
+
   static Stream<T> _mergeStreams<T>(Iterable<Stream<T>> streams) {
     final inputs = streams.toList(growable: false);
     late final StreamController<T> controller;
@@ -2658,11 +2853,47 @@ class DshApiClient {
   static Map<String, dynamic> _normalizeHistoryValue(
     Map<String, dynamic> value,
   ) {
-    if (value['events'] is List) return value;
+    Map<String, dynamic>? eventOf(dynamic entry) {
+      if (entry is! Map) return null;
+      final direct = entry['event'];
+      if (direct is Map) return direct.cast<String, dynamic>();
+      final wrapped = entry['value'];
+      if (wrapped is Map) {
+        final nested = wrapped['event'];
+        if (nested is Map) return nested.cast<String, dynamic>();
+        if (wrapped['type'] != null) {
+          return wrapped.cast<String, dynamic>();
+        }
+      }
+      if (entry['type'] != null) return entry.cast<String, dynamic>();
+      return null;
+    }
+
+    List<dynamic> order(List<dynamic> entries) {
+      final normalized = <Map<String, dynamic>>[];
+      for (final entry in entries) {
+        final event = eventOf(entry);
+        if (event != null) normalized.add({'event': event});
+      }
+      final ordered = normalized.asMap().entries.toList()
+        ..sort((a, b) {
+          final aEvent = a.value['event'];
+          final bEvent = b.value['event'];
+          final aSeq = aEvent is Map ? (aEvent['seq'] as num?)?.toInt() : null;
+          final bSeq = bEvent is Map ? (bEvent['seq'] as num?)?.toInt() : null;
+          if (aSeq == null || bSeq == null) return a.key.compareTo(b.key);
+          return aSeq.compareTo(bSeq);
+        });
+      return ordered.map((entry) => entry.value).toList();
+    }
+
+    if (value['events'] is List) {
+      return {...value, 'events': order(value['events'] as List)};
+    }
     final records = value['records'];
     if (records is! List) return value;
     return {
-      'events': records,
+      'events': order(records),
       if (value['hasMore'] != null) 'hasMore': value['hasMore'],
       if (value['projections'] != null) 'projections': value['projections'],
     };

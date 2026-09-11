@@ -386,6 +386,129 @@ void main() {
     expect(msgs[1].toolCalls.first.name, 'web_search');
   });
 
+  test('rc.2 session/page 倒序 records 按事件序号恢复为聊天顺序', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'records': [
+              {
+                'event': event('assistant/message', 2, {
+                  'message': {
+                    'role': 'assistant',
+                    'content': [
+                      {'type': 'text', 'text': '最终回复'},
+                    ],
+                  },
+                }),
+              },
+              {
+                'event': event('user/message', 1, {
+                  'content': [
+                    {'type': 'text', 'text': '问题'},
+                  ],
+                  'id': 'user-1',
+                }),
+              },
+            ],
+            'hasMore': false,
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    final msgs = await clientWith(mock).history('session-test');
+    expect(msgs.map((m) => m.content), ['问题', '最终回复']);
+  });
+
+  test('rc.2 session/page value 包装的记录也恢复为聊天顺序', () async {
+    final mock = MockClient(
+      (req) async => http.Response(
+        jsonEncode(
+          okValue({
+            'records': [
+              {
+                'value': event('assistant/message', 2, {
+                  'message': {
+                    'content': [
+                      {'type': 'text', 'text': '回复'},
+                    ],
+                  },
+                }),
+              },
+              {
+                'value': event('user/message', 1, {
+                  'content': [
+                    {'type': 'text', 'text': '问题'},
+                  ],
+                }),
+              },
+            ],
+            'hasMore': false,
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      ),
+    );
+    final msgs = await clientWith(mock).history('session-value-wrapped');
+    expect(msgs.map((m) => m.content), ['问题', '回复']);
+  });
+
+  test('rc.2 session/page hasMore 会按 throughSeq 继续读取旧页', () async {
+    var calls = 0;
+    final mock = MockClient((req) async {
+      calls++;
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      final args = ((body['payload'] as Map)['args'] as Map)
+          .cast<String, dynamic>();
+      final request = (args['request'] as Map).cast<String, dynamic>();
+      final before = request['throughSeq'];
+      final oldPage = request['beforeSeq'] == 1;
+      if (calls == 1) {
+        expect(before, -1);
+        expect(request['beforeSeq'], isNull);
+      } else {
+        expect(before, 2);
+        expect(request['beforeSeq'], 1);
+      }
+      return http.Response(
+        jsonEncode(
+          okValue({
+            'records': [
+              {
+                'event': event(
+                  oldPage ? 'user/message' : 'assistant/message',
+                  oldPage ? 1 : 2,
+                  {
+                    if (oldPage)
+                      'content': [
+                        {'type': 'text', 'text': '旧问题'},
+                      ],
+                    if (!oldPage)
+                      'message': {
+                        'role': 'assistant',
+                        'content': [
+                          {'type': 'text', 'text': '新回复'},
+                        ],
+                      },
+                  },
+                ),
+              },
+            ],
+            'hasMore': !oldPage,
+          }),
+        ),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final msgs = await clientWith(mock).history('session-test');
+    expect(calls, 2);
+    expect(msgs.map((m) => m.content), ['旧问题', '新回复']);
+  });
+
   test('history：正文里的 think 标签拆进 reasoning', () async {
     final mock = MockClient(
       (req) async => http.Response(
@@ -911,9 +1034,7 @@ void main() {
 
     final client = DshApiClient(
       baseUrl: 'http://127.0.0.1:${server.port}',
-      client: MockClient(
-        (request) async => http.Response('unexpected', 500),
-      ),
+      client: MockClient((request) async => http.Response('unexpected', 500)),
     );
     var sawSnapshot = false;
     var sawSubscribed = false;
@@ -957,6 +1078,44 @@ void main() {
     expect(follow['assistantStream'], isTrue);
     expect((follow['address'] as Map)['kind'], 'session');
     expect((follow['address'] as Map)['sessionId'], 'sess-1');
+  });
+
+  test('rc.2 session/control 使用无参数官方流并筛选当前会话', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    Map<String, dynamic>? opened;
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((raw) {
+        final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+        if (frame['type'] != 'open') return;
+        opened = frame;
+        final streamId = frame['streamId'];
+        socket.add(
+          jsonEncode({
+            'type': 'item',
+            'streamId': streamId,
+            'value': {
+              'type': 'queue',
+              'sessionId': 'sess-1',
+              'items': <dynamic>[],
+            },
+          }),
+        );
+      });
+    });
+
+    final client = DshApiClient(
+      baseUrl: 'http://127.0.0.1:${server.port}',
+      client: MockClient((request) async => http.Response('unexpected', 500)),
+    );
+    final frame = await client
+        .watchSessionControl(sessionId: 'sess-1')
+        .first
+        .timeout(const Duration(seconds: 3));
+    expect(frame['type'], 'queue');
+    expect(opened!['endpoint'], 'session/control');
+    expect((opened!['payload'] as Map)['args'], isEmpty);
   });
 
   test('agentEngine 设置随 JSON 往返持久化', () {
