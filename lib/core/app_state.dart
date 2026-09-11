@@ -599,6 +599,14 @@ class ShiyiState extends ChangeNotifier {
           scopeKey: scopeKey,
           setDefault: false,
         );
+        if (DshEndpoint.isLocal(settings)) {
+          await _confirmLocalRelaySelection(
+            api: api,
+            sessionId: id,
+            provider: provider,
+            model: modelId,
+          );
+        }
         _activeDshRelayLeases[id] = lease;
         _syncRelayBackgroundState();
         return lease;
@@ -615,6 +623,26 @@ class ShiyiState extends ChangeNotifier {
         rethrow;
       }
     });
+  }
+
+  /// 本机 DSH 的 settings.mutate / session.selectModel 可能先返回、后刷新
+  /// 会话投影。回合开始前必须确认 prompt 真正会落到临时 provider。
+  Future<void> _confirmLocalRelaySelection({
+    required DshApiClient api,
+    required String sessionId,
+    required String provider,
+    required String model,
+  }) async {
+    Future<bool> matches() async {
+      final current = (await api.sessionModels(sessionId)).current;
+      return current.provider.trim() == provider &&
+          current.model.trim() == model;
+    }
+
+    if (await matches()) return;
+    await api.selectModel(sessionId, provider, model);
+    if (await matches()) return;
+    throw StateError('本机 DSH 未确认临时中转已切换到 $provider / $model');
   }
 
   Future<void> releaseDshRelayLease(DshRelayLease lease) =>

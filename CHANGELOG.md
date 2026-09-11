@@ -14,6 +14,7 @@
 - 修复 DSH 本地服务启动竞态，避免首轮探活早于认证 Cookie 换取。
 - 修复 Android release APK 中 Flutter 引擎发布产物异常导致的启动闪退，并保持 arm64 包体处于正常体积。
 - 修复群聊 Agent 绕过 LAAP 认知注入的问题；每个成员现在都会携带独立的 PSI 认知快照，并在回复后完成回合反思。
+- 修复本机 DSH 临时中转只收到 `session.selectModel` 成功回执、却未确认会话真实模型的问题；本机现在会回读并校验 provider/model，不一致时自动重选一次。
 
 ### 新增
 
