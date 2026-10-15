@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
@@ -8,6 +9,7 @@ import '../services/dsh_endpoint.dart';
 import '../services/dsh_plugin_store.dart';
 import '../services/dsh_service.dart';
 import '../widgets/context_menu.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
@@ -354,12 +356,33 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
     return cleaned;
   }
 
-  void _openMenu(DshPluginEntry entry, Offset globalPosition) {
-    if (_remote) {
-      _readOnlyHint();
-      return;
+  /// 镜像源测速：官方 `pluginRegistryProbe/fastest`（无参数，unary、局域网也通）。
+  Future<void> _probeFastestRegistry() async {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('正在测速插件镜像源…')));
+    try {
+      final api = DshService.instance.apiFor(widget.shiyi!.settings);
+      final url = await api.fastestPluginRegistry();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(url == null ? '目标没有可用镜像源' : '最快镜像源：$url'),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('测速失败：$e')));
     }
-    if (entry.builtin) return;
+  }
+
+  void _openMenu(DshPluginEntry entry, Offset globalPosition) {
+    // 远端也能启停了：官方 `pluginManager/setPluginEnabled(id, enabled)`
+    // **不需要会话 id**（wire 只有 id + enabled），局域网也通；
+    // 删除 / 编辑配置仍要登录目标服务器改 cordis.patch.yml。
+    if (entry.builtin && !_remote) return;
     final items = <DesktopMenuItem>[
       DesktopMenuItem(
         label: entry.disabled ? '启用' : '停用',
@@ -367,22 +390,46 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
             ? CupertinoIcons.play_circle_fill
             : CupertinoIcons.pause_circle_fill,
         iconColor: _pluginTeal,
-        onTap: () => _toggleDisabled(entry, !entry.disabled),
+        onTap: () => _remote
+            ? _toggleRemoteEnabled(entry, !entry.disabled)
+            : _toggleDisabled(entry, !entry.disabled),
       ),
-      DesktopMenuItem(
-        label: '编辑配置',
-        icon: CupertinoIcons.settings,
-        iconColor: _pluginOrange,
-        onTap: () => _editConfig(entry),
-      ),
-      DesktopMenuItem(
-        label: '删除',
-        icon: CupertinoIcons.delete,
-        iconColor: CupertinoColors.systemRed,
-        onTap: () => _delete(entry),
-      ),
+      if (!_remote) ...[
+        DesktopMenuItem(
+          label: '编辑配置',
+          icon: CupertinoIcons.settings,
+          iconColor: _pluginOrange,
+          onTap: () => _editConfig(entry),
+        ),
+        DesktopMenuItem(
+          label: '删除',
+          icon: CupertinoIcons.delete,
+          iconColor: CupertinoColors.systemRed,
+          onTap: () => _delete(entry),
+        ),
+      ],
     ];
     showDesktopMenu(context, globalPosition: globalPosition, items: items);
+  }
+
+  /// 远端插件启停：`pluginManager/setPluginEnabled(id, enabled)`。
+  Future<void> _toggleRemoteEnabled(DshPluginEntry entry, bool enabled) async {
+    try {
+      final api = DshService.instance.apiFor(widget.shiyi!.settings);
+      await api.setPluginEnabled(entry.id, enabled);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(enabled ? '已启用 ${entry.id}' : '已停用 ${entry.id}'),
+        ),
+      );
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('启停失败：$e')));
+    }
   }
 
   void _pop() {
@@ -432,6 +479,12 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
                 ),
                 const SizedBox(width: 4),
                 MacActionButton(
+                  icon: CupertinoIcons.bolt,
+                  tooltip: '镜像测速',
+                  onTap: () => unawaited(_probeFastestRegistry()),
+                ),
+                const SizedBox(width: 4),
+                MacActionButton(
                   icon: CupertinoIcons.ellipsis,
                   tooltip: '关于',
                   onTap: () => _showAbout(),
@@ -476,7 +529,7 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -493,7 +546,7 @@ class _DshPluginsScreenState extends State<DshPluginsScreen> {
               const SizedBox(height: 12),
               Text(_error!, textAlign: TextAlign.center),
               const SizedBox(height: 14),
-              CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+              GlassActionButton(label: '重试', onPressed: _load, accent: true),
             ],
           ),
         ),

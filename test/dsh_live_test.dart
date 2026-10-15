@@ -512,4 +512,80 @@ void main() {
     );
     expect(cancelFrame['streamId'], openFrame['streamId']);
   });
+
+  group('收口判定：会话停止后不接受历史重建的 live', () {
+    // “生成完成多一条重复气泡”的现场：事件流里有 chunk 与 assistant/message、
+    // 缺 turn/end，于是 fromHistoryValue 还原出 open 的缓冲，而同一段缓冲也已经
+    // 冻成正式助手消息。此时 session.list 报 stopped，必须允许关掉 live。
+    DshLiveTurn rebuiltWithoutTurnEnd() {
+      final live = DshLiveTurn();
+      live.ingest(
+        ev('assistant/chunk', 1, {
+          'chunk': {'type': 'text-delta', 'index': 0, 'text': 'Hi again!'},
+        }),
+      );
+      live.ingest(ev('assistant/message', 2, const {}));
+      live.ingest(
+        ev('assistant/chunk', 3, {
+          'chunk': {
+            'type': 'text-delta',
+            'index': 0,
+            'text': 'What can I help you with?',
+          },
+        }),
+      );
+      return live;
+    }
+
+    test('缺 turn/end 时重建出的缓冲确实是 open 的（复现条件）', () {
+      expect(rebuiltWithoutTurnEnd().open, isTrue);
+    });
+
+    test('回合已收口（stopped）时允许关掉，不再保留重复的流式气泡', () {
+      expect(
+        dshAllowsLiveClose(
+          turnInFlight: false,
+          incomingLiveOpen: true,
+          historyConfirmsLive: true,
+        ),
+        isTrue,
+      );
+      // 历史相对本地倒退时也一样：stopped 就该以正式历史为准。
+      expect(
+        dshAllowsLiveClose(
+          turnInFlight: false,
+          incomingLiveOpen: true,
+          historyConfirmsLive: false,
+        ),
+        isTrue,
+      );
+    });
+
+    test('回合仍在跑时保持原口径：open 或历史未确认都不关', () {
+      expect(
+        dshAllowsLiveClose(
+          turnInFlight: true,
+          incomingLiveOpen: true,
+          historyConfirmsLive: true,
+        ),
+        isFalse,
+      );
+      expect(
+        dshAllowsLiveClose(
+          turnInFlight: true,
+          incomingLiveOpen: false,
+          historyConfirmsLive: false,
+        ),
+        isFalse,
+      );
+      expect(
+        dshAllowsLiveClose(
+          turnInFlight: true,
+          incomingLiveOpen: false,
+          historyConfirmsLive: true,
+        ),
+        isTrue,
+      );
+    });
+  });
 }

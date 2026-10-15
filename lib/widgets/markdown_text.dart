@@ -691,16 +691,17 @@ class MarkdownBlock extends StatelessWidget {
 }
 
 /// 自适应 Markdown 渲染：短内容一次性渲染（随消息自然展开，保持现有体验），
-/// 超长内容自动切换为限高懒加载列表，避免大文本一次性构建卡顿。
+/// 超长内容按块拆分逐个渲染，降低单次解析量；高度不设上限，
+/// 超长消息必须能完整看到，不能只露一个固定视口。
 class AdaptiveMarkdownText extends StatelessWidget {
   final String data;
   final TextStyle? style;
 
-  /// 超过该字符数时启用懒加载渲染。
+  /// 超过该字符数时按块拆分渲染。
   final int lazyThreshold;
 
   /// 流式中：只画纯文本，不拆 Markdown，避免每个 token 重建卡顿。
-  /// 结束后再按长度决定完整渲染或懒加载。
+  /// 结束后再按长度决定完整渲染或分块渲染。
   final bool isStreaming;
 
   const AdaptiveMarkdownText(
@@ -720,18 +721,18 @@ class AdaptiveMarkdownText extends StatelessWidget {
     final refs = markdownReferenceLinkDefs(data);
     if (data.length > lazyThreshold) {
       final blocks = splitMarkdownBlocks(data);
-      return ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 400),
-        child: ListView.builder(
-          padding: EdgeInsets.zero,
-          itemCount: blocks.length,
-          itemBuilder: (context, i) => MarkdownBlock(
-            blocks[i],
-            style: style,
-            footnotes: footnotes,
-            refs: refs,
-          ),
-        ),
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final block in blocks)
+            MarkdownBlock(
+              block,
+              style: style,
+              footnotes: footnotes,
+              refs: refs,
+            ),
+        ],
       );
     }
     return MarkdownText(data, style: style);

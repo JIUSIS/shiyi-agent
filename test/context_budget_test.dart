@@ -218,6 +218,19 @@ void main() {
       expect(plan.shouldTrim, isFalse);
     });
 
+    test('输出上限调到比上下文还大时，输入预算不被挤成 0（历史仍会裁剪）', () {
+      final plan = ShiyiState.planContextBudget(
+        contextLimit: 128000,
+        maxOutputTokens: 384000,
+        estimatedInputTokens: 120000,
+      );
+      // 输出预留最多占一半，输入预算必须保持为正，否则整段历史不裁剪、
+      // 请求会直接超出上下文窗口被服务商拒绝。
+      expect(plan.outputReserve, 64000);
+      expect(plan.usableInputTokens, 61440);
+      expect(plan.shouldTrim, isTrue);
+    });
+
     test('约 100K Token 不因 /4 误判而裁剪', () {
       final plan = ShiyiState.planContextBudget(
         contextLimit: 128000,

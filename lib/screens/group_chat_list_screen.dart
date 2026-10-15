@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import '../widgets/chat_liquid_glass.dart';
 import '../core/app_state.dart';
 import '../core/group_chat.dart';
 import '../core/mac_page_route.dart';
@@ -153,7 +154,7 @@ class _GroupChatListScreenState extends State<GroupChatListScreen> {
             ),
           ),
           body: _loading
-              ? const Center(child: CupertinoActivityIndicator())
+              ? const Center(child: AppLoading())
               : _rooms.isEmpty
               ? _EmptyGroupChats(onCreate: _create)
               : ListView(

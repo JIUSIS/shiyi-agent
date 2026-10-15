@@ -8,10 +8,12 @@ import 'package:flutter/services.dart';
 
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../core/poll_visibility.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_live.dart';
 import '../services/dsh_service.dart';
 import '../widgets/dsh_stats_bar.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
@@ -79,9 +81,18 @@ class _DshSubagentsScreenState extends State<DshSubagentsScreen> {
     _refreshTimer?.cancel();
     if (!_entries.any((e) => e.running)) return;
     _refreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      // 后台 / 被盖住时不拉（真机发热复盘 docs/fix-log.md #393）。
+      if (!_pollVisible) return;
       unawaited(_refresh());
     });
   }
+
+  /// 页面/应用是否可见（后台、被别的 route 盖住都算不可见）。
+  bool get _pollVisible => dshPollVisible(
+    mounted: mounted,
+    lifecycle: WidgetsBinding.instance.lifecycleState,
+    routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+  );
 
   Future<void> _refresh() async {
     try {
@@ -150,7 +161,7 @@ class _DshSubagentsScreenState extends State<DshSubagentsScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -159,7 +170,7 @@ class _DshSubagentsScreenState extends State<DshSubagentsScreen> {
           children: [
             Text(_error!, textAlign: TextAlign.center),
             const SizedBox(height: 12),
-            CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+            GlassActionButton(label: '重试', onPressed: _load, accent: true),
           ],
         ),
       );
@@ -268,7 +279,7 @@ class _DshSubagentsScreenState extends State<DshSubagentsScreen> {
       return const SizedBox(
         width: 18,
         height: 18,
-        child: CircularProgressIndicator(strokeWidth: 2),
+        child: AppLoading(size: AppLoadingSize.inline),
       );
     }
     return const Icon(
@@ -462,9 +473,18 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
     } catch (_) {}
   }
 
+  /// 页面/应用是否可见（后台、被别的 route 盖住都算不可见）。
+  bool get _pollVisible => dshPollVisible(
+    mounted: mounted,
+    lifecycle: WidgetsBinding.instance.lifecycleState,
+    routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+  );
+
   void _maybePoll() {
     if (_pollTimer != null) return;
     _pollTimer = Timer.periodic(const Duration(milliseconds: 400), (_) async {
+      // 后台 / 被盖住时不拉：这条 400ms 一轮就是两个远端请求。
+      if (!_pollVisible) return;
       try {
         final results = await Future.wait<Object?>([
           _api.subagentHistoryBundle(
@@ -831,7 +851,7 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
 
   Widget _buildMessages() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -860,7 +880,7 @@ class _SubagentDetailScreenState extends State<_SubagentDetailScreen>
                 ),
               ),
               const SizedBox(height: 14),
-              CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+              GlassActionButton(label: '重试', onPressed: _load, accent: true),
             ],
           ),
         ),
@@ -1160,7 +1180,7 @@ class _SubagentStatusFooter extends StatelessWidget {
               const SizedBox(
                 width: 14,
                 height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2),
+                child: AppLoading(size: AppLoadingSize.inline),
               )
             else
               const Icon(

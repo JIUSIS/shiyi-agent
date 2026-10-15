@@ -84,6 +84,60 @@ class DshEndpoint {
     return 'http://$h:$p';
   }
 
+  /// 局域网「一条链接」：把主机 / 端口 / Token 合成一行，供设置页显示与回填。
+  static String lanLink({
+    required String host,
+    required int port,
+    String token = '',
+  }) {
+    final base = lanUrl(host, port);
+    final raw = token.trim();
+    if (base.isEmpty) return raw.isEmpty ? '' : raw;
+    return raw.isEmpty ? base : '$base?token=$raw';
+  }
+
+  /// 解析设置页那一条链接，支援这些写法：
+  ///   `192.168.1.8`、`192.168.1.8:3081`、`http://192.168.1.8:3080/app`
+  /// 带 Token 时（`?token=xxx` / `?access_token=xxx` / `#token=xxx`）一并取出，
+  /// 并**从主机串里删掉**——Token 只进安全存储，不能落到 prefs 明文里。
+  static ({String host, int port, String token}) parseLanInput(
+    String raw, {
+    int fallbackPort = defaultPort,
+  }) {
+    final text = raw.trim();
+    if (text.isEmpty) {
+      return (host: '', port: validPort(fallbackPort), token: '');
+    }
+    final hasScheme = text.contains('://');
+    final uri = Uri.tryParse(hasScheme ? text : 'http://$text');
+    if (uri == null || uri.host.isEmpty) {
+      return (host: text, port: validPort(fallbackPort), token: '');
+    }
+    var token = '';
+    final query = Map<String, String>.from(uri.queryParameters);
+    for (final key in const ['token', 'access_token', 't', 'auth']) {
+      final value = (query[key] ?? '').trim();
+      if (value.isEmpty) continue;
+      token = value;
+      query.remove(key);
+    }
+    final fragment = uri.fragment.trim();
+    var fragmentStripped = false;
+    if (fragment.startsWith('token=')) {
+      if (token.isEmpty) token = fragment.substring('token='.length).trim();
+      fragmentStripped = true;
+    }
+    var host = text;
+    if (token.isNotEmpty || fragmentStripped) {
+      final scheme = hasScheme ? '${uri.scheme}://' : '';
+      final portPart = uri.hasPort ? ':${uri.port}' : '';
+      final path = stripSlash(uri.path);
+      host = '$scheme${uri.host}$portPart$path';
+    }
+    final port = uri.hasPort ? validPort(uri.port) : validPort(fallbackPort);
+    return (host: stripSlash(host), port: port, token: token);
+  }
+
   static String remoteUrl(String raw) {
     var s = raw.trim();
     if (s.isEmpty) return '';

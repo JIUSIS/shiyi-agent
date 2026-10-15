@@ -182,14 +182,19 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
     WSL2 / Git Bash / pwsh / cmd；Android 默认 `/storage/emulated/0/agent` +
     Alpine / apk / init-host。测试：`test/file_workspace_test.dart`、
     `test/terminal_backend_test.dart`、`test/prompt_section_test.dart`。
-12. **拾忆跨会话查阅**：用户复制会话 ID 发到另一个拾忆会话时，模型必须用
+12. **DSH rc.2 会话历史读取**：必须先通过 `session/follow` 获取快照游标，
+    再以 `session/page(throughSeq: cursor)` 读取完整历史；禁止直接用
+    `throughSeq: -1` 作为真实历史读取方式。DSH 启动期间缓存首帧为空时，
+    服务恢复到 `running` 后必须补读，避免 assistant 正文丢失、气泡错序和思考状态残留。
+    详见 `docs/fix-log.md` #378。
+13. **拾忆跨会话查阅**：用户复制会话 ID 发到另一个拾忆会话时，模型必须用
     `search_sessions` / `read_session` 找到并阅读，禁止声称搜不到。
     按完整会话 ID 命中本地库。这不是 DSH `session.search`。
     测试：`test/session_bridge_test.dart`。
-13. **终端捏合 / 补全 / 命令分色**：`TerminalPane` 双指捏合缩放字号（1~28，默认 13），
+14. **终端捏合 / 补全 / 命令分色**：`TerminalPane` 双指捏合缩放字号（1~28，默认 13），
     捏合不弹键盘；中文回退字体；前缀补全（历史优先 + 幽灵字）；命令行 token 分色。
     测试：`test/terminal_pane_test.dart`。
-14. **拾忆主页长按拖拽**：`HomeLongPressDrag` + 自建 overlay 拖起整张卡片；
+15. **拾忆主页长按拖拽**：`HomeLongPressDrag` + 自建 overlay 拖起整张卡片；
     松手飞入空隙，远放不瞬移；提交贴齐禁止反向弹回。跨项目须停满 1 秒，
     拖回原项目立刻取消「松开以移入」。列表外层必须裁剪，不能让挤开位移盖住搜索栏/状态栏。
     顺序写 `sort_order`，缺列补列不清库。跨组提交只收被拖项源槽，禁止把同组其它卡片收成 0。
@@ -197,7 +202,7 @@ Windows 无原生端：先尝试 channel（测试环境有 mock），捕获
     悬停其他工作区不得展开或显示「松开以移入」。拾忆跨项目拖拽仍走乐观更新。
     详见 `docs/fix-log.md` #241-#273、#327-#329。
     测试：`test/home_list_order_test.dart`、`test/home_sessions_tab_test.dart`、`test/staggered_sessions_test.dart`、`test/dsh_workspace_display_name_test.dart`。
-15. **拾忆 API 三条协议 + 冻头/动尾**：`openai` / `responses` / `anthropic` 并列。
+16. **拾忆 API 三条协议 + 冻头/动尾**：`openai` / `responses` / `anthropic` 并列。
     Responses 可移植子集：冻头 → `instructions`，其余 → `input`，`store: false`。
     禁止 `previous_response_id` / `prompt_cache_key`。图片 Chat 走 `image_url` 对象，
     Responses 必须转 `input_image` + 字符串 URL。冻头跨请求字节稳定；记忆 / 活人感 /
@@ -289,6 +294,12 @@ DS Harness 引擎验证点（#114，两端共享）：
 
 ## 8. 变更记录
 
+- **2026-09-11 2.6.6**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #378）：
+  DSH rc.2 会话历史读取改为官方 `session/follow` → `session/page` 游标流程，
+  修复本机缓存会话启动后历史空页导致的 assistant 正文丢失、思考气泡错序、
+  新消息覆盖旧气泡和思考状态残留；DSH 恢复运行后会自动补读权威历史。
+  DSH 相关测试 148 项全绿，正式 arm64 APK 构建成功并通过覆盖安装验证。
+  Windows 继续使用本机终端与本机 Python LAAP。
 - **2026-09-02 2.6.5**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #374-#375）：
   拾忆普通会话修复 thinking 历史里 assistant 缺失 `reasoning_content` 导致的 `LITELLM_ERROR 400`；输入区模型 / 思考强度 / 权限预设 / 缓存抽屉在键盘收起后跟随按钮重新定位。Windows 继续使用本机终端后端，不引入 Android Alpine 路径。
 - **2026-09-02 2.6.4**（共享 `lib/`；Windows 无新增平台分支；详见 `docs/fix-log.md` #366-#373）：

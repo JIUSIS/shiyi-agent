@@ -71,13 +71,37 @@ class _SmoothStreamTextState extends State<SmoothStreamText>
     if (widget.text == _target) return;
     if (widget.text.length > _target.length &&
         widget.text.startsWith(_target)) {
+      // 纯追加：从上一帧位置继续逐字补齐（不重打已经显示的内容）。
       _target = widget.text;
-    } else {
-      _target = widget.text;
-      _visible = '';
-      _offset = 0;
+      _maybeStart();
+      return;
     }
+    // 同一段内容的收缩/改写（例如续写接缝去重把重复段裁掉）：
+    // 直接对齐到最新内容，不能从头重打整段长文。
+    final shared = _commonPrefixLength(widget.text, _target);
+    final shorter = widget.text.length < _target.length
+        ? widget.text.length
+        : _target.length;
+    if (shorter > 0 && shared * 2 >= shorter) {
+      _target = widget.text;
+      _visible = _target;
+      _offset = _target.length;
+      _ticker.stop();
+      return;
+    }
+    _target = widget.text;
+    _visible = '';
+    _offset = 0;
     _maybeStart();
+  }
+
+  static int _commonPrefixLength(String a, String b) {
+    final n = a.length < b.length ? a.length : b.length;
+    var i = 0;
+    while (i < n && a.codeUnitAt(i) == b.codeUnitAt(i)) {
+      i++;
+    }
+    return i;
   }
 
   @override

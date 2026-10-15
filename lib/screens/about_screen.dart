@@ -2,6 +2,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart' show Material, MaterialType;
 import 'package:flutter/services.dart';
 
+import '../widgets/chat_liquid_glass.dart';
 import '../core/app_state.dart';
 import '../services/update_service.dart';
 import '../widgets/ios_style.dart';
@@ -296,7 +297,7 @@ class _AboutScreenState extends State<AboutScreen> {
                             _checking ? '正在检查…' : '从 GitHub Releases 检查新版本',
                           ),
                           trailing: _checking
-                              ? const CupertinoActivityIndicator()
+                              ? const AppLoading()
                               : const CupertinoListTileChevron(),
                           onTap: _checkUpdate,
                         ),

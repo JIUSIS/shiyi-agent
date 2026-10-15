@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
+import 'chat_liquid_glass.dart';
+import '../core/poll_visibility.dart';
 import '../core/models.dart';
 
 String toolEventLabel(String name) => switch (name) {
@@ -201,7 +202,16 @@ class _ToolPillState extends State<ToolPill> {
     }
     if (_timer != null) return;
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      // 后台 / 被盖住时不用刷新秒数（发热复盘 #393）。
+      if (!dshPollVisible(
+        mounted: true,
+        lifecycle: WidgetsBinding.instance.lifecycleState,
+        routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+      )) {
+        return;
+      }
+      setState(() {});
     });
   }
 
@@ -233,7 +243,7 @@ class _ToolPillState extends State<ToolPill> {
                 SizedBox(
                   width: 12,
                   height: 12,
-                  child: CupertinoActivityIndicator(radius: 6),
+                  child: AppLoading(size: AppLoadingSize.inline),
                 )
               else
                 Icon(
@@ -370,7 +380,7 @@ class _ToolLogItem extends StatelessWidget {
                 ? SizedBox(
                     width: 14,
                     height: 14,
-                    child: CupertinoActivityIndicator(radius: 7),
+                    child: AppLoading(size: AppLoadingSize.inline),
                   )
                 : Icon(
                     event.ok ? Icons.check_circle : Icons.error,

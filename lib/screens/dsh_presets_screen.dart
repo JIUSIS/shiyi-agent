@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../services/dsh_api.dart';
 import '../services/dsh_service.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 
@@ -326,7 +327,7 @@ class _DshPresetsScreenState extends State<DshPresetsScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -335,7 +336,7 @@ class _DshPresetsScreenState extends State<DshPresetsScreen> {
           children: [
             Text(_error!, textAlign: TextAlign.center),
             const SizedBox(height: 12),
-            CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+            GlassActionButton(label: '重试', onPressed: _load, accent: true),
           ],
         ),
       );
@@ -501,6 +502,8 @@ class _DshPresetsScreenState extends State<DshPresetsScreen> {
   }
 
   bool _hasActions(DshPresetInfo p) {
+    // rc.2 没有 copy / deletePreset：撞过 404 之后收起入口（见 fix-log #396）。
+    if (!_api.agentPresetMutable) return false;
     if (p.broken != null && p.broken!.isNotEmpty) return p.trust == 'user';
     return true;
   }
@@ -542,7 +545,10 @@ class _DshPresetsScreenState extends State<DshPresetsScreen> {
               },
               child: const Text('复制为新预设'),
             ),
-          if (p.trust == 'user')
+          // 删除也是「作者动作」：rc.2 的 agentPresets/list 没有 authorable 字段
+          // （schema 只有 presets），等于不可用；否则每个预设都会显示「删除」
+          // 并打到已不存在的 agentPresets/deletePreset。见 docs/fix-log.md #396。
+          if (_authorable && p.trust == 'user')
             CupertinoActionSheetAction(
               isDestructiveAction: true,
               onPressed: () {

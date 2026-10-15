@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import 'chat_liquid_glass.dart';
 import '../core/models.dart';
 
 /// iOS 化页面共用样式：Material Scaffold 不解析 Cupertino 动态颜色，
@@ -181,7 +182,7 @@ Future<T> showIosProgressDialog<T>({
             content: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const CupertinoActivityIndicator(),
+                const AppLoading(),
                 const SizedBox(width: 14),
                 Flexible(child: Text(message)),
               ],

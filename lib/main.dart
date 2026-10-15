@@ -57,7 +57,6 @@ Future<void> main() async {
     ),
   );
   runApp(ShiyiAgentApp(initialThemeMode: initialThemeMode));
-  unawaited(PermissionService.ensureOnLaunch());
 }
 
 /// 在首帧渲染前读取持久化的主题设置，避免先按默认深色主题渲染造成闪黑。
@@ -108,6 +107,10 @@ class ShiyiAgentApp extends StatefulWidget {
 class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
   late final ShiyiState shiyi;
   late String _themeModeSetting;
+
+  /// 首启启动序列：权限 → 回到前台 → 状态初始化。
+  /// 欢迎页等它完成才进主页，避免「权限还没给完就进了软件」。
+  late final Future<void> _startup;
   final GlobalKey<ScaffoldMessengerState> _messengerKey =
       GlobalKey<ScaffoldMessengerState>();
   final _RuntimeRouteObserver _routeObserver = _RuntimeRouteObserver();
@@ -119,11 +122,36 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
     shiyi = ShiyiState();
     _themeModeSetting = widget.initialThemeMode;
     shiyi.addListener(_handleShiyiChanged);
-    shiyi.init();
+    _startup = _bootstrap();
     // 冷启动立即体检，与欢迎动画并行，不等主页出现再拉服务。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_checkDshOnLaunch());
     });
+  }
+
+  /// 首启顺序：权限全部走完（含「所有文件访问」设置页）→ 回到前台 →
+  /// 再初始化状态。以前是 `runApp` 之后并发请求权限，初始化和系统弹窗
+  /// 抢前台，首启会出现「初始化失败」和「权限没给完就进主页」。
+  Future<void> _bootstrap() async {
+    try {
+      // 权限流程加个上限：任何一次系统调用卡住都不能让 App 停在欢迎页。
+      // 超时后仍会等回到前台再初始化，不会在后台跑初始化。
+      await PermissionService.ensureOnLaunch().timeout(
+        const Duration(seconds: 60),
+      );
+    } catch (_) {}
+    await _waitForForeground();
+    await shiyi.init();
+  }
+
+  /// 等 App 回到前台：授权设置页停留期间不要跑初始化。
+  Future<void> _waitForForeground() async {
+    final binding = WidgetsBinding.instance;
+    for (var i = 0; i < 300; i++) {
+      final state = binding.lifecycleState;
+      if (state == null || state == AppLifecycleState.resumed) return;
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
   }
 
   Future<void> _checkDshOnLaunch() async {
@@ -344,7 +372,7 @@ class _ShiyiAgentAppState extends State<ShiyiAgentApp> {
         );
         return MediaQuery(data: media, child: content);
       },
-      home: WelcomeScreen(shiyi: shiyi),
+      home: WelcomeScreen(shiyi: shiyi, startup: _startup),
     );
   }
 }

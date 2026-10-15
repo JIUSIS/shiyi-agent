@@ -7,6 +7,7 @@ import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_service.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import 'dsh_center_screen.dart';
@@ -273,7 +274,7 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -282,9 +283,10 @@ class _DshFilesScreenState extends State<DshFilesScreen> {
           children: [
             Text(_error!, textAlign: TextAlign.center),
             const SizedBox(height: 12),
-            CupertinoButton.filled(
+            GlassActionButton(
+              label: '重试',
               onPressed: () => _loadDir(_path),
-              child: const Text('重试'),
+              accent: true,
             ),
           ],
         ),

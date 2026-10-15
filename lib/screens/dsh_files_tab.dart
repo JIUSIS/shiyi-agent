@@ -5,6 +5,8 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../widgets/chat_liquid_glass.dart';
+import '../core/poll_visibility.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../services/dsh_api.dart';
@@ -34,6 +36,8 @@ class _DshFilesTabState extends State<DshFilesTab> {
   List<DshDirEntry> _crumbs = [];
   final List<String> _stack = [];
   bool _loading = true;
+  /// 目标只提供原生目录选择器（不支持浏览）—— 退化态，改用 pick。
+  bool _browseUnavailable = false;
   String? _error;
   String _cwdPath = '';
   List<DshDirEntry> _roots = const [];
@@ -142,13 +146,41 @@ class _DshFilesTabState extends State<DshFilesTab> {
       );
     } catch (e) {
       if (!mounted || epoch != _requestEpoch) return;
+      final browseUnavailable = _isBrowseUnavailable(e);
       final hint = await DshService.instance.unavailableReason();
       if (!mounted || epoch != _requestEpoch) return;
       setState(() {
         _loading = false;
-        _error = hint ?? '$e';
+        _browseUnavailable = browseUnavailable;
+        _error = browseUnavailable
+            ? '目标 DSH 只提供「原生目录选择器」，不支持在手机上逐级浏览它的目录。'
+                '点「选择目录」让目标电脑弹出选择框；要看会话工作区里的文件，'
+                '请到会话页附件 →「浏览工作区文件」。'
+            : (hint ?? '$e');
       });
       if (hint != null) _scheduleServiceRetry();
+    }
+  }
+
+  /// 目标组合的是原生 picker，`directoryPicker/list` 会返回
+  /// `directory-picker/unavailable`（见 docs/fix-log.md #403）。
+  static bool _isBrowseUnavailable(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('directory-picker/unavailable');
+  }
+
+  /// 浏览不可用时的兜底：让目标自己弹原生选择框（`directoryPicker/pick`）。
+  Future<bool> _pickNative() async {
+    try {
+      final picked = await _api.pickDirectory();
+      if (picked == null || picked.trim().isEmpty || !mounted) return false;
+      _stack.clear();
+      await _loadDir(picked.trim());
+      return true;
+    } catch (e) {
+      if (!mounted) return false;
+      setState(() => _error = '选择目录失败：$e');
+      return false;
     }
   }
 
@@ -212,7 +244,14 @@ class _DshFilesTabState extends State<DshFilesTab> {
   void _scheduleServiceRetry() {
     _retryTimer?.cancel();
     _retryTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
-      if (!mounted) return;
+      // 后台 / 被盖住时不重查（发热复盘 #393）。
+      if (!dshPollVisible(
+        mounted: mounted,
+        lifecycle: WidgetsBinding.instance.lifecycleState,
+        routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+      )) {
+        return;
+      }
       final reason = await DshService.instance.unavailableReason();
       if (!mounted) return;
       if (reason == null) {
@@ -259,7 +298,11 @@ class _DshFilesTabState extends State<DshFilesTab> {
       add(root.name.isEmpty ? root.path : root.name, root.path);
     }
     add('工作目录', _cwdPath);
-    if (locations.isEmpty) return;
+    if (locations.isEmpty) {
+      // 原生 picker 场景：没有可列的位置，直接让目标弹选择框。
+      if (_browseUnavailable) await _pickNative();
+      return;
+    }
     final selected = await showIosFadeModalPopup<String>(
       context: context,
       builder: (ctx) => CupertinoActionSheet(
@@ -449,9 +492,25 @@ class _DshFilesTabState extends State<DshFilesTab> {
                   horizontal: 16,
                   vertical: 6,
                 ),
-                child: Text(
-                  _error!,
-                  style: const TextStyle(color: CupertinoColors.systemRed),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: CupertinoColors.systemRed),
+                    ),
+                    if (_browseUnavailable) ...[
+                      const SizedBox(height: 8),
+                      CupertinoButton.filled(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        onPressed: () => unawaited(_pickNative()),
+                        child: const Text('选择目录（在目标电脑上弹）'),
+                      ),
+                    ],
+                  ],
                 ),
               ),
             Expanded(child: _buildList()),
@@ -508,7 +567,7 @@ class _DshFilesTabState extends State<DshFilesTab> {
 
   Widget _buildList() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_items.isEmpty) {
       return Center(

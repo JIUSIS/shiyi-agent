@@ -13,15 +13,25 @@ void main() {
     expect(find.byType(MarkdownText), findsOneWidget);
   });
 
-  testWidgets('AdaptiveMarkdownText 超长内容切懒加载列表', (tester) async {
-    final big = List.generate(3000, (i) => '- 第 $i 项 **加粗** `code`').join('\n');
+  testWidgets('AdaptiveMarkdownText 超长内容按块渲染且不设高度上限', (tester) async {
+    final big = List.generate(400, (i) => '- 第 $i 项 **加粗** `code`').join('\n');
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: AdaptiveMarkdownText(big, lazyThreshold: 100)),
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: AdaptiveMarkdownText(big, lazyThreshold: 100),
+          ),
+        ),
       ),
     );
     expect(tester.takeException(), isNull);
-    expect(find.byType(ListView), findsWidgets);
+    // 不能退化成固定高度的嵌套滚动视口：超长消息必须能整段看完，
+    // 高度要随内容自然撑开（这里远大于旧的 400px 视口）。
+    expect(find.byType(ListView), findsNothing);
+    expect(
+      tester.getSize(find.byType(AdaptiveMarkdownText)).height,
+      greaterThan(400),
+    );
   });
 
   testWidgets('表格渲染：表头与数据行都可见', (tester) async {

@@ -5,6 +5,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../widgets/chat_liquid_glass.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/model_presets.dart';
@@ -114,7 +115,7 @@ Future<T> _runWithLoading<T>(
         content: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const CupertinoActivityIndicator(),
+            const AppLoading(),
             const SizedBox(width: 14),
             Flexible(child: Text(message)),
           ],
@@ -1842,10 +1843,14 @@ class _ContextSectionPage extends StatefulWidget {
 class _ContextSectionPageState extends State<_ContextSectionPage> {
   late int _contextLimit;
   late int _maxOutputTokens;
+  late int _streamWaitSeconds;
+  late int _continuationRounds;
   late double _threshold;
   late bool _autoCompress;
   late final TextEditingController _contextLimitCtrl;
   late final TextEditingController _maxOutputTokensCtrl;
+  late final TextEditingController _streamWaitCtrl;
+  late final TextEditingController _continuationCtrl;
   late final TextEditingController _thresholdCtrl;
   late final _DebouncedSave _save;
 
@@ -1855,11 +1860,19 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
     final s = widget.shiyi.settings;
     _contextLimit = s.contextLimit;
     _maxOutputTokens = s.maxOutputTokens;
+    _streamWaitSeconds = s.streamWaitSeconds;
+    _continuationRounds = s.maxContinuationRounds;
     _threshold = s.compressThresholdPercent;
     _autoCompress = s.autoCompress;
     _contextLimitCtrl = TextEditingController(text: _contextLimit.toString());
     _maxOutputTokensCtrl = TextEditingController(
       text: _maxOutputTokens.toString(),
+    );
+    _streamWaitCtrl = TextEditingController(
+      text: _streamWaitSeconds.toString(),
+    );
+    _continuationCtrl = TextEditingController(
+      text: _continuationRounds.toString(),
     );
     _thresholdCtrl = TextEditingController(text: _threshold.toStringAsFixed(0));
     _save = _DebouncedSave(
@@ -1867,6 +1880,8 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
       () => widget.shiyi.settings.copyWith(
         contextLimit: _contextLimit,
         maxOutputTokens: _maxOutputTokens,
+        streamWaitSeconds: _streamWaitSeconds,
+        maxContinuationRounds: _continuationRounds,
         compressThresholdPercent: _threshold,
         autoCompress: _autoCompress,
       ),
@@ -1877,6 +1892,8 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
   void dispose() {
     _contextLimitCtrl.dispose();
     _maxOutputTokensCtrl.dispose();
+    _streamWaitCtrl.dispose();
+    _continuationCtrl.dispose();
     _thresholdCtrl.dispose();
     // 快速返回时把未落盘的编辑立即保存，避免丢改动。
     if (_save.hasPending) unawaited(_save.flush());
@@ -1913,6 +1930,62 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                   final n = int.tryParse(v);
                   if (n != null && n > 0) {
                     setState(() => _maxOutputTokens = n.clamp(512, 384000));
+                    _save.schedule();
+                  }
+                },
+              ),
+            ),
+            CupertinoListTile(
+              leading: _IosIconTile(
+                icon: CupertinoIcons.timer,
+                color: _iosOrange,
+              ),
+              title: const Text('长推理等待上限'),
+              subtitle: const Text(
+                '等模型开始回包、以及流中途没数据的上限（秒）。思考型模型会长时间不出字，'
+                '被普通网络超时砍断时调大；默认 600，最大 3600。',
+              ),
+              trailing: _IosValueField(
+                controller: _streamWaitCtrl,
+                keyboardType: TextInputType.number,
+                width: 110,
+                onChanged: (v) {
+                  final n = int.tryParse(v);
+                  if (n != null && n > 0) {
+                    setState(
+                      () => _streamWaitSeconds = n.clamp(
+                        kMinStreamWaitSeconds,
+                        kMaxStreamWaitSeconds,
+                      ),
+                    );
+                    _save.schedule();
+                  }
+                },
+              ),
+            ),
+            CupertinoListTile(
+              leading: _IosIconTile(
+                icon: CupertinoIcons.arrow_2_circlepath,
+                color: _iosGreen,
+              ),
+              title: const Text('自动续写轮数'),
+              subtitle: const Text(
+                '被输出上限截断后自动接着写的轮数（每轮都按输出上限算）；'
+                '0 = 不续写，只标记内容不完整。默认 16。',
+              ),
+              trailing: _IosValueField(
+                controller: _continuationCtrl,
+                keyboardType: TextInputType.number,
+                width: 110,
+                onChanged: (v) {
+                  final n = int.tryParse(v);
+                  if (n != null && n >= 0) {
+                    setState(
+                      () => _continuationRounds = n.clamp(
+                        0,
+                        kMaxContinuationRoundsLimit,
+                      ),
+                    );
                     _save.schedule();
                   }
                 },
@@ -2305,9 +2378,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
   late String _engine;
   late String _dshMode;
   late final _DebouncedSave _save;
-  late final TextEditingController _lanHostCtrl;
-  late final TextEditingController _lanPortCtrl;
-  late final TextEditingController _lanTokenCtrl;
+  late final TextEditingController _lanLinkCtrl;
   late final TextEditingController _remoteUrlCtrl;
   late final TextEditingController _remoteHostCtrl;
   late final TextEditingController _remoteTokenCtrl;
@@ -2332,9 +2403,15 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     final s = widget.shiyi.settings;
     _engine = s.agentEngine;
     _dshMode = DshEndpoint.modeOf(s);
-    _lanHostCtrl = TextEditingController(text: s.dshLanHost);
-    _lanPortCtrl = TextEditingController(text: '${s.dshLanPort}');
-    _lanTokenCtrl = TextEditingController(text: s.dshLanToken);
+    // 局域网只填一条链接（主机 + 端口 + Token 合成一行），保存时再拆回
+    // dshLanHost / dshLanPort / dshLanToken（Token 仍只进安全存储）。
+    _lanLinkCtrl = TextEditingController(
+      text: DshEndpoint.lanLink(
+        host: s.dshLanHost,
+        port: s.dshLanPort,
+        token: s.dshLanToken,
+      ),
+    );
     _remoteUrlCtrl = TextEditingController(text: s.dshRemoteUrl);
     _remoteHostCtrl = TextEditingController(text: s.dshRemoteHost);
     _remoteTokenCtrl = TextEditingController(text: s.dshRemoteToken);
@@ -2361,9 +2438,7 @@ class AgentEnginePageState extends State<AgentEnginePage> {
     _installOutputScroll.dispose();
     final pending = _save.hasPending ? _draftSettings() : null;
     _save.dispose();
-    _lanHostCtrl.dispose();
-    _lanPortCtrl.dispose();
-    _lanTokenCtrl.dispose();
+    _lanLinkCtrl.dispose();
     _remoteUrlCtrl.dispose();
     _remoteHostCtrl.dispose();
     _remoteTokenCtrl.dispose();
@@ -2667,16 +2742,15 @@ class AgentEnginePageState extends State<AgentEnginePage> {
   }
 
   AppSettings _draftSettings() {
-    final port =
-        int.tryParse(_lanPortCtrl.text.trim()) ?? DshEndpoint.defaultPort;
+    final lan = DshEndpoint.parseLanInput(_lanLinkCtrl.text);
     return widget.shiyi.settings.copyWith(
       agentEngine: _engine,
       dshConnectionMode: _dshMode,
       dshRelayEnabled: false,
       dshRelayPublicUrl: '',
-      dshLanHost: _lanHostCtrl.text.trim(),
-      dshLanPort: DshEndpoint.validPort(port),
-      dshLanToken: _lanTokenCtrl.text,
+      dshLanHost: lan.host,
+      dshLanPort: lan.port,
+      dshLanToken: lan.token,
       dshRemoteUrl: _remoteUrlCtrl.text.trim(),
       dshRemoteHost: _remoteHostCtrl.text.trim(),
       dshRemoteToken: _remoteTokenCtrl.text,
@@ -2710,15 +2784,24 @@ class AgentEnginePageState extends State<AgentEnginePage> {
       if (!mounted) return;
       setState(() {
         _testingConn = false;
-        _connectHint = _dshMode == 'lan' ? '请填写局域网主机' : '请填写公网地址';
+        _connectHint = _dshMode == 'lan' ? '请填写局域网地址' : '请填写公网地址';
       });
       return;
     }
+    // 局域网 / 公网：先把 Token 换成会话 Cookie 再探测，否则带鉴权的
+    // 目标一律报「连接失败」，看不出是 Token 不对还是网络不通。
+    final sessionOk = await DshService.instance.ensureRemoteSession(
+      widget.shiyi.settings,
+    );
     final ok = await api.rpcPing();
     if (!mounted) return;
     setState(() {
       _testingConn = false;
-      _connectHint = ok ? '连接成功：$url' : '连接失败：$url';
+      _connectHint = ok
+          ? '连接成功：$url'
+          : sessionOk
+          ? '连接失败：$url（端口通了但接口/鉴权不通，确认电脑 DSH 已允许局域网）'
+          : '连接失败：$url（Token 没换到会话 Cookie，检查是否是电脑启动行里的那个 Token）';
     });
     unawaited(_refreshStatus());
   }
@@ -2838,7 +2921,8 @@ class AgentEnginePageState extends State<AgentEnginePage> {
           header: const Text('连接方式'),
           footer: _iosSectionFooter(
             _dshMode == 'lan'
-                ? '电脑上的 DSH 需允许局域网访问（监听 0.0.0.0:3080），手机填电脑 IP。不要填 127.0.0.1。'
+                ? '一条链接即可：填电脑 IP（如 192.168.1.8:3080），或直接把电脑上带 ?token= 的地址整条粘进来。'
+                      '电脑上的 DSH 需允许局域网访问（监听 0.0.0.0:3080），不要填 127.0.0.1。'
                 : _dshMode == 'remote'
                 ? '可填公网 IP 或域名。公网与局域网共用手机局域网 Relay，目标 DSH 主机需能访问手机 Wi-Fi IP。'
                 : '本机模式会安装并启动当前设备上的 DSH（127.0.0.1:3080）。',
@@ -2869,32 +2953,15 @@ class AgentEnginePageState extends State<AgentEnginePage> {
               onTap: () => _setDshMode('remote'),
             ),
             if (_dshMode == 'lan') ...[
+              // 一条链接：主机 + 端口 + Token 都写在这一行里
+              // （`192.168.1.8:3080` 或直接粘贴 `http://…?token=xxx`）。
               _IosTextFieldTile(
-                icon: CupertinoIcons.desktopcomputer,
+                icon: CupertinoIcons.link,
                 color: _iosTeal,
-                title: '主机',
-                controller: _lanHostCtrl,
-                placeholder: '192.168.1.8 或 192.168.1.8:3080',
-                onChanged: (_) => _save.schedule(),
-              ),
-              _IosTextFieldTile(
-                icon: CupertinoIcons.number,
-                color: _iosGray,
-                title: '端口',
-                controller: _lanPortCtrl,
-                placeholder: '3080',
-                keyboardType: TextInputType.number,
-                onChanged: (_) => _save.schedule(),
-              ),
-              _IosSecretFieldTile(
-                icon: CupertinoIcons.lock_fill,
-                color: _iosOrange,
-                title: 'Token（可选）',
-                controller: _lanTokenCtrl,
-                placeholder: 'Bearer 或访问令牌',
-                obscure: !_tokenVisible,
-                onToggleVisibility: () =>
-                    setState(() => _tokenVisible = !_tokenVisible),
+                title: '地址',
+                controller: _lanLinkCtrl,
+                placeholder: '192.168.1.8:3080 或 http://电脑IP:3080/?token=xxx',
+                keyboardType: TextInputType.url,
                 onChanged: (_) => _save.schedule(),
               ),
             ],

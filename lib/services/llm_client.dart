@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../core/reasoning_models.dart';
@@ -72,6 +73,32 @@ class LlmClient {
   /// 文本尾部、tool_calls 块数等。
   final void Function(String line)? onDiag;
 
+  /// 等待响应头 / 流中途无数据的上限。思考型模型可能在网关侧先推理很久才
+  /// 出第一个字节，按普通 HTTP 超时砍会误杀（表现为「思考到一半就停了」）。
+  /// 同一个值同时用于「等响应头」和「流空闲」，都可由用户配置。
+  final Duration streamWaitTimeout;
+
+  /// 被输出上限截断后的自动续写轮数上限（0 = 不续写，只标记不完整）。
+  final int maxContinuationRounds;
+
+  /// 最近一次请求的结束原因（Chat 的 finish_reason、Anthropic 的 stop_reason、
+  /// Responses 的 incomplete 推导）。`length` / `max_tokens` 表示被输出上限截断。
+  String? lastFinishReason;
+
+  /// 本次 send 实际发起的续写轮数。
+  int continuationRounds = 0;
+
+  /// 续写预算用尽（或续写无进展）时仍处于截断状态：上层必须告知用户原因，
+  /// 不能当成正常完成。
+  bool endedIncomplete = false;
+
+  /// 最近一轮是否因连接断开/空闲超时而提前结束（用于续写恢复判定）。
+  bool lastRoundInterrupted = false;
+
+  /// 跨续写轮累计的正文/思考（供上层直接取用，避免只看到最后一轮）。
+  String get accumulatedText => _displayText;
+  String get accumulatedReasoning => _displayReasoning;
+
   /// 最近一次请求的 total_tokens（来自流式 usage，兼容 Chat Completions 与
   /// Responses API 的 input+output 推导）。
   int? lastTotalTokens;
@@ -90,11 +117,29 @@ class LlmClient {
   /// 最近一次请求的缓存输入 token（兼容 OpenAI / 网关 / Anthropic 风格字段）。
   int? lastCachedTokens;
 
-  /// 单行 SSE 缓冲上限（防无界增长）。
-  static const int _maxLineBufferChars = 1024 * 1024;
+  /// 单行 SSE 缓冲上限（只用于诊断告警，不再据此丢数据）。
+  static const int _maxLineBufferChars = 4 * 1024 * 1024;
 
   /// 最近一轮收到的文本（纯文本截断续写时拼接用）。
   String _lastRoundText = '';
+
+  /// 最近一轮收到的原始文本（未 trim，续写拼接按字节衔接，不丢中间空格）。
+  String _roundTextRaw = '';
+
+  /// 跨续写轮累计的正文（emit 时前缀拼给上层，避免只保留最后一轮）。
+  String _displayText = '';
+
+  /// 跨续写轮累计的思考内容。
+  String _displayReasoning = '';
+
+  /// 续写轮开头与上一轮结尾重复的字符数（展示时跳过，避免同一句出现两遍）。
+  int _roundSkip = 0;
+
+  /// 本轮是否还需要判定开头的重复段（首轮或已判定则为 false）。
+  bool _roundTrimPending = false;
+
+  /// 判定接缝重复时最多看本轮前多少字符（超过就认为没有重复）。
+  static const int _overlapProbeLimit = 300;
 
   /// 最近一轮收到的思考内容（thinking 模式网关要求续写时必须
   /// 把 reasoning_content 一起回传，否则 HTTP 400）。
@@ -106,6 +151,10 @@ class LlmClient {
   /// 当前传输客户端。停止时关闭它，底层 SSE/HTTP Future 会立即结束。
   http.Client? _activeHttpClient;
   bool _cancelRequested = false;
+
+  /// 「静默结束」（既没有 finish_reason 也没有 [DONE]）只补一次续写确认，
+  /// 避免对本来就不发 [DONE] 的网关每轮多打一次请求。
+  bool _silentEndResumed = false;
 
   LlmClient({
     required this.baseUrl,
@@ -121,6 +170,8 @@ class LlmClient {
     this.shouldStop,
     this.reasoningEffortOverride,
     this.onDiag,
+    this.streamWaitTimeout = const Duration(minutes: 10),
+    this.maxContinuationRounds = 16,
   });
 
   bool get _isResponses => protocol == 'responses';
@@ -196,14 +247,72 @@ class LlmClient {
               '不要重复已经输出的内容。';
   }
 
+  /// 续写拼接：模型被截断后重新生成时常会把上一段的结尾再抄一遍，
+  /// 取最大重叠后拼上，避免同一句话出现两遍。重叠至少 [minOverlap] 个
+  /// 字符才裁剪（单字符重叠多为正常接续用词，不做处理）。
+  static String mergeContinuedText(
+    String previous,
+    String next, {
+    int minOverlap = 2,
+    int maxProbe = 2000,
+  }) {
+    if (previous.isEmpty) return next;
+    if (next.isEmpty) return previous;
+    var limit = previous.length < next.length ? previous.length : next.length;
+    if (limit > maxProbe) limit = maxProbe;
+    for (var n = limit; n >= minOverlap; n--) {
+      if (previous.endsWith(next.substring(0, n))) {
+        return previous + next.substring(n);
+      }
+    }
+    return previous + next;
+  }
+
+  /// 本轮正文里「第一次与上一轮结尾重叠」的字符数判定：重叠段一定在开头，
+  /// 一旦确认就越过了重叠段（本轮已写出新内容），之后固定不再变。
+  void _resolveRoundOverlap(String roundText) {
+    if (!_roundTrimPending) return;
+    if (roundText.isEmpty || _displayText.isEmpty) return;
+    final merged = mergeContinuedText(_displayText, roundText);
+    final skip = _displayText.length + roundText.length - merged.length;
+    if (skip <= 0) {
+      // 开头没有重叠；本轮写得够长还是没有，就认为模型没重复上一段。
+      if (roundText.length >= _overlapProbeLimit) _roundTrimPending = false;
+      return;
+    }
+    if (roundText.length > skip) {
+      _roundSkip = skip;
+      _roundTrimPending = false;
+    }
+  }
+
+  /// 本轮正文中真正要追加到累计正文里的部分（跳过接缝重复）。
+  String _visibleRoundText(String roundText) {
+    if (_roundSkip <= 0) return roundText;
+    return _roundSkip >= roundText.length
+        ? ''
+        : roundText.substring(_roundSkip);
+  }
+
   Future<void> send(List<Map<String, dynamic>> messages) async {
     lastTotalTokens = null;
     lastPromptTokens = null;
     lastOutputTokens = null;
     lastInputTokens = null;
     lastCachedTokens = null;
+    _lastRoundText = '';
+    _roundTextRaw = '';
     _lastRoundReasoning = '';
     _lastRoundReasoningEncrypted = '';
+    _displayText = '';
+    _displayReasoning = '';
+    lastFinishReason = null;
+    continuationRounds = 0;
+    endedIncomplete = false;
+    lastRoundInterrupted = false;
+    _silentEndResumed = false;
+    _roundSkip = 0;
+    _roundTrimPending = false;
     final requestId =
         'llm_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
     final requestStarted = DateTime.now();
@@ -212,7 +321,7 @@ class LlmClient {
     try {
       _throwIfCancelled();
       var includeUsage = true;
-      // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级到 8192 重试。
+      // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级重试。
       var outputLimit = maxTokens;
       // 明显思考型模型默认请求思考输出；网关拒绝 thinking / reasoning_effort
       // 时分别去掉不兼容字段重试，普通模型/旧网关不受影响。
@@ -240,7 +349,7 @@ class LlmClient {
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
-      for (var round = 0; round < 8; round++) {
+      for (var round = 0; round <= maxContinuationRounds; round++) {
         _throwIfCancelled();
         final body = _buildRequestBody(
           messages: [...messages, ...continuation],
@@ -296,7 +405,7 @@ class LlmClient {
           _throwIfCancelled();
           final response = await client
               .send(request)
-              .timeout(const Duration(seconds: 60));
+              .timeout(streamWaitTimeout);
           _throwIfCancelled();
           if (response.statusCode != 200) {
             final err = await response.stream.bytesToString();
@@ -362,10 +471,11 @@ class LlmClient {
               includeUsage = false;
               continue;
             }
-            // max_tokens 过大被网关拒绝：降级到 8192 再试一次。
-            if (outputLimit > 8192 && _isMaxTokensParamError(err)) {
-              outputLimit = 8192;
-              onDiag?.call('[stream] max_tokens 过大被拒绝，降级 8192 重试');
+            // max_tokens 被网关拒（超过该服务商硬上限）：逐步下调到它接受的
+            // 值再试，而不是盲降固定数字（盲降仍可能超限）。
+            if (outputLimit > 1024 && _isMaxTokensParamError(err)) {
+              outputLimit = (outputLimit ~/ 2).clamp(1024, outputLimit);
+              onDiag?.call('[stream] max_tokens 被拒，下调到 $outputLimit 重试');
               continue;
             }
             throw LlmHttpException(
@@ -373,6 +483,9 @@ class LlmClient {
               err,
             );
           }
+          // 新一轮开始：确认与上一轮结尾的重复段（续写接缝去重）。
+          _roundSkip = 0;
+          _roundTrimPending = _displayText.isNotEmpty;
           final needContinue = protocol == 'anthropic'
               ? await _parseAnthropicSse(response.stream)
               : _isResponses
@@ -404,18 +517,45 @@ class LlmClient {
             ),
           );
           if (!needContinue) return;
+          // 服务商是否明确报了「输出到上限」。
+          final providerTruncated =
+              lastFinishReason == 'length' || lastFinishReason == 'max_tokens';
+          // 续写预算用尽：模型仍被输出上限截断（或连接反复断），如实标记
+          // 不完整（上层据此告知用户原因），绝不假装正常完成。
+          if (round == maxContinuationRounds) {
+            endedIncomplete = providerTruncated || lastRoundInterrupted;
+            onDiag?.call(
+              '[stream] 续写轮数用尽（$maxContinuationRounds 轮）：'
+              'incomplete=$endedIncomplete',
+            );
+            return;
+          }
+          // 跨轮拼接：把本轮正文接到累计正文后面，重叠部分裁掉，
+          // 否则上层只会看到最后一轮，前面的内容会整体丢失。
+          final merged = mergeContinuedText(_displayText, _roundTextRaw);
+          if (merged == _displayText && _lastRoundReasoning.isEmpty) {
+            // 续写没有产出任何新内容：说明上一段其实已经写完，
+            // 只有服务商明确报了截断才算不完整。
+            endedIncomplete = providerTruncated;
+            onDiag?.call('[stream] 续写无新增内容，收口（incomplete=$endedIncomplete）');
+            return;
+          }
+          _displayText = merged;
+          _displayReasoning += _lastRoundReasoning;
+          continuationRounds = round + 1;
           // 纯文本截断：追加已输出 + 继续指令，发起续写请求。
           final lastText = _lastRoundText.trim();
           final toolKick =
               tools.isNotEmpty &&
               (lastText.endsWith('：') || lastText.endsWith(':'));
           onDiag?.call(
-            '[stream] 续写第 ${round + 1} 轮${toolKick ? ' (工具唤醒)' : ''}',
+            '[stream] 续写第 ${round + 1} 轮${toolKick ? ' (工具唤醒)' : ''}'
+            '${lastRoundInterrupted ? ' (断流恢复)' : ''}',
           );
           continuation.addAll([
             {
               'role': 'assistant',
-              'content': _lastRoundText,
+              'content': _roundTextRaw,
               // thinking 模式网关（OpenCode Go 等）要求 reasoning_content
               // 必须原样回传，否则上游 HTTP 400 拒绝续写请求。
               if (_lastRoundReasoning.isNotEmpty)
@@ -464,7 +604,11 @@ class LlmClient {
               data: {'round': round + 1},
             ),
           );
-          throw LlmException('请求超时：网络连接或响应过慢，请重试');
+          throw LlmException(
+            '等待模型响应已超过 ${streamWaitTimeout.inSeconds} 秒：'
+            '可能是网络中断，也可能是模型长时间没出字。'
+            '可在「设置 → 上下文 → 长推理等待上限」调大后重试。',
+          );
         } on http.ClientException catch (e) {
           if (_cancelRequested || (shouldStop?.call() ?? false)) {
             throw LlmCancelledException();
@@ -1102,6 +1246,12 @@ class LlmClient {
   static String? defaultReasoningEffort(String model) =>
       ReasoningModels.defaultEffort(model);
 
+  /// 测试专用：直接喂一条 SSE 字节流给 Chat Completions 解析器，
+  /// 用于精确控制「已经收到内容、之后长时间无数据」的时序。
+  @visibleForTesting
+  Future<bool> parseOpenAiStreamForTest(Stream<List<int>> raw) =>
+      _parseOpenAiSse(raw);
+
   /// 根据模型名返回支持的思考强度档位列表；不支持思考的模型返回 null。
   static Map<String, String?>? reasoningEffortsForModel(String model) =>
       ReasoningModels.effortsFor(model);
@@ -1145,10 +1295,10 @@ class LlmClient {
 
     final client = await Socks5Proxy.client();
     try {
-      final response = await client
-          .send(request)
-          .timeout(const Duration(seconds: 90));
-      final raw = await response.stream.bytesToString();
+      final response = await client.send(request).timeout(streamWaitTimeout);
+      final raw = await response.stream.bytesToString().timeout(
+        streamWaitTimeout,
+      );
       if (response.statusCode != 200) {
         throw LlmHttpException(
           LlmErrorInfo.fromHttp(response.statusCode, raw),
@@ -1176,7 +1326,10 @@ class LlmClient {
       final msg = choices.first['message'] as Map<String, dynamic>?;
       return (msg?['content'] as String?)?.trim() ?? '';
     } on TimeoutException {
-      throw LlmException('请求超时：网络连接或响应过慢，请重试');
+      throw LlmException(
+        '等待模型响应已超过 ${streamWaitTimeout.inSeconds} 秒，请重试'
+        '（可在「设置 → 上下文 → 长推理等待上限」调大）。',
+      );
     } on http.ClientException catch (e) {
       throw LlmException('网络连接失败：${_short(e.message)}，请检查网络/代理或稍后重试');
     } finally {
@@ -1323,30 +1476,33 @@ class LlmClient {
     var doneReceived = false;
     var stoppedByUser = false;
     var rawFramesLeft = 25;
+    var streamBroken = false;
+    var oversizeWarned = false;
     String? finishReason;
     final completer = Completer<bool>();
 
+    bool toolsComplete() =>
+        toolBuf.isNotEmpty &&
+        toolBuf.values.every((t) {
+          final a = t['arguments'] ?? '';
+          return a.trim().isNotEmpty && _tryDecode(a) != null;
+        });
+
     void emitPartial() {
-      if (text.isNotEmpty || reasoning.isNotEmpty) {
-        onTurn?.call(
-          TurnResult(
-            text: text,
-            reasoning: reasoning,
-            reasoningEncrypted: reasoningEncrypted,
-            toolCalls: _snapshotTools(toolBuf),
-          ),
-        );
-      }
+      if (text.isEmpty && reasoning.isEmpty) return;
+      _resolveRoundOverlap(text);
+      onTurn?.call(
+        TurnResult(
+          text: _displayText + _visibleRoundText(text),
+          reasoning: _displayReasoning + reasoning,
+          reasoningEncrypted: reasoningEncrypted,
+          toolCalls: _snapshotTools(toolBuf),
+        ),
+      );
     }
 
     bool decideContinue() {
       if (completer.isCompleted) return false;
-      final toolsComplete =
-          toolBuf.isNotEmpty &&
-          toolBuf.values.every((t) {
-            final a = t['arguments'] ?? '';
-            return a.trim().isNotEmpty && _tryDecode(a) != null;
-          });
       final t = text.trim();
       final halfCut =
           reasoning.isNotEmpty &&
@@ -1358,7 +1514,7 @@ class LlmClient {
               t.endsWith(','));
       final truncated = finishReason == 'length' || halfCut;
       if (!truncated) return false;
-      if (toolsComplete) return false;
+      if (toolsComplete()) return false;
       if (toolBuf.isNotEmpty) {
         completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
         return false;
@@ -1551,15 +1707,99 @@ class LlmClient {
 
     StreamSubscription<String>? sub;
     Timer? idleTimer;
+
+    /// 收口本轮：落定断点文本、决定是否续写。
+    void finishRound({required bool broken}) {
+      idleTimer?.cancel();
+      if (completer.isCompleted) return;
+      if (lineBuffer.isNotEmpty) {
+        final rest = lineBuffer.toString();
+        if (rest.trim().isNotEmpty) {
+          for (final line in rest.split('\n')) {
+            handleLine(line);
+          }
+        }
+        lineBuffer.clear();
+      }
+      final tail = text.length <= 40
+          ? text
+          : '…${text.substring(text.length - 40)}';
+      onDiag?.call(
+        '[stream] end responses model=$model max=$maxTokens '
+        'fr=$finishReason done=$doneReceived broken=$broken '
+        'textLen=${text.length} tools=${toolBuf.length} '
+        'reasoningLen=${reasoning.length} tail=${tail.trim()}',
+      );
+      if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
+        _resolveRoundOverlap(text);
+        onTurn?.call(
+          TurnResult(
+            text: _displayText + _visibleRoundText(text).trim(),
+            reasoning: _displayReasoning + reasoning,
+            reasoningEncrypted: reasoningEncrypted,
+            toolCalls: _snapshotTools(toolBuf),
+          ),
+        );
+      }
+      if (finishReason != null) lastFinishReason = finishReason;
+      _roundTextRaw = text;
+      _lastRoundText = text.trim();
+      _lastRoundReasoning = reasoning;
+      _lastRoundReasoningEncrypted = reasoningEncrypted;
+      var needContinue = decideContinue();
+      if (completer.isCompleted) return;
+      if (!needContinue &&
+          !broken &&
+          !stoppedByUser &&
+          toolBuf.isEmpty &&
+          text.trim().isNotEmpty &&
+          !doneReceived &&
+          finishReason == null &&
+          !_silentEndResumed) {
+        // 既没有 finish_reason 也没有 [DONE] 就结束：静默截断。
+        _silentEndResumed = true;
+        needContinue = true;
+        lastRoundInterrupted = true;
+        onDiag?.call('[stream] 静默结束（无 finish_reason / 无 [DONE]）：续写确认一次');
+      }
+      if (!needContinue && broken && !stoppedByUser) {
+        final hasContent =
+            text.trim().isNotEmpty || reasoning.trim().isNotEmpty;
+        if (toolBuf.isNotEmpty && !toolsComplete()) {
+          completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
+          return;
+        }
+        if (hasContent && toolBuf.isEmpty) {
+          // 连接断了但已经生成内容：按断点续写，绝不把半截内容丢掉重来。
+          needContinue = true;
+          lastRoundInterrupted = true;
+          onDiag?.call('[stream] 断流：从已生成内容断点续写');
+        }
+      }
+      onDiag?.call(
+        '[stream] needContinue=$needContinue model=$model '
+        'max=$maxTokens fr=$finishReason '
+        'done=$doneReceived tools=${toolBuf.length}',
+      );
+      if (needContinue) {
+        completer.complete(true);
+        return;
+      }
+      if (broken && !stoppedByUser && text.isEmpty && toolBuf.isEmpty) {
+        completer.completeError(LlmInterruptedException('回复不完整：连接提前断开，请重试'));
+        return;
+      }
+      completer.complete(false);
+    }
+
     void resetIdleTimer() {
       idleTimer?.cancel();
-      idleTimer = Timer(const Duration(seconds: 180), () {
+      idleTimer = Timer(streamWaitTimeout, () {
         idleTimer = null;
+        streamBroken = true;
         sub?.cancel();
-        onDiag?.call('[stream] idle 超时断开');
-        if (!completer.isCompleted) {
-          completer.completeError(LlmInterruptedException('回复中断：连接长时间无数据，请重试'));
-        }
+        onDiag?.call('[stream] idle 超时断开（${streamWaitTimeout.inSeconds}s 无数据）');
+        finishRound(broken: true);
       });
     }
 
@@ -1576,10 +1816,14 @@ class LlmClient {
             }
             resetIdleTimer();
             lineBuffer.write(chunk);
-            if (lineBuffer.length > _maxLineBufferChars) {
-              handleLine(lineBuffer.toString());
-              lineBuffer.clear();
+            // 快路径：本块没有换行且缓冲未超限，先不切片（避免大帧 O(n²)）。
+            if (!chunk.contains('\n') &&
+                lineBuffer.length <= _maxLineBufferChars) {
               return;
+            }
+            if (!oversizeWarned && lineBuffer.length > _maxLineBufferChars) {
+              oversizeWarned = true;
+              onDiag?.call('[stream] 单帧超过 $_maxLineBufferChars 字符：继续缓冲，不丢内容');
             }
             var s = lineBuffer.toString();
             int idx;
@@ -1592,66 +1836,15 @@ class LlmClient {
             lineBuffer.write(s);
           },
           onError: (Object e) {
-            idleTimer?.cancel();
             onDiag?.call('[stream] onError: $e');
-            if (!completer.isCompleted) {
-              completer.completeError(LlmInterruptedException('回复中断（连接断开）：$e'));
-            }
+            streamBroken = true;
+            finishRound(broken: true);
           },
-          onDone: () {
-            idleTimer?.cancel();
-            if (lineBuffer.isNotEmpty) {
-              final rest = lineBuffer.toString();
-              if (rest.trim().isNotEmpty) {
-                for (final line in rest.split('\n')) {
-                  handleLine(line);
-                }
-              }
-              lineBuffer.clear();
-            }
-            final tail = text.length <= 40
-                ? text
-                : '…${text.substring(text.length - 40)}';
-            onDiag?.call(
-              '[stream] end model=$model max=$maxTokens '
-              'fr=$finishReason done=$doneReceived '
-              'textLen=${text.length} tools=${toolBuf.length} '
-              'reasoningLen=${reasoning.length} tail=${tail.trim()}',
-            );
-            if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
-              onTurn?.call(
-                TurnResult(
-                  text: text.trim(),
-                  reasoning: reasoning,
-                  reasoningEncrypted: reasoningEncrypted,
-                  toolCalls: _snapshotTools(toolBuf),
-                ),
-              );
-            }
-            final needContinue = decideContinue();
-            _lastRoundText = text.trim();
-            _lastRoundReasoning = reasoning;
-            _lastRoundReasoningEncrypted = reasoningEncrypted;
-            onDiag?.call(
-              '[stream] needContinue=$needContinue model=$model '
-              'max=$maxTokens fr=$finishReason '
-              'done=$doneReceived tools=${toolBuf.length}',
-            );
-            if (!completer.isCompleted) {
-              if (!doneReceived &&
-                  !stoppedByUser &&
-                  text.isEmpty &&
-                  toolBuf.isEmpty) {
-                completer.completeError(
-                  LlmInterruptedException('回复不完整：连接提前断开，请重试'),
-                );
-              } else {
-                completer.complete(needContinue);
-              }
-            }
-          },
+          onDone: () => finishRound(broken: streamBroken),
           cancelOnError: true,
         );
+    // 首个字节之前也要计时：网关收下请求却长时间不出字时，不能永远挂着。
+    resetIdleTimer();
     return completer.future;
   }
 
@@ -1664,19 +1857,30 @@ class LlmClient {
     var stoppedByUser = false;
     var reasoningSeeded = false;
     var rawFramesLeft = 25;
+    var streamBroken = false;
+    var oversizeWarned = false;
     String? finishReason; // 最后一条 chunk 的 finish_reason：'length' = 输出被截断
     final completer = Completer<bool>();
 
+    /// 工具参数是否已经收齐（能 JSON 解析）。收齐即可照常执行，
+    /// 即使 finish_reason=length（截断的只是后续文本）。
+    bool toolsComplete() =>
+        toolBuf.isNotEmpty &&
+        toolBuf.values.every((t) {
+          final a = t['arguments'] ?? '';
+          return a.trim().isNotEmpty && _tryDecode(a) != null;
+        });
+
     void emitPartial() {
-      if (text.isNotEmpty || reasoning.isNotEmpty) {
-        onTurn?.call(
-          TurnResult(
-            text: text,
-            reasoning: reasoning,
-            toolCalls: _snapshotTools(toolBuf),
-          ),
-        );
-      }
+      if (text.isEmpty && reasoning.isEmpty) return;
+      _resolveRoundOverlap(text);
+      onTurn?.call(
+        TurnResult(
+          text: _displayText + _visibleRoundText(text),
+          reasoning: _displayReasoning + reasoning,
+          toolCalls: _snapshotTools(toolBuf),
+        ),
+      );
     }
 
     /// 判断本轮是否因输出截断需要续写。
@@ -1685,12 +1889,6 @@ class LlmClient {
     /// （截断的只是后续文本，工具照常执行）。
     bool decideContinue() {
       if (completer.isCompleted) return false;
-      final toolsComplete =
-          toolBuf.isNotEmpty &&
-          toolBuf.values.every((t) {
-            final a = t['arguments'] ?? '';
-            return a.trim().isNotEmpty && _tryDecode(a) != null;
-          });
       final t = text.trim();
       final halfCut =
           reasoning.isNotEmpty &&
@@ -1702,7 +1900,7 @@ class LlmClient {
               t.endsWith(','));
       final truncated = finishReason == 'length' || halfCut;
       if (!truncated) return false;
-      if (toolsComplete) return false; // 工具完整：截断不影响执行
+      if (toolsComplete()) return false; // 工具完整：截断不影响执行
       if (toolBuf.isNotEmpty) {
         // 工具调用不完整（参数半截）：无法续写，抛给上层整轮重试。
         completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
@@ -1846,15 +2044,102 @@ class LlmClient {
 
     StreamSubscription<String>? sub;
     Timer? idleTimer;
+
+    /// 收口本轮：落定断点文本、决定是否续写。
+    /// [broken] = 连接断开/空闲超时（不是服务商正常结束）。
+    void finishRound({required bool broken}) {
+      idleTimer?.cancel();
+      if (completer.isCompleted) return;
+      if (lineBuffer.isNotEmpty) {
+        final rest = lineBuffer.toString();
+        if (rest.trim().isNotEmpty) {
+          for (final line in rest.split('\n')) {
+            handleLine(line);
+          }
+        }
+        lineBuffer.clear();
+      }
+      final tail = text.length <= 40
+          ? text
+          : '…${text.substring(text.length - 40)}';
+      onDiag?.call(
+        '[stream] end model=$model max=$maxTokens '
+        'fr=$finishReason done=$doneReceived broken=$broken '
+        'textLen=${text.length} tools=${toolBuf.length} '
+        'reasoningLen=${reasoning.length} tail=${tail.trim()}',
+      );
+      if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
+        _resolveRoundOverlap(text);
+        onTurn?.call(
+          TurnResult(
+            text: _displayText + _visibleRoundText(text).trim(),
+            reasoning: _displayReasoning + reasoning,
+            toolCalls: _snapshotTools(toolBuf),
+          ),
+        );
+      }
+      if (finishReason != null) lastFinishReason = finishReason;
+      _roundTextRaw = text;
+      _lastRoundText = text.trim();
+      _lastRoundReasoning = reasoning;
+      // 截断决策：纯文本截断 → 续写；工具完整 → 正常完成。
+      var needContinue = decideContinue();
+      if (completer.isCompleted) return;
+      if (!needContinue &&
+          !broken &&
+          !stoppedByUser &&
+          toolBuf.isEmpty &&
+          text.trim().isNotEmpty &&
+          !doneReceived &&
+          finishReason == null &&
+          !_silentEndResumed) {
+        // 既没有 finish_reason 也没有 [DONE] 就结束：网关/代理静默截断的
+        // 典型特征。已生成内容原样保留，只补一轮续写确认（每轮最多一次）。
+        _silentEndResumed = true;
+        needContinue = true;
+        lastRoundInterrupted = true;
+        onDiag?.call('[stream] 静默结束（无 finish_reason / 无 [DONE]）：续写确认一次');
+      }
+      if (!needContinue && broken && !stoppedByUser) {
+        final hasContent =
+            text.trim().isNotEmpty || reasoning.trim().isNotEmpty;
+        if (toolBuf.isNotEmpty && !toolsComplete()) {
+          completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
+          return;
+        }
+        if (hasContent && toolBuf.isEmpty) {
+          // 连接断了但已经生成内容：按断点续写，绝不把半截内容丢掉重来。
+          needContinue = true;
+          lastRoundInterrupted = true;
+          onDiag?.call('[stream] 断流：从已生成内容断点续写');
+        }
+      }
+      onDiag?.call(
+        '[stream] needContinue=$needContinue model=$model '
+        'max=$maxTokens fr=$finishReason '
+        'done=$doneReceived tools=${toolBuf.length}',
+      );
+      if (needContinue) {
+        completer.complete(true);
+        return;
+      }
+      // 已经收到内容但没有 [DONE]：不少网关/代理正常结束时不发 [DONE]，
+      // 此时视为回复完成，避免误报"回复不完整"导致丢内容重试。
+      if (broken && !stoppedByUser && text.isEmpty && toolBuf.isEmpty) {
+        completer.completeError(LlmInterruptedException('回复不完整：连接提前断开，请重试'));
+        return;
+      }
+      completer.complete(false);
+    }
+
     void resetIdleTimer() {
       idleTimer?.cancel();
-      idleTimer = Timer(const Duration(seconds: 180), () {
+      idleTimer = Timer(streamWaitTimeout, () {
         idleTimer = null;
+        streamBroken = true;
         sub?.cancel();
-        onDiag?.call('[stream] idle 超时断开');
-        if (!completer.isCompleted) {
-          completer.completeError(LlmInterruptedException('回复中断：连接长时间无数据，请重试'));
-        }
+        onDiag?.call('[stream] idle 超时断开（${streamWaitTimeout.inSeconds}s 无数据）');
+        finishRound(broken: true);
       });
     }
 
@@ -1871,12 +2156,14 @@ class LlmClient {
             }
             resetIdleTimer();
             lineBuffer.write(chunk);
-            // 单行无界增长防护：异常长行（网关异常/恶意流）不会无限占内存，
-            // 超限整段强制按一行处理（解析失败即丢弃）。
-            if (lineBuffer.length > _maxLineBufferChars) {
-              handleLine(lineBuffer.toString());
-              lineBuffer.clear();
+            // 快路径：本块没有换行且缓冲未超限，先不切片（避免大帧 O(n²)）。
+            if (!chunk.contains('\n') &&
+                lineBuffer.length <= _maxLineBufferChars) {
               return;
+            }
+            if (!oversizeWarned && lineBuffer.length > _maxLineBufferChars) {
+              oversizeWarned = true;
+              onDiag?.call('[stream] 单帧超过 $_maxLineBufferChars 字符：继续缓冲，不丢内容');
             }
             var s = lineBuffer.toString();
             int idx;
@@ -1889,67 +2176,15 @@ class LlmClient {
             lineBuffer.write(s);
           },
           onError: (Object e) {
-            idleTimer?.cancel();
             onDiag?.call('[stream] onError: $e');
-            if (!completer.isCompleted) {
-              completer.completeError(LlmInterruptedException('回复中断（连接断开）：$e'));
-            }
+            streamBroken = true;
+            finishRound(broken: true);
           },
-          onDone: () {
-            idleTimer?.cancel();
-            if (lineBuffer.isNotEmpty) {
-              final rest = lineBuffer.toString();
-              if (rest.trim().isNotEmpty) {
-                for (final line in rest.split('\n')) {
-                  handleLine(line);
-                }
-              }
-              lineBuffer.clear();
-            }
-            final tail = text.length <= 40
-                ? text
-                : '…${text.substring(text.length - 40)}';
-            onDiag?.call(
-              '[stream] end model=$model max=$maxTokens '
-              'fr=$finishReason done=$doneReceived '
-              'textLen=${text.length} tools=${toolBuf.length} '
-              'reasoningLen=${reasoning.length} tail=${tail.trim()}',
-            );
-            if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
-              onTurn?.call(
-                TurnResult(
-                  text: text.trim(),
-                  reasoning: reasoning,
-                  toolCalls: _snapshotTools(toolBuf),
-                ),
-              );
-            }
-            // 截断决策：纯文本截断 → 续写；工具完整 → 正常完成。
-            final needContinue = decideContinue();
-            _lastRoundText = text.trim();
-            _lastRoundReasoning = reasoning;
-            onDiag?.call(
-              '[stream] needContinue=$needContinue model=$model '
-              'max=$maxTokens fr=$finishReason '
-              'done=$doneReceived tools=${toolBuf.length}',
-            );
-            if (!completer.isCompleted) {
-              // 已收到内容但没有 [DONE]：不少网关/代理正常结束时不发 [DONE]，
-              // 此时视为回复完成，避免误报"回复不完整"导致丢内容重试。
-              if (!doneReceived &&
-                  !stoppedByUser &&
-                  text.isEmpty &&
-                  toolBuf.isEmpty) {
-                completer.completeError(
-                  LlmInterruptedException('回复不完整：连接提前断开，请重试'),
-                );
-              } else {
-                completer.complete(needContinue);
-              }
-            }
-          },
+          onDone: () => finishRound(broken: streamBroken),
           cancelOnError: true,
         );
+    // 首个字节之前也要计时：网关收下请求却长时间不出字时，不能永远挂着。
+    resetIdleTimer();
     return completer.future;
   }
 
@@ -1961,29 +2196,32 @@ class LlmClient {
     final toolBuf = <int, Map<String, String>>{};
     var doneReceived = false;
     var stoppedByUser = false;
+    var streamBroken = false;
+    var oversizeWarned = false;
     String? stopReason;
     final completer = Completer<bool>();
 
+    bool toolsComplete() =>
+        toolBuf.isNotEmpty &&
+        toolBuf.values.every((t) {
+          final a = t['arguments'] ?? '';
+          return a.trim().isNotEmpty && _tryDecode(a) != null;
+        });
+
     void emitPartial() {
-      if (text.isNotEmpty || reasoning.isNotEmpty) {
-        onTurn?.call(
-          TurnResult(
-            text: text,
-            reasoning: reasoning,
-            toolCalls: _snapshotTools(toolBuf),
-          ),
-        );
-      }
+      if (text.isEmpty && reasoning.isEmpty) return;
+      _resolveRoundOverlap(text);
+      onTurn?.call(
+        TurnResult(
+          text: _displayText + _visibleRoundText(text),
+          reasoning: _displayReasoning + reasoning,
+          toolCalls: _snapshotTools(toolBuf),
+        ),
+      );
     }
 
     bool decideContinue() {
       if (completer.isCompleted) return false;
-      final toolsComplete =
-          toolBuf.isNotEmpty &&
-          toolBuf.values.every((t) {
-            final a = t['arguments'] ?? '';
-            return a.trim().isNotEmpty && _tryDecode(a) != null;
-          });
       final t = text.trim();
       final halfCut =
           reasoning.isNotEmpty &&
@@ -1995,7 +2233,7 @@ class LlmClient {
               t.endsWith(','));
       final truncated = stopReason == 'max_tokens' || halfCut;
       if (!truncated) return false;
-      if (toolsComplete) return false;
+      if (toolsComplete()) return false;
       if (toolBuf.isNotEmpty) {
         completer.completeError(LlmInterruptedException('工具调用被截断，正在自动重试'));
         return false;
@@ -2076,15 +2314,89 @@ class LlmClient {
 
     StreamSubscription<String>? sub;
     Timer? idleTimer;
+
+    /// 收口本轮：落定断点文本、决定是否续写。
+    void finishRound({required bool broken}) {
+      idleTimer?.cancel();
+      if (completer.isCompleted) return;
+      if (buffer.isNotEmpty) {
+        final rest = buffer.toString();
+        if (rest.trim().isNotEmpty) {
+          for (final line in rest.split('\n')) {
+            handleLine(line);
+          }
+        }
+        buffer.clear();
+      }
+      onDiag?.call(
+        '[stream] end anthropic model=$model max=$maxTokens '
+        'sr=$stopReason done=$doneReceived broken=$broken '
+        'textLen=${text.length} tools=${toolBuf.length} '
+        'reasoningLen=${reasoning.length}',
+      );
+      if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
+        _resolveRoundOverlap(text);
+        onTurn?.call(
+          TurnResult(
+            text: _displayText + _visibleRoundText(text).trim(),
+            reasoning: _displayReasoning + reasoning,
+            toolCalls: _snapshotTools(toolBuf),
+          ),
+        );
+      }
+      if (stopReason != null) lastFinishReason = stopReason;
+      _roundTextRaw = text;
+      _lastRoundText = text.trim();
+      _lastRoundReasoning = reasoning;
+      var needContinue = decideContinue();
+      if (completer.isCompleted) return;
+      if (!needContinue &&
+          !broken &&
+          !stoppedByUser &&
+          toolBuf.isEmpty &&
+          text.trim().isNotEmpty &&
+          !doneReceived &&
+          stopReason == null &&
+          !_silentEndResumed) {
+        // 既没有 stop_reason 也没有 message_stop 就结束：静默截断。
+        _silentEndResumed = true;
+        needContinue = true;
+        lastRoundInterrupted = true;
+        onDiag?.call('[stream] 静默结束（无 stop_reason / 无 message_stop）：续写确认一次');
+      }
+      if (!needContinue && broken && !stoppedByUser) {
+        final hasContent =
+            text.trim().isNotEmpty || reasoning.trim().isNotEmpty;
+        if (toolBuf.isNotEmpty && !toolsComplete()) {
+          completer.completeError(LlmInterruptedException('工具调用被截断，交上层整轮重试'));
+          return;
+        }
+        if (hasContent && toolBuf.isEmpty) {
+          // 连接断了但已经生成内容：按断点续写，绝不把半截内容丢掉重来。
+          needContinue = true;
+          lastRoundInterrupted = true;
+          onDiag?.call('[stream] 断流：从已生成内容断点续写');
+        }
+      }
+      if (needContinue) {
+        completer.complete(true);
+        return;
+      }
+      if (broken && !stoppedByUser && text.isEmpty && toolBuf.isEmpty) {
+        completer.completeError(LlmInterruptedException('回复不完整：连接提前断开，请重试'));
+        return;
+      }
+      completer.complete(false);
+    }
+
     void resetIdleTimer() {
       idleTimer?.cancel();
-      idleTimer = Timer(const Duration(seconds: 180), () {
+      idleTimer = Timer(streamWaitTimeout, () {
         idleTimer = null;
+        streamBroken = true;
         sub?.cancel();
-        onDiag?.call('[stream] idle 超时断开');
-        if (!completer.isCompleted) {
-          completer.completeError(LlmInterruptedException('回复中断：连接长时间无数据，请重试'));
-        }
+        onDiag?.call('[stream] idle 超时断开（${streamWaitTimeout.inSeconds}s 无数据）');
+        finishRound(broken: true);
       });
     }
 
@@ -2101,11 +2413,13 @@ class LlmClient {
             }
             resetIdleTimer();
             buffer.write(chunk);
-            // 单行无界增长防护：异常长行不会无限占内存，超限整段强制处理。
-            if (buffer.length > _maxLineBufferChars) {
-              handleLine(buffer.toString());
-              buffer.clear();
+            // 快路径：本块没有换行且缓冲未超限，先不切片（避免大帧 O(n²)）。
+            if (!chunk.contains('\n') && buffer.length <= _maxLineBufferChars) {
               return;
+            }
+            if (!oversizeWarned && buffer.length > _maxLineBufferChars) {
+              oversizeWarned = true;
+              onDiag?.call('[stream] 单帧超过 $_maxLineBufferChars 字符：继续缓冲，不丢内容');
             }
             var s = buffer.toString();
             int idx;
@@ -2118,50 +2432,15 @@ class LlmClient {
             buffer.write(s);
           },
           onError: (Object e) {
-            idleTimer?.cancel();
             onDiag?.call('[stream] onError: $e');
-            if (!completer.isCompleted) {
-              completer.completeError(LlmInterruptedException('回复中断（连接断开）：$e'));
-            }
+            streamBroken = true;
+            finishRound(broken: true);
           },
-          onDone: () {
-            idleTimer?.cancel();
-            if (buffer.isNotEmpty) {
-              final rest = buffer.toString();
-              if (rest.trim().isNotEmpty) {
-                for (final line in rest.split('\n')) {
-                  handleLine(line);
-                }
-              }
-              buffer.clear();
-            }
-            if (text.isNotEmpty || toolBuf.isNotEmpty || reasoning.isNotEmpty) {
-              onTurn?.call(
-                TurnResult(
-                  text: text.trim(),
-                  reasoning: reasoning,
-                  toolCalls: _snapshotTools(toolBuf),
-                ),
-              );
-            }
-            final needContinue = decideContinue();
-            _lastRoundText = text.trim();
-            _lastRoundReasoning = reasoning;
-            if (!completer.isCompleted) {
-              if (!doneReceived &&
-                  !stoppedByUser &&
-                  text.isEmpty &&
-                  toolBuf.isEmpty) {
-                completer.completeError(
-                  LlmInterruptedException('回复不完整：连接提前断开，请重试'),
-                );
-              } else {
-                completer.complete(needContinue);
-              }
-            }
-          },
+          onDone: () => finishRound(broken: streamBroken),
           cancelOnError: true,
         );
+    // 首个字节之前也要计时：网关收下请求却长时间不出字时，不能永远挂着。
+    resetIdleTimer();
     return completer.future;
   }
 

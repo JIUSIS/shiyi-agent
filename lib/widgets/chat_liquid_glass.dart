@@ -38,6 +38,109 @@ LiquidGlassStyle chatLiquidGlassStyle(
   );
 }
 
+/// 全站液态玻璃按钮：拾忆首页空态、DSH 各空态/错误态的主按钮统一用它。
+///
+/// 内部直接用官方 `LiquidGlassButton`（liquid_glass_easy 自带组件，含它的
+/// 胶囊几何与触摸反馈），外观参数统一走 [chatLiquidGlassStyle]，各页面不再
+/// 自己拼玻璃样式与前景色。
+class GlassActionButton extends StatelessWidget {
+  final String label;
+  final IconData? icon;
+  final VoidCallback? onPressed;
+
+  /// 蓝色强调款：取用户气泡那套玻璃蓝，主行动按钮用它。
+  final bool accent;
+  final double height;
+
+  const GlassActionButton({
+    super.key,
+    required this.label,
+    this.icon,
+    this.onPressed,
+    this.accent = false,
+    this.height = 44,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
+    // 官方按钮不给显式 width 时会撑满可用宽度；按文案量出胶囊宽度，
+    // 保持紧凑胶囊外观（与各页面原来的按钮尺寸一致）。
+    final labelWidth = _measureLabel(context, label);
+    final width = labelWidth + (icon == null ? 0 : 24) + 48;
+    return LiquidGlassButton(
+      label: label,
+      icon: icon,
+      onPressed: onPressed,
+      width: width,
+      height: height,
+      foregroundColor: accent
+          ? (dark ? Colors.white : const Color(0xFF14264A))
+          : theme.colorScheme.onSurface,
+      fontSize: 15,
+      iconSize: 16,
+      style: chatLiquidGlassStyle(
+        context,
+        cornerRadius: height / 2,
+        tint: accent
+            ? (dark ? const Color(0x991A4DAD) : const Color(0x5C9EC5FF))
+            : (dark ? const Color(0x8A1C1C1E) : const Color(0x8AF2F2F7)),
+      ),
+    );
+  }
+
+  static double _measureLabel(BuildContext context, String text) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+      ),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    return painter.width;
+  }
+}
+
+/// 全站统一加载指示器：iOS 风格灰色菊花（与系统控件、聊天页同一套观感）。
+///
+/// 尺寸只留三档，覆盖原来的各种半径写法：
+/// - [AppLoadingSize.inline]（半径 7）：气泡 / 工具胶囊 / 按钮里的小图标位；
+/// - [AppLoadingSize.page]（半径 11）：整页或整块加载（默认）；
+/// - [AppLoadingSize.hero]（半径 13）：首屏大加载。
+///
+/// 整页居中直接用 `AppLoading.centered()`。
+enum AppLoadingSize { inline, page, hero }
+
+class AppLoading extends StatelessWidget {
+  final AppLoadingSize size;
+
+  /// 需要跟着状态色走时（如会话卡「思考中…」的蓝点）才传；
+  /// 其余一律系统灰，保证全站一致。
+  final Color? color;
+
+  const AppLoading({super.key, this.size = AppLoadingSize.page, this.color});
+
+  /// 整页 / 整块居中加载。
+  static Widget centered({
+    AppLoadingSize size = AppLoadingSize.page,
+    Color? color,
+  }) => Center(
+    child: AppLoading(size: size, color: color),
+  );
+
+  double get _radius => switch (size) {
+    AppLoadingSize.inline => 7,
+    AppLoadingSize.page => 11,
+    AppLoadingSize.hero => 13,
+  };
+
+  @override
+  Widget build(BuildContext context) =>
+      CupertinoActivityIndicator(radius: _radius, color: color);
+}
+
 /// 液态玻璃抽屉的弹层路由：透明屏障 + 零过渡，把抽屉放进导航栈。
 ///
 /// 系统返回键 / 手势返回会先落在抽屉路由上：这里拦截后先播收合动画再移除，
@@ -1169,12 +1272,20 @@ class _SessionModelSelectorState extends State<SessionModelSelector>
   }
 
   void _showPopup() {
-    if (widget.options.isEmpty) return;
+    // 先触发取数：模型目录是异步来的，选项为空时如果直接 return，
+    // 用户点了会毫无反应（"弹不出选项"）。取到后由 didUpdateWidget 重建。
+    widget.onOpening?.call();
+    if (widget.options.isEmpty) {
+      // 给了反馈，用户才知道"在读"而不是"按钮坏了"。
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('正在读取模型目录…')),
+      );
+      return;
+    }
     final box = _buttonKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return;
     _anchor = box.localToGlobal(Offset.zero) & box.size;
     _openProfile = null;
-    widget.onOpening?.call();
     HapticFeedback.selectionClick();
     _popup = LiquidGlassPopupRoute<void>(
       builder: _buildOverlay,
@@ -1592,7 +1703,7 @@ class ChatCompressionButton extends StatelessWidget {
         color: theme.colorScheme.onSurfaceVariant,
         disabledColor: theme.disabledColor,
         icon: busy
-            ? const CupertinoActivityIndicator(radius: 7)
+            ? const AppLoading(size: AppLoadingSize.inline)
             : const Icon(CupertinoIcons.rectangle_compress_vertical),
       ),
     );

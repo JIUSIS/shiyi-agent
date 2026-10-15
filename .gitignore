@@ -71,3 +71,19 @@ android/build/
 
 # 维护日志仅本地保存，不随仓库发布
 /docs/fix-log.md
+
+# 本地临时产物（不随仓库发布）
+*.apk
+.tmp*
+_*.py
+*_out.txt
+*_out2.txt
+test_out_*.txt
+phone_runtime_*.jsonl
+/tools/_*.py
+/docs/screenshots/
+
+# 本地 AI 工具状态目录
+/.claude/
+/.freebuff/
+/.zcode/

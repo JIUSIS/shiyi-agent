@@ -4,6 +4,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../widgets/chat_liquid_glass.dart';
 import '../core/app_state.dart';
 import '../core/group_chat.dart';
 import '../core/group_mindmap.dart';
@@ -413,7 +414,7 @@ class _GroupChatSetupScreenState extends State<GroupChatSetupScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   onPressed: _saving ? null : _save,
                   child: _saving
-                      ? const CupertinoActivityIndicator()
+                      ? const AppLoading()
                       : const Text(
                           '保存',
                           style: TextStyle(

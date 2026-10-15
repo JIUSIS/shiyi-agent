@@ -456,23 +456,15 @@ void main() {
     expect(msgs.map((m) => m.content), ['问题', '回复']);
   });
 
-  test('rc.2 session/page hasMore 会按 throughSeq 继续读取旧页', () async {
-    var calls = 0;
+  test('rc.2 session/page 窗口读取：只取尾页，更早的交给 historyOlder', () async {
+    final requests = <Map<String, dynamic>>[];
     final mock = MockClient((req) async {
-      calls++;
       final body = jsonDecode(req.body) as Map<String, dynamic>;
       final args = ((body['payload'] as Map)['args'] as Map)
           .cast<String, dynamic>();
       final request = (args['request'] as Map).cast<String, dynamic>();
-      final before = request['throughSeq'];
-      final oldPage = request['beforeSeq'] == 1;
-      if (calls == 1) {
-        expect(before, -1);
-        expect(request['beforeSeq'], isNull);
-      } else {
-        expect(before, 2);
-        expect(request['beforeSeq'], 1);
-      }
+      requests.add(request);
+      final oldPage = request['beforeSeq'] != null;
       return http.Response(
         jsonEncode(
           okValue({
@@ -497,16 +489,40 @@ void main() {
                 ),
               },
             ],
-            'hasMore': !oldPage,
+            'hasMore': true,
           }),
         ),
         200,
         headers: {'content-type': 'application/json'},
       );
     });
-    final msgs = await clientWith(mock).history('session-test');
-    expect(calls, 2);
-    expect(msgs.map((m) => m.content), ['旧问题', '新回复']);
+    final client = clientWith(mock);
+    final bundle = await client.historyBundle('session-test');
+    // 首帧只读官方尾部窗口：maxMessages + turnWindow，游标用 -1 哨兵。
+    expect(requests, hasLength(1));
+    expect(requests.single['throughSeq'], -1);
+    expect(requests.single['beforeSeq'], isNull);
+    expect(requests.single['maxMessages'], DshApiClient.historyWindowMessages);
+    expect(requests.single['turnWindow'], {
+      'minMessages': DshApiClient.historyWindowMinMessages,
+      'minTurns': DshApiClient.historyWindowTurns,
+    });
+    expect(bundle.messages.map((m) => m.content), ['新回复']);
+    expect(bundle.hasMoreOlder, isTrue);
+    expect(bundle.oldestSeq, 2);
+    expect(bundle.newestSeq, 2);
+
+    // 上翻：beforeSeq = 已加载最老 seq（开区间上界），沿用固定尾部游标。
+    final older = await client.historyOlder(
+      'session-test',
+      beforeSeq: bundle.oldestSeq!,
+      throughSeq: bundle.newestSeq,
+    );
+    expect(requests, hasLength(2));
+    expect(requests[1]['beforeSeq'], 2);
+    expect(requests[1]['throughSeq'], 2);
+    expect(requests[1]['maxMessages'], DshApiClient.historyOlderMessages);
+    expect(older.messages.map((m) => m.content), ['旧问题']);
   });
 
   test('history：正文里的 think 标签拆进 reasoning', () async {
@@ -2144,47 +2160,84 @@ void main() {
     expect(paths, ['/']);
   });
 
-  test('subagent.list：按官方 id/label/activity 条目解析', () async {
-    final mock = MockClient(
-      (req) async => http.Response(
+  test('subagent.list：由 session/list 的 subagentCatalog 派生（rc.2 没有 '
+      'subagents/list）', () async {
+    late http.Request captured;
+    final mock = MockClient((req) async {
+      captured = req;
+      return http.Response(
         jsonEncode(
           okValue({
-            'entries': [
+            'items': [
               {
-                'kind': 'child',
-                'id': 'sub-1',
-                'mode': 'continuable',
-                'activity': 'running',
-                'hasChildren': false,
-                'label': '审查代码',
+                'sessionId': 'parent',
+                'updatedAt': 1786000000000,
+                'running': true,
+                'blank': false,
+                'agentAvailable': true,
+                'projections': {
+                  'values': {
+                    'subagentCatalog': [
+                      {
+                        'id': 'sub-1',
+                        'createdAt': 1786000000000,
+                        'mode': 'continuable',
+                        'label': '审查代码',
+                      },
+                      {
+                        'id': 'sub-2',
+                        'createdAt': 1786000000001,
+                        'mode': 'one-shot',
+                      },
+                    ],
+                  },
+                },
               },
               {
-                'kind': 'child',
-                'id': 'sub-2',
-                'mode': 'one-shot',
-                'activity': 'inactive',
-                'hasChildren': true,
+                'sessionId': 'sub-1',
+                'origin': 'subagent',
+                'parentSessionId': 'parent',
+                'updatedAt': 1786000000002,
+                'running': true,
+                'blank': false,
+              },
+              {
+                'sessionId': 'sub-2',
+                'origin': 'subagent',
+                'parentSessionId': 'parent',
+                'updatedAt': 1786000000003,
+                'running': false,
+                'blank': false,
+              },
+              {
+                'sessionId': 'sub-2-1',
+                'origin': 'subagent',
+                'parentSessionId': 'sub-2',
+                'updatedAt': 1786000000004,
+                'running': false,
+                'blank': false,
               },
             ],
-            'parentAvailable': true,
           }),
         ),
         200,
         headers: {'content-type': 'application/json'},
-      ),
-    );
+      );
+    });
     final r = await clientWith(mock).listSubagents('parent');
+    // 走的是 session/list（不再打已不存在的 subagents/list）
+    expect(captured.url.path, contains('session/list'));
     expect(r.parentAvailable, isTrue);
-    expect(r.entries, hasLength(2));
-    expect(r.entries.first.sessionId, 'sub-1');
-    expect(r.entries.first.title, '审查代码');
-    expect(r.entries.first.running, isTrue);
-    expect(r.entries.first.mode, 'continuable');
-    expect(r.entries.last.running, isFalse);
-    expect(r.entries.last.mode, 'one-shot');
-    expect(r.entries.first.hasChildren, isFalse);
-    expect(r.entries.last.hasChildren, isTrue);
-    expect(r.entries.last.kind, 'child');
+    expect(r.entries.map((e) => e.sessionId), ['sub-2', 'sub-1']);
+    final first = r.entries.firstWhere((e) => e.sessionId == 'sub-1');
+    expect(first.title, '审查代码');
+    expect(first.running, isTrue);
+    expect(first.mode, 'continuable');
+    expect(first.hasChildren, isFalse);
+    final second = r.entries.firstWhere((e) => e.sessionId == 'sub-2');
+    expect(second.running, isFalse);
+    expect(second.mode, 'one-shot');
+    expect(second.hasChildren, isTrue); // sub-2-1 是它的子代理
   });
 
   test('subagent.history bundle：mode 透传 + live token + 投影统计', () async {

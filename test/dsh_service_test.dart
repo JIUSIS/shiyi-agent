@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -626,6 +628,154 @@ import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, trun
         'cmake',
         'ninja',
       ]);
+    });
+  });
+
+  group('官方 koffi 依赖对齐（Android musl ARM64 崩溃修复）', () {
+    test('补齐 dependencies 与 overrides 到官方声明 ^3.1.4', () {
+      const raw = '''
+{
+  "name": "@deepseek-ai/dsh",
+  "version": "0.2.0-rc.2",
+  "dependencies": {
+    "@deepseek-ai/dsh-fs-local": "0.2.0-rc.2"
+  }
+}
+''';
+      final out = DshService.withOfficialKoffiDeclaration(raw);
+      final map = jsonDecode(out) as Map<String, dynamic>;
+      expect((map['dependencies'] as Map)['koffi'], '^3.1.4');
+      expect((map['overrides'] as Map)['koffi'], '^3.1.4');
+      // 原有依赖不能丢。
+      expect(
+        (map['dependencies'] as Map)['@deepseek-ai/dsh-fs-local'],
+        '0.2.0-rc.2',
+      );
+      expect(out.endsWith('\n'), isTrue);
+    });
+
+    test('已有 overrides 其它条目原样保留', () {
+      const raw =
+          '{"name":"@deepseek-ai/dsh",'
+          '"overrides":{"semver":"7.6.0","koffi":"3.1.1"}}';
+      final map =
+          jsonDecode(DshService.withOfficialKoffiDeclaration(raw))
+              as Map<String, dynamic>;
+      final overrides = map['overrides'] as Map;
+      expect(overrides['semver'], '7.6.0');
+      expect(overrides['koffi'], '^3.1.4');
+    });
+
+    test('缺失 dependencies 时新建，不抛异常', () {
+      final map =
+          jsonDecode(DshService.withOfficialKoffiDeclaration('{"name":"dsh"}'))
+              as Map<String, dynamic>;
+      expect((map['dependencies'] as Map)['koffi'], '^3.1.4');
+    });
+
+    // 低于 3.1.3 的 koffi 预编译包加载器没有官方「动态检测 Linux libc」，
+    // 在 Alpine/musl 上会先 require glibc 版并当场 SIGABRT。
+    test('3.1.1 判定为需要升级，3.1.3/3.3.2 判定为可用', () {
+      expect(DshService.compareSemver('3.1.1', '3.1.3') < 0, isTrue);
+      expect(DshService.compareSemver('3.1.3', '3.1.3') >= 0, isTrue);
+      expect(DshService.compareSemver('3.3.2', '3.1.3') >= 0, isTrue);
+    });
+  });
+
+  // Android app 数据分区不允许 hard link（真机 EACCES），DSH 的会话世代迁移
+  // 与附件发布都靠 link() 做「不覆盖」发布，因此都要有等价的降级路径。
+  group('Android hardlink 降级补丁', () {
+    const persistSource =
+        'import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";\n'
+        'async function publishCurrentExclusive(staged, currentPath, internals) {\n'
+        '\ttry {\n'
+        '\t\tawait internals.fs.link(staged, currentPath);\n'
+        '\t} catch (error) {\n'
+        '\t\t/* v8 ignore else -- a non-collision filesystem error propagates unchanged. */\n'
+        '\t\tif (isEEXIST(error)) return false;\n'
+        '\t\t/* v8 ignore next -- the filesystem error is already complete. */\n'
+        '\t\tthrow error;\n'
+        '\t}\n'
+        '\tawait syncDirectory(dirname(currentPath), internals);\n'
+        '\treturn true;\n'
+        '}\n';
+
+    const attachmentSource =
+        'import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";\n'
+        'async function publishImmutableAlias(root, source, target, sha256) {\n'
+        '\ttry {\n'
+        '\t\tawait ensureDurableDirectory(parent);\n'
+        '\t\ttry {\n'
+        '\t\t\tawait link(source, target);\n'
+        '\t\t} catch (error) {\n'
+        '\t\t\t/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */\n'
+        '\t\t\tif (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;\n'
+        '\t\t\tif (await digestFile(target) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");\n'
+        '\t\t}\n'
+        '\t\tawait chmod(target, 256);\n'
+        '\t} catch (error) {\n'
+        '\t\tthrow new AttachmentError("Unable to persist attachment.", "ATTACHMENT_WRITE_FAILED");\n'
+        '\t}\n'
+        '}\n'
+        'async function publishStagedObject(root, staged, target) {\n'
+        '\ttry {\n'
+        '\t\tawait ensureDurableDirectory(dirname(target));\n'
+        '\t\ttry {\n'
+        '\t\t\tawait link(staged.path, target);\n'
+        '\t\t} catch (error) {\n'
+        '\t\t\t/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */\n'
+        '\t\t\tif (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;\n'
+        '\t\t\tif (await digestFile(target) !== staged.sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");\n'
+        '\t\t}\n'
+        '\t} catch (error) {\n'
+        '\t\tthrow new AttachmentError("Unable to persist attachment.", "ATTACHMENT_WRITE_FAILED");\n'
+        '\t}\n'
+        '}\n';
+
+    test('会话世代迁移：EACCES 回退 rename，EEXIST 语义不变', () {
+      final out = DshService.patchAndroidSessionMigrationLink(persistSource);
+      expect(out, isNot(persistSource));
+      expect(out.contains('realpath, rename, rm'), isTrue);
+      expect(out.contains('if (isEEXIST(error)) return false;'), isTrue);
+      expect(out.contains('await rename(staged, currentPath);'), isTrue);
+      // 非「分区不支持 link」的错误仍然原样抛出。
+      expect(
+        out.contains(
+          'if (error?.code !== "EACCES" && error?.code !== "ENOSYS" && '
+          'error?.code !== "EPERM" && error?.code !== "ENOTSUP" && '
+          'error?.code !== "EOPNOTSUPP") throw error;',
+        ),
+        isTrue,
+      );
+      // rename 之前必须先探测目标是否已被别人发布，避免覆盖。
+      expect(
+        out.indexOf('await internals.fs.stat(currentPath);') <
+            out.indexOf('await rename(staged, currentPath);'),
+        isTrue,
+      );
+      expect(DshService.patchAndroidSessionMigrationLink(out), out);
+    });
+
+    test('附件发布：两处 link 都降级为 COPYFILE_EXCL 拷贝', () {
+      final out = DshService.patchAndroidAttachmentLink(attachmentSource);
+      expect(out, isNot(attachmentSource));
+      expect(out.contains('import { chmod, copyFile, link,'), isTrue);
+      expect(
+        'constants.COPYFILE_EXCL'.allMatches(out).length,
+        2,
+        reason: '两个 link 站点都要有降级拷贝',
+      );
+      expect(out.contains('await copyFile(source, target'), isTrue);
+      expect(out.contains('await copyFile(staged.path, target'), isTrue);
+      // 摘要校验（官方完整性语义）必须保留。
+      expect('ATTACHMENT_CORRUPT'.allMatches(out).length, 4);
+      expect(DshService.patchAndroidAttachmentLink(out), out);
+    });
+
+    test('源码结构变化时不误改', () {
+      const other = 'const x = 1;\n';
+      expect(DshService.patchAndroidSessionMigrationLink(other), other);
+      expect(DshService.patchAndroidAttachmentLink(other), other);
     });
   });
 }

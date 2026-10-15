@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import '../core/poll_visibility.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../services/dsh_service.dart';
@@ -44,10 +45,17 @@ class _DshFeaturesTabState extends State<DshFeaturesTab> {
     super.initState();
     DshService.instance.status.addListener(_onDshStatus);
     unawaited(_checkStatus());
-    _statusTimer = Timer.periodic(
-      const Duration(seconds: 3),
-      (_) => _checkStatus(),
-    );
+    _statusTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      // 后台 / 被盖住时不查状态（发热复盘 #393）。
+      if (!dshPollVisible(
+        mounted: mounted,
+        lifecycle: WidgetsBinding.instance.lifecycleState,
+        routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+      )) {
+        return;
+      }
+      _checkStatus();
+    });
   }
 
   @override

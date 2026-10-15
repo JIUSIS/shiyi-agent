@@ -385,12 +385,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final contextSummary = await _store.getSummary(room.id, agent.id);
     final latestUserText = _messages.lastWhere(
       (message) => message.isUser,
-      orElse: () => GroupMessage(
-        id: '',
-        roomId: '',
-        role: 'user',
-        createdAt: 0,
-      ),
+      orElse: () =>
+          GroupMessage(id: '', roomId: '', role: 'user', createdAt: 0),
     );
     final presencePrompt = await widget.shiyi.cognitivePromptFor(
       '群聊成员「${agent.name}」正在处理：${latestUserText.content}',
@@ -422,6 +418,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
               ? ReasoningModels.defaultEffort(model)
               : 'off',
           shouldStop: () => _activeRun.stopRequested,
+          streamWaitTimeout: Duration(seconds: settings.streamWaitSeconds),
+          maxContinuationRounds: settings.maxContinuationRounds,
           onTurn: (turn) {
             lastTurn = turn;
             draft.content = turn.text;
@@ -1011,6 +1009,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       tools: const [],
       reasoningEffortOverride: 'off',
       shouldStop: () => _activeRun.stopRequested,
+      streamWaitTimeout: Duration(
+        seconds: widget.shiyi.settings.streamWaitSeconds,
+      ),
+      maxContinuationRounds: widget.shiyi.settings.maxContinuationRounds,
       onTurn: (turn) => summary = turn.text,
     );
     _activeRun.clients.add(client);
@@ -1185,7 +1187,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                   ],
                 ),
                 body: _loading || room == null
-                    ? const Center(child: CupertinoActivityIndicator())
+                    ? const Center(child: AppLoading())
                     : ChatFloatingComposerScaffold(
                         messages: (context, overlayHeight) {
                           if (_visibleMessages.isEmpty) {
@@ -1211,7 +1213,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                               itemCount: _visibleMessages.length,
                               itemBuilder: (context, index) {
                                 final message =
-                                    _visibleMessages[_visibleMessages.length - 1 - index];
+                                    _visibleMessages[_visibleMessages.length -
+                                        1 -
+                                        index];
                                 return MessageBubble(
                                   key: ValueKey(message.id),
                                   message: _asChat(message),

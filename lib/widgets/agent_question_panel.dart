@@ -359,7 +359,7 @@ class _AgentQuestionPanelState extends State<AgentQuestionPanel> {
                 ? const SizedBox(
                     width: 16,
                     height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
+                    child: AppLoading(size: AppLoadingSize.inline),
                   )
                 : const Text('提交'),
           ),

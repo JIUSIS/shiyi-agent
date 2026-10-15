@@ -7,6 +7,7 @@ import '../services/dsh_model_sync.dart';
 import '../services/dsh_provider_config.dart';
 import '../services/dsh_service.dart';
 import 'dsh_provider_editor_screen.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 
@@ -36,6 +37,27 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
   void initState() {
     super.initState();
     _load();
+  }
+
+  /// 刷新某个 provider 的模型目录：官方 `llm/discoverModels(settingsNs, request)`。
+  ///
+  /// 接口是 unary（HTTP），局域网也通；`settingsNs` 为空的内置声明跳过。
+  Future<void> _discoverModels(DshProviderConfig provider) async {
+    final ns = provider.settingsNs.trim();
+    if (ns.isEmpty) return;
+    try {
+      await _api.discoverModels(ns, request: {'providerId': provider.id});
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已刷新「${provider.id}」的模型目录')),
+      );
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('发现模型失败：$e')));
+    }
   }
 
   Future<void> _load() async {
@@ -179,7 +201,7 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -188,7 +210,7 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
           children: [
             Text(_error!, textAlign: TextAlign.center),
             const SizedBox(height: 12),
-            CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+            GlassActionButton(label: '重试', onPressed: _load, accent: true),
           ],
         ),
       );
@@ -317,6 +339,14 @@ class _DshModelsScreenState extends State<DshModelsScreen> {
                     size: 15,
                     color: CupertinoColors.systemGrey,
                   ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: provider.settingsNs.trim().isEmpty
+                      ? null
+                      : () => _discoverModels(provider),
+                  child: const Icon(CupertinoIcons.arrow_clockwise, size: 18),
+                ),
                 CupertinoButton(
                   padding: EdgeInsets.zero,
                   minimumSize: const Size(36, 36),

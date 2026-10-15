@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -11,11 +12,14 @@ import 'package:path/path.dart' as p;
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../core/poll_visibility.dart';
 import '../core/subagent_live.dart';
+import '../core/at_trigger.dart';
 import '../core/slash_trigger.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
 import '../services/dsh_endpoint.dart';
+import '../services/dsh_history_window.dart';
 import '../services/dsh_live.dart';
 import '../services/dsh_model_sync.dart';
 import '../services/dsh_provider_config.dart';
@@ -88,6 +92,51 @@ Future<void> openDshChat(
 }
 
 /// DSH 聊天页：拾忆会话页同款壳，数据走 DeepSeek Harness。
+/// mux 下行流重连退避。
+///
+/// 局域网 8080 是套在真网关前的转发层，普通 HTTP 能过、**WebSocket 升级后
+/// 静默**（真机实测：升级成功但 6 秒无任何帧，见 docs/fix-log.md #391）。
+/// 这种情况下每 2 秒重连等于持续烧手机/网络，按失败次数退避、封顶 60 秒；
+/// 一旦真连上（收到 `session/subscribed`）计数归零，恢复灵敏。
+Duration dshMuxRetryDelay(int failures) {
+  if (failures <= 1) return const Duration(seconds: 2);
+  if (failures == 2) return const Duration(seconds: 5);
+  if (failures == 3) return const Duration(seconds: 15);
+  return const Duration(seconds: 60);
+}
+
+/// 会话页轮询节流（真机发热复盘 #390/#393/#397）。
+///
+/// - **mux 正常**（有实时下行）：保持原节奏 —— 空闲 2s；
+/// - **mux 不可用**（局域网 8080 转发层不做 WS 隧道，见 #392）：这条链路上
+///   *没有任何实时流*，全量历史轮询只有在「输出确实在增长」时才值得跑：
+///   增长中 800ms、回合在跑但没变化 4.8s、空闲 12s。
+///   真机实测：按旧的 800ms 常速跑，后台 + 充电时电池 43.6°C，强停后 60 秒
+///   降到 41.1°C。
+({bool fetch, bool withList}) dshChatPollTick({
+  required int ticks,
+  required bool running,
+  required bool muxUp,
+  bool growing = false,
+  bool unreachable = false,
+}) {
+  final withListTick = ticks % 5 == 0;
+  if (muxUp) {
+    // 有实时下行时轮询只是兜底：维持原来的 2s 一拍。
+    return (fetch: withListTick, withList: withListTick);
+  }
+  var every = growing
+      ? 2 // 800ms：正在出字
+      : running
+      ? 12 // 4.8s：回合在跑但历史没动
+      : 30; // 12s：空闲
+  // 目标不可达（Connection refused 等）：再放慢 5 倍 —— 打不通的请求
+  // 纯属发热/耗电，真机实测「电脑 DSH 没开」时 40 秒打了 51 次（#401）。
+  if (unreachable) every = every * 5;
+  final due = ticks % every == 0;
+  return (fetch: due, withList: due && withListTick);
+}
+
 class DshChatScreen extends StatefulWidget {
   final String sessionId;
   final String initialTitle;
@@ -125,6 +174,22 @@ class _DshChatScreenState extends State<DshChatScreen>
   Timer? _subagentPollTimer;
   bool _refreshingSubagents = false;
   List<DshSubagentEntry> _subagents = [];
+
+  /// 主轮询最近一次 `session/list` 的结果（子代理派生直接复用，省 RPC）。
+  List<DshSessionSummary> _sessionsSnapshot = const [];
+  DateTime? _sessionsSnapshotAt;
+
+  /// 目标不可达（Connection refused 等）：放慢轮询，别对着打不通的地址猛打。
+  bool _pollUnreachable = false;
+
+  static bool _isUnreachableError(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('unreachable') ||
+        text.contains('connection refused') ||
+        text.contains('socketexception') ||
+        text.contains('failed host lookup') ||
+        text.contains('connection closed');
+  }
   int _subagentRefreshGeneration = 0;
   final Set<String> _syncedResponseModels = {};
   late String _title = widget.initialTitle;
@@ -213,6 +278,259 @@ class _DshChatScreenState extends State<DshChatScreen>
   /// 当前会话已加载的 DSH 技能。发送下一条消息时会一起注入调用指令，
   /// 与拾忆会话的“已加载技能”保持同一交互模型。
   final List<DshSkillInfo> _selectedSkills = [];
+
+  /// 后台任务（官方 `job/list`）：输入框上方芯片 + 面板可结束。
+  List<DshJobInfo> _jobs = const [];
+
+  /// 消息反馈（官方 `messageFeedback/list`）：messageId → positive/negative。
+  Map<String, String> _feedback = const {};
+
+  /// 目标机终端（官方 `terminal/*`）：本机模式专用。
+  final ValueNotifier<String> _termOutput = ValueNotifier<String>('');
+  final TextEditingController _termInput = TextEditingController();
+  StreamSubscription<Map<String, dynamic>>? _termSub;
+  String _termId = '';
+  String? _termAttachmentId;
+
+  static String _stripAnsi(String value) =>
+      value.replaceAll(RegExp(r'\x1B\[[0-9;?]*[a-zA-Z]'), '');
+
+  /// 打开目标机终端（`terminal/*`）。
+  ///
+  /// **只在本机模式给入口**：`terminal/follow` 是 stream，局域网 8080 转发层
+  /// 不做 WS 隧道（#392）→ 局域网收不到任何输出。
+  Future<void> _openTerminalPanel() async {
+    final settings = widget.shiyi?.settings;
+    if (settings == null || !DshEndpoint.isLocal(settings)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('目标机终端只在「本机」模式可用（局域网收不到终端流）')),
+      );
+      return;
+    }
+    _termOutput.value = '正在连接目标机终端…';
+    unawaited(_ensureTerminal());
+    await showIosFadeSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(ctx).viewInsets.bottom,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+                child: Row(
+                  children: [
+                    Text(
+                      '目标机终端',
+                      style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      _termId.isEmpty ? '' : _termId,
+                      style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(ctx).hintColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              ValueListenableBuilder<String>(
+                valueListenable: _termOutput,
+                builder: (_, text, _) => Container(
+                  width: double.infinity,
+                  constraints: const BoxConstraints(maxHeight: 320),
+                  padding: const EdgeInsets.all(12),
+                  child: SingleChildScrollView(
+                    reverse: true,
+                    child: SelectableText(
+                      text.isEmpty ? '（已连接，输入命令回车）' : text,
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        height: 1.35,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _termInput,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          hintText: '输入命令后回车',
+                          border: OutlineInputBorder(),
+                        ),
+                        onSubmitted: _sendTerminalLine,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    CupertinoButton.filled(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
+                      ),
+                      onPressed: () => _sendTerminalLine(_termInput.text),
+                      child: const Text('发送'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 复用已有终端，没有就 create，然后订阅 `terminal/follow`。
+  Future<void> _ensureTerminal() async {
+    try {
+      final existing = await _api.listTerminals(widget.sessionId);
+      var id = '';
+      for (final terminal in existing) {
+        final shell = (terminal['shell'] as Map?)?.cast<String, dynamic>();
+        if (shell?['state'] == 'running') {
+          id = (terminal['id'] ?? '').toString();
+          _termAttachmentId = terminal['attachmentId']?.toString();
+          break;
+        }
+      }
+      if (id.isEmpty) {
+        final created = await _api.createTerminal(
+          widget.sessionId,
+          request: {if (_cwd.trim().isNotEmpty) 'cwd': _cwd.trim()},
+        );
+        id = (created['id'] ?? '').toString();
+        _termAttachmentId = created['attachmentId']?.toString();
+      }
+      if (id.isEmpty) throw StateError('没有拿到终端 id');
+      _termId = id;
+      await _termSub?.cancel();
+      _termSub = _api
+          .watchTerminal(widget.sessionId, id, attachmentId: _termAttachmentId)
+          .listen(
+            (frame) {
+              final type = frame['type']?.toString() ?? '';
+              if (type == 'snapshot') {
+                _termOutput.value = _stripAnsi(
+                  (frame['screen'] ?? '').toString(),
+                );
+                final info = (frame['info'] as Map?)?.cast<String, dynamic>();
+                final attachment = info?['attachmentId']?.toString();
+                if ((attachment ?? '').isNotEmpty) {
+                  _termAttachmentId = attachment;
+                }
+              } else if (type == 'output') {
+                _termOutput.value =
+                    '${_termOutput.value}${_stripAnsi((frame['data'] ?? '').toString())}';
+              }
+            },
+            onError: (_) {},
+            onDone: () {},
+            cancelOnError: true,
+          );
+    } catch (e) {
+      _termOutput.value = '终端启动失败：$e';
+    }
+  }
+
+  void _sendTerminalLine(String line) {
+    final data = line.trimRight();
+    if (data.isEmpty || _termId.isEmpty) return;
+    _termInput.clear();
+    unawaited(
+      _api.writeTerminal(
+        widget.sessionId,
+        _termId,
+        '$data\n',
+        attachmentId: _termAttachmentId,
+      ),
+    );
+  }
+
+  /// 从 App 侧消息 id 还原服务端 messageId。
+  ///
+  /// 历史解析把服务端 id 保留成 `dsh-<服务端id>`；服务端没给 id 时退化成
+  /// `dsh-<seq>`（纯数字），那种不能拿去反馈。
+  String? _dshMessageId(String id) {
+    final raw = id.startsWith('dsh-') ? id.substring(4) : id;
+    if (raw.isEmpty) return null;
+    if (int.tryParse(raw) != null) return null;
+    return raw;
+  }
+
+  Future<void> _refreshFeedback() async {
+    try {
+      final items = await _api.listMessageFeedback(widget.sessionId);
+      if (!mounted) return;
+      setState(() {
+        _feedback = {
+          for (final item in items)
+            if ((item['messageId'] ?? '').toString().isNotEmpty)
+              item['messageId'].toString(): (item['rating'] ?? '').toString(),
+        };
+      });
+    } catch (_) {
+      // 旧版没有 messageFeedback/*：按钮只是不亮。
+    }
+  }
+
+  Future<void> _sendFeedback(ChatMessage message, String rating) async {
+    final messageId = _dshMessageId(message.id);
+    if (messageId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('这条消息没有服务端 id，无法反馈')),
+      );
+      return;
+    }
+    // 再点一次同一个评分 = 取消（官方 list/delete 支持）。
+    final next = _feedback[messageId] == rating ? null : rating;
+    try {
+      if (next == null) {
+        await _api.deleteMessageFeedback(widget.sessionId, messageId);
+      } else {
+        await _api.putMessageFeedback(
+          widget.sessionId,
+          messageId,
+          rating: next,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        final updated = Map<String, String>.of(_feedback);
+        if (next == null) {
+          updated.remove(messageId);
+        } else {
+          updated[messageId] = next;
+        }
+        _feedback = updated;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(next == null ? '已取消反馈' : '已记录反馈')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('反馈失败：$e')));
+    }
+  }
   final Map<String, ToolEvent> _timedToolEvents = {};
   StreamSubscription<Map<String, dynamic>>? _muxSub;
   StreamSubscription<Map<String, dynamic>>? _hostSub;
@@ -224,6 +542,14 @@ class _DshChatScreenState extends State<DshChatScreen>
   int _historyReadGeneration = 0;
   Future<void> _cacheWriteTail = Future<void>.value();
   bool _muxUp = false;
+
+  /// 连续失败的 mux 连接次数（成功收到 `session/subscribed` 归零），
+  /// 用来做重连退避：局域网 8080 前面那层转发不能隧道 WebSocket，升级后
+  /// 一直静默，每 2 秒无限重连等于持续烧手机（见 docs/fix-log.md #391）。
+  int _muxFailures = 0;
+
+  /// 首帧看门狗：升级成功但 8 秒内没拿到 `session/subscribed` 就当死连接。
+  Timer? _muxWatchdog;
   DateTime _lastStreamEmit = DateTime.fromMillisecondsSinceEpoch(0);
   int _lastStreamLen = 0;
   bool _autoScrollScheduled = false;
@@ -236,10 +562,39 @@ class _DshChatScreenState extends State<DshChatScreen>
   String? _pendingPromptText;
   final DshTurnCommandQueue _turnCommands = DshTurnCommandQueue();
   DateTime? _lastSlashTrigger;
+  DateTime? _lastAtTrigger;
   int _pollTicks = 0;
+
+  /// 「历史还在增长」的衰减计数（0=没动静）。LAN 上没有 mux 时用它决定轮询
+  /// 节奏：只有真的在出字才跑 800ms，否则退到 4.8s / 12s（发热复盘 #397）。
+  int _growTicks = 0;
+  int _lastGrowthSeq = -1;
   int _muxGen = 0;
   static const _liveId = 'dsh-live';
   static const _maxHistorySettleDelayStep = 8;
+
+  /// 上翻加载的更早历史，渲染时始终排在 [_messages] 之前。
+  ///
+  /// 与 [_messages] 分开放：尾部窗口每拍都会被历史合并重写，混在一起会让
+  /// 已翻出来的老消息被合并逻辑反复重排。
+  List<ChatMessage> _olderMessages = const [];
+
+  /// 还能不能继续向更早翻（官方 `session/page` 的 `hasMore`）。
+  bool _hasMoreOlder = false;
+
+  /// 正在补更早的一页。
+  bool _loadingOlder = false;
+
+  /// 尾页窗口的尾部游标（官方 `throughSeq`）：同一轮翻页必须沿用它，
+  /// 否则每次都会用新游标重新定位窗口。
+  int? _historyThroughSeq;
+
+  /// 已加载消息里最老的事件 seq，上翻时作为 `beforeSeq`（开区间上界）。
+  int? _oldestLoadedSeq;
+
+  /// 用户上翻读历史时暂停尾部刷新：读历史时每拍重排列表既卡又把视线
+  /// 拽回底部，回到最新位置后自动恢复。
+  bool _tailRefreshPaused = false;
 
   DshApiClient get _api => DshService.instance.api;
 
@@ -257,6 +612,7 @@ class _DshChatScreenState extends State<DshChatScreen>
       _subagents = List<DshSubagentEntry>.of(rememberedSubagents);
     }
     DshService.instance.status.addListener(_onDshStatus);
+    _scroll.addListener(_onScroll);
     _streamText.addListener(_onStreamTextChanged);
     TtsService.instance.speakingId.addListener(_onSpeakingChanged);
     TtsService.instance.lastError.addListener(_onTtsError);
@@ -289,6 +645,7 @@ class _DshChatScreenState extends State<DshChatScreen>
     _queueCacheWrite();
     WidgetsBinding.instance.removeObserver(this);
     DshService.instance.status.removeListener(_onDshStatus);
+    _scroll.removeListener(_onScroll);
     _streamText.removeListener(_onStreamTextChanged);
     TtsService.instance.speakingId.removeListener(_onSpeakingChanged);
     TtsService.instance.lastError.removeListener(_onTtsError);
@@ -299,6 +656,10 @@ class _DshChatScreenState extends State<DshChatScreen>
     _historySettleTimer?.cancel();
     _muxGen = 0;
     _muxRetry?.cancel();
+    _muxWatchdog?.cancel();
+    unawaited(_termSub?.cancel());
+    _termOutput.dispose();
+    _termInput.dispose();
     unawaited(_muxSub?.cancel());
     unawaited(_hostSub?.cancel());
     unawaited(_controlSub?.cancel());
@@ -404,7 +765,10 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   List<ChatMessage> get _visible {
-    return _messages
+    final source = _olderMessages.isEmpty
+        ? _messages
+        : <ChatMessage>[..._olderMessages, ..._messages];
+    return source
         .where(
           (m) =>
               m.role != 'tool' &&
@@ -688,6 +1052,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         _waitingService = false;
       });
       _rememberResponseModels(bundle);
+      _applyHistoryWindow(bundle);
       if (_running || bundle.live.open) {
         _awaitingFinalReply = true;
         _pendingPromptText = _latestUserText(_messages);
@@ -1352,6 +1717,21 @@ class _DshChatScreenState extends State<DshChatScreen>
             _selectedModelTargetDsh = _usesTargetDshApi || !matchesLocal;
           }
         }
+        // 诊断：模型目录到底给了几组/几个模型（局域网抽屉空的排查用，#403）。
+        RuntimeLogger.instance.info(
+          'DSH',
+          'model.catalog',
+          sessionId: widget.sessionId,
+          data: {
+            'groups': groups.length,
+            'detail': [
+              for (final group in groups.take(8))
+                '${group.id}:${group.models.length}',
+            ].join(','),
+            'defaultProvider': current?.provider ?? '',
+            'defaultModel': current?.model ?? '',
+          },
+        );
         _dshModelOptions = [
           for (final group in groups)
             if (group.id.trim().isNotEmpty &&
@@ -1374,6 +1754,25 @@ class _DshChatScreenState extends State<DshChatScreen>
                 targetProvider: group.id,
               ),
         ];
+        // 目录没给分组（目标只回了 default）时别让抽屉空着：用 default 造一条。
+        final currentSelection = current;
+        if (_dshModelOptions.isEmpty &&
+            currentSelection != null &&
+            currentSelection.provider.trim().isNotEmpty &&
+            currentSelection.model.trim().isNotEmpty) {
+          final provider = currentSelection.provider.trim();
+          final model = currentSelection.model.trim();
+          _dshModelOptions = [
+            SessionModelOption(
+              value: provider,
+              label: provider,
+              subtitle: model,
+              models: [model],
+              targetDsh: true,
+              targetProvider: provider,
+            ),
+          ];
+        }
         _applyReasoningCapabilities(
           savedRelayProfile != null
               ? _model
@@ -1418,12 +1817,43 @@ class _DshChatScreenState extends State<DshChatScreen>
     } catch (_) {}
   }
 
+  /// 页面/应用是否可见（后台、被别的 route 盖住都算不可见）。
+  bool get _pollVisible => dshPollVisible(
+    mounted: mounted,
+    lifecycle: WidgetsBinding.instance.lifecycleState,
+    routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+  );
+
+  /// 记录「历史是否在增长」：新 seq 前进或 live 可见内容在跑 = 在出字。
+  /// LAN 没有 mux 时，只有这里为真才值得 800ms 轮询（发热复盘 #397）。
+  void _noteHistoryGrowth(DshHistoryBundle bundle) {
+    final seq = bundle.newestSeq ?? -1;
+    final grew =
+        seq > _lastGrowthSeq || (bundle.live.open && bundle.live.hasVisible);
+    _lastGrowthSeq = seq;
+    if (grew) {
+      _growTicks = 3;
+    } else if (_growTicks > 0) {
+      _growTicks--;
+    }
+  }
+
   void _maybePoll() {
     if (_pollTimer != null) return;
     _pollTimer = Timer.periodic(const Duration(milliseconds: 400), (_) async {
       _pollTicks++;
+      // 页面不在最前 / 应用在后台时一律不拉：真机上这是纯发热。
+      if (!_pollVisible) return;
       final wantFast = _running && !_muxUp;
-      if (!wantFast && _pollTicks % 5 != 0) return;
+      final tick = dshChatPollTick(
+        ticks: _pollTicks,
+        running: _running,
+        muxUp: _muxUp,
+        growing: _growTicks > 0,
+        unreachable: _pollUnreachable,
+      );
+      if (!tick.fetch) return;
+      final withList = tick.withList;
       try {
         // mux 连上不代表每一条 reasoning-delta 都已经送达；旧版 2.0
         // 由 history/stream 双路共同喂给 streamReasoning。运行中的回合继续
@@ -1436,15 +1866,23 @@ class _DshChatScreenState extends State<DshChatScreen>
         if (wantFast) {
           final results = await Future.wait([
             _api.historyBundle(widget.sessionId),
-            _api.listSessions(),
+            if (withList) _api.listSessions(),
           ]);
           if (!mounted || readGeneration != _historyReadGeneration) return;
+          _pollUnreachable = false;
           final bundle = results[0] as DshHistoryBundle;
-          final list = results[1] as List<DshSessionSummary>;
+          _noteHistoryGrowth(bundle);
           final historyConfirmsLive = _historyConfirmsLive(bundle.messages);
           _rememberResponseModels(bundle);
+          _applyHistoryWindow(bundle);
           _adoptHistoryReasoning(bundle.messages);
-          _applySessionMeta(list);
+          if (withList) {
+            _applySessionMeta(results[1] as List<DshSessionSummary>);
+            // 后台任务清单在目标里是 stream 端点（`job/list`），只有 mux 通
+            // 才有意义；局域网没有 WS 隧道，打了也必被拒（#403）。
+            if (_muxUp) unawaited(_refreshJobs());
+            unawaited(_refreshFeedback());
+          }
           final finalizesTurn = _shouldFinalizeHistory(bundle);
           _replaceMessages(
             _mergeHistory(
@@ -1461,57 +1899,65 @@ class _DshChatScreenState extends State<DshChatScreen>
           } else {
             _adoptLive(
               bundle.live,
-              allowClose:
-                  !_awaitingFinalReply &&
-                  !bundle.live.open &&
-                  historyConfirmsLive,
+              allowClose: _allowsLiveClose(bundle, historyConfirmsLive),
             );
           }
-          if (bundle.live.open || bundle.live.hasVisible) {
+          _dropStrandedLiveIfIdle();
+          if ((bundle.live.open || bundle.live.hasVisible) &&
+              !_tailRefreshPaused) {
             _scrollToBottom();
           }
           return;
         }
         final results = await Future.wait([
           _api.historyBundle(widget.sessionId),
-          _api.listSessions(),
+          if (withList) _api.listSessions(),
         ]);
         if (!mounted || readGeneration != _historyReadGeneration) return;
+        _pollUnreachable = false;
         final bundle = results[0] as DshHistoryBundle;
-        final list = results[1] as List<DshSessionSummary>;
+        _noteHistoryGrowth(bundle);
         final historyConfirmsLive = _historyConfirmsLive(bundle.messages);
         _rememberResponseModels(bundle);
+        _applyHistoryWindow(bundle);
         _adoptHistoryReasoning(bundle.messages);
         final prevLast = _messages.isEmpty ? null : _messages.last;
         final nextLast = bundle.messages.isEmpty ? null : bundle.messages.last;
         final changed =
             bundle.messages.length != _messages.length ||
             nextLast?.content != prevLast?.content;
-        _applySessionMeta(list);
-        final finalizesTurn = _shouldFinalizeHistory(bundle);
-        _replaceMessages(
-          _mergeHistory(
-            bundle.messages,
-            live: bundle.live,
-            preserveLocalProgress:
-                !finalizesTurn &&
-                (_shouldPreserveLocalProgress(bundle) || !historyConfirmsLive),
-          ),
-        );
-        if (finalizesTurn) {
-          _finishPendingTurn();
-        } else {
-          _adoptLive(
-            bundle.live,
-            force: true,
-            allowClose:
-                !_awaitingFinalReply &&
-                !bundle.live.open &&
-                historyConfirmsLive,
-          );
+        if (withList) {
+          _applySessionMeta(results[1] as List<DshSessionSummary>);
         }
-        if (changed) _scrollToBottom();
-        if (!_running && !changed && !bundle.live.open) {
+        final finalizesTurn = _shouldFinalizeHistory(bundle);
+        // 用户正在上翻读历史（且没有回合在跑、也没到收口时机）：这拍不重排
+        // 尾部列表、也不把视线拽回底部；回到最新位置后自动恢复。
+        final pauseTail =
+            _tailRefreshPaused && !_turnInFlight && !finalizesTurn;
+        if (!pauseTail) {
+          _replaceMessages(
+            _mergeHistory(
+              bundle.messages,
+              live: bundle.live,
+              preserveLocalProgress:
+                  !finalizesTurn &&
+                  (_shouldPreserveLocalProgress(bundle) ||
+                      !historyConfirmsLive),
+            ),
+          );
+          if (finalizesTurn) {
+            _finishPendingTurn();
+          } else {
+            _adoptLive(
+              bundle.live,
+              force: true,
+              allowClose: _allowsLiveClose(bundle, historyConfirmsLive),
+            );
+          }
+          _dropStrandedLiveIfIdle();
+          if (changed) _scrollToBottom();
+        }
+        if (!_running && !changed && (!bundle.live.open || !_live.open)) {
           final last = _messages.isEmpty ? null : _messages.last;
           final done =
               last == null ||
@@ -1521,6 +1967,9 @@ class _DshChatScreenState extends State<DshChatScreen>
         }
       } catch (e) {
         // 不自动拉起服务：轮询失败等用户手动启动。
+        // 目标打不通（Connection refused 之类）就进入"不可达"状态，
+        // 轮询节奏再放慢 5 倍（见 dshChatPollTick 的 unreachable）。
+        if (mounted) _pollUnreachable = _isUnreachableError(e);
       }
     });
   }
@@ -1569,6 +2018,61 @@ class _DshChatScreenState extends State<DshChatScreen>
     _scheduleCacheWrite();
   }
 
+  /// 把待发附件变成官方 content 块。
+  ///
+  /// - 图片：读成 base64 内联（rc.2 的 image 块不用先上传）；
+  /// - 文件：`fileUploads/upload` 换 receiptId（file 块只带 receiptId）；
+  /// - 失败的那些退回文本提示，至少让模型知道文件名。
+  Future<
+    ({
+      List<DshImageAttachment> images,
+      List<String> receipts,
+      String fallback,
+    })
+  >
+  _prepareOutgoingAttachments(
+    List<String> imagePaths,
+    List<String> filePaths,
+  ) async {
+    final images = <DshImageAttachment>[];
+    final receipts = <String>[];
+    final fallback = StringBuffer();
+    for (final path in imagePaths) {
+      try {
+        final bytes = await File(path).readAsBytes();
+        if (bytes.isEmpty) throw StateError('空图片');
+        images.add(
+          DshImageAttachment(
+            mediaType: DshImageAttachment.mediaTypeForPath(path),
+            base64: base64Encode(bytes),
+            name: p.basename(path),
+          ),
+        );
+      } catch (_) {
+        fallback.writeln('【图片：${p.basename(path)}】');
+      }
+    }
+    for (final path in filePaths) {
+      try {
+        final bytes = await File(path).readAsBytes();
+        final receipt = await _api.uploadFile(
+          widget.sessionId,
+          base64: base64Encode(bytes),
+          name: p.basename(path),
+        );
+        if (receipt.receiptId.isEmpty) throw StateError('没有 receiptId');
+        receipts.add(receipt.receiptId);
+      } catch (_) {
+        fallback.writeln('【附件：${p.basename(path)}】');
+      }
+    }
+    return (
+      images: images,
+      receipts: receipts,
+      fallback: fallback.toString().trim(),
+    );
+  }
+
   Future<void> _send() async {
     final text = _input.text.trim();
     final images = List<String>.of(_pendingImages);
@@ -1586,6 +2090,16 @@ class _DshChatScreenState extends State<DshChatScreen>
     // from the previous turn must not repaint this turn's status.
     ++_subagentRefreshGeneration;
     final sendGeneration = ++_sendGeneration;
+    // 上线正文：只有文本 + 技能指令；附件走官方 content 块
+    // （图片内联 base64、文件先上传换 receiptId），不再把本地路径当文本发出去。
+    final wireText = StringBuffer();
+    if (_selectedSkills.isNotEmpty) {
+      for (final skill in _selectedSkills) {
+        wireText.writeln('/${skill.name}');
+      }
+    }
+    if (text.isNotEmpty) wireText.write(text);
+    // 乐观消息仍显示本地预览（图片/文件名 + 路径），刷新后由服务端历史覆盖。
     final content = StringBuffer();
     for (final path in images) {
       content.writeln('![图片]($path)');
@@ -1594,13 +2108,9 @@ class _DshChatScreenState extends State<DshChatScreen>
       content.writeln('【附件：${p.basename(path)}】');
       content.writeln('路径：$path');
     }
-    if (_selectedSkills.isNotEmpty) {
-      for (final skill in _selectedSkills) {
-        content.writeln('/${skill.name}');
-      }
-    }
-    if (text.isNotEmpty) content.write(text);
+    if (wireText.isNotEmpty) content.write(wireText.toString());
     final prompt = content.toString().trim();
+    final wirePrompt = wireText.toString().trim();
     // 先让输入区/附件立即让位并显示乐观消息：租约和取消都不能让界面
     // 看起来“点了没反应”，同帧第二个发送入口也会因空输入直接退出。
     _input.clear();
@@ -1697,10 +2207,26 @@ class _DshChatScreenState extends State<DshChatScreen>
     _scrollToBottom();
     _maybePoll();
     await _reaffirmRemoteSelection();
-    Future<void> sendPrompt() => DshService.instance.withRecover(
-      () => _turnCommands.enqueue(() => _api.prompt(widget.sessionId, prompt)),
-      recover: true,
-    );
+    Future<void> sendPrompt() async {
+      // 官方 content 块：图片内联、文件先上传换 receiptId；失败的退回文本提示，
+      // 至少让模型知道有这个东西（见 docs/dsh-parity.md）。
+      final prepared = await _prepareOutgoingAttachments(images, files);
+      final outgoing = [
+        if (wirePrompt.isNotEmpty) wirePrompt,
+        if (prepared.fallback.isNotEmpty) prepared.fallback,
+      ].join('\n');
+      return DshService.instance.withRecover(
+        () => _turnCommands.enqueue(
+          () => _api.prompt(
+            widget.sessionId,
+            outgoing,
+            images: prepared.images,
+            fileReceiptIds: prepared.receipts,
+          ),
+        ),
+        recover: true,
+      );
+    }
     void markAccepted() {
       _ignoreLateRunningStatus = false;
       if (!mounted || sendGeneration != _sendGeneration) return;
@@ -1983,6 +2509,20 @@ class _DshChatScreenState extends State<DshChatScreen>
             CupertinoActionSheetAction(
               onPressed: () {
                 Navigator.pop(ctx);
+                unawaited(_browseWorkspaceFiles());
+              },
+              child: const Text('浏览工作区文件'),
+            ),
+            CupertinoActionSheetAction(
+              onPressed: () {
+                Navigator.pop(ctx);
+                unawaited(_openTerminalPanel());
+              },
+              child: const Text('目标机终端（本机模式）'),
+            ),
+            CupertinoActionSheetAction(
+              onPressed: () {
+                Navigator.pop(ctx);
                 unawaited(_pickFile());
               },
               child: const Text('发送文件'),
@@ -1998,6 +2538,16 @@ class _DshChatScreenState extends State<DshChatScreen>
   }
 
   void _onInputChanged() {
+    if (isAtReferenceTrigger(_input.text)) {
+      final now = DateTime.now();
+      if (_lastAtTrigger != null &&
+          now.difference(_lastAtTrigger!).inMilliseconds < 600) {
+        return;
+      }
+      _lastAtTrigger = now;
+      unawaited(_pickReferenceSheet());
+      return;
+    }
     if (!isSkillSlashTrigger(_input.text)) return;
     final now = DateTime.now();
     if (_lastSlashTrigger != null &&
@@ -2006,6 +2556,120 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
     _lastSlashTrigger = now;
     unawaited(_pickSkillSheet());
+  }
+
+  /// 末尾 `@词` 触发引用选择（官方 @-引用：`fileReferences/list` +
+  /// `sessionReferenceResolver/candidates`）。判定逻辑见 `core/at_trigger.dart`。
+  Future<void> _pickReferenceSheet() async {
+    final query = atReferenceQuery(_input.text) ?? '';
+    final references = <String>[];
+    final sessions = <Map<String, dynamic>>[];
+    try {
+      references.addAll(await _api.listFileReferences(widget.sessionId, query));
+    } catch (_) {
+      // 旧版没有 fileReferences/list。
+    }
+    try {
+      sessions.addAll(
+        await _api.sessionReferenceCandidates(widget.sessionId, query),
+      );
+    } catch (_) {
+      // 旧版没有 sessionReferenceResolver/candidates。
+    }
+    if (!mounted) return;
+    if (references.isEmpty && sessions.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('没有匹配的引用')));
+      return;
+    }
+    final picked = await showIosFadeSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+              child: Row(
+                children: [
+                  Text(
+                    '插入引用',
+                    style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const Spacer(),
+                  if (query.isNotEmpty)
+                    Text(
+                      '@$query',
+                      style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(ctx).hintColor,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
+                children: [
+                  for (final path in references)
+                    ListTile(
+                      dense: true,
+                      leading: const Icon(CupertinoIcons.doc, size: 18),
+                      title: Text(
+                        path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      onTap: () => Navigator.pop(ctx, path),
+                    ),
+                  for (final session in sessions)
+                    ListTile(
+                      dense: true,
+                      leading: const Icon(
+                        CupertinoIcons.chat_bubble_2,
+                        size: 18,
+                      ),
+                      title: Text(
+                        (session['title'] ??
+                                session['sessionId'] ??
+                                session['id'] ??
+                                '')
+                            .toString(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        (session['sessionId'] ?? session['id'] ?? '')
+                            .toString(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      onTap: () => Navigator.pop(
+                        ctx,
+                        (session['sessionId'] ?? session['id'] ?? '')
+                            .toString(),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked == null || picked.isEmpty || !mounted) return;
+    final replaced = replaceAtReference(_input.text, picked);
+    _input.value = TextEditingValue(
+      text: replaced,
+      selection: TextSelection.collapsed(offset: replaced.length),
+    );
   }
 
   /// 选择技能后移除触发选择器用的末尾斜杠，保留用户已经输入的正文。
@@ -2027,10 +2691,27 @@ class _DshChatScreenState extends State<DshChatScreen>
       );
       final skills = await _api.listSkills(sessionId: widget.sessionId);
       if (!mounted) return;
-      if (skills.isEmpty) {
+      // 官方斜杠命令（`commands/list`）一起列出来：它们是动作，不是可多选的技能，
+      // 所以单独一段、点一下即执行（带参数的只填 `/name ` 让用户补完）。
+      var commands = const <DshCommandInfo>[];
+      try {
+        commands = await _api.listCommands(widget.sessionId);
+      } catch (_) {
+        // 旧版没有 commands/list：只显示技能。
+      }
+      if (!mounted) return;
+      // 定时任务（官方 `schedule/list`，unary，局域网也通）。
+      var schedules = const <Map<String, dynamic>>[];
+      try {
+        schedules = await _api.listSchedules(widget.sessionId);
+      } catch (_) {
+        // 旧版没有 schedule/* ：这一段不显示。
+      }
+      if (!mounted) return;
+      if (skills.isEmpty && commands.isEmpty && schedules.isEmpty) {
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(const SnackBar(content: Text('当前会话没有可用技能')));
+        ).showSnackBar(const SnackBar(content: Text('当前会话没有可用技能或命令')));
         return;
       }
       final picked = await showIosFadeSheet<Set<String>>(
@@ -2073,6 +2754,137 @@ class _DshChatScreenState extends State<DshChatScreen>
                       ],
                     ),
                   ),
+                  if (commands.isNotEmpty) ...[
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(18, 10, 18, 2),
+                      child: Row(
+                        children: [
+                          Text(
+                            '官方命令',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    for (final command in commands)
+                      ListTile(
+                        dense: true,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        leading: Icon(
+                          CupertinoIcons.command,
+                          size: 18,
+                          color: Theme.of(ctx).colorScheme.primary,
+                        ),
+                        title: Text('/${command.name}'),
+                        subtitle:
+                            (command.description.isEmpty &&
+                                command.hint.isEmpty)
+                            ? null
+                            : Text(
+                                command.hint.isEmpty
+                                    ? command.description
+                                    : '${command.description}'
+                                          '${command.description.isEmpty ? '' : ' · '}'
+                                          '${command.hint}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                        trailing: const Icon(
+                          CupertinoIcons.chevron_right,
+                          size: 16,
+                        ),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          if (command.needsArgs) {
+                            _input.text = '/${command.name} ';
+                            _input.selection = TextSelection.collapsed(
+                              offset: _input.text.length,
+                            );
+                            _stripSlash();
+                            return;
+                          }
+                          unawaited(
+                            _runOfficialCommand('/${command.name}'),
+                          );
+                        },
+                      ),
+                    const Divider(height: 8),
+                  ],
+                  if (schedules.isNotEmpty) ...[
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(18, 10, 18, 2),
+                      child: Text(
+                        '定时任务',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    for (final schedule in schedules)
+                      ListTile(
+                        dense: true,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        leading: Icon(
+                          CupertinoIcons.time,
+                          size: 18,
+                          color: Theme.of(ctx).colorScheme.primary,
+                        ),
+                        title: Text(
+                          (schedule['title'] ??
+                                  schedule['name'] ??
+                                  schedule['id'] ??
+                                  '')
+                              .toString(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          [
+                            if ((schedule['cron'] ?? '').toString().isNotEmpty)
+                              schedule['cron'].toString(),
+                            if ((schedule['nextRunAt'] ??
+                                    schedule['next'] ??
+                                    '')
+                                .toString()
+                                .isNotEmpty)
+                              '下次 ${schedule['nextRunAt'] ?? schedule['next']}',
+                          ].join(' · '),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: IconButton(
+                          icon: const Icon(CupertinoIcons.trash, size: 18),
+                          onPressed: () async {
+                            final id =
+                                (schedule['id'] ?? schedule['scheduleId'] ?? '')
+                                    .toString();
+                            Navigator.pop(ctx);
+                            if (id.isEmpty) return;
+                            try {
+                              await _api.deleteSchedule(widget.sessionId, id);
+                              if (!mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('已删除定时任务')),
+                              );
+                            } catch (e) {
+                              if (!mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text('删除失败：$e')),
+                              );
+                            }
+                          },
+                        ),
+                      ),
+                    const Divider(height: 8),
+                  ],
                   const Divider(height: 1),
                   Flexible(
                     child: ListView.separated(
@@ -2152,6 +2964,348 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
   }
 
+  /// 刷新后台任务清单（`job/list`，纯 HTTP，局域网也通）。
+  Future<void> _refreshJobs() async {
+    try {
+      final jobs = await _api.listJobs(widget.sessionId);
+      if (!mounted) return;
+      setState(() => _jobs = jobs);
+    } catch (_) {
+      // 旧版 / 服务未挂时静默：芯片本来就不显示。
+    }
+  }
+
+  /// 后台任务面板：列出任务，运行中的可以结束。
+  Future<void> _openJobsSheet() async {
+    await _refreshJobs();
+    if (!mounted) return;
+    if (_jobs.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('当前会话没有后台任务')));
+      return;
+    }
+    await showIosFadeSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+              child: Row(
+                children: [
+                  Text(
+                    '后台任务',
+                    style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '${_jobs.where((j) => j.running).length} 个运行中',
+                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(ctx).hintColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
+                children: [
+                  for (final job in _jobs)
+                    ListTile(
+                      dense: true,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      leading: Icon(
+                        job.running
+                            ? CupertinoIcons.hammer
+                            : CupertinoIcons.checkmark_circle,
+                        size: 18,
+                        color: job.running
+                            ? Theme.of(ctx).colorScheme.primary
+                            : Theme.of(ctx).hintColor,
+                      ),
+                      title: Text(
+                        job.label.isEmpty ? job.id : job.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        [
+                          if (job.kind.isNotEmpty) job.kind,
+                          if (job.status.isNotEmpty) job.status,
+                          if ((job.progress ?? '').isNotEmpty) job.progress!,
+                        ].join(' · '),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: job.running
+                          ? TextButton(
+                              onPressed: () async {
+                                Navigator.pop(ctx);
+                                try {
+                                  await _api.killJob(
+                                    widget.sessionId,
+                                    job.id,
+                                  );
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(content: Text('已请求结束 ${job.label}')),
+                                  );
+                                  await _refreshJobs();
+                                } catch (e) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(content: Text('结束失败：$e')),
+                                  );
+                                }
+                              },
+                              child: const Text('结束'),
+                            )
+                          : null,
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 工作区文件浏览 + 预览（官方 `workspaceFiles/*`，scopeId = 会话 id）。
+  ///
+  /// 这是官方侧边栏那条链路：只看会话工作区内的文件，能读文本、能看图片；
+  /// 目录选择器（`directoryPicker/*`）仍留给「换工作目录」。
+  Future<void> _browseWorkspaceFiles({String path = ''}) async {
+    try {
+      final listing = await _api.listWorkspaceFiles(widget.sessionId, path);
+      if (!mounted) return;
+      await showIosFadeSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (ctx) => SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        listing.path.isEmpty
+                            ? '工作区文件'
+                            : '工作区文件 / ${listing.path}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    if (listing.truncated)
+                      Text(
+                        '已截断',
+                        style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(ctx).hintColor,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Flexible(
+                child: ListView(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
+                  children: [
+                    if (listing.entries.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text('这个目录是空的'),
+                      ),
+                    for (final entry in listing.entries)
+                      ListTile(
+                        dense: true,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        leading: Icon(
+                          entry.isDir
+                              ? CupertinoIcons.folder
+                              : CupertinoIcons.doc_text,
+                          size: 18,
+                          color: entry.isDir
+                              ? Theme.of(ctx).colorScheme.primary
+                              : Theme.of(ctx).hintColor,
+                        ),
+                        title: Text(
+                          entry.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: entry.size == null
+                            ? null
+                            : Text('${entry.size} B'),
+                        trailing: entry.isDir
+                            ? const Icon(CupertinoIcons.chevron_right, size: 16)
+                            : null,
+                        onTap: () {
+                          final child = listing.path.isEmpty
+                              ? entry.name
+                              : '${listing.path}/${entry.name}';
+                          Navigator.pop(ctx);
+                          unawaited(
+                            entry.isDir
+                                ? _browseWorkspaceFiles(path: child)
+                                : _previewWorkspaceFile(child),
+                          );
+                        },
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('打开工作区文件失败：$e')));
+    }
+  }
+
+  /// 预览工作区文件：图片走 `readBytes`，其余按文本读（读不动就报错）。
+  Future<void> _previewWorkspaceFile(String path) async {
+    final lower = path.toLowerCase();
+    final isImage =
+        lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.gif');
+    try {
+      if (isImage) {
+        final bytes = await _api.readWorkspaceFileBytes(widget.sessionId, path);
+        if (!mounted) return;
+        if (bytes.isEmpty) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('图片内容为空')));
+          return;
+        }
+        await showIosFadeSheet<void>(
+          context: context,
+          builder: (ctx) => SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 10),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 420),
+                    child: Image.memory(bytes, fit: BoxFit.contain),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        return;
+      }
+      final file = await _api.readWorkspaceFile(widget.sessionId, path);
+      if (!mounted) return;
+      await showIosFadeSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (ctx) => SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(ctx).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${file.lines} 行${file.eof ? '' : '（未完）'}',
+                      style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(ctx).hintColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Flexible(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(16),
+                  child: SelectableText(
+                    file.text.isEmpty ? '（空文件）' : file.text,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      height: 1.45,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('预览失败：$e')));
+    }
+  }
+
+  /// 执行一条官方斜杠命令（不带参数的，如 `/compact`）。
+  Future<void> _runOfficialCommand(String line) async {
+    try {
+      await _api.executeCommand(sessionId: widget.sessionId, line: line);
+      if (!mounted) return;
+      _stripSlash();
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已执行 $line')));
+      _maybePoll();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('命令执行失败：$e')));
+    }
+  }
+
   Future<void> _openWorkspace() async {
     // DSH 的 cwd 属于 DSH 主机（本机、局域网或公网电脑）。这里必须用
     // host API 选择目录并写回 session cwd，不能打开手机本地文件选择器。
@@ -2215,12 +3369,19 @@ class _DshChatScreenState extends State<DshChatScreen>
   Future<void> _connectDownlink() async {
     final gen = ++_muxGen;
     _muxRetry?.cancel();
+    _muxWatchdog?.cancel();
     await _muxSub?.cancel();
     await _hostSub?.cancel();
     await _controlSub?.cancel();
     _muxSub = null;
     _hostSub = null;
     _controlSub = null;
+    // 局域网 8080 转发层会让 WebSocket「升级成功但永不下发」：没有这个
+    // 看门狗，应用会一直攥着一个死连接（既不重连也不释放），
+    // `_onMuxLost` 永远不触发。只盯首帧，连上后不再打扰。
+    _muxWatchdog = Timer(const Duration(seconds: 8), () {
+      if (mounted && gen == _muxGen && !_muxUp) _onMuxLost();
+    });
     try {
       _muxSub = _api
           .watchMux(sessionId: widget.sessionId)
@@ -2252,6 +3413,21 @@ class _DshChatScreenState extends State<DshChatScreen>
 
   void _onControlFrame(Map<String, dynamic> frame) {
     final type = frame['type']?.toString() ?? '';
+    if (type == 'baseline') {
+      // rc.2 的 `session/control` 首帧是
+      // `{type:'baseline', value:{projections:{<id>:{asOfSeq,values:{…}}}}}`，
+      // 原来的解析只认 `projection` 帧，baseline 被整帧丢掉 → 会话开头拿不到
+      // inbox/permissions 这类投影（见 docs/fix-log.md #396）。
+      final value = frame['value'];
+      final projections = value is Map ? value['projections'] : null;
+      if (projections is Map) {
+        for (final entry in projections.values) {
+          final values = entry is Map ? entry['values'] : null;
+          if (values is Map) _applyControlProjectionValues(values);
+        }
+      }
+      return;
+    }
     if (type == 'projection') {
       final key = frame['key']?.toString() ?? '';
       final value = frame['value'];
@@ -2271,6 +3447,19 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
   }
 
+  /// 官方投影 values 里能推出「有活在跑」的信号：
+  /// `inbox.next-turn` / `inbox.next-step` 非空 = 有排队或正在推进的回合。
+  void _applyControlProjectionValues(Map<dynamic, dynamic> values) {
+    final inbox = values['inbox'];
+    if (inbox is! Map) return;
+    final nextTurn = inbox['next-turn'];
+    final nextStep = inbox['next-step'];
+    final hasWork =
+        (nextTurn is List && nextTurn.isNotEmpty) ||
+        (nextStep is List && nextStep.isNotEmpty);
+    if (hasWork) _applyControlRunning(true);
+  }
+
   void _applyControlRunning(bool running) {
     if (!mounted || running == _running) return;
     setState(() => _running = running);
@@ -2283,8 +3472,10 @@ class _DshChatScreenState extends State<DshChatScreen>
   void _onMuxLost() {
     if (!mounted) return;
     _muxUp = false;
+    _muxFailures++;
+    _muxWatchdog?.cancel();
     _muxRetry?.cancel();
-    _muxRetry = Timer(const Duration(seconds: 2), () {
+    _muxRetry = Timer(dshMuxRetryDelay(_muxFailures), () {
       if (mounted && _muxGen != 0) unawaited(_connectDownlink());
     });
   }
@@ -2296,6 +3487,8 @@ class _DshChatScreenState extends State<DshChatScreen>
 
     if (type == 'session/subscribed') {
       _muxUp = true;
+      _muxFailures = 0;
+      _muxWatchdog?.cancel();
       final last = (frame['lastSeq'] as num?)?.toInt() ?? -1;
       if (last > _live.lastSeq) {
         unawaited(_refreshHistory(clearLive: false));
@@ -2352,6 +3545,12 @@ class _DshChatScreenState extends State<DshChatScreen>
       setState(() {
         _pendingQuestion = {
           'rpcId': rpcId,
+          // rc.2 的 `userQuestions/answer(agentId, callId, answer)` 要 callId，
+          // 帧里优先用它自己的 id，没有就退回 rpcId（见 docs/fix-log.md #398）。
+          'callId':
+              frame['callId']?.toString() ??
+              frame['id']?.toString() ??
+              rpcId,
           'sessionId': sid.isEmpty ? widget.sessionId : sid,
           'questions': (frame['questions'] as List?) ?? const [],
         };
@@ -2489,6 +3688,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         setState(() => _sessionPermission = bundle.permissionPreset!);
       }
       _rememberResponseModels(bundle);
+      _applyHistoryWindow(bundle);
       _adoptHistoryReasoning(bundle.messages);
       final current = DshChatCache.materializeMessages(
         sessionId: widget.sessionId,
@@ -2518,8 +3718,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         _adoptLive(
           bundle.live,
           force: true,
-          allowClose:
-              !_awaitingFinalReply && !bundle.live.open && historyConfirmsLive,
+          allowClose: _allowsLiveClose(bundle, historyConfirmsLive),
         );
         if (clearLive && _awaitingFinalReply) {
           _historySettleAttempts++;
@@ -2533,8 +3732,10 @@ class _DshChatScreenState extends State<DshChatScreen>
           });
         }
       }
+      _dropStrandedLiveIfIdle();
       _scheduleCacheWrite();
-      _scrollToBottom();
+      // 读历史时不要把视线拽回底部。
+      if (!_tailRefreshPaused) _scrollToBottom();
     } catch (e) {
       // 不自动拉起服务：刷新失败等用户手动启动。手动压缩需要把失败
       // 交给调用方，避免在权威历史尚未重载时误报成功。
@@ -2551,6 +3752,88 @@ class _DshChatScreenState extends State<DshChatScreen>
     }
   }
 
+  /// 记录尾页窗口的分页元数据（每次读到尾部历史后调用）。
+  ///
+  /// `newestSeq` 只在增长时更新，保证同一轮上翻沿用一个固定的尾部游标。
+  void _applyHistoryWindow(DshHistoryBundle bundle) {
+    _hasMoreOlder = bundle.hasMoreOlder;
+    final newest = bundle.newestSeq;
+    if (newest != null &&
+        (_historyThroughSeq == null || newest > _historyThroughSeq!)) {
+      _historyThroughSeq = newest;
+    }
+    final oldest = bundle.oldestSeq;
+    if (oldest != null &&
+        (_oldestLoadedSeq == null || oldest < _oldestLoadedSeq!)) {
+      _oldestLoadedSeq = oldest;
+    }
+  }
+
+  /// 长会话滚动：接近最老一段时补一页更早的消息；离开最新位置时暂停
+  /// 尾部刷新，避免读历史时每拍重排列表。
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final position = _scroll.position;
+    final paused = dshShouldPauseTailRefresh(pixels: position.pixels);
+    if (paused != _tailRefreshPaused) {
+      setState(() => _tailRefreshPaused = paused);
+    }
+    if (dshShouldLoadOlder(
+      hasMoreOlder: _hasMoreOlder,
+      loading: _loadingOlder,
+      pixels: position.pixels,
+      maxScrollExtent: position.maxScrollExtent,
+    )) {
+      unawaited(_loadOlder());
+    }
+  }
+
+  /// 取比当前已加载的最老一条更早的一页（官方 beforeSeq 是开区间上界）。
+  Future<void> _loadOlder() async {
+    if (_loadingOlder || !_hasMoreOlder) return;
+    final before = _oldestLoadedSeq;
+    if (before == null) return;
+    setState(() => _loadingOlder = true);
+    try {
+      final bundle = await _api.historyOlder(
+        widget.sessionId,
+        beforeSeq: before,
+        throughSeq: _historyThroughSeq,
+      );
+      if (!mounted) return;
+      setState(() {
+        _olderMessages = dshPrependOlderMessages(
+          older: bundle.messages,
+          current: _olderMessages,
+        );
+        _hasMoreOlder = bundle.hasMoreOlder;
+        _oldestLoadedSeq = bundle.oldestSeq ?? before;
+        _loadingOlder = false;
+      });
+    } catch (_) {
+      // 失败不弹错：回到最新位置会重新触发；留着哨兵行等用户再上翻。
+      if (!mounted) return;
+      setState(() => _loadingOlder = false);
+    }
+  }
+
+  Widget _olderLoader() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      child: Center(
+        child: _loadingOlder
+            ? const AppLoading()
+            : Text(
+                '上翻加载更早的消息',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                ),
+              ),
+      ),
+    );
+  }
+
   Future<void> _refreshMeta() async {
     try {
       final list = await _api.listSessions();
@@ -2562,6 +3845,11 @@ class _DshChatScreenState extends State<DshChatScreen>
   void _applySessionMeta(List<DshSessionSummary> list) {
     final me = list.where((s) => s.sessionId == widget.sessionId).firstOrNull;
     final running = me?.running ?? false;
+    // 子代理要从 `session/list` 派生（官方没有 subagents/list，见 #396）。
+    // 这里把刚拿到的那份存下来，子代理轮询就不必每 2 秒再打一次 session.list
+    // —— 之前 500ms × session.list 是发热源之一（#399 之后实测 48 次/31 秒）。
+    _sessionsSnapshot = list;
+    _sessionsSnapshotAt = DateTime.now();
     setState(() {
       _running = running;
       if (me != null && (me.title?.isNotEmpty ?? false)) {
@@ -2595,7 +3883,19 @@ class _DshChatScreenState extends State<DshChatScreen>
     final refreshGeneration = _subagentRefreshGeneration;
     _refreshingSubagents = true;
     try {
-      final result = await _api.listSubagents(widget.sessionId);
+      // 主轮询刚拉过 session/list 就直接派生，省掉一次 RPC（发热敏感）。
+      final snapshot = _sessionsSnapshot;
+      final at = _sessionsSnapshotAt;
+      final fresh =
+          snapshot.isNotEmpty &&
+          at != null &&
+          DateTime.now().difference(at) < const Duration(seconds: 6);
+      final result = fresh
+          ? DshApiClient.deriveSubagents(
+              parentSessionId: widget.sessionId,
+              sessions: snapshot,
+            )
+          : await _api.listSubagents(widget.sessionId);
       if (!mounted || refreshGeneration != _subagentRefreshGeneration) return;
       _rememberDshSubagents(
         _dshSubagentMemoryKey(widget.sessionId),
@@ -2616,11 +3916,20 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (!mounted) return;
     final shouldPoll = _running || _subagents.any((e) => e.running);
     if (shouldPoll) {
-      _subagentPollTimer ??= Timer.periodic(const Duration(milliseconds: 500), (
-        _,
-      ) {
-        unawaited(_refreshSubagents());
-      });
+      _subagentPollTimer ??= Timer.periodic(
+        const Duration(milliseconds: 2000),
+        (timer) {
+          // 后台不拉！真机复盘（docs/fix-log.md #393）：这条定时器原先没有可见性
+          // 判断，应用退到桌面后仍 2Hz 拉列表，边充电边跑 → 电池 56.7°C。
+          // 2026-10-12 又降到 0.5Hz：那时每次都是一发 `session.list`
+          // （子代理要从 session/list 派生，#396），实测 48 次/31 秒；
+          // 现在改为优先复用主轮询那份结果，RPC 基本归零（#401）。
+          if (!_pollVisible) return;
+          // 目标打不通时别跟着一起打（子代理列表也要走会话列表）。
+          if (_pollUnreachable) return;
+          unawaited(_refreshSubagents());
+        },
+      );
       return;
     }
     _subagentPollTimer?.cancel();
@@ -2782,6 +4091,41 @@ class _DshChatScreenState extends State<DshChatScreen>
     if (!mounted || _sameMessages(_messages, next)) return;
     setState(() => _messages = next);
     _scheduleCacheWrite();
+  }
+
+  /// 是否仍有一轮在跑（DSH 报 running 或本地还在等正式助手消息）。
+  bool get _turnInFlight => _running || _awaitingFinalReply;
+
+  /// 是否允许关掉 live 缓冲。
+  ///
+  /// `bundle.live` 是从会话事件流**重建**的，本身不代表会话在跑：同一段未收口
+  /// 缓冲既会冻成正式助手消息（`dsh_api.dart` 的 `freezePendingLive`），也会被
+  /// `DshLiveTurn.fromHistoryValue` 还原成 `open` 的 live。若在会话已经 stopped
+  /// 时还让这份重建缓冲压住收口，正式消息与重建的流式气泡会同时渲染，出现
+  /// “生成完成多一条重复信息”；`_maybePoll` 的停止条件又要求 `!bundle.live.open`，
+  /// 于是轮询也停不下来。所以只有仍在跑时才看 `bundle.live.open`。
+  bool _allowsLiveClose(DshHistoryBundle bundle, bool historyConfirmsLive) {
+    return dshAllowsLiveClose(
+      turnInFlight: _turnInFlight,
+      incomingLiveOpen: bundle.live.open,
+      historyConfirmsLive: historyConfirmsLive,
+    );
+  }
+
+  /// 回合已经不在跑时，任何残留的流式气泡都必须清掉。
+  ///
+  /// 迟到 chunk、历史重建的 live、`_adoptHistoryReasoning` 事后补思考都能重新
+  /// 点亮 live 气泡，而收口路径只认 `_awaitingFinalReply` / `wasRunning`，
+  /// 覆盖不到这些“事后点亮”。幂等（`_live.reset()` 后 `_live.hasVisible` 为
+  /// false，`_clearLiveUi` 也不会再点亮 live），所以可以每拍执行。
+  void _dropStrandedLiveIfIdle() {
+    if (_turnInFlight || !mounted) return;
+    if (!_live.open &&
+        !_live.hasVisible &&
+        !_messages.any((m) => m.streaming)) {
+      return;
+    }
+    _clearLiveUi(preserveVisible: _live.hasVisible);
   }
 
   void _adoptLive(
@@ -2970,6 +4314,7 @@ class _DshChatScreenState extends State<DshChatScreen>
         q['rpcId']?.toString() ?? '',
         q['sessionId']?.toString() ?? widget.sessionId,
         answers,
+        callId: q['callId']?.toString(),
       );
       if (!mounted) return;
       setState(() {
@@ -3385,11 +4730,13 @@ class _DshChatScreenState extends State<DshChatScreen>
   String _messageListItemKey(Object item) {
     if (item is ChatMessage) return _itemKey(item);
     if (item is _DshThinkingPlaceholder) return 'dsh-thinking-placeholder';
+    if (item is _DshOlderLoader) return 'dsh-older-loader';
     return 'unknown:${identityHashCode(item)}';
   }
 
   Widget _buildMessageListItem(BuildContext context, Object item) {
     if (item is _DshThinkingPlaceholder) return _thinkingPlaceholder();
+    if (item is _DshOlderLoader) return _olderLoader();
     final m = item as ChatMessage;
     return KeyedSubtree(
       key: ValueKey(_itemKey(m)),
@@ -3412,6 +4759,16 @@ class _DshChatScreenState extends State<DshChatScreen>
               onStopSpeak: _stopSpeak,
               onSaveMemory: widget.shiyi == null ? null : _saveMemory,
               onSaveSkill: widget.shiyi == null ? null : _saveSkill,
+              // 官方消息反馈（messageFeedback/*）。
+              feedbackRating: _dshMessageId(m.id) == null
+                  ? null
+                  : _feedback[_dshMessageId(m.id)],
+              onFeedbackUp: m.role == 'assistant'
+                  ? (msg) => unawaited(_sendFeedback(msg, 'positive'))
+                  : null,
+              onFeedbackDown: m.role == 'assistant'
+                  ? (msg) => unawaited(_sendFeedback(msg, 'negative'))
+                  : null,
             ),
           ),
         ),
@@ -3422,8 +4779,11 @@ class _DshChatScreenState extends State<DshChatScreen>
   Widget _composerFloatChips() {
     final showSubagent = _subagentTotalCount > 0 || _subagentPeekOpen;
     final showStats = DshStatsBar.hasContent(_summary);
-    if (!showSubagent && !showStats) return const SizedBox.shrink();
-    return ChatComposerFloatChips(
+    final runningJobs = _jobs.where((j) => j.running).length;
+    if (!showSubagent && !showStats && runningJobs == 0) {
+      return const SizedBox.shrink();
+    }
+    final chips = ChatComposerFloatChips(
       stats: showStats ? DshStatsBar(summary: _summary) : null,
       subagent: showSubagent
           ? SubagentStatusBar(
@@ -3439,18 +4799,38 @@ class _DshChatScreenState extends State<DshChatScreen>
             )
           : null,
     );
+    if (runningJobs == 0) return chips;
+    // 官方后台任务：有任务在跑时挂一个芯片，点开可结束。
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(right: 12, bottom: 6),
+          child: ChatComposerChip(
+            tooltip: '后台任务',
+            onTap: () => unawaited(_openJobsSheet()),
+            children: [
+              const Icon(CupertinoIcons.hammer, size: 14),
+              const SizedBox(width: 5),
+              Text('任务 $runningJobs'),
+            ],
+          ),
+        ),
+        chips,
+      ],
+    );
   }
 
   Widget _buildMessages(double overlayHeight) {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_waitingService) {
       return const Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            CupertinoActivityIndicator(radius: 12),
+            AppLoading(),
             SizedBox(height: 12),
             Text(
               'DSH 启动中…',
@@ -3490,7 +4870,7 @@ class _DshChatScreenState extends State<DshChatScreen>
                 ),
               ),
               const SizedBox(height: 14),
-              CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+              GlassActionButton(label: '重试', onPressed: _load, accent: true),
             ],
           ),
         ),
@@ -3516,6 +4896,8 @@ class _DshChatScreenState extends State<DshChatScreen>
     final items = <Object>[
       if (thinkingNeeded) const _DshThinkingPlaceholder(),
       ...visibleItems,
+      // reverse 列表：追加在最后 = 渲染在最上面（最老的一端）。
+      if (_hasMoreOlder || _loadingOlder) const _DshOlderLoader(),
     ];
     return ScrollConfiguration(
       behavior: ScrollConfiguration.of(context).copyWith(overscroll: false),
@@ -3537,6 +4919,11 @@ class _DshChatScreenState extends State<DshChatScreen>
 
 class _DshThinkingPlaceholder {
   const _DshThinkingPlaceholder();
+}
+
+/// reverse 列表里“更早的消息”哨兵行：渲染在最老的一端，可见即触发上翻。
+class _DshOlderLoader {
+  const _DshOlderLoader();
 }
 
 class _DshWelcome extends StatelessWidget {

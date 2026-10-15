@@ -16,6 +16,7 @@ import '../core/models.dart';
 import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
 import '../services/update_service.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/home_drag.dart';
 import '../widgets/home_group_chats.dart';
 import '../widgets/home_group_header.dart';
@@ -269,9 +270,13 @@ class _HomeScreenState extends State<HomeScreen>
     );
     if (ok == true && mounted) {
       // 显式退出按用户开关决定是否停服务；退后台保持常驻，重开即用。
-      if (widget.shiyi.settings.dshStopOnExit &&
-          DshService.instance.managesLocalProcess) {
-        await DshService.instance.stop();
+      // 只有真的要停本机 DSH 时才去停，而且必须有上限：没启动过也要等
+      // rootfs 初始化会让「退出」点了没反应（见 docs/fix-log.md #385）。
+      final dsh = DshService.instance;
+      if (widget.shiyi.settings.dshStopOnExit && dsh.needsStopOnExit) {
+        try {
+          await dsh.stop().timeout(const Duration(seconds: 3));
+        } catch (_) {}
       }
       SystemNavigator.pop();
     }
@@ -306,18 +311,27 @@ class _HomeScreenState extends State<HomeScreen>
               child: Center(
                 child: Padding(
                   padding: const EdgeInsets.all(24),
-                  child: Text(
-                    '初始化失败：${shiyi.initError}',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyMedium,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '初始化失败：${shiyi.initError}',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                      const SizedBox(height: 18),
+                      // 失败可以就地重试，不需要卸载重装。
+                      CupertinoButton.filled(
+                        onPressed: () => unawaited(shiyi.init()),
+                        child: const Text('重试'),
+                      ),
+                    ],
                   ),
                 ),
               ),
             );
           }
-          return const SafeArea(
-            child: Center(child: CircularProgressIndicator()),
-          );
+          return SafeArea(child: AppLoading.centered());
         }
         // IndexedStack 常驻全部 tab：切换零构建、立即响应；切换时淡入。
         // 桌面宽窗口下内容区居中限宽，避免手机布局被横向拉伸。
@@ -2020,7 +2034,7 @@ class _SessionsTabState extends State<_SessionsTab> {
       future: _searchFutureFor(q),
       builder: (context, snap) {
         if (!snap.hasData) {
-          return const Center(child: CircularProgressIndicator());
+          return AppLoading.centered();
         }
         final results = snap.data!;
         if (results.isEmpty) {
@@ -2340,10 +2354,7 @@ class _SessionTile extends StatelessWidget {
               SizedBox(
                 width: 12,
                 height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.8,
-                  color: _iosBlue,
-                ),
+                child: AppLoading(size: AppLoadingSize.inline, color: _iosBlue),
               ),
               const SizedBox(width: 6),
               Text(
@@ -2647,33 +2658,33 @@ class _EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // 键盘弹起 / 小窗时可用高度会低于内容高度：滚动而不是溢出，
+    // 保证「新建项目」按钮始终在可视区内。
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          WelcomeAvatar(size: 240),
-          const SizedBox(height: 16),
-          Text('新建一个项目开始', style: theme.textTheme.titleLarge),
-          const SizedBox(height: 8),
-          Text(
-            '项目分类管理会话 · 每个项目可设置工作目录',
-            style: theme.textTheme.bodyMedium!.copyWith(color: theme.hintColor),
-          ),
-          const SizedBox(height: 28),
-          CupertinoButton.filled(
-            onPressed: onCreate,
-            borderRadius: BorderRadius.circular(24),
-            padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 12),
-            child: const Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(CupertinoIcons.plus, size: 16),
-                SizedBox(width: 6),
-                Text('新建项目', style: TextStyle(fontSize: 15)),
-              ],
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            WelcomeAvatar(size: 240),
+            const SizedBox(height: 16),
+            Text('新建一个项目开始', style: theme.textTheme.titleLarge),
+            const SizedBox(height: 8),
+            Text(
+              '项目分类管理会话 · 每个项目可设置工作目录',
+              style: theme.textTheme.bodyMedium!.copyWith(
+                color: theme.hintColor,
+              ),
             ),
-          ),
-        ],
+            const SizedBox(height: 28),
+            GlassActionButton(
+              label: '新建项目',
+              icon: CupertinoIcons.plus,
+              onPressed: onCreate,
+              accent: true,
+              height: 46,
+            ),
+          ],
+        ),
       ),
     );
   }

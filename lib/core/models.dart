@@ -12,6 +12,28 @@ int sanitizeLoadedContextLimit(int value) {
   return value;
 }
 
+/// 长推理等待上限（秒）：等响应头与流中途无数据共用同一上限。
+/// 思考型模型可能在网关侧先推理很久才开始回包，普通 HTTP 超时会误杀。
+const int kDefaultStreamWaitSeconds = 600;
+const int kMinStreamWaitSeconds = 30;
+const int kMaxStreamWaitSeconds = 3600;
+
+/// 单轮回复被输出上限截断后的自动续写轮数上限（0 = 不续写）。
+const int kDefaultContinuationRounds = 16;
+const int kMaxContinuationRoundsLimit = 100;
+
+int sanitizeStreamWaitSeconds(int value) {
+  if (value < kMinStreamWaitSeconds) return kDefaultStreamWaitSeconds;
+  if (value > kMaxStreamWaitSeconds) return kMaxStreamWaitSeconds;
+  return value;
+}
+
+int sanitizeContinuationRounds(int value) {
+  if (value < 0) return kDefaultContinuationRounds;
+  if (value > kMaxContinuationRoundsLimit) return kMaxContinuationRoundsLimit;
+  return value;
+}
+
 /// 本会话实际生效的上下文上限：>0 用会话自定义，否则用全局新建会话默认。
 int effectiveContextLimit({
   required int sessionContextLimit,
@@ -626,7 +648,15 @@ class AppSettings {
   int contextLimit;
 
   /// 单次请求最大输出 token（思考型模型容易把预算花在推理上，默认 8192）。
+  /// 这只是「单次」上限：被服务商按该值截断后会自动续写，见
+  /// [maxContinuationRounds]。
   int maxOutputTokens;
+
+  /// 长推理等待上限（秒）：等响应头 / 流中途无数据共用。
+  int streamWaitSeconds;
+
+  /// 被输出上限截断后的自动续写轮数上限（0 = 只标记不完整，不续写）。
+  int maxContinuationRounds;
 
   /// 上下文压缩阈值（占上下文上限的百分比，如 80 表示 80%）。
   double compressThresholdPercent;
@@ -676,6 +706,13 @@ class AppSettings {
 
   /// DSH 连接：local（本机 127.0.0.1:3080）/ lan（局域网）/ remote（公网）。
   String dshConnectionMode;
+
+  /// [dshConnectionMode] 是否来自**已落盘的设置**。
+  ///
+  /// 默认值（[AppSettings] 构造函数 / 设置丢失）里它恒为 false：那种情况下
+  /// 「local」只是缺省值、不代表用户选择，冷启动**不得**据此自动拉起手机里
+  /// 的 Alpine DSH（proot + node 很重，真机发热复盘见 docs/fix-log.md #391）。
+  bool dshConnectionModeConfigured;
 
   /// DSH 使用的 API 来源：shiyi（拾忆 API）/ dsh（目标 DSH 自有 API）。
   /// 缺省按连接模式迁移：本机保留拾忆 API，局域网/公网默认使用 DSH 自有 API，
@@ -735,6 +772,8 @@ class AppSettings {
     this.themeMode = 'dark',
     this.contextLimit = kDefaultContextLimit,
     this.maxOutputTokens = 8192,
+    this.streamWaitSeconds = kDefaultStreamWaitSeconds,
+    this.maxContinuationRounds = kDefaultContinuationRounds,
     this.compressThresholdPercent = 80,
     this.autoCompress = true,
     this.visionEnabled = false,
@@ -751,6 +790,7 @@ class AppSettings {
     this.dshSearchProvider = 'auto',
     this.dshSearchKey = '',
     this.dshConnectionMode = 'local',
+    this.dshConnectionModeConfigured = false,
     this.dshApiSource = 'shiyi',
     this.dshLanHost = '',
     this.dshLanPort = 3080,
@@ -788,6 +828,8 @@ class AppSettings {
     String? themeMode,
     int? contextLimit,
     int? maxOutputTokens,
+    int? streamWaitSeconds,
+    int? maxContinuationRounds,
     double? compressThresholdPercent,
     bool? autoCompress,
     bool? visionEnabled,
@@ -804,6 +846,7 @@ class AppSettings {
     String? dshSearchProvider,
     String? dshSearchKey,
     String? dshConnectionMode,
+    bool? dshConnectionModeConfigured,
     String? dshApiSource,
     String? dshLanHost,
     int? dshLanPort,
@@ -839,6 +882,8 @@ class AppSettings {
     themeMode: themeMode ?? this.themeMode,
     contextLimit: contextLimit ?? this.contextLimit,
     maxOutputTokens: maxOutputTokens ?? this.maxOutputTokens,
+    streamWaitSeconds: streamWaitSeconds ?? this.streamWaitSeconds,
+    maxContinuationRounds: maxContinuationRounds ?? this.maxContinuationRounds,
     compressThresholdPercent:
         compressThresholdPercent ?? this.compressThresholdPercent,
     autoCompress: autoCompress ?? this.autoCompress,
@@ -856,6 +901,8 @@ class AppSettings {
     dshSearchProvider: dshSearchProvider ?? this.dshSearchProvider,
     dshSearchKey: dshSearchKey ?? this.dshSearchKey,
     dshConnectionMode: dshConnectionMode ?? this.dshConnectionMode,
+    dshConnectionModeConfigured:
+        dshConnectionModeConfigured ?? this.dshConnectionModeConfigured,
     dshApiSource: dshApiSource ?? this.dshApiSource,
     dshLanHost: dshLanHost ?? this.dshLanHost,
     dshLanPort: dshLanPort ?? this.dshLanPort,
@@ -892,6 +939,8 @@ class AppSettings {
     'themeMode': themeMode,
     'contextLimit': contextLimit,
     'maxOutputTokens': maxOutputTokens,
+    'streamWaitSeconds': streamWaitSeconds,
+    'maxContinuationRounds': maxContinuationRounds,
     'compressThresholdPercent': compressThresholdPercent,
     'autoCompress': autoCompress,
     'visionEnabled': visionEnabled,
@@ -943,6 +992,13 @@ class AppSettings {
     themeMode: j['themeMode'] ?? 'dark',
     contextLimit: (j['contextLimit'] as num?)?.toInt() ?? kDefaultContextLimit,
     maxOutputTokens: (j['maxOutputTokens'] as num?)?.toInt() ?? 8192,
+    streamWaitSeconds: sanitizeStreamWaitSeconds(
+      (j['streamWaitSeconds'] as num?)?.toInt() ?? kDefaultStreamWaitSeconds,
+    ),
+    maxContinuationRounds: sanitizeContinuationRounds(
+      (j['maxContinuationRounds'] as num?)?.toInt() ??
+          kDefaultContinuationRounds,
+    ),
     compressThresholdPercent:
         (j['compressThresholdPercent'] as num?)?.toDouble() ?? 80,
     autoCompress: j['autoCompress'] ?? true,
@@ -960,6 +1016,8 @@ class AppSettings {
     dshSearchProvider: j['dshSearchProvider'] ?? 'auto',
     dshSearchKey: j['dshSearchKey'] ?? '',
     dshConnectionMode: _dshConnectionModeFromJson(j['dshConnectionMode']),
+    // 只有落盘过连接模式的设置才算「用户选过」；缺失时不要据此拉起本机 DSH。
+    dshConnectionModeConfigured: j.containsKey('dshConnectionMode'),
     dshApiSource: _dshApiSourceFromJson(
       j['dshApiSource'],
       _dshConnectionModeFromJson(j['dshConnectionMode']),

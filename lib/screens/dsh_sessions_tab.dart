@@ -3,12 +3,14 @@ import 'dart:async';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import '../core/poll_visibility.dart';
 import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
 import '../services/dsh_service.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import '../widgets/traffic_lights_button.dart';
@@ -45,7 +47,15 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
     _load();
     // 运行中会话的状态会变化，30s 轻量刷新一次（阶段 1 轮询过渡）。
     _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-      if (mounted) _load(silent: true);
+      // 这个 tab 常驻 IndexedStack：后台 / 被别的页面盖住时不拉（发热复盘 #393）。
+      if (!dshPollVisible(
+        mounted: mounted,
+        lifecycle: WidgetsBinding.instance.lifecycleState,
+        routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+      )) {
+        return;
+      }
+      _load(silent: true);
     });
     // 进入 DSH 模式：自动检查一次更新（开关开启时），发现新版提示。
     unawaited(_autoCheckUpdate());
@@ -266,7 +276,7 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
 
   Widget _buildBody(bool dark) {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -309,7 +319,7 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
                 ),
               ),
               const SizedBox(height: 12),
-              CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+              GlassActionButton(label: '重试', onPressed: _load, accent: true),
             ],
           ),
         ),
@@ -328,9 +338,10 @@ class _DshSessionsTabState extends State<DshSessionsTab> {
             const SizedBox(height: 12),
             const Text('还没有 DeepSeek Harness 会话'),
             const SizedBox(height: 14),
-            CupertinoButton.filled(
+            GlassActionButton(
+              label: '新建会话',
               onPressed: _newSession,
-              child: const Text('新建会话'),
+              accent: true,
             ),
           ],
         ),

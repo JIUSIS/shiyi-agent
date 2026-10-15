@@ -9,6 +9,7 @@ import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
 import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/dsh_directory_picker.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
@@ -88,26 +89,12 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
         ? !DshEndpoint.isLocal(widget.shiyi!.settings)
         : !DshService.instance.managesLocalProcess;
     if (hostDirectory) {
-      try {
-        picked = await dshHostDefaultDirectory(_api);
-        ctrl.text = picked;
-      } catch (e) {
-        if (!mounted) {
-          ctrl.dispose();
-          return;
-        }
-        _toast('无法读取远程电脑目录：$e');
-        ctrl.dispose();
-        return;
-      }
+      // 原生选择器场景拿不到默认目录：不放弃，交给对话框里的「选择目录」。
+      picked = await dshHostDefaultDirectory(_api);
+      ctrl.text = picked;
     }
     if (!mounted) {
       ctrl.dispose();
-      return;
-    }
-    if (hostDirectory && (picked ?? '').trim().isEmpty) {
-      ctrl.dispose();
-      _toast('远程电脑没有返回有效工作目录');
       return;
     }
     final path = await showIosFadeDialog<String>(
@@ -392,7 +379,7 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -401,7 +388,7 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
           children: [
             Text(_error!, textAlign: TextAlign.center),
             const SizedBox(height: 12),
-            CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+            GlassActionButton(label: '重试', onPressed: _load, accent: true),
           ],
         ),
       );
@@ -420,9 +407,10 @@ class _DshWorkspacesScreenState extends State<DshWorkspacesScreen> {
                   const SizedBox(height: 12),
                   const Text('还没有工作数据'),
                   const SizedBox(height: 14),
-                  CupertinoButton.filled(
+                  GlassActionButton(
+                    label: '添加工作数据',
                     onPressed: _busy ? null : _create,
-                    child: const Text('添加工作数据'),
+                    accent: true,
                   ),
                 ],
               )

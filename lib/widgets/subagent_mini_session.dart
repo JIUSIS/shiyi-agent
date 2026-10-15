@@ -5,9 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
+import 'chat_liquid_glass.dart';
+import '../core/poll_visibility.dart';
 import '../core/models.dart';
 import '../core/subagent_live.dart';
-import 'chat_liquid_glass.dart';
 import 'markdown_text.dart';
 import 'smooth_stream_text.dart';
 import 'tool_pill.dart';
@@ -224,7 +225,7 @@ class _SubagentStatusBarState extends State<SubagentStatusBar>
                 const SizedBox(
                   width: 10,
                   height: 10,
-                  child: CupertinoActivityIndicator(radius: 5),
+                  child: AppLoading(size: AppLoadingSize.inline),
                 ),
               ],
             ],
@@ -299,8 +300,16 @@ class _SubagentMiniOverlayState extends State<_SubagentMiniOverlay> {
     _stopDetailPoll();
     if (widget.resolveDetail == null) return;
     _detailPoll = Timer.periodic(const Duration(milliseconds: 400), (_) {
+      // 后台 / 被盖住时不拉：这条 400ms 一轮是远端 subagent.history。
       final agent = _currentAgent;
       if (agent == null) return;
+      if (!dshPollVisible(
+        mounted: mounted,
+        lifecycle: WidgetsBinding.instance.lifecycleState,
+        routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+      )) {
+        return;
+      }
       unawaited(_resolve(agent));
     });
   }

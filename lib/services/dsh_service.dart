@@ -30,6 +30,13 @@ enum DshStatus {
   error,
 }
 
+/// 本机 DSH 启动就绪的轮询间隔：前 20 秒 500ms（冷启动往往很快），
+/// 之后退到 2 秒 —— 真机复盘发现局域网切走后旧等待仍按 2Hz 打请求，
+/// 白烧 CPU/网络（见 docs/fix-log.md #391）。抽成纯函数便于单测。
+Duration dshStartPollDelay(Duration elapsed) => elapsed.inSeconds < 20
+    ? const Duration(milliseconds: 500)
+    : const Duration(seconds: 2);
+
 /// DSH（DeepSeek Harness）服务管理：版本检测 / 安装更新 / 启动停止。
 ///
 /// - 版本源：npm registry（@deepseek-ai/dsh，官方发布渠道，与源码同步）；
@@ -246,6 +253,99 @@ class DshService {
     return src.contains(needle) ? src.replaceFirst(needle, repl) : src;
   }
 
+  /// Android app 数据分区禁止 hard link：DSH 的会话「世代迁移」也走 link()
+  /// 做无覆盖发布（`session.migration.<token>.jsonl.zstd.tmp` →
+  /// `session.v4.jsonl.zstd`）。失败会让 `session/resume` 抛
+  /// `EACCES: permission denied, link …`，上层 RPC 表现为
+  /// `session/selectModel` → `gateway/internal: resume failed for session …`，
+  /// 临时中转因此整条链路失败（provider 刚注入就被撤销）。
+  /// 保持官方语义：EEXIST 仍返回 false（交给调用方校验已在位的文件）；
+  /// 只有 EACCES 一类「本分区不支持 link」才回退 rename()，回退前先探测目标
+  /// 是否已被其它写者发布，避免覆盖。
+  static String patchAndroidSessionMigrationLink(String src) {
+    var out = src;
+    const importOld =
+        'import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";';
+    const importNew =
+        'import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, truncate } from "node:fs/promises";';
+    if (out.contains(importOld)) out = out.replaceFirst(importOld, importNew);
+    const needle =
+        '\t\tawait internals.fs.link(staged, currentPath);\n'
+        '\t} catch (error) {\n'
+        '\t\t/* v8 ignore else -- a non-collision filesystem error propagates unchanged. */\n'
+        '\t\tif (isEEXIST(error)) return false;\n'
+        '\t\t/* v8 ignore next -- the filesystem error is already complete. */\n'
+        '\t\tthrow error;\n'
+        '\t}';
+    const repl =
+        '\t\tawait internals.fs.link(staged, currentPath);\n'
+        '\t} catch (error) {\n'
+        '\t\tif (isEEXIST(error)) return false;\n'
+        '\t\tif (error?.code !== "EACCES" && error?.code !== "ENOSYS" && error?.code !== "EPERM" && error?.code !== "ENOTSUP" && error?.code !== "EOPNOTSUPP") throw error;\n'
+        '\t\tlet occupied = false;\n'
+        '\t\ttry {\n'
+        '\t\t\tawait internals.fs.stat(currentPath);\n'
+        '\t\t\toccupied = true;\n'
+        '\t\t} catch {}\n'
+        '\t\tif (occupied) return false;\n'
+        '\t\tawait rename(staged, currentPath);\n'
+        '\t}';
+    if (out.contains(needle)) out = out.replaceFirst(needle, repl);
+    return out;
+  }
+
+  /// 同类问题：附件（图片/文件）的 content-addressed 发布同样走 link()，
+  /// 在 app 数据分区上一样 EACCES（表现为 `ATTACHMENT_WRITE_FAILED`）。
+  /// 保留官方「目标已存在则校验摘要」的语义，只把 link 换成
+  /// `copyFile(..., COPYFILE_EXCL)`——它同样不会覆盖已有对象。
+  static String patchAndroidAttachmentLink(String src) {
+    var out = src;
+    const importOld =
+        'import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";';
+    const importNew =
+        'import { chmod, copyFile, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";';
+    if (out.contains(importOld)) out = out.replaceFirst(importOld, importNew);
+    const guard =
+        '\t\t\t/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */\n'
+        '\t\t\tif (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;';
+    for (final site in <({String call, String src, String digest})>[
+      (call: 'await link(source, target);', src: 'source', digest: 'sha256'),
+      (
+        call: 'await link(staged.path, target);',
+        src: 'staged.path',
+        digest: 'staged.sha256',
+      ),
+    ]) {
+      final digest =
+          '\t\t\tif (await digestFile(target) !== ${site.digest}) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");';
+      final needle = [
+        '\t\t\t${site.call}',
+        '\t\t} catch (error) {',
+        guard,
+        digest,
+        '\t\t}',
+      ].join('\n');
+      final repl = [
+        '\t\t\t${site.call}',
+        '\t\t} catch (error) {',
+        '\t\t\tif (error?.code === "EACCES" || error?.code === "ENOSYS" || error?.code === "EPERM" || error?.code === "ENOTSUP" || error?.code === "EOPNOTSUPP") {',
+        '\t\t\t\ttry {',
+        '\t\t\t\t\tawait copyFile(${site.src}, target, constants.COPYFILE_EXCL);',
+        '\t\t\t\t} catch (copyError) {',
+        '\t\t\t\t\tif (copyError?.code !== "EEXIST") throw copyError;',
+        '\t\t\t\t\t${digest.trimLeft()}',
+        '\t\t\t\t}',
+        '\t\t\t} else {',
+        guard,
+        digest,
+        '\t\t\t}',
+        '\t\t}',
+      ].join('\n');
+      if (out.contains(needle)) out = out.replaceFirst(needle, repl);
+    }
+    return out;
+  }
+
   /// Android：dsh npm 全局包目录（Alpine 的 npm prefix=/usr/local，
   /// 与 Termux 的 /usr 不同——所有 dsh 包路径统一走这里解析）。
   Future<String> _androidDshDir() async {
@@ -282,10 +382,14 @@ class DshService {
     );
     if (await persist.exists()) {
       final raw = await persist.readAsString();
-      final next = patchAndroidHardlinkPublish(raw);
+      // 两处 link 发布：旧版会话写盘（link(tmp, final)）与会话世代迁移
+      // （link(staged, currentPath)，0.2.0 起 session/resume 会走）。
+      var next = patchAndroidHardlinkPublish(raw);
+      next = patchAndroidSessionMigrationLink(next);
       if (next != raw) {
         await persist.writeAsString(next);
         changed = true;
+        await _appendServiceLog('已打 Android hardlink 补丁：$persist');
       }
     }
     final fsLocal = File(
@@ -297,6 +401,19 @@ class DshService {
       if (next != raw) {
         await fsLocal.writeAsString(next);
         changed = true;
+        await _appendServiceLog('已打 Android hardlink 补丁：$fsLocal');
+      }
+    }
+    final attachment = File(
+      '$dshDir/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js',
+    );
+    if (await attachment.exists()) {
+      final raw = await attachment.readAsString();
+      final next = patchAndroidAttachmentLink(raw);
+      if (next != raw) {
+        await attachment.writeAsString(next);
+        changed = true;
+        await _appendServiceLog('已打 Android hardlink 补丁：$attachment');
       }
     }
     return changed;
@@ -808,6 +925,13 @@ class DshService {
       await refreshStatus();
       return false;
     }
+    // 只在「用户确实选过本机」时才自动拉起：设置丢失 / 尚未落盘时
+    // dshConnectionMode 的 'local' 只是缺省值，据此启动 Alpine + node
+    // 会在手机上白烧 CPU（真机发热复盘见 docs/fix-log.md #391）。
+    if (!_modeConfigured) {
+      await refreshStatus();
+      return true;
+    }
     if (await isRunning()) {
       await refreshStatus();
     } else {
@@ -1222,6 +1346,20 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
   /// 旧版 Android 精简补丁标记（用于识别并清理自动生成的禁用配置）。
   static const String _androidPatchMarker = '# Android: 禁用依赖不可用原生模块';
 
+  /// 官方发行包在 DSH 树根声明的 koffi 版本范围：
+  /// `deepseek-harness-pkg/package.json` → dependencies
+  /// `{"@deepseek-ai/dsh": "0.2.0-rc.2", "koffi": "^3.1.4"}`。
+  /// Android 只 `npm install -g @deepseek-ai/dsh` 会漏掉 koffi 这一半，npm 就把
+  /// dsh-fs-local 等 6 个包 pin 死的 koffi 3.1.1 装满整棵树（实测 3.1.1）。
+  static const String _officialKoffiRange = '^3.1.4';
+
+  /// koffi 官方首个带「动态检测 Linux libc」的版本：CHANGELOG.md:84-91（3.1.3，
+  /// 2026-07-30）——避免在 musl 上先加载 glibc 构建，修复 Alpine ARM64 加载崩溃。
+  /// 低于该版本的预编译包加载器固定先 `require("./linux_arm64/koffi.node")`
+  /// （glibc），在 musl/gcompat 上直接 SIGABRT(`std::system_error`)，而信号无法被
+  /// koffi 自己的 try/catch 或 DSH 的探测 try/catch 捕获。
+  static const String _minMuslKoffiVersion = '3.1.3';
+
   /// Android 完整模式准备：确保 node-pty / koffi 可用，并移除旧版禁用补丁。
   /// [force] 安装/修复后强制重建；普通启动只在前置检查失败时重建
   /// （工具链缺失会触发 apk 下载 + node-gyp 编译，流量大耗时长，
@@ -1237,6 +1375,9 @@ description: 手机端预设：禁用依赖 node-pty/subprocess 的本地工具
       );
     }
     await _ensureAndroidBuildToolchain();
+    // 官方依赖对齐：harness 发行包在 DSH 树根同时声明 koffi（见
+    // _officialKoffiRange）。先补齐它，失败不阻断（后面的源码重建仍可兜底）。
+    await _ensureAndroidTreeKoffi();
     final rebuilt = await _rebuildAndroidNodePty();
     if (!rebuilt) {
       final detail = statusMessage.value.isNotEmpty
@@ -2094,6 +2235,206 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
     );
   }
 
+  /// 按官方声明给 DSH 包的 package.json 补上 `koffi`：
+  /// - `dependencies.koffi = ^3.1.4`：官方 harness 发行包在树根声明的另一半，
+  ///   Android 单独装 `@deepseek-ai/dsh` 时漏掉；
+  /// - `overrides.koffi = ^3.1.4`：npm 官方机制，统一子树里被
+  ///   `dsh-fs-local` / `dsh-subprocess-local` 等 6 个包精确 pin 死的 koffi 3.1.1。
+  /// 已有依赖与覆盖项原样保留，缩进统一 2 空格并补尾换行。
+  @visibleForTesting
+  static String withOfficialKoffiDeclaration(String rawJson) {
+    final map = jsonDecode(rawJson) as Map<String, dynamic>;
+    final deps = Map<String, dynamic>.from(
+      (map['dependencies'] as Map?) ?? const <String, dynamic>{},
+    );
+    deps['koffi'] = _officialKoffiRange;
+    map['dependencies'] = deps;
+    final overrides = Map<String, dynamic>.from(
+      (map['overrides'] as Map?) ?? const <String, dynamic>{},
+    );
+    overrides['koffi'] = _officialKoffiRange;
+    map['overrides'] = overrides;
+    return '${const JsonEncoder.withIndent('  ').convert(map)}\n';
+  }
+
+  /// 读取当前树内 koffi 的解析路径与版本（只读 package.json，不加载原生模块，
+  /// 所以不会触发 SIGABRT）。
+  ///
+  /// 注意：koffi 的 `exports` 不导出 `./package.json`，`require.resolve(
+  /// "koffi/package.json")` 在真机上会抛 `Package subpath './package.json' is
+  /// not defined by "exports"…`（2026-10-01 真机验证）。所以先 `require.resolve(
+  /// "koffi")` 拿入口真实路径，再沿目录向上找到 `name === "koffi"` 的
+  /// package.json。
+  Future<({String? path, String? version, String? error})>
+  _androidKoffiInfo() async {
+    try {
+      final dshDir = await _androidDshDir();
+      final usr = await TermuxRuntime.usrDir();
+      final probeDir = '/usr/${dshDir.substring(usr.length)}';
+      final probe = File('$dshDir/.koffi-info.cjs');
+      await probe.writeAsString(
+        'const fs=require("fs"),path=require("path");const out={};'
+        'try{const entry=require.resolve("koffi");out.entry=entry;'
+        'let d=path.dirname(entry);'
+        'while(d&&d!=="/"){const f=path.join(d,"package.json");'
+        'if(fs.existsSync(f)){try{const j=JSON.parse(fs.readFileSync(f,"utf8"));'
+        'if(j.name==="koffi"){out.path=f;out.version=j.version;break;}}catch(_){}}'
+        'd=path.dirname(d);}'
+        'if(!out.version)out.error="koffi package.json not found from "+entry;}'
+        'catch(e){out.error=String((e&&e.message)||e);}'
+        'console.log("KINFO"+JSON.stringify(out));',
+      );
+      final r = await _runCommand([
+        'sh',
+        '-c',
+        r'cd "$1" && exec node .koffi-info.cjs',
+        'koffi-info',
+        probeDir,
+      ], timeout: const Duration(seconds: 40));
+      final line = r.output
+          .split(RegExp(r'\r?\n'))
+          .where((l) => l.contains('KINFO'))
+          .lastOrNull;
+      if (line == null) {
+        return (path: null, version: null, error: r.output);
+      }
+      final json =
+          jsonDecode(line.substring(line.indexOf('{'))) as Map<String, dynamic>;
+      return (
+        path: json['path'] as String?,
+        version: json['version'] as String?,
+        error: json['error'] as String?,
+      );
+    } catch (e) {
+      return (path: null, version: null, error: '$e');
+    }
+  }
+
+  /// 按官方声明把 DSH 树里的 koffi 升到 `_officialKoffiRange`。
+  /// 这是新版 DSH 在 Android 启动失败的根因修复：
+  /// 1. 官方 harness 发行包在树根声明 `koffi: ^3.1.4`（同时依赖 @deepseek-ai/dsh），
+  ///    Android 只装 @deepseek-ai/dsh，漏掉这台「官方搭配」；
+  /// 2. npm 于是把 dsh-fs-local / dsh-subprocess-local 等 6 个包 pin 的
+  ///    `koffi 3.1.1` 装满整棵树；
+  /// 3. 3.1.1 的预编译包加载器没有 3.1.3 才加入的「动态检测 Linux libc」，
+  ///    固定先 require glibc 二进制 → Alpine(musl)+gcompat 上加载即 SIGABRT
+  ///    （日志：`terminate called after throwing an instance of 'std::system_error'`
+  ///    + musl strerror 的 "No error information"）。
+  /// 用 npm 官方机制对齐版本：树根 package.json 写入 dependencies + overrides
+  /// （overrides 统一子树里被 pin 死的旧版本），再 `npm install` 让 npm 自己重算
+  /// 依赖树。升级后 koffi 自己的加载器会按 process.execPath 的 ELF 解释器选
+  /// `musl_arm64/koffi.node`，不再碰 glibc 构建。
+  Future<bool> _ensureAndroidTreeKoffi() async {
+    final dshDir = await _androidDshDir();
+    final pkg = File('$dshDir/package.json');
+    if (!await pkg.exists()) return false;
+    final before = await _androidKoffiInfo();
+    if (before.version != null &&
+        compareSemver(before.version!, _minMuslKoffiVersion) >= 0) {
+      // 版本已满足官方声明：只为排错留一行记录（这条日志是判断「树内 koffi 是否
+      // 已被对齐」的唯一现场依据，不要删）。
+      await _appendServiceLog(
+        'koffi 版本已满足官方声明（$_officialKoffiRange）：'
+        '${before.version} ${before.path ?? ""}',
+      );
+      return true;
+    }
+    statusMessage.value = '正在按官方声明对齐 koffi（musl ARM64 预编译）…';
+    await _appendServiceLog(
+      'Android koffi 升级前：${before.version ?? "(未安装)"} '
+      '${before.path ?? before.error ?? ""}',
+    );
+    try {
+      final updated = withOfficialKoffiDeclaration(await pkg.readAsString());
+      await pkg.writeAsString(updated);
+    } catch (e) {
+      await _appendServiceLog('写入 koffi 官方依赖声明失败：$e');
+      return false;
+    }
+    final usr = await TermuxRuntime.usrDir();
+    final prootDsh = '/usr/${dshDir.substring(usr.length)}';
+    final proxy = await _detectProxy();
+    final env = <String, String>{
+      'npm_config_registry': 'https://registry.npmmirror.com',
+      'npm_config_fetch_timeout': '300000',
+      'npm_config_fetch_retries': '2',
+      if (proxy != null) 'npm_config_proxy': proxy.url,
+      if (proxy != null) 'npm_config_https_proxy': proxy.url,
+    };
+    // 同 sharp wasm32 补装：cd 进 dsh 目录用 npm-cli 装，让 npm 认这个目录为项目根。
+    final r = await _runCommand(
+      [
+        'sh',
+        '-c',
+        r'cd "$1" && exec node "$2" install --prefer-offline --ignore-scripts'
+            ' --no-audit --no-fund --loglevel=http',
+        'koffi-upgrade',
+        prootDsh,
+        '/usr/lib/node_modules/npm/bin/npm-cli.js',
+      ],
+      extraEnv: env,
+      timeout: const Duration(minutes: 15),
+    );
+    if (r.exitCode != 0) {
+      await _appendServiceLog('koffi 官方依赖对齐失败：${npmErrorTail(r.output, 600)}');
+      return false;
+    }
+    final after = await _androidKoffiInfo();
+    await _appendServiceLog(
+      'Android koffi 升级后：${after.version ?? "(未安装)"} '
+      '${after.path ?? after.error ?? ""}',
+    );
+    _koffiDiagnosedOnce = false;
+    return after.version != null &&
+        compareSemver(after.version!, _minMuslKoffiVersion) >= 0;
+  }
+
+  /// koffi 加载失败时的深入诊断（写 error.log）。
+  /// 官方预编译包（@koromix/koffi-linux-arm64）里同时装了 musl_arm64 与
+  /// linux_arm64 两个二进制：3.1.3+ 的加载器按 libc 动态选，失败才回退另一个。
+  /// 这里让每个候选各起一个 node 进程——SIGABRT 只杀那一个进程，不会掩盖
+  /// 另一个候选的结果，从而区分「选错 glibc 构建」与「musl 构建在 proot 下也崩」。
+  Future<void> _diagnoseAndroidKoffi() async {
+    try {
+      final dshDir = await _androidDshDir();
+      final usr = await TermuxRuntime.usrDir();
+      final probeDir = '/usr/${dshDir.substring(usr.length)}';
+      final info = await _androidKoffiInfo();
+      final buf = StringBuffer()
+        ..writeln('koffi 诊断：')
+        ..writeln('解析路径：${info.path ?? "(未解析)"}')
+        ..writeln('版本：${info.version ?? "(未知)"}')
+        ..writeln('解析错误：${info.error ?? "-"}');
+      final loader = File('$dshDir/.koffi-load.cjs');
+      await loader.writeAsString(
+        'console.log("node="+process.version+" platform="+process.platform'
+        '+" arch="+process.arch);'
+        'console.log("execPath="+process.execPath);'
+        'try{const m=require(process.argv[2]);'
+        'console.log("load-ok version="+(m&&m.version));}'
+        'catch(e){console.log("load-err "+String((e&&e.message)||e));}',
+      );
+      for (final rel in const [
+        './node_modules/@koromix/koffi-linux-arm64/musl_arm64/koffi.node',
+        './node_modules/@koromix/koffi-linux-arm64/linux_arm64/koffi.node',
+        './node_modules/koffi/build/koffi/linux_arm64/koffi.node',
+      ]) {
+        final r = await _runCommand([
+          'sh',
+          '-c',
+          r'cd "$1" && exec node .koffi-load.cjs "$2"',
+          'koffi-load',
+          probeDir,
+          rel,
+        ], timeout: const Duration(seconds: 40));
+        buf.writeln('$rel → exit=${r.exitCode} ${_tailOutput(r.output, 400)}');
+      }
+      await _appendServiceLog(buf.toString());
+    } catch (e) {
+      await _appendServiceLog('koffi 诊断异常：$e');
+    }
+  }
+
   /// 用户手动触发：完整模式修复（Android）。
   /// 探测 koffi（dsh sandbox 的 FFI 原生模块）是否可加载。
   Future<bool> _androidKoffiProbe() async {
@@ -2117,6 +2458,10 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
         await _appendServiceLog(
           'koffi probe 失败 exit=${r.exitCode} out=${r.output}',
         );
+        if (!_koffiDiagnosedOnce) {
+          _koffiDiagnosedOnce = true;
+          await _diagnoseAndroidKoffi();
+        }
       }
       return r.exitCode == 0 && r.output.contains('koffi-ok');
     } catch (e) {
@@ -2142,9 +2487,21 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   /// 在 dsh 包目录重建 koffi（Android 无 prebuild，源码编译）。
   /// Alpine rootfs 内 cmake/ninja 工具链正常，直接跑 koffi 自带构建脚本
   /// （cnoke.cjs），无需 Termux 时代的 ninja shim 手段。
+  ///
+  /// 顺序（严格按官方机制）：
+  /// 1. 先探测现有 koffi（官方预编译）；
+  /// 2. 失败先按官方声明把整棵树的 koffi 对齐到 `_officialKoffiRange`
+  ///    （3.1.3+ 自带动态 libc 检测，直接加载 musl 预编译）——正常设备到此即可用，
+  ///    不必源码编译。旧日志「cnoke 重建成功但加载验证失败」就是因为树里的
+  ///    3.1.1 预编译加载器先 require glibc 构建，崩在自建二进制之前；
+  /// 3. 仍不行才源码编译（cnoke --prebuild 官方构建脚本，musl 三元组产物）。
   Future<bool> _rebuildAndroidKoffi() async {
     final dshDir = await _androidDshDir();
     if (await _androidKoffiProbe()) return true;
+    if (await _ensureAndroidTreeKoffi() && await _androidKoffiProbe()) {
+      await _appendServiceLog('koffi 已按官方声明升级到 musl 可用版本，无需源码编译');
+      return true;
+    }
     statusMessage.value = '正在编译 FFI 支持（koffi，约 1-3 分钟）…';
     await _ensureNodeGypExecutable();
     final koffiDir = '$dshDir/node_modules/koffi';
@@ -2404,6 +2761,9 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   }
 
   DateTime? _lastProgressAt;
+
+  /// koffi 加载失败诊断每会话最多跑一次（见 _diagnoseAndroidKoffi）。
+  bool _koffiDiagnosedOnce = false;
   int _npmExpectedFetches = 0;
   int _npmFetchedLines = 0;
   int _phaseOutputBytes = 0;
@@ -2462,10 +2822,19 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   }
 
   /// 按设置切换 API 地址。远程模式关掉本机进程管理。
+  /// 当前连接模式是否来自已落盘的设置（见 [AppSettings.dshConnectionModeConfigured]）。
+  bool _modeConfigured = true;
+
   void applyConnection(AppSettings s) {
     managesLocalProcess = DshEndpoint.isLocal(s);
+    _modeConfigured = s.dshConnectionModeConfigured;
     _currentScopeKey = DshEndpoint.scopeKeyOf(s);
     apiFor(s);
+    // 局域网 / 公网带 Token：先换一次会话 Cookie（rc.2 官方客户端机制）。
+    // 只发 Authorization: Bearer 在真机上会被当未鉴权——「连不上」就是这个。
+    if (DshEndpoint.requiresLivePageData(s)) {
+      unawaited(ensureRemoteSession(s));
+    }
     final uri = Uri.tryParse(DshEndpoint.urlOf(s));
     unawaited(
       RuntimeLogger.instance.info(
@@ -2484,6 +2853,52 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
 
   /// 服务是否在运行（RPC 就绪探测，端口通了但 API 未初始化也算未就绪）。
   Future<bool> isRunning() => api.rpcPing();
+
+  /// 同一 Token 的换 Cookie 请求不并发重复发。
+  final Map<String, Future<bool>> _remoteCookieExchanges = {};
+
+  /// 局域网 / 公网：带 Token 时用它换取会话 Cookie 再发 RPC。
+  ///
+  /// rc.2 的 Web 端鉴权是「启动行里的 Token → `GET /?token=xxx` → 303 +
+  /// Set-Cookie」，浏览器与手机客户端都吃这套；只带 `Authorization: Bearer`
+  /// 时真机上会被当成未鉴权（表现就是局域网 / 公网「连不上」）。
+  /// 没填 Token 时返回 true（走直连，服务器若不需要鉴权也正常）。
+  Future<bool> ensureRemoteSession(AppSettings s) {
+    if (!DshEndpoint.requiresLivePageData(s)) return Future.value(true);
+    final client = apiFor(s);
+    if (client.authCookie.isNotEmpty) return Future.value(true);
+    final token = client.token.trim();
+    final key = '${client.scopeKey}|$token';
+    final inFlight = _remoteCookieExchanges[key];
+    if (inFlight != null) return inFlight;
+    final future = () async {
+      try {
+        // ① 先用落盘的 Cookie：应用重启后不必重新换。真机实测（#395）：
+        //    内存 Cookie 一丢、启动 Token 又被轮换，重换必然失败
+        //    （响应不是 303）→ 局域网 401 再也连不上。
+        if (await client.restoreAuthCookie()) {
+          await _appendServiceLog('复用已保存的远端 DSH 会话 Cookie');
+          return true;
+        }
+        // 没填 Token：走直连（服务器若不需要鉴权也正常）。
+        if (token.isEmpty) return true;
+        final ok = await client.authenticateWithLaunchToken(token);
+        await _appendServiceLog(
+          ok
+              ? '已用 Token 换取远端 DSH 会话 Cookie'
+              : '远端 DSH Token 未换到 Cookie（响应不是 303/Set-Cookie），继续用 Bearer 尝试',
+        );
+        return ok;
+      } catch (e) {
+        await _appendServiceLog('远端 DSH Token 换取 Cookie 失败：$e');
+        return false;
+      } finally {
+        _remoteCookieExchanges.remove(key);
+      }
+    }();
+    _remoteCookieExchanges[key] = future;
+    return future;
+  }
 
   Future<void> _restoreWebUiAuthFromLog() async {
     if (!managesLocalProcess || api.baseUrl.isEmpty) return;
@@ -2764,12 +3179,21 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
       );
       progress.value = .42;
       _appendRuntimeOutput('dsh web 已启动，正在等待 127.0.0.1:3080…\n');
-      // 轮询就绪（500ms 间隔；dsh 冷启动真机实测约 4 分钟，超时放宽到
-      // 5 分钟，避免服务还在初始化就被误判「启动超时」）。
+      // 轮询就绪（前 20 秒 500ms，之后退到 2 秒；dsh 冷启动真机实测约
+      // 4 分钟，超时放宽到 5 分钟，避免服务还在初始化就被误判「启动超时」）。
       final readyStartedAt = DateTime.now();
       final readyDeadline = DateTime.now().add(const Duration(minutes: 5));
       while (DateTime.now().isBefore(readyDeadline)) {
-        await Future<void>.delayed(const Duration(milliseconds: 500));
+        await Future<void>.delayed(
+          dshStartPollDelay(DateTime.now().difference(readyStartedAt)),
+        );
+        // 等待期间用户切到局域网/公网：立刻收手。否则这个旧的本机启动
+        // 等待会继续每 500ms 打一次 session.list，白烧 CPU/网络最长 5 分钟
+        // （真机发热复盘，见 docs/fix-log.md #391）。
+        if (!managesLocalProcess) {
+          await _appendServiceLog('连接已切换到远端，停止等待本机 DSH 启动');
+          return false;
+        }
         if (serverExited) {
           if (!retryPluginLoad &&
               isBuiltInPluginLoadFailure(installOutput.value)) {
@@ -2832,6 +3256,19 @@ env | sort | grep -E '^(LD_LIBRARY_PATH|PATH|SHELL|PREFIX|TMPDIR|HOME|CC|CXX)=' 
   }
 
   /// 停止 DSH 服务。远程模式不杀本机进程。
+  /// 退出 App 时是否需要真的去停本机 DSH。
+  ///
+  /// 只有「进程在跑 / 正在启动」才需要。没启动过、没安装时去跑 `init-host`
+  /// 会卡在 Alpine rootfs 首次初始化（apk 装基础包，实测可达数分钟），
+  /// 用户点「退出」就变成点了没反应。见 docs/fix-log.md #385。
+  bool get needsStopOnExit {
+    if (!managesLocalProcess) return false;
+    if (_serverProcess != null) return true;
+    return status.value == DshStatus.starting ||
+        status.value == DshStatus.running ||
+        status.value == DshStatus.stopping;
+  }
+
   Future<void> stop() async {
     if (!managesLocalProcess) return;
     status.value = DshStatus.stopping;

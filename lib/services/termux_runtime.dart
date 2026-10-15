@@ -23,6 +23,7 @@ class TermuxRuntime {
   static const String _shmemAsset = 'assets/termux/libandroid-shmem.so';
   static const String _loaderAsset = 'assets/termux/loader';
   static const String _loader32Asset = 'assets/termux/loader32';
+
   /// apk-tools 2.x 静态版（Alpine 3.20 官方包 apk-tools-static 提取）。
   /// rootfs 自带 apk-tools 3 写数据库用 hardlink 原子发布，无 root 设备
   /// SELinux 禁 app_data_file link，apk add 装完文件但写 db 报
@@ -220,8 +221,9 @@ class TermuxRuntime {
   static Future<String?> nativeLibraryDir() async {
     if (isWindows) return null;
     try {
-      return _nativeLibDir ??=
-          await _channel.invokeMethod<String>('nativeLibraryDir');
+      return _nativeLibDir ??= await _channel.invokeMethod<String>(
+        'nativeLibraryDir',
+      );
     } catch (_) {
       return null;
     }
@@ -249,6 +251,17 @@ class TermuxRuntime {
 
   static Future<String> _versionFilePath() async =>
       '${await _baseDir()}/.env_version';
+
+  /// 首次 init 是否已完成（`/etc/shiyi-ready` 就位 = 基础包已装好）。
+  /// 未就绪时任何 apk/pip 命令都要先等 init，别叠命令上去把它挤死。
+  static Future<bool> isReady() async {
+    if (isWindows) return true;
+    try {
+      return File('${await rootfsDir()}/etc/shiyi-ready').existsSync();
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// 是否已安装且版本匹配（proot + rootfs busybox 存在 + 版本文件一致）。
   /// Windows 恒为 true。
@@ -289,8 +302,7 @@ class TermuxRuntime {
       try {
         await Directory(rootfs).delete(recursive: true);
       } catch (_) {
-        final orphan =
-            '$rootfs.old.${DateTime.now().millisecondsSinceEpoch}';
+        final orphan = '$rootfs.old.${DateTime.now().millisecondsSinceEpoch}';
         await Directory(rootfs).rename(orphan);
       }
     }
@@ -307,10 +319,12 @@ class TermuxRuntime {
     await _copyAsset(_prootAsset, '${binDir.path}/proot', executable: true);
     await _copyAsset(_tallocAsset, '${libDir.path}/libtalloc.so.2');
     await _copyAsset(_shmemAsset, '${libDir.path}/libandroid-shmem.so');
-    await _copyAsset(_loaderAsset, '${libDir.path}/loader',
-        executable: true);
-    await _copyAsset(_loader32Asset, '${libDir.path}/loader32',
-        executable: true);
+    await _copyAsset(_loaderAsset, '${libDir.path}/loader', executable: true);
+    await _copyAsset(
+      _loader32Asset,
+      '${libDir.path}/loader32',
+      executable: true,
+    );
 
     await ensureScripts();
 
@@ -339,8 +353,11 @@ class TermuxRuntime {
     try {
       final env = await environment();
       final argv = await shellCommand(const ['-c', 'true']);
-      await Process.run(argv.first, argv.sublist(1), environment: env)
-          .timeout(const Duration(minutes: 4));
+      await Process.run(
+        argv.first,
+        argv.sublist(1),
+        environment: env,
+      ).timeout(const Duration(minutes: 4));
     } catch (_) {}
   }
 
@@ -352,10 +369,9 @@ class TermuxRuntime {
     final data = await rootBundle.load(assetPath);
     final f = File(target);
     f.parent.createSync(recursive: true);
-    f.writeAsBytesSync(data.buffer.asUint8List(
-      data.offsetInBytes,
-      data.lengthInBytes,
-    ));
+    f.writeAsBytesSync(
+      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+    );
     if (executable) {
       try {
         await Process.run('/system/bin/chmod', ['755', target]);
@@ -400,7 +416,9 @@ class TermuxRuntime {
     try {
       final parts = <String>[];
       if (!File(await shellPath()).existsSync()) parts.add('init-host');
-      if (!File('${await localDir()}/bin/proot').existsSync()) parts.add('proot');
+      if (!File('${await localDir()}/bin/proot').existsSync()) {
+        parts.add('proot');
+      }
       if (!File('${await rootfsDir()}/bin/busybox').existsSync()) {
         parts.add('rootfs/bin/busybox');
       }
@@ -408,7 +426,9 @@ class TermuxRuntime {
       if (!vf.existsSync()) {
         parts.add('.env_version missing');
       } else if ((await vf.readAsString()).trim() != _envVersion) {
-        parts.add('.env_version=${(await vf.readAsString()).trim()} != $_envVersion');
+        parts.add(
+          '.env_version=${(await vf.readAsString()).trim()} != $_envVersion',
+        );
       }
       return parts.isEmpty ? 'unknown' : parts.join(', ');
     } catch (e) {
@@ -432,11 +452,15 @@ class TermuxRuntime {
     try {
       final env = await environment();
       final argv = await shellCommand(const ['-c', 'true']);
-      final proc =
-          await Process.start(argv.first, argv.sublist(1), environment: env);
+      final proc = await Process.start(
+        argv.first,
+        argv.sublist(1),
+        environment: env,
+      );
       // init-host 会同步跑完整 init；锁被占时等持有者完成（init 最坏
-      // 一轮约 8 分钟）。15 分钟超时兜底，超时不 kill（避免留锁）。
-      final deadline = DateTime.now().add(const Duration(minutes: 15));
+      // 一轮约 3×(120s update + 480s add) ≈ 30 分钟）。20 分钟超时兜底，
+      // 超时不 kill（避免留锁）。
+      final deadline = DateTime.now().add(const Duration(minutes: 20));
       while (DateTime.now().isBefore(deadline) && !readyFile.existsSync()) {
         if (await proc.exitCode.timeout(
               const Duration(seconds: 5),
@@ -538,13 +562,13 @@ class TermuxRuntime {
     }
     final prefix = await prefixDir();
     final local = await localDir();
-    final linker =
-        File('/system/bin/linker64').existsSync()
-            ? '/system/bin/linker64'
-            : '/system/bin/linker';
+    final linker = File('/system/bin/linker64').existsSync()
+        ? '/system/bin/linker64'
+        : '/system/bin/linker';
     final nativeLib = await nativeLibraryDir();
-    final loaderDir =
-        (nativeLib == null || nativeLib.isEmpty) ? '$local/lib' : nativeLib;
+    final loaderDir = (nativeLib == null || nativeLib.isEmpty)
+        ? '$local/lib'
+        : nativeLib;
     return {
       'HOME': '$prefix/home',
       'PREFIX': prefix,
@@ -679,21 +703,35 @@ exec "$LINKER" "$PROOT_BIN" $ARGS /bin/sh -c '
 # mkdir 原子互斥：app 多命令并发触发 init 时同一时刻只跑一个（proot 下
 # flock 不可靠，并发 apk 会锁冲突 EAGAIN/EINTR，基础包装不上）。
 INIT_LOCK=/tmp/shiyi-init.lock
+# 日志与分支先定义：下面的 lock 分支也要能落日志（否则「卡住」时看不到
+# 任何 init 记录，只能靠猜）。
+INIT_LOG=/sdcard/agent/logs/init-debug.log
+INIT_VERSION=7
+branch=v3.24
+echo "[$(date)] init start v=$INIT_VERSION ready=$([ -f /etc/shiyi-ready ] && echo yes || echo no) lock=$([ -d "$INIT_LOCK" ] && echo held || echo free) branch=[$branch] release=[$(cat /etc/alpine-release 2>/dev/null)] apk=$(apk --version 2>/dev/null)" >> "$INIT_LOG" 2>/dev/null
 if ! mkdir "$INIT_LOCK" 2>/dev/null; then
-  # 锁被占：等待持有者完成（init 一轮最长约 8 分钟），不能直接退出——
-  # 否则后续命令会绕过 init 直接跑 apk，与正在进行的 apk 并发抢数据库
-  # 锁（EAGAIN/EINTR），基础包/工具链互相踩踏（2026-08-16 安装死循环）。
-  i=0
-  while [ $i -lt 120 ] && [ -d "$INIT_LOCK" ]; do
-    # 超过 15 分钟视为残留（init 一轮最长 5×90s+重试 ≈ 8 分钟），清除重试
-    if find "$INIT_LOCK" -mmin +15 2>/dev/null | grep -q .; then
-      chmod 777 "$INIT_LOCK" 2>/dev/null
-      rm -rf "$INIT_LOCK" 2>/dev/null
-      break
+  # 锁被占：只在「持锁进程确实还活着」时等它（PID 写在锁目录里）。
+  # 进程已被杀 / 上层超时放弃 / 旧版残留锁（没有 pid 文件）→ 立刻清锁继续，
+  # 不能傻等：真机踩坑是残留锁让每个新 init 白等 10 分钟然后放弃，
+  # 基础包永远装不上，LAAP / DSH 安装全部卡在 8%。
+  holder=$(cat "$INIT_LOCK/pid" 2>/dev/null)
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    i=0
+    while [ $i -lt 60 ] && [ -d "$INIT_LOCK" ] && kill -0 "$holder" 2>/dev/null; do
+      sleep 5
+      i=$((i + 1))
+    done
+  fi
+  if [ -d "$INIT_LOCK" ]; then
+    stale=no
+    find "$INIT_LOCK" -mmin +40 2>/dev/null | grep -q . && stale=yes
+    if [ "$stale" = no ] && [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      # 真的还在装（一轮最长 3×(120s update + 480s add) ≈ 30 分钟）：让它装完
+      exit 0
     fi
-    sleep 5
-    i=$((i + 1))
-  done
+    chmod 777 "$INIT_LOCK" 2>/dev/null
+    rm -rf "$INIT_LOCK" 2>/dev/null
+  fi
   mkdir "$INIT_LOCK" 2>/dev/null || exit 0
   chmod 777 "$INIT_LOCK" 2>/dev/null
   # 等待期间持有者已完成初始化：直接释放锁退出，不重复安装
@@ -705,6 +743,7 @@ fi
 # proot -0 下 mkdir 的目录宿主属主是 root，app 无写权限删不掉（rmdir EACCES
 # → 锁残留 → 后续 init 永远被挡）。chmod 777 让 app 随时能删，锁才真正释放。
 chmod 777 "$INIT_LOCK" 2>/dev/null
+echo $$ > "$INIT_LOCK/pid" 2>/dev/null
 [ -f /etc/shiyi-ready ] && [ -x /usr/local/bin/shiyi-apk-sources ] && { rmdir "$INIT_LOCK" 2>/dev/null; exit 0; }
 # DNS 兜底：国内网络优先用国内 DNS（8.8.8.8 被 QoS/丢包，libfetch 解析
 # 会间歇失败报 DNS: transient error / Permission denied）。
@@ -794,10 +833,7 @@ exit 0
 SHIYI_APK_SOURCES
 chmod +x /usr/local/bin/shiyi-apk-sources 2>/dev/null
 shiyi-apk-sources 2>/dev/null || true
-# 分支：rootfs 固定 Alpine 3.24.1，写死 v3.24（动态解析曾失败导致
-# 单源 URL 404、基础包自举失败）。
-branch=v3.24
-# 基础包（幂等；网络抖动时最多重试 5 轮，失败不阻塞、下次执行再试）。
+# 基础包（幂等；网络抖动时最多重试 3 轮，失败不阻塞、下次执行再试）。
 # apk 默认 10s 网络超时对慢网络大包不够，固定 --wait 300（apk-tools
 # 2.x 与 3.x 都支持；3.x 没有 --network-timeout，实测报 unrecognized）。
 # apk 参数按主版本：apk 2 的 --wait 是网络超时（默认 10s 大包必超时，
@@ -811,33 +847,30 @@ branch=v3.24
 # 直接下载解包，重试代价只是重下索引，基础包阶段足够快。
 APK_TO="--wait 60 --no-cache"
 apk --version 2>/dev/null | grep -q 'apk-tools 2' && APK_TO="--wait 300 --no-cache"
-# 基础包阶段用清华单源（-X）：多源索引下载（9 源 × main/community）
-# 在国内慢网络下会卡死（probe 超时实测）；单源镜像全量足够，
-# 就绪后 repositories 保持多源（add 时按顺序尝试官方优先）。
-# 注意：apk 3 的 -X 期待完整仓库 URL，分支会被吞（alpine/v3.24 → 
-# alpine/aarch64 404），必须带 /main 或 /community 子目录。
 APK_SINGLE="-X http://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main"
-# 部署进度日志（定位 init 卡点，普通用户无感）
-INIT_LOG=/sdcard/agent/logs/init-debug.log
-INIT_VERSION=6
-echo "[$(date)] init start v=$INIT_VERSION ready=$([ -f /etc/shiyi-ready ] && echo yes || echo no) branch=[$branch] release=[$(cat /etc/alpine-release 2>/dev/null)] apk=$(apk --version 2>/dev/null)" >> "$INIT_LOG" 2>/dev/null
 if ! apk info -e bash >/dev/null 2>&1; then
+  # 基础包阶段只留清华单源：多源 repositories（18 个 URL，其中 8 个失效）
+  # 每轮 update 要 90s 以上，33 个基础包在 120s 的 add 里必被杀在半路
+  # （真机实测停在 13/33），于是每轮从零重来、rootfs 永远不就绪——
+  # 所有依赖终端的流程（LAAP 安装 / DSH 安装 / 终端）全部卡在这。
+  # 基础包装完再恢复多源（见下面 shiyi-apk-sources）。
+  printf '%s\n%s\n' \
+    "http://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main" \
+    "http://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community" \
+    > /etc/apk/repositories 2>/dev/null
   i=0
-  while [ $i -lt 5 ]; do
-    # timeout 防 libfetch 挂死：apk 3 无网络超时（fetchTimeout=0），连接
-    # 挂起时 apk 永久阻塞 → init 卡住 → 锁残留 → 后续 init 全被挡。
-    # 90s 兜底：单源索引下载+解压正常 5-30s，慢网络 90s 足够。
-    # update 失败不阻断 add：apk 3 的 -X 单源只是追加，repositories 的
-    # 18 个 URL 全量更新，个别源（sjtug 等）失败会让 update 非零退出，
-    # 但其余源索引已可用——add 必须继续尝试，否则基础包永远装不上。
-    timeout 90 apk $APK_TO $APK_SINGLE update >>"$INIT_LOG" 2>&1 || true
-    if timeout 120 apk $APK_TO $APK_SINGLE add bash gcompat glib nano curl ca-certificates coreutils >>"$INIT_LOG" 2>&1; then
+  while [ $i -lt 3 ]; do
+    # 单源索引 5-15s；480s 给 33 个包（--no-cache 每轮重下）留足预算。
+    timeout 120 apk $APK_TO update >>"$INIT_LOG" 2>&1 || true
+    if timeout 480 apk $APK_TO add bash gcompat glib nano curl ca-certificates coreutils >>"$INIT_LOG" 2>&1; then
       break
     fi
     i=$((i + 1))
     sleep 5
   done
   timeout 60 apk $APK_TO cache clean 2>/dev/null || true
+  # 基础包就绪：恢复「官方优先 + 国内镜像测速」的多源列表
+  shiyi-apk-sources >>"$INIT_LOG" 2>&1 || true
 fi
 echo "[$(date)] init: base done bash=$([ -x /bin/bash ] && echo yes || echo no)" >> "$INIT_LOG" 2>/dev/null
 # apk-tools 自身升级到分支最新补丁（minirootfs 是发布快照，索引里可能有
@@ -936,11 +969,3 @@ rm -rf "$TMPD"
 exit 0
 ''';
 }
-
-
-
-
-
-
-
-

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
+import 'chat_liquid_glass.dart';
 import '../services/dsh_api.dart';
 import 'ios_style.dart';
 
@@ -21,16 +22,27 @@ Future<String?> pickDshHostDirectory(
 }
 
 /// 取得当前 DSH 主机默认工作目录，不能回退到手机的 agent 目录。
+///
+/// 目标只提供**原生**目录选择器时（`directoryPicker/list` 返回
+/// `directory-picker/unavailable`），浏览式探测拿不到目录；此时直接返回
+/// 空串，由调用方用「选择目录」（`directoryPicker/pick`）让用户选，
+/// 或用已知的会话/工作区 cwd 兜底 —— 不要在这里抛（见 fix-log #403）。
 Future<String> dshHostDefaultDirectory(DshApiClient api) async {
   try {
     final host = await api.hostDescribe();
     final path = host.cwd.trim().isNotEmpty ? host.cwd : host.home;
     if (path.trim().isNotEmpty) return path.trim();
   } catch (_) {
-    // 旧版 DSH 可能没有 host.describe，继续用目录接口探测。
+    // 忽略：走下面的目录探测。
   }
-  final listing = await api.directoryListing();
-  return (listing.path.trim().isNotEmpty ? listing.path : listing.home).trim();
+  try {
+    final listing = await api.directoryListing();
+    final path = listing.path.trim().isNotEmpty ? listing.path : listing.home;
+    if (path.trim().isNotEmpty) return path.trim();
+  } catch (_) {
+    // 原生选择器场景：没有浏览能力，交给调用方兜底。
+  }
+  return '';
 }
 
 class _DshHostDirectoryPicker extends StatefulWidget {
@@ -215,7 +227,7 @@ class _DshHostDirectoryPickerState extends State<_DshHostDirectoryPicker> {
   }
 
   Widget _buildBody() {
-    if (_loading) return const Center(child: CupertinoActivityIndicator());
+    if (_loading) return AppLoading.centered();
     if (_error.isNotEmpty) {
       return Center(
         child: Text(

@@ -12,11 +12,13 @@ import '../core/app_state.dart';
 import '../core/home_list_order.dart';
 import '../core/mac_page_route.dart';
 import '../core/models.dart';
+import '../core/poll_visibility.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_chat_cache.dart';
 import '../services/dsh_endpoint.dart';
 import '../services/dsh_service.dart';
 import '../services/file_workspace.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/home_drag.dart';
 import '../widgets/home_group_header.dart';
 import '../widgets/dsh_directory_picker.dart';
@@ -37,8 +39,13 @@ const _iosGray = Color(0xFF8E8E93);
 
 /// 默认 agent 目录工作区显示为「默认」；用户改过名则保留。
 String dshNormalizedPath(String path) {
-  var p = path.replaceAll(r'\\', '/');
-  if (p.length > 1 && p.endsWith('/')) p = p.substring(0, p.length - 1);
+  // 注意 `r'\\'` 在 Dart 里是「两个反斜杠」的字面量，单个 `\` 根本不会
+  // 被替换（Windows 路径 C:\a\b 与 C:/a/b 因此匹配不上）。这里用普通字符
+  // 串 `'\\'`（= 一个反斜杠）。
+  var p = path.replaceAll('\\', '/');
+  while (p.length > 1 && p.endsWith('/')) {
+    p = p.substring(0, p.length - 1);
+  }
   return p;
 }
 
@@ -132,6 +139,37 @@ String dshWorkspaceDisplayName(String title, String path, String defaultPath) {
 
 const dshWorkspaceExpandedPrefsKey = 'dsh_workspace_expanded_v1';
 const dshWorkspaceListCacheKey = 'dsh_workspace_list_cache_v1';
+
+/// workspace 接口拿不到时，按会话 cwd 反推工作区列表。
+///
+/// 会话接口（`session/list`）本身带 cwd，比 workspace 接口稳；工作数据页
+/// 宁可显示「按目录分组」的真实会话，也不要一直转圈。标题留空由
+/// [dshWorkspaceDisplayName] 按目录名显示。
+List<DshWorkspace> dshWorkspacesFromSessions(List<DshSessionSummary> sessions) {
+  final groups = <String, List<DshSessionSummary>>{};
+  for (final s in sessions) {
+    final cwd = dshNormalizedPath((s.cwd ?? '').trim());
+    if (cwd.isEmpty) continue;
+    groups.putIfAbsent(cwd, () => <DshSessionSummary>[]).add(s);
+  }
+  final out = <DshWorkspace>[
+    for (final entry in groups.entries)
+      DshWorkspace(
+        workspaceId: entry.key,
+        path: entry.key,
+        title: '',
+        sessionIds: [for (final s in entry.value) s.sessionId],
+        createdAt: '',
+        updatedAt: entry.value
+            .map((s) => s.updatedAt)
+            .fold<int>(0, (a, b) => a > b ? a : b)
+            .toString(),
+      ),
+  ];
+  // 最近有更新的排前面（与官方列表观感一致）。
+  out.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  return out;
+}
 
 /// 主页工作区/会话列表的本地缓存：冷启动或服务未就绪时先显示上次数据，
 /// 避免加载页长时间挡住主页；服务就绪后由 [_load] 静默刷新覆盖。
@@ -392,10 +430,18 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     }
     DshService.instance.status.addListener(_onDshStatus);
     // 远端列表可能由其他设备修改，空闲时也要同步工作区与会话。
-    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (!mounted) return;
-      unawaited(_load(quiet: true));
-    });
+    // 但这个 tab 常驻在 IndexedStack 里（切走也不销毁），被别的页面盖住
+    // 或在后台时不该继续拉——真机上这是纯发热。
+    // 局域网 / 公网没有 WebSocket（8080 转发层不做隧道），一拍就是 1–2 个
+    // 请求，放宽到 10 秒（本机有 mux，保持 5 秒）。见 docs/fix-log.md #397。
+    _refreshTimer = Timer.periodic(
+      Duration(seconds: _usesLivePageData ? 10 : 5),
+      (_) {
+        // 应用不在前台（含 inactive）或页面被盖住就不拉。
+        if (!_pollVisible) return;
+        unawaited(_load(quiet: true));
+      },
+    );
   }
 
   bool get _usesLivePageData =>
@@ -508,11 +554,15 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
         (_hasCache || _workspaces.isNotEmpty || _sessions.isNotEmpty);
     final hasCurrentData = hasCache || _remoteLoaded;
     // 跨组提交中不要先 setState：本地名单还是旧归属时源槽会被撑开。
-    if (!quiet || !hasCurrentData) {
+    // 静默刷新（5 秒一拍）在「没数据但已经知道失败」时不要再把加载页翻
+    // 出来——否则错误页会一直和转圈互相顶，看着就是「一直转圈」。
+    if (!quiet) {
       setState(() {
         _loading = !hasCurrentData;
         _error = null;
       });
+    } else if (!hasCurrentData && _error == null) {
+      setState(() => _loading = true);
     }
     // 先诊断服务：未安装提示未安装，未启动提示未启动，就绪再拉列表。
     final reason = await DshService.instance.unavailableReason();
@@ -527,66 +577,108 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       return;
     }
     _stopServiceRetry();
+    var workspaceApiOk = true;
+    var workspaceError = '';
+    var spaces = const <DshWorkspace>[];
+    var archived = const <String>[];
     try {
-      var r = await DshService.instance.withRecover(
+      final r = await DshService.instance.withRecover(
         _api.listWorkspaces,
         recover: false,
       );
-      var list = await DshService.instance.withRecover(
-        _api.listSessions,
-        recover: false,
-      );
-      if (r.items.isEmpty &&
+      spaces = r.items;
+      archived = r.archivedSessionIds;
+    } catch (e) {
+      // workspace 接口在新版 DSH 上可能整个不可用（旧协议 404、下行流不
+      // 给 baseline）。这里不直接放弃：先记下来，用会话 cwd 兜底分组。
+      workspaceApiOk = false;
+      workspaceError = '$e';
+    }
+    final list = await DshService.instance.withRecover(
+      _api.listSessions,
+      recover: false,
+    );
+    if (!workspaceApiOk && list.isNotEmpty) {
+      spaces = dshWorkspacesFromSessions(list);
+      archived = const <String>[];
+    }
+    try {
+      if (workspaceApiOk &&
+          spaces.isEmpty &&
           mounted &&
           DshService.instance.managesLocalProcess) {
         // 没有工作区时自动创建：链接软件默认 agent 目录。
-        try {
-          await DshService.instance.withRecover(
-            () => _api.createWorkspace(FileWorkspace.defaultWorkspacePath),
-            recover: false,
-          );
-          r = await _api.listWorkspaces();
-          list = await _api.listSessions();
-        } catch (_) {}
-      }
-      if (!mounted) return;
-      setState(() {
-        _workspaces = r.items;
-        _archivedSessionIds = r.archivedSessionIds;
-        _sessions = list;
-        _loading = false;
-        _hasCache = !_usesLivePageData;
-        _remoteLoaded = _usesLivePageData;
-        _error = null;
-        _applyExpandedPrefs();
-        _reapplyPendingMove();
-      });
-      if (!_usesLivePageData) {
-        unawaited(
-          dshWriteWorkspaceListCache(
-            workspaces: _workspaces,
-            sessions: _sessions,
-            archivedSessionIds: _archivedSessionIds,
-          ),
+        await DshService.instance.withRecover(
+          () => _api.createWorkspace(FileWorkspace.defaultWorkspacePath),
+          recover: false,
         );
+        final r = await _api.listWorkspaces();
+        spaces = r.items;
+        archived = r.archivedSessionIds;
+        final refreshed = await _api.listSessions();
+        if (!mounted) return;
+        setState(() {
+          _workspaces = spaces;
+          _archivedSessionIds = archived;
+          _sessions = refreshed;
+          _loading = false;
+          _hasCache = !_usesLivePageData;
+          _remoteLoaded = _usesLivePageData;
+          _error = null;
+          _applyExpandedPrefs();
+          _reapplyPendingMove();
+        });
+        if (!_usesLivePageData) {
+          unawaited(
+            dshWriteWorkspaceListCache(
+              workspaces: _workspaces,
+              sessions: _sessions,
+              archivedSessionIds: _archivedSessionIds,
+            ),
+          );
+        }
+        return;
       }
-    } catch (e) {
-      if (!mounted) return;
-      final hint = await DshService.instance.unavailableReason();
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _error = hasCache ? null : (hint ?? '$e');
-      });
-      if (hint != null || hasCache) _scheduleServiceRetry();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _workspaces = spaces;
+      _archivedSessionIds = archived;
+      _sessions = list;
+      _loading = false;
+      _hasCache = !_usesLivePageData;
+      _remoteLoaded = _usesLivePageData;
+      // 工作区接口挂了但会话读得到：页面照常显示（按目录分组）。
+      // 连会话都没有才把错误摆出来。
+      _error = (!workspaceApiOk && list.isEmpty)
+          ? (workspaceError.isEmpty ? '工作区列表读取失败' : workspaceError)
+          : null;
+      _applyExpandedPrefs();
+      _reapplyPendingMove();
+    });
+    if (!_usesLivePageData) {
+      unawaited(
+        dshWriteWorkspaceListCache(
+          workspaces: _workspaces,
+          sessions: _sessions,
+          archivedSessionIds: _archivedSessionIds,
+        ),
+      );
     }
   }
+
+  /// 页面/应用是否可见（后台、被别的 route 盖住都算不可见）。
+  bool get _pollVisible => dshPollVisible(
+    mounted: mounted,
+    lifecycle: WidgetsBinding.instance.lifecycleState,
+    routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+  );
 
   /// 服务未就绪时每 3 秒自动重查，起来后重新加载列表。
   void _scheduleServiceRetry() {
     _retryTimer?.cancel();
     _retryTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
-      if (!mounted) return;
+      if (!_pollVisible) return;
       final reason = await DshService.instance.unavailableReason();
       if (!mounted) return;
       if (reason == null) {
@@ -676,7 +768,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   Future<void> _runSearch(String q) async {
     try {
-      final hits = await _api.searchSessions(q);
+      final hits = await _api.searchSessions(q, knownSessions: _sessions);
       if (!mounted || _query != q) return;
       setState(() {
         _searchHits = hits;
@@ -708,8 +800,11 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
   // ── 工作区操作（红绿灯 = 添加工作区 = workspace.create） ───────────
 
   static String _folderName(String dir) {
-    var t = dir.replaceAll(r'\\', '/');
-    if (t.endsWith('/')) t = t.substring(0, t.length - 1);
+    // `r'\\'` 是两个反斜杠的字面量，单个 `\` 归一化不到（同 dshNormalizedPath）。
+    var t = dir.replaceAll('\\', '/');
+    while (t.length > 1 && t.endsWith('/')) {
+      t = t.substring(0, t.length - 1);
+    }
     final i = t.lastIndexOf('/');
     return i >= 0 ? t.substring(i + 1) : t;
   }
@@ -719,26 +814,13 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     final hostDirectory = DshEndpoint.modeOf(widget.shiyi.settings) != 'local';
     final nameCtrl = TextEditingController(text: '默认');
     var folder = hostDirectory ? '' : defPath;
+    // 目标只提供原生选择器时拿不到默认目录（directory-picker/unavailable）：
+    // 这时**不要放弃**新建 —— 让用户进对话框用「选择目录」自己挑。
     if (hostDirectory) {
-      try {
-        folder = await dshHostDefaultDirectory(_api);
-      } catch (e) {
-        if (!mounted) {
-          nameCtrl.dispose();
-          return;
-        }
-        _toast('无法读取远程电脑目录：$e');
-        nameCtrl.dispose();
-        return;
-      }
+      folder = await dshHostDefaultDirectory(_api);
     }
     if (!mounted) {
       nameCtrl.dispose();
-      return;
-    }
-    if (hostDirectory && folder.trim().isEmpty) {
-      nameCtrl.dispose();
-      _toast('远程电脑没有返回有效工作目录');
       return;
     }
     final path = await showIosFadeDialog<String>(
@@ -840,6 +922,15 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text('取消'),
               ),
+              // 官方 `workspace/initializeDefault`：让宿主自己初始化它的默认
+              // 工作区（远端起新实例、本地还没建工作区时最省事）。
+              CupertinoDialogAction(
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  await _initializeDefaultWorkspace();
+                },
+                child: const Text('用宿主默认'),
+              ),
               CupertinoDialogAction(
                 isDefaultAction: true,
                 onPressed: () => Navigator.pop(ctx, folder),
@@ -872,6 +963,22 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
       _load();
     } catch (e) {
       _toast('添加工作区失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// 让宿主初始化它的默认工作区：官方 `workspace/initializeDefault`（无参数）。
+  Future<void> _initializeDefaultWorkspace() async {
+    setState(() => _busy = true);
+    try {
+      final id = await _api.initializeDefaultWorkspace();
+      if (!mounted) return;
+      if (id.isNotEmpty) setState(() => _expandedGroups.add(id));
+      _toast(id.isEmpty ? '宿主没返回默认工作区' : '已使用宿主默认工作区');
+      await _load();
+    } catch (e) {
+      _toast('初始化默认工作区失败：$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -985,6 +1092,138 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     } catch (e) {
       _toast('归档失败：$e');
     }
+  }
+
+  /// 会话分叉：官方 `session/fork({sessionId})`（unary，局域网可用）。
+  ///
+  /// 不带 `atSeq` 就是"从当前状态复制一个会话"，成功后刷新列表并把新会话
+  /// 提示出来（新会话 id 由服务端返回）。
+  Future<void> _forkSession(DshSessionSummary s) async {
+    try {
+      final newId = await _api.forkSession(s.sessionId);
+      if (!mounted) return;
+      _toast(newId.isEmpty ? '已分叉' : '已分叉出新会话：$newId');
+      await _load(quiet: true);
+    } catch (e) {
+      _toast('分叉失败：$e');
+    }
+  }
+
+  /// 置顶会话：官方 `workspace/pinSession({sessionId})`。
+  ///
+  /// 置顶**状态**来自 `workspace/follow` 的 baseline（WS），局域网拿不到，
+  /// 所以这里只做动作、不做已置顶标记（见 docs/dsh-parity.md）。
+  Future<void> _pinSession(DshSessionSummary s) async {
+    try {
+      await _api.pinSession(s.sessionId);
+      if (!mounted) return;
+      _toast('已置顶 ${s.title ?? s.sessionId}');
+      _load(quiet: true);
+    } catch (e) {
+      _toast('置顶失败：$e');
+    }
+  }
+
+  /// 已归档会话：列表里被过滤掉了，这里一键取消归档。
+  ///
+  /// 官方 `workspace/unarchiveSession({sessionId})`（unary，局域网可用）。
+  /// 标题要从全量 `session/list` 取（`listSessions` 已经滤掉归档与子代理）。
+  Future<void> _openArchivedSheet() async {
+    List<DshSessionSummary> all;
+    try {
+      all = await _api.listAllSessions();
+    } catch (e) {
+      _toast('读取会话失败：$e');
+      return;
+    }
+    if (!mounted) return;
+    final archived = all
+        .where((s) => _archivedSessionIds.contains(s.sessionId))
+        .toList();
+    if (archived.isEmpty) {
+      _toast('没有已归档的会话');
+      return;
+    }
+    await showIosFadeSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+              child: Row(
+                children: [
+                  Text(
+                    '已归档会话',
+                    style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '${archived.length} 个',
+                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(ctx).hintColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
+                children: [
+                  for (final session in archived)
+                    ListTile(
+                      dense: true,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      leading: const Icon(CupertinoIcons.archivebox, size: 18),
+                      title: Text(
+                        session.title == null || session.title!.isEmpty
+                            ? '未命名会话'
+                            : session.title!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        session.sessionId,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: TextButton(
+                        onPressed: () async {
+                          Navigator.pop(ctx);
+                          try {
+                            final ids = await _api.unarchiveSession(
+                              session.sessionId,
+                            );
+                            if (!mounted) return;
+                            setState(() {
+                              _archivedSessionIds = ids;
+                            });
+                            _toast('已恢复');
+                            await _load();
+                          } catch (e) {
+                            _toast('恢复失败：$e');
+                          }
+                        },
+                        child: const Text('取消归档'),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _copySessionId(DshSessionSummary s) async {
@@ -1283,7 +1522,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                   child: Row(
                     children: [
-                      const CupertinoActivityIndicator(radius: 7),
+                      const AppLoading(size: AppLoadingSize.inline),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
@@ -1343,7 +1582,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     if (_error != null) {
       return Center(
@@ -1352,7 +1591,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
           children: [
             Text(_error!, textAlign: TextAlign.center),
             const SizedBox(height: 12),
-            CupertinoButton.filled(onPressed: _load, child: const Text('重试')),
+            GlassActionButton(label: '重试', onPressed: _load, accent: true),
           ],
         ),
       );
@@ -1362,7 +1601,7 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
     }
     if (_query.isNotEmpty) {
       if (_searching) {
-        return const Center(child: CircularProgressIndicator());
+        return AppLoading.centered();
       }
       if (_searchHits != null) {
         final hits = dshActiveSessions(_searchHits!, _archivedSessionIds);
@@ -1421,6 +1660,25 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
                   _visibleSessionsFor(workspaces[i].workspaceId, byWorkspace),
                   searchMode,
                   workspaceIndex: i,
+                ),
+              ),
+            // 归档会话被列表过滤掉了：给个入口才能恢复
+            // （官方 `workspace/unarchiveSession`，unary、局域网可用）。
+            if (_archivedSessionIds.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6, bottom: 10),
+                child: Center(
+                  child: CupertinoButton(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 6,
+                    ),
+                    onPressed: () => unawaited(_openArchivedSheet()),
+                    child: Text(
+                      '已归档 ${_archivedSessionIds.length} 个会话',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
                 ),
               ),
           ],
@@ -1564,17 +1822,21 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
 
   Widget _sessionTile(DshSessionSummary s, {bool disableSwipe = false}) {
     final title = s.title == null || s.title!.isEmpty ? '未命名会话' : s.title!;
-    final subtitle =
-        '${_timeLabel(s.updatedAt)}'
-        '${s.turnCount > 0 ? ' · ${s.turnCount} 轮' : ''}'
-        '${s.blank ? ' · 空' : ''}';
+    // 搜索结果里优先显示命中片段（rc.2 的 session/search 只给 sessionId+snippet，
+    // 标题靠 join 补回来）。见 docs/fix-log.md #396。
+    final snippet = s.searchSnippet?.trim() ?? '';
+    final subtitle = snippet.isNotEmpty
+        ? snippet
+        : '${_timeLabel(s.updatedAt)}'
+              '${s.turnCount > 0 ? ' · ${s.turnCount} 轮' : ''}'
+              '${s.blank ? ' · 空' : ''}';
     return SwipeActions(
       key: ValueKey(s.sessionId),
       openNotifier: _openSwipeKey,
       onOpenRectChanged: _onOpenSwipeRectChanged,
       swipeKey: s.sessionId,
       disableSwipe: disableSwipe,
-      actionWidth: 176,
+      actionWidth: 220,
       actions: [
         CircularSwipeAction(
           icon: CupertinoIcons.pencil,
@@ -1584,6 +1846,26 @@ class _DshWorkspacesTabState extends State<DshWorkspacesTab> {
           onTap: () {
             _openSwipeKey.value = null;
             _renameSession(s);
+          },
+        ),
+        CircularSwipeAction(
+          icon: CupertinoIcons.arrow_branch,
+          label: '分叉',
+          backgroundColor: _iosGreen,
+          foregroundColor: Colors.white,
+          onTap: () {
+            _openSwipeKey.value = null;
+            unawaited(_forkSession(s));
+          },
+        ),
+        CircularSwipeAction(
+          icon: CupertinoIcons.pin,
+          label: '置顶',
+          backgroundColor: _iosBlue,
+          foregroundColor: Colors.white,
+          onTap: () {
+            _openSwipeKey.value = null;
+            unawaited(_pinSession(s));
           },
         ),
         CircularSwipeAction(
@@ -2889,33 +3171,32 @@ class _EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // 与拾忆会话页同款：可用高度不足时滚动，不溢出。
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const WelcomeAvatar(size: 240),
-          const SizedBox(height: 16),
-          Text('新建一个工作区开始', style: theme.textTheme.titleLarge),
-          const SizedBox(height: 8),
-          Text(
-            '工作区分类管理会话 · 每个工作区对应一个文件夹',
-            style: theme.textTheme.bodyMedium!.copyWith(color: theme.hintColor),
-          ),
-          const SizedBox(height: 28),
-          CupertinoButton.filled(
-            onPressed: onCreate,
-            borderRadius: BorderRadius.circular(24),
-            padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 12),
-            child: const Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(CupertinoIcons.plus, size: 16),
-                SizedBox(width: 6),
-                Text('添加工作区', style: TextStyle(fontSize: 15)),
-              ],
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const WelcomeAvatar(size: 240),
+            const SizedBox(height: 16),
+            Text('新建一个工作区开始', style: theme.textTheme.titleLarge),
+            const SizedBox(height: 8),
+            Text(
+              '工作区分类管理会话 · 每个工作区对应一个文件夹',
+              style: theme.textTheme.bodyMedium!.copyWith(
+                color: theme.hintColor,
+              ),
             ),
-          ),
-        ],
+            const SizedBox(height: 28),
+            GlassActionButton(
+              label: '添加工作区',
+              icon: CupertinoIcons.plus,
+              onPressed: onCreate,
+              accent: true,
+              height: 46,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2941,10 +3222,7 @@ class _DshSessionCard extends StatelessWidget {
               SizedBox(
                 width: 12,
                 height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.8,
-                  color: _iosBlue,
-                ),
+                child: AppLoading(size: AppLoadingSize.inline, color: _iosBlue),
               ),
               SizedBox(width: 6),
               Text(

@@ -318,6 +318,12 @@ class SubagentRunner {
   /// <= 0 表示不裁剪；超预算时裁剪早期工具轮，防复杂任务撑爆上下文。
   final int contextBudgetTokens;
 
+  /// 长推理等待上限（等响应头 / 流空闲共用，与主会话同口径）。
+  final Duration streamWaitTimeout;
+
+  /// 被输出上限截断后的自动续写轮数上限（与主会话同口径）。
+  final int maxContinuationRounds;
+
   /// 测试专用：覆盖单轮执行（默认 null 走真实 LlmClient）。
   @visibleForTesting
   Future<TurnResult?> Function(List<Map<String, dynamic>> msgs)? roundOverride;
@@ -339,6 +345,8 @@ class SubagentRunner {
     this.onLiveTurn,
     this.onTranscript,
     this.contextBudgetTokens = 0,
+    this.streamWaitTimeout = const Duration(minutes: 10),
+    this.maxContinuationRounds = 16,
     this.roundOverride,
   });
 
@@ -523,6 +531,8 @@ class SubagentRunner {
       maxTokens: maxTokens,
       tools: toolsJson,
       shouldStop: shouldStop,
+      streamWaitTimeout: streamWaitTimeout,
+      maxContinuationRounds: maxContinuationRounds,
       onTurn: (t) {
         accumulated = t;
         onLiveTurn?.call(t);

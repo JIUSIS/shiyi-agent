@@ -47,6 +47,10 @@ class SettingsService {
       s.dshLanToken = await _readKey(_dshLanTokenKey);
       s.socks5Servers = await _attachServerPasswords(s.socks5Servers);
       s.contextLimit = sanitizeLoadedContextLimit(s.contextLimit);
+      s.streamWaitSeconds = sanitizeStreamWaitSeconds(s.streamWaitSeconds);
+      s.maxContinuationRounds = sanitizeContinuationRounds(
+        s.maxContinuationRounds,
+      );
       // 旧版本没有输出上限字段：按已选预设带出建议值，
       // 避免思考型模型继续用偏小的 8192。
       if (!json.containsKey('maxOutputTokens')) {

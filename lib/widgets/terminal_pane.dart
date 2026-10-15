@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../core/poll_visibility.dart';
 
 /// 命令输出偏灰绿，输入浅蓝，错误红，警告黄；命令行再按 token 分色。
 const Color terminalOutputColor = Color(0xFF9BBB9B);
@@ -444,6 +445,14 @@ class _TerminalPaneState extends State<TerminalPane>
     widget.focusNode.addListener(_onFocusChanged);
     _cursorTimer = Timer.periodic(const Duration(milliseconds: 530), (_) {
       if (!mounted || !widget.focusNode.hasFocus) return;
+      // 后台 / 被盖住时不闪光标（发热复盘 #393）。
+      if (!dshPollVisible(
+        mounted: true,
+        lifecycle: WidgetsBinding.instance.lifecycleState,
+        routeIsCurrent: ModalRoute.of(context)?.isCurrent ?? true,
+      )) {
+        return;
+      }
       setState(() => _cursorOn = !_cursorOn);
     });
   }

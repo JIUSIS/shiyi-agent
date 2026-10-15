@@ -10,6 +10,7 @@ import 'package:crypto/crypto.dart';
 import '../core/home_list_order.dart';
 import '../core/model_presets.dart';
 import '../core/models.dart';
+import '../core/poll_visibility.dart';
 import '../services/db.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_service.dart';
@@ -160,6 +161,10 @@ class _SessionRun {
   bool sessionCacheKnown = false;
   int sessionContextTokens = 0;
   int sessionContextTokensFull = 0;
+
+  /// 本轮因服务商输出上限/断流而没能写完时的提示；回合结束后展示给用户，
+  /// 不能假装正常完成。
+  String? incompleteNotice;
 
   void resetLastRoundStats() {
     lastRoundTokens = 0;
@@ -658,6 +663,10 @@ class ShiyiState extends ChangeNotifier {
       try {
         while (_activeDshRelayLeases[lease.sessionId]?.token == lease.token) {
           await Future<void>.delayed(const Duration(milliseconds: 500));
+          // 应用不在前台就不做网络轮询：这条循环是「离开会话页之后」启动的
+          // 兜底清理，回合跑几小时就会 2Hz 拉几小时——真机发热复盘 #393/#394。
+          // 循环本身继续等（token 变了就退出），只是不发请求。
+          if (!dshAppForeground()) continue;
           try {
             final sessions = await lease.api.listSessions();
             final session = sessions
@@ -1490,11 +1499,19 @@ class ShiyiState extends ChangeNotifier {
   Future<void> init() async {
     if (loaded) return;
     final started = DateTime.now();
+    // 允许重试：上一次失败的错误先清掉，界面上的「初始化失败」不会一直挂着。
+    initErrorNotifier.value = null;
     unawaited(RuntimeLogger.instance.info('App', 'state.init.started'));
     try {
       settings = await _settingsService.load();
-      if (DshModelSync.canUseShiyiRelay(settings)) {
-        await _ensureDshRelayToken();
+      // 中转令牌、模型目录缓存都不是启动的必需项：写失败（首次运行
+      // Keystore / 目录不可用等）不能把整个 App 卡在「初始化失败」。
+      try {
+        if (DshModelSync.canUseShiyiRelay(settings)) {
+          await _ensureDshRelayToken();
+        }
+      } catch (e) {
+        await _logError('Relay', '中转令牌初始化失败（不阻塞启动）: $e');
       }
       Socks5Proxy.apply(settings);
       DshService.instance.applyConnection(settings);
@@ -1503,7 +1520,11 @@ class ShiyiState extends ChangeNotifier {
       if (matchedProfile != null) {
         settings.apiProfileId = matchedProfile.profileId;
       }
-      await reloadModelCatalogs(notify: false);
+      try {
+        await reloadModelCatalogs(notify: false);
+      } catch (e) {
+        await _logError('模型目录', '读取缓存目录失败（不阻塞启动）: $e');
+      }
       // 同步 DSH 代理开关到服务单例。
       DshService.instance.useProxyEnabled = settings.dshUseProxy;
       await FileWorkspace.ensure();
@@ -2739,6 +2760,7 @@ class ShiyiState extends ChangeNotifier {
       ..completion = Completer<void>()
       ..status = null
       ..streaming = null
+      ..incompleteNotice = null
       ..resetLastRoundStats()
       ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
       ..planMode = currentSessionId == targetSessionId
@@ -3077,9 +3099,10 @@ class ShiyiState extends ChangeNotifier {
     }
 
     // 兜底：只要有一次尝试成功（completed），就清除重试/等待提示，
-    // 避免中断重试成功后状态条残留。
+    // 避免中断重试成功后状态条残留。因服务商输出上限而没写完时保留提示，
+    // 明确告诉用户为什么不完整。
     if (completed) {
-      run.status = null;
+      run.status = run.incompleteNotice;
       _publishRun(run);
     }
 
@@ -3091,15 +3114,14 @@ class ShiyiState extends ChangeNotifier {
   }
 
   /// 清掉半截占位消息，为自动重试做准备。
+  /// 已经生成的内容不清空：重试成功会被新内容整体覆盖，重试再失败时
+  /// 用户至少还能看到上一次的半截内容（不是「凭空消失」）。
   Future<void> _retryReset(_SessionRun run, ChatMessage firstAsst) async {
     final st = run.streaming;
     if (st != null) {
-      st.content = '';
       st.toolCalls = [];
       st.streaming = true;
-      if (identical(st, firstAsst)) {
-        await _db.updateMessageContent(st.id, '');
-      } else {
+      if (!identical(st, firstAsst)) {
         if (currentSessionId == st.sessionId) messages.remove(st);
         await _db.deleteMessage(st.id);
       }
@@ -3228,6 +3250,7 @@ class ShiyiState extends ChangeNotifier {
       ..stopForGuide = false
       ..guideWaiting = false
       ..status = null
+      ..incompleteNotice = null
       ..resetLastRoundStats()
       ..loadedSkillsSnapshot = List<Skill>.of(loadedSkills)
       ..planMode = planMode;
@@ -3288,6 +3311,9 @@ class ShiyiState extends ChangeNotifier {
   /// 多轮工具调用循环：每轮工具调用输出的文字作为独立消息保留，
   /// 最多 99 轮（每轮可含多个工具），最后一轮强制再请求一次拿到最终文本。
   static const int _maxToolRounds = 99;
+
+  /// 流式增量落库的节流间隔（毫秒）。
+  static const int _streamCheckpointMs = 2000;
 
   Future<void> _runAgentLoop(
     _SessionRun run,
@@ -3683,6 +3709,8 @@ class ShiyiState extends ChangeNotifier {
     TurnResult? accumulated;
     var lastStreamEmit = DateTime.now();
     var lastStreamLen = 0;
+    // 流式增量落库节流：切后台/被系统杀掉时不至于把整段生成白丢。
+    var lastCheckpoint = DateTime.now();
     final clientSettings = clientSettingsForSession(sessionId);
     final client = LlmClient(
       baseUrl: clientSettings.baseUrl,
@@ -3696,6 +3724,8 @@ class ShiyiState extends ChangeNotifier {
       reasoningEffortOverride: run.thinkingOn ? run.reasoningEffort : 'off',
       shouldStop: () => run.stopRequested,
       onDiag: (line) => unawaited(_logError('StreamDiag', line)),
+      streamWaitTimeout: Duration(seconds: settings.streamWaitSeconds),
+      maxContinuationRounds: settings.maxContinuationRounds,
       onTurn: (t) {
         accumulated = t;
         // 流式期间同步处理：归一化思考字段 + think 标签兜底拆分。
@@ -3737,6 +3767,22 @@ class ShiyiState extends ChangeNotifier {
           lastStreamEmit = now;
           lastStreamLen = totalLen;
         }
+        // 增量落库（每 _streamCheckpointMs 一次）：手机切后台/被系统回收后
+        // 重新打开仍能看到已经生成的内容，而不是回到空气泡。
+        if (asst.streaming &&
+            now.difference(lastCheckpoint).inMilliseconds >=
+                _streamCheckpointMs) {
+          lastCheckpoint = now;
+          unawaited(
+            _db
+                .updateMessageContent(
+                  asst.id,
+                  asst.content,
+                  reasoning: asst.reasoning.isEmpty ? null : asst.reasoning,
+                )
+                .catchError((Object _) {}),
+          );
+        }
       },
       onError: (e) {
         run.status = '错误: $e';
@@ -3749,6 +3795,15 @@ class ShiyiState extends ChangeNotifier {
       await client.send(msgs);
     } finally {
       run.activeLlmClients.remove(client);
+    }
+    // 服务商输出上限 / 反复断流导致这一轮没写完：明确告诉用户原因，
+    // 不把未完成的内容当成正常完成。
+    if (client.endedIncomplete) {
+      run.incompleteNotice =
+          '模型输出被截断（${client.lastFinishReason ?? '连接中断'}），'
+          '已自动续写 ${client.continuationRounds} 轮仍未写完，本段内容可能不完整。'
+          '可继续发送「接着写」，或在「设置 → 上下文」调大输出上限 / 续写轮数。';
+      unawaited(_logError('生成', '输出未完成：${run.incompleteNotice}'));
     }
     // 以服务端真实 usage 作为会话上下文统计基线（Codex 口径）。
     // 工具多轮循环时每次请求都会覆盖为最新一轮的真实 total。
@@ -4756,6 +4811,8 @@ class ShiyiState extends ChangeNotifier {
           protocol: clientSettings.apiProtocol,
           temperature: settings.temperature,
           maxTokens: settings.maxOutputTokens,
+          streamWaitTimeout: Duration(seconds: settings.streamWaitSeconds),
+          maxContinuationRounds: settings.maxContinuationRounds,
           toolsJson: _toolsJsonFor(def.allowedTools),
           // 子代理上下文预算：主会话 contextLimit 的 75%（留出输出与工具定义空间）。
           contextBudgetTokens: parentLimit > 0 ? (parentLimit * 3) ~/ 4 : 0,
@@ -5091,12 +5148,16 @@ class ShiyiState extends ChangeNotifier {
 
   /// 唯一的硬裁剪预算决策：usable = contextLimit - 实际输出上限 - 2% 安全余量。
   /// 所有输入都是 Token，禁止字符数直接参与比较。
+  ///
+  /// 输出预留最多上下文的一半：用户把单次输出上限调到比上下文还大时，
+  /// 不能把输入预算挤成 0——那会让历史完全不裁剪，整个请求超出窗口被拒。
   static ContextBudgetPlan planContextBudget({
     required int contextLimit,
     required int maxOutputTokens,
     required int estimatedInputTokens,
   }) {
-    final outputReserve = maxOutputTokens.clamp(0, contextLimit);
+    final outputCap = contextLimit > 0 ? contextLimit ~/ 2 : 0;
+    final outputReserve = maxOutputTokens.clamp(0, outputCap);
     final safetyReserve = (contextLimit * 0.02).round().clamp(
       0,
       (contextLimit * 0.05).round(),
@@ -5210,6 +5271,7 @@ class ShiyiState extends ChangeNotifier {
       protocol: clientSettings.apiProtocol,
       temperature: 0.2,
       tools: _activeToolsFor(planMode: planModeForSession(sessionId)),
+      streamWaitTimeout: Duration(seconds: settings.streamWaitSeconds),
     );
     final summary = await client.completeOne(compactMsgs, temperature: 0.2);
     final clean = summary.trim();
@@ -5425,6 +5487,7 @@ class ShiyiState extends ChangeNotifier {
         protocol: refineSettings.apiProtocol,
         temperature: 0.2,
         tools: const [],
+        streamWaitTimeout: Duration(seconds: settings.streamWaitSeconds),
       );
       final result = await client.completeOne([
         {

@@ -4,6 +4,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../widgets/chat_liquid_glass.dart';
 import '../core/app_state.dart';
 import '../services/file_workspace.dart';
 import '../services/permission_service.dart';
@@ -255,14 +256,14 @@ class _FilesScreenState extends State<FilesScreen> {
   Widget _buildList() {
     final future = _entriesFuture;
     if (future == null) {
-      return const Center(child: CircularProgressIndicator());
+      return AppLoading.centered();
     }
     return FutureBuilder<List<FileSystemEntity>>(
       future: future,
       builder: (context, snap) {
         final entries = snap.data ?? const <FileSystemEntity>[];
         if (snap.connectionState != ConnectionState.done) {
-          return const Center(child: CircularProgressIndicator());
+          return AppLoading.centered();
         }
         if (entries.isEmpty) {
           return Center(
@@ -694,9 +695,7 @@ class _FilesScreenState extends State<FilesScreen> {
                       builder: (context, snap) {
                         final dirs = snap.data ?? const <Directory>[];
                         if (snap.connectionState != ConnectionState.done) {
-                          return const Center(
-                            child: CircularProgressIndicator(),
-                          );
+                          return AppLoading.centered();
                         }
                         if (dirs.isEmpty) {
                           return const Center(child: Text('没有子文件夹'));

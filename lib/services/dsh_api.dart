@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import '../core/models.dart';
@@ -88,6 +90,24 @@ class DshSessionSummary {
   /// 是否为子代理会话（origin=subagent，由 agent 派生，不显示在会话列表）。
   final bool isSubagent;
 
+  /// `session/search` 命中片段。
+  ///
+  /// rc.2 的 `session/search` 只回 `{items:[{sessionId, snippet}]}`（**没有**
+  /// 标题 / 时间），必须与 `session/list` 做 join 才能显示完整结果；片段本身
+  /// 也要留着给搜索列表用（见 docs/fix-log.md #396）。
+  final String? searchSnippet;
+
+  /// 子代理会话的父会话 id（官方 `session/list` 的 `parentSessionId`）。
+  final String? parentSessionId;
+
+  /// 官方 `agentAvailable`：父会话的 agent 是否仍在（子代理详情页可发消息的依据）。
+  final bool agentAvailable;
+
+  /// `projections.values.subagentCatalog`：官方子代理目录
+  /// （`{id, createdAt, mode:'one-shot'|'continuable'|'unknown', label?}`）。
+  /// rc.2 没有 `subagents/list`，列表要从这里派生。
+  final List<Map<String, dynamic>> subagentCatalog;
+
   /// 会话统计栏的 billed 输入口径（官方 tokenUsage 三桶之和）。
   int get billedInputTokens =>
       uncachedInputTokens + cacheReadTokens + cacheWriteTokens;
@@ -105,6 +125,10 @@ class DshSessionSummary {
     this.turnCount = 0,
     this.stepCount = 0,
     this.isSubagent = false,
+    this.searchSnippet,
+    this.parentSessionId,
+    this.agentAvailable = false,
+    this.subagentCatalog = const [],
     this.llmMs = 0,
     this.toolMs = 0,
     this.ttftMs = 0,
@@ -131,10 +155,18 @@ class DshSessionSummary {
       running: j['running'] == true,
       blank: j['blank'] == true,
       cwd: j['cwd']?.toString(),
-      agentPreset: j['agentPreset']?.toString(),
+      // 官方 schema 里 agentPreset 在 projections.values 下（顶层没有）。
+      agentPreset:
+          (values['agentPreset'] ?? j['agentPreset'])?.toString(),
       turnCount: (stats?['turns'] as num?)?.toInt() ?? 0,
       stepCount: (stats?['steps'] as num?)?.toInt() ?? 0,
       isSubagent: j['origin']?.toString() == 'subagent',
+      parentSessionId: j['parentSessionId']?.toString(),
+      agentAvailable: j['agentAvailable'] == true,
+      subagentCatalog: ((values['subagentCatalog'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList(),
       llmMs: (stats?['llmMs'] as num?)?.toInt() ?? 0,
       toolMs: (stats?['toolMs'] as num?)?.toInt() ?? 0,
       ttftMs: (stats?['ttftMs'] as num?)?.toInt() ?? 0,
@@ -159,6 +191,38 @@ class DshSessionSummary {
     turnCount: turnCount,
     stepCount: stepCount,
     isSubagent: isSubagent,
+    searchSnippet: searchSnippet,
+    parentSessionId: parentSessionId,
+    agentAvailable: agentAvailable,
+    subagentCatalog: subagentCatalog,
+    llmMs: llmMs,
+    toolMs: toolMs,
+    ttftMs: ttftMs,
+    ttftSteps: ttftSteps,
+    decodeMs: decodeMs,
+    decodeTokens: decodeTokens,
+    uncachedInputTokens: uncachedInputTokens,
+    cacheReadTokens: cacheReadTokens,
+    cacheWriteTokens: cacheWriteTokens,
+    outputTokens: outputTokens,
+  );
+
+  /// 附上 `session/search` 的命中片段（其余字段照搬）。
+  DshSessionSummary withSearchSnippet(String? snippet) => DshSessionSummary(
+    sessionId: sessionId,
+    title: title,
+    updatedAt: updatedAt,
+    running: running,
+    blank: blank,
+    cwd: cwd,
+    agentPreset: agentPreset,
+    turnCount: turnCount,
+    stepCount: stepCount,
+    isSubagent: isSubagent,
+    searchSnippet: snippet,
+    parentSessionId: parentSessionId,
+    agentAvailable: agentAvailable,
+    subagentCatalog: subagentCatalog,
     llmMs: llmMs,
     toolMs: toolMs,
     ttftMs: ttftMs,
@@ -180,9 +244,12 @@ class DshSessionSummary {
     'cwd': cwd,
     'agentPreset': agentPreset,
     'origin': isSubagent ? 'subagent' : null,
+    'parentSessionId': parentSessionId,
+    'agentAvailable': agentAvailable,
     'projections': {
       'values': {
         'title': title,
+        if (subagentCatalog.isNotEmpty) 'subagentCatalog': subagentCatalog,
         'sessionStats': {
           'turns': turnCount,
           'steps': stepCount,
@@ -443,7 +510,11 @@ class DshCredentialSlot {
 
   /// credentials.describe 返回 credentials 映射，而不是 slots 列表。
   static List<DshCredentialSlot> fromDescribeValue(Map<String, dynamic> v) {
-    final raw = v['credentials'];
+    // rc.2 的 `credentials/describe` 返回**按 ref 键控的 record**：
+    // `{ref: {configured, source?, writable}}`（schema 见 dsh-api-settings-controller）。
+    // 旧版才包一层 `credentials` / `slots`；只认包装形状会让凭据列表永远为空
+    // （见 docs/fix-log.md #396）。
+    final raw = v['credentials'] ?? (v.containsKey('slots') ? null : v);
     if (raw is Map) {
       return raw.entries.map((e) {
         final info = (e.value is Map)
@@ -462,6 +533,138 @@ class DshCredentialSlot {
           (e) => DshCredentialSlot.fromJson((e as Map).cast<String, dynamic>()),
         )
         .toList();
+  }
+}
+
+/// 工作区文件条目（`workspaceFiles/list`）。
+class DshWorkspaceFileEntry {
+  final String name;
+  final String type; // file · directory · other
+  final int? size;
+  const DshWorkspaceFileEntry({
+    required this.name,
+    this.type = 'file',
+    this.size,
+  });
+
+  bool get isDir => type == 'directory';
+
+  factory DshWorkspaceFileEntry.fromJson(Map<String, dynamic> j) =>
+      DshWorkspaceFileEntry(
+        name: (j['name'] ?? '').toString(),
+        type: (j['type'] ?? 'file').toString(),
+        size: (j['size'] as num?)?.toInt(),
+      );
+}
+
+/// 后台任务（`job/list` 一行）。
+class DshJobInfo {
+  final String id;
+  final String kind;
+  final String label;
+
+  /// running · stopping · completed · failed · killed
+  final String status;
+  final String? progress;
+  final String? detail;
+  final int startedAt;
+  final int? finishedAt;
+  const DshJobInfo({
+    required this.id,
+    this.kind = '',
+    this.label = '',
+    this.status = '',
+    this.progress,
+    this.detail,
+    this.startedAt = 0,
+    this.finishedAt,
+  });
+
+  bool get running => status == 'running' || status == 'stopping';
+
+  factory DshJobInfo.fromJson(Map<String, dynamic> j) => DshJobInfo(
+    id: (j['id'] ?? '').toString(),
+    kind: (j['kind'] ?? '').toString(),
+    label: (j['label'] ?? '').toString(),
+    status: (j['status'] ?? '').toString(),
+    progress: j['progress']?.toString(),
+    detail: j['detail']?.toString(),
+    startedAt: (j['startedAt'] as num?)?.toInt() ?? 0,
+    finishedAt: (j['finishedAt'] as num?)?.toInt(),
+  );
+}
+
+/// 官方斜杠命令（`commands/list` 一行）。
+class DshCommandInfo {
+  final String name;
+  final String description;
+
+  /// 参数提示；非空表示要参数（选中后只填 `/name `，让用户补完再发）。
+  final String hint;
+  final bool acceptsAttachments;
+  const DshCommandInfo({
+    required this.name,
+    this.description = '',
+    this.hint = '',
+    this.acceptsAttachments = false,
+  });
+
+  factory DshCommandInfo.fromJson(Map<String, dynamic> j) {
+    final input = (j['input'] as Map?)?.cast<String, dynamic>();
+    return DshCommandInfo(
+      name: (j['name'] ?? '').toString(),
+      description: (j['description'] ?? '').toString(),
+      hint: (input?['hint'] ?? '').toString(),
+      acceptsAttachments: input?['attachments'] == true,
+    );
+  }
+
+  bool get needsArgs => hint.trim().isNotEmpty;
+}
+
+/// 出站图片附件（rc.2 `session/prompt` 的 image 块：直接内联 base64）。
+class DshImageAttachment {
+  /// image/png · image/jpeg · image/webp · image/gif（服务端只认这四种）。
+  final String mediaType;
+  final String base64;
+  final String? name;
+  const DshImageAttachment({
+    required this.mediaType,
+    required this.base64,
+    this.name,
+  });
+
+  /// 按扩展名推断 mediaType；不认识的按 jpeg（服务端会拒就只能回退文本提示）。
+  static String mediaTypeForPath(String path) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    return 'image/jpeg';
+  }
+}
+
+/// 文件上传回执（`session/prompt` 的 file 块用 receiptId）。
+class DshFileReceipt {
+  final String receiptId;
+  final String attachmentId;
+  final String name;
+  final int bytes;
+  const DshFileReceipt({
+    required this.receiptId,
+    this.attachmentId = '',
+    this.name = '',
+    this.bytes = 0,
+  });
+
+  factory DshFileReceipt.fromJson(Map<String, dynamic> j) {
+    final file = (j['file'] as Map?)?.cast<String, dynamic>() ?? const {};
+    return DshFileReceipt(
+      receiptId: (j['receiptId'] ?? '').toString(),
+      attachmentId: (file['attachmentId'] ?? '').toString(),
+      name: (file['name'] ?? '').toString(),
+      bytes: (file['bytes'] as num?)?.toInt() ?? 0,
+    );
   }
 }
 
@@ -729,6 +932,24 @@ class DshApiClient {
   /// 全局单例：会话列表与聊天页共享同一连接（避免重复探测/缓存丢失）。
   static final DshApiClient instance = DshApiClient();
 
+  /// 打开会话与轮询时只读这么多条消息（官方 `session/page` 的 `maxMessages`）。
+  ///
+  /// 官方默认一页 50 条（`DEFAULT_MAX_MESSAGES`）。上千轮的长会话若一次性
+  /// 把所有页拼成时间线，会在首帧和每一拍轮询里重复拉取/解析整段事件流，
+  /// 这正是长会话卡顿的来源；改成只读尾部一页后，更早的消息交给
+  /// [historyOlder] 按需翻页。
+  static const int historyWindowMessages = 20;
+
+  /// 窗口至少覆盖这么多轮（官方 `turnWindow.minTurns`），避免上翻停在半轮上。
+  static const int historyWindowTurns = 12;
+
+  /// `turnWindow.minMessages`：与 [historyWindowMessages] 一起交给官方分页器，
+  /// 必须 ≤ [historyWindowMessages]。
+  static const int historyWindowMinMessages = 6;
+
+  /// 上翻补更早历史时每页取多少条消息。
+  static const int historyOlderMessages = 40;
+
   String _baseUrl;
   final String _scopeKey;
   String _token;
@@ -882,7 +1103,54 @@ class DshApiClient {
     await response.stream.drain<void>();
     if (response.statusCode != 303 || cookie == null) return false;
     _authCookie = cookie;
+    await _persistAuthCookie();
     return true;
+  }
+
+  /// 会话 Cookie 的落盘键。按连接 scope 隔离：地址 / 模式一换就是另一个 key，
+  /// 不会把 A 主机的 Cookie 用到 B 主机上。
+  static String authCookieStorageKey(String scopeKey) =>
+      'shiyi_dsh_cookie|$scopeKey';
+
+  static const FlutterSecureStorage _cookieStorage = FlutterSecureStorage();
+
+  /// 复用上一次换到的会话 Cookie（应用重启后不必重新换）。
+  ///
+  /// 真机实测（docs/fix-log.md #395）：Cookie 只在内存里，应用一重启就丢；
+  /// 而 DSH 的启动 Token 会随 activation 轮换，重换直接失败
+  /// （`响应不是 303/Set-Cookie`）→ 局域网 401 再也连不上，只能重新粘链接。
+  Future<bool> restoreAuthCookie() async {
+    if (_scopeKey.isEmpty) return false;
+    try {
+      final stored = await _cookieStorage.read(
+        key: authCookieStorageKey(_scopeKey),
+      );
+      if (stored == null || stored.isEmpty) return false;
+      _authCookie = stored;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _persistAuthCookie() async {
+    if (_scopeKey.isEmpty || _authCookie.isEmpty) return;
+    try {
+      await _cookieStorage.write(
+        key: authCookieStorageKey(_scopeKey),
+        value: _authCookie,
+      );
+    } catch (_) {}
+  }
+
+  /// 服务端拒绝了这个 Cookie（过期 / 宿主重启换了 secret）：内存和落盘都丢掉，
+  /// 让下一次 `ensureRemoteSession` 重新用 Token 换。
+  Future<void> _dropAuthCookie() async {
+    _authCookie = '';
+    if (_scopeKey.isEmpty) return;
+    try {
+      await _cookieStorage.delete(key: authCookieStorageKey(_scopeKey));
+    } catch (_) {}
   }
 
   /// 从 Set-Cookie 头中只取 dsh-auth-* 的 name=value 对。
@@ -947,8 +1215,9 @@ class DshApiClient {
     String method,
     Map<String, dynamic> payload, {
     bool forceLegacy = false,
+    Map<String, dynamic>? legacyPayload,
   }) async {
-    final legacy = _legacyRpcCall(method, payload);
+    final legacy = _legacyRpcCall(method, legacyPayload ?? payload);
     final modern = forceLegacy ? null : _modernRpcCall(method, payload);
     if (modern != null && !_sameRpcCall(modern, legacy)) {
       try {
@@ -991,6 +1260,11 @@ class DshApiClient {
             body: encoded,
           )
           .timeout(_timeout);
+      if (res.statusCode == 401 && _authCookie.isNotEmpty) {
+        // Cookie 过期 / 宿主重启换了 secret：丢掉（含落盘），
+        // 让下一次 ensureRemoteSession 重新用 Token 换（#395）。
+        unawaited(_dropAuthCookie());
+      }
       if (res.statusCode == 403 &&
           _configuredHostOverride.isEmpty &&
           _compatHostOverride == null &&
@@ -1148,7 +1422,7 @@ class DshApiClient {
         });
       case 'session.history':
         return call('session/page', {
-          'request': _sessionPageRequest(
+          'request': historyPageRequest(
             address: {
               'kind': 'session',
               'sessionId': (payload['sessionId'] ?? '').toString(),
@@ -1156,6 +1430,8 @@ class DshApiClient {
             beforeSeq: (payload['beforeSeq'] as num?)?.toInt(),
             throughSeq: (payload['throughSeq'] as num?)?.toInt(),
             maxMessages: (payload['maxMessages'] as num?)?.toInt(),
+            minMessages: (payload['minMessages'] as num?)?.toInt(),
+            minTurns: (payload['minTurns'] as num?)?.toInt(),
           ),
         });
       case 'session.models':
@@ -1190,13 +1466,68 @@ class DshApiClient {
       case 'workspace.insertBefore':
       case 'workspace.archiveSession':
       case 'workspace.insertSessionBefore':
+      case 'workspace.unarchiveSession':
+      case 'workspace.pinSession':
+      case 'workspace.unpinSession':
         return call('workspace/${method.substring('workspace.'.length)}', {
           'request': payload,
         });
-      case 'subagent.list':
-        return call('subagents/list', {
-          'parentSessionId': (payload['parentSessionId'] ?? '').toString(),
+      case 'workspace.initializeDefault':
+        return call('workspace/initializeDefault', const {});
+      case 'terminal.list':
+      case 'terminal.shells':
+      case 'terminal.create':
+      case 'terminal.write':
+      case 'terminal.resize':
+      case 'terminal.close':
+      case 'terminal.rename':
+      case 'terminal.retain':
+      case 'terminal.environment':
+        return call('terminal/${method.substring('terminal.'.length)}', payload);
+      case 'schedule.list':
+      case 'schedule.catalog':
+      case 'schedule.history':
+      case 'schedule.update':
+      case 'schedule.delete':
+        return call('schedule/${method.substring('schedule.'.length)}', payload);
+      case 'messageFeedback.list':
+      case 'messageFeedback.put':
+      case 'messageFeedback.delete':
+        // 目标的描述符只有一个 `request` 参数（不包就会被网关拒：
+        // gateway/arguments-invalid: args fields do not match the descriptor）。
+        return call(
+          'messageFeedback/${method.substring('messageFeedback.'.length)}',
+          {'request': payload},
+        );
+      case 'pluginManager.listPlugins':
+      case 'pluginManager.listBundles':
+      case 'pluginManager.inspect':
+      case 'pluginManager.installBundle':
+      case 'pluginManager.removeBundle':
+      case 'pluginManager.setPluginEnabled':
+      case 'pluginManager.setBundleEnabled':
+      case 'pluginManager.registries':
+      case 'pluginManager.listVersionExemptions':
+      case 'pluginManager.setVersionExemption':
+      case 'pluginManager.cancelInstall':
+      case 'pluginManager.waitForInstall':
+        return call(
+          'pluginManager/${method.substring('pluginManager.'.length)}',
+          payload,
+        );
+      case 'session.updateQueue':
+      case 'session.fork':
+        return call('session/${method.substring('session.'.length)}', {
+          'request': payload,
         });
+      case 'session.fileReferences':
+        return call('fileReferences/list', payload);
+      case 'session.referenceCandidates':
+        return call('sessionReferenceResolver/candidates', payload);
+      case 'permissionPresets.catalog':
+        return call('permissionPresets/catalog', const {});
+      case 'llm.discoverModels':
+        return call('llm/discoverModels', payload);
       case 'subagent.history':
         return call('session/page', {
           'request': _sessionPageRequest(
@@ -1219,8 +1550,65 @@ class DshApiClient {
           'parentSessionId': (payload['parentSessionId'] ?? '').toString(),
           'mode': (payload['mode'] ?? 'continuable').toString(),
         });
+      case 'settings.openSettingsDocument':
+      case 'settings.replace':
+        return call('settings/${method.substring('settings.'.length)}', payload);
+      case 'llm.listProviders':
+        return call('llm/listProviders', const {});
+      case 'officeToPdf.generation':
+        return call('officeToPdf/generation', payload);
+      case 'pluginRegistryProbe.fastest':
+        return call('pluginRegistryProbe/fastest', const {});
+      case 'sessionFeedback.record':
+        return call('sessionFeedback/record', {'request': payload});
+      case 'account.getState':
+      case 'account.getProfile':
+      case 'account.getBalance':
+        return call('account/${method.substring('account.'.length)}', payload);
+      case 'speech.catalog':
+      case 'speech.prepare':
+      case 'speech.cancelPreparation':
+      case 'speech.transcribe':
+      case 'speech.configure':
+        return call('speech/${method.substring('speech.'.length)}', payload);
+      case 'cordis.inventory':
+      case 'cordis.invoke':
+        return call(
+          'dynamicCordisRunner/${method.substring('cordis.'.length)}',
+          payload,
+        );
+      case 'officeToPdf.render':
+        return call('officeToPdf/render', payload);
+      case 'workspaceFiles.list':
+      case 'workspaceFiles.read':
+      case 'workspaceFiles.readBytes':
+      case 'workspaceFiles.stat':
+      case 'workspaceFiles.changes':
+        return call(
+          'workspaceFiles/${method.substring('workspaceFiles.'.length)}',
+          payload,
+        );
+      case 'job.list':
+      case 'job.kill':
+      case 'job.follow':
+        return call('job/${method.substring('job.'.length)}', {
+          'request': payload,
+        });
+      case 'commands.list':
+      case 'commands.execute':
+        return call('commands/${method.substring('commands.'.length)}', payload);
+      case 'fileUploads.upload':
+        return call('fileUploads/upload', payload);
+      case 'session.attachment':
+        return call('session/attachment', {'request': payload});
       case 'skill.list':
         return call('skills/list', {'request': payload});
+      case 'userQuestions.answer':
+      case 'userQuestions.attachWait':
+        return call(
+          'userQuestions/${method.substring('userQuestions.'.length)}',
+          payload,
+        );
       case 'credentials.describe':
       case 'credentials.set':
       case 'credentials.unset':
@@ -1247,8 +1635,9 @@ class DshApiClient {
           'name': (payload['name'] ?? '').toString(),
         });
       case 'host.openPath':
+        // 官方 `session/openWorkspacePath` 的 wire 参数名是 `request`。
         return call('session/openWorkspacePath', {
-          'path': (payload['path'] ?? '').toString(),
+          'request': {'path': (payload['path'] ?? '').toString()},
         });
       case 'goal.create':
         return call('goals/create', {
@@ -1287,16 +1676,47 @@ class DshApiClient {
     int? beforeSeq,
     int? throughSeq,
     int? maxMessages,
+    int? minMessages,
+    int? minTurns,
   }) {
+    final limit = (maxMessages != null && maxMessages > 0) ? maxMessages : null;
+    final window = limit == null
+        ? null
+        : {
+            'minMessages':
+                (minMessages == null ? limit : min(limit, max(1, minMessages)))
+                    .toInt(),
+            'minTurns': (minTurns == null || minTurns < 1) ? 1 : minTurns,
+          };
     return {
       'address': address,
       // throughSeq is the fixed tail cursor for the whole pagination walk.
       // beforeSeq alone moves the upper bound and must not move this cursor.
       'throughSeq': throughSeq ?? -1,
-      if (beforeSeq != null) 'beforeSeq': beforeSeq,
-      if (maxMessages != null && maxMessages > 0) 'maxMessages': maxMessages,
+      'beforeSeq': ?beforeSeq,
+      'maxMessages': ?limit,
+      // 官方 turnWindow：向后翻到至少 minTurns 轮 / minMessages 条，避免
+      // 上翻时停在半轮上（validateHistoryWindow 要求 minMessages ≤ maxMessages）。
+      if (window != null && minTurns != null) 'turnWindow': window,
     };
   }
+
+  /// 官方 `session/page` 请求体的构造（对外暴露，便于单测断言窗口字段）。
+  static Map<String, dynamic> historyPageRequest({
+    required Map<String, dynamic> address,
+    int? beforeSeq,
+    int? throughSeq,
+    int? maxMessages,
+    int? minMessages,
+    int? minTurns,
+  }) => _sessionPageRequest(
+    address: address,
+    beforeSeq: beforeSeq,
+    throughSeq: throughSeq,
+    maxMessages: maxMessages,
+    minMessages: minMessages,
+    minTurns: minTurns,
+  );
 
   static Map<String, dynamic> _normalizeRpcValue(String method, dynamic value) {
     if (value is Map) return value.cast<String, dynamic>();
@@ -1385,19 +1805,25 @@ class DshApiClient {
   /// 会话列表（按 updatedAt 倒序；过滤子代理会话——它们由 agent 派生，
   /// 不应出现在用户会话列表）。
   Future<List<DshSessionSummary>> listSessions() async {
+    final all = await listAllSessions();
+    return all.where((s) => !s.isSubagent).toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  }
+
+  /// 原始会话条目，**包含** `origin=subagent` 的子代理会话。
+  ///
+  /// [listSessions] 是给界面用的（滤掉子代理），子代理列表的派生需要全量
+  /// （见 [deriveSubagents]）。
+  Future<List<DshSessionSummary>> listAllSessions() async {
     final value = await _rpc('session.list', {});
     final items = (value['items'] as List?) ?? const [];
-    final out =
-        items
-            .map(
-              (e) => DshSessionSummary.fromJson(
-                (e as Map).cast<String, dynamic>(),
-              ),
-            )
-            .where((s) => !s.isSubagent)
-            .toList()
-          ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
-    return out;
+    return items
+        .map(
+          (e) => DshSessionSummary.fromJson(
+            (e as Map).cast<String, dynamic>(),
+          ),
+        )
+        .toList();
   }
 
   /// 新建或唤醒会话。传入 [sessionId] 会复用 DSH 已有会话并完成挂载。
@@ -1458,27 +1884,584 @@ class DshApiClient {
   }
 
   /// 发送消息（非阻塞：立即返回，agent 后台运行，轮询 history 收结果）。
-  Future<void> prompt(String sessionId, String text) async {
+  /// 发送消息。
+  ///
+  /// rc.2 的 `content` 三态（见 `session/prompt` schema 与 docs/dsh-parity.md）：
+  /// - `{type:'text', text}`；
+  /// - `{type:'image', mediaType, data}` —— **图片直接内联 base64，不用先上传**；
+  /// - `{type:'file', receiptId}` —— 文件先走 [uploadFile] 换 receiptId。
+  Future<void> prompt(
+    String sessionId,
+    String text, {
+    List<DshImageAttachment> images = const [],
+    List<String> fileReceiptIds = const [],
+    String mode = 'queue',
+  }) async {
+    final content = <Map<String, dynamic>>[
+      if (text.trim().isNotEmpty) {'type': 'text', 'text': text},
+      for (final image in images)
+        if (image.base64.isNotEmpty)
+          {
+            'type': 'image',
+            'mediaType': image.mediaType,
+            'data': image.base64,
+            if ((image.name ?? '').isNotEmpty) 'name': image.name,
+          },
+      for (final id in fileReceiptIds)
+        if (id.trim().isNotEmpty) {'type': 'file', 'receiptId': id.trim()},
+    ];
+    if (content.isEmpty) return;
     await _rpc('session.prompt', {
       'requestId': _newRpcId(),
       'sessionId': sessionId,
-      'mode': 'queue',
-      'content': [
-        {'type': 'text', 'text': text},
-      ],
+      'mode': mode,
+      'content': content,
       'clientTimeZone': 'Asia/Shanghai',
     });
+  }
+
+  /// 上传文件换 receiptId（`session/prompt` 的 file 块用它）。
+  ///
+  /// 官方 `fileUploads/upload(agentId, {data, name})` → `{receiptId, file:{…}}`。
+  Future<DshFileReceipt> uploadFile(
+    String sessionId, {
+    required String base64,
+    String? name,
+  }) async {
+    final v = await _rpc('fileUploads.upload', {
+      'agentId': sessionId,
+      'request': {
+        'data': base64,
+        if ((name ?? '').isNotEmpty) 'name': name,
+      },
+    });
+    return DshFileReceipt.fromJson(v);
+  }
+
+  // ── 官方能力补齐（⑥⑦）：工作区置顶/默认、队列、分叉、模型发现、
+  //    定时任务、消息反馈、插件远端管理、目标机终端 ─────────────────────
+
+  /// 取消归档：`workspace/unarchiveSession({sessionId})`。
+  Future<List<String>> unarchiveSession(String sessionId) async {
+    final v = await _rpc('workspace.unarchiveSession', {
+      'sessionId': sessionId,
+    });
+    return ((v['archivedSessionIds'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList();
+  }
+
+  /// 置顶 / 取消置顶会话：`workspace/pinSession` · `workspace/unpinSession`。
+  Future<List<String>> pinSession(String sessionId, {bool pinned = true}) async {
+    final v = await _rpc(
+      pinned ? 'workspace.pinSession' : 'workspace.unpinSession',
+      {'sessionId': sessionId},
+    );
+    return ((v['pinnedSessionIds'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList();
+  }
+
+  /// 采用宿主默认工作区（`workspace/initializeDefault`，无参数）。
+  Future<String> initializeDefaultWorkspace() async {
+    final v = await _rpc('workspace.initializeDefault', const {});
+    final workspace = (v['workspace'] as Map?)?.cast<String, dynamic>();
+    return (workspace?['workspaceId'] ?? '').toString();
+  }
+
+  /// 刷新某个 provider 的模型目录：`llm/discoverModels(settingsNs, request)`。
+  Future<Map<String, dynamic>> discoverModels(
+    String settingsNs, {
+    Map<String, dynamic> request = const {},
+  }) async {
+    return _rpc('llm.discoverModels', {
+      'settingsNs': settingsNs,
+      'request': request,
+    });
+  }
+
+  /// 队列编辑（引导插话）：`session/updateQueue`。
+  Future<void> updateQueue(
+    String sessionId,
+    String itemId,
+    Map<String, dynamic> action,
+  ) async {
+    await _rpc('session.updateQueue', {
+      'sessionId': sessionId,
+      'itemId': itemId,
+      'action': action,
+    });
+  }
+
+  /// 会话分叉：`session/fork`。
+  Future<String> forkSession(
+    String sessionId, {
+    Map<String, dynamic> request = const {},
+  }) async {
+    final v = await _rpc('session.fork', {'sessionId': sessionId, ...request});
+    return (v['sessionId'] ?? '').toString();
+  }
+
+  /// @-引用候选：`fileReferences/list(agentId, query)`。
+  Future<List<String>> listFileReferences(
+    String sessionId,
+    String query,
+  ) async {
+    final v = await _rpc('session.fileReferences', {
+      'agentId': sessionId,
+      'query': query,
+    });
+    final raw = v['items'] ?? v['references'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw
+        .map((e) => e is Map ? (e['path'] ?? e['name'] ?? '').toString() : '$e')
+        .where((e) => e.isNotEmpty)
+        .toList();
+  }
+
+  /// 会话引用候选：`sessionReferenceResolver/candidates`。
+  Future<List<Map<String, dynamic>>> sessionReferenceCandidates(
+    String sessionId,
+    String query,
+  ) async {
+    final v = await _rpc('session.referenceCandidates', {
+      'agentId': sessionId,
+      'query': query,
+    });
+    final raw = v['items'] ?? v['candidates'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  /// 权限预设目录：`permissionPresets/catalog`（比从 settings.describe 猜更准）。
+  Future<List<Map<String, dynamic>>> permissionPresetCatalog() async {
+    final v = await _rpc('permissionPresets.catalog', const {});
+    final raw = v['items'] ?? v['presets'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  /// 定时任务：`schedule/list|catalog|history|update|delete`。
+  Future<List<Map<String, dynamic>>> listSchedules(
+    String sessionId,
+  ) async {
+    final v = await _rpc('schedule.list', {'agentId': sessionId});
+    final raw = v['items'] ?? v['schedules'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  Future<void> deleteSchedule(String sessionId, String id) async {
+    await _rpc('schedule.delete', {'agentId': sessionId, 'id': id});
+  }
+
+  /// 消息反馈：`messageFeedback/list|put|delete`。
+  Future<List<Map<String, dynamic>>> listMessageFeedback(
+    String sessionId,
+  ) async {
+    final v = await _rpc('messageFeedback.list', {'sessionId': sessionId});
+    final raw = v['items'] ?? v['feedback'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  /// 删除一条消息反馈：`messageFeedback/delete({sessionId,messageId})`。
+  Future<void> deleteMessageFeedback(
+    String sessionId,
+    String messageId,
+  ) async {
+    await _rpc('messageFeedback.delete', {
+      'sessionId': sessionId,
+      'messageId': messageId,
+    });
+  }
+
+  /// 消息反馈：`messageFeedback/put({sessionId,messageId,rating,note?,category?,ifVersion})`。
+  ///
+  /// `rating` 只有 `positive` / `negative`（官方 schema），不是自由文本。
+  Future<void> putMessageFeedback(
+    String sessionId,
+    String messageId, {
+    required String rating,
+    String? note,
+    String? category,
+    String? ifVersion,
+  }) async {
+    await _rpc('messageFeedback.put', {
+      'sessionId': sessionId,
+      'messageId': messageId,
+      'rating': rating,
+      if ((note ?? '').isNotEmpty) 'note': note,
+      if ((category ?? '').isNotEmpty) 'category': category,
+      'ifVersion': ?ifVersion,
+    });
+  }
+
+  /// 插件远端管理：`pluginManager/listPlugins`（无参数）与启停。
+  Future<Map<String, dynamic>> pluginManagerList() async {
+    return _rpc('pluginManager.listPlugins', const {});
+  }
+
+  /// 启用 / 停用插件：`pluginManager/setPluginEnabled(id, enabled)`
+  /// —— **不需要会话 id**（wire 只有 id + enabled）。
+  Future<void> setPluginEnabled(String id, bool enabled) async {
+    await _rpc('pluginManager.setPluginEnabled', {
+      'id': id,
+      'enabled': enabled,
+    });
+  }
+
+  /// 目标机终端：`terminal/list(sessionId)` / `terminal/create` / `write` / `resize` / `close`。
+  Future<List<Map<String, dynamic>>> listTerminals(String sessionId) async {
+    final v = await _rpc('terminal.list', {'sessionId': sessionId});
+    final raw = v['items'] ?? v['terminals'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  Future<Map<String, dynamic>> createTerminal(
+    String sessionId, {
+    Map<String, dynamic> request = const {},
+  }) async {
+    return _rpc('terminal.create', {
+      'agentId': sessionId,
+      'request': request,
+    });
+  }
+
+  Future<void> writeTerminal(
+    String sessionId,
+    String id,
+    String data, {
+    String? attachmentId,
+  }) async {
+    await _rpc('terminal.write', {
+      'agentId': sessionId,
+      'id': id,
+      if ((attachmentId ?? '').isNotEmpty) 'attachmentId': attachmentId,
+      'data': data,
+    });
+  }
+
+  Future<void> resizeTerminal(
+    String sessionId,
+    String id, {
+    required int cols,
+    required int rows,
+    String? attachmentId,
+  }) async {
+    await _rpc('terminal.resize', {
+      'agentId': sessionId,
+      'id': id,
+      if ((attachmentId ?? '').isNotEmpty) 'attachmentId': attachmentId,
+      'cols': cols,
+      'rows': rows,
+    });
+  }
+
+  Future<void> closeTerminal(String sessionId, String id) async {
+    await _rpc('terminal.close', {'agentId': sessionId, 'id': id});
+  }
+
+  /// 目标机终端下行（`terminal/follow`，**stream**）。
+  ///
+  /// 帧：`snapshot{screen}` → `output{data}` → `state`/`retained`。
+  /// 注意这是 WS 流：局域网 8080 转发层不做隧道（#392）→ 只有本机模式收得到。
+  Stream<Map<String, dynamic>> watchTerminal(
+    String sessionId,
+    String id, {
+    String? attachmentId,
+  }) => DshWsDownlink.openRemoteStream(
+    _baseUrl,
+    'terminal/follow',
+    {
+      'agentId': sessionId,
+      'id': id,
+      if ((attachmentId ?? '').isNotEmpty) 'attachmentId': attachmentId,
+    },
+    headers: _wsHeaders(),
+  ).where((e) => e is Map).map((e) => (e as Map).cast<String, dynamic>());
+
+  // ── 语音转写（experimental）/ PDF / Cordis 动态插件 ────────────────────
+  //
+  // 说明（docs/dsh-parity.md ⑦）：
+  // - `account/*` 的 getState/getBalance 需要服务端注入的 `client` 查找参数，
+  //   原始 RPC 造不出来 → 暂不接。
+  // - `speech/follow` 是 stream（WS），局域网收不到，只接 unary 的这几个。
+  // - `officeToPdf/render` 返回二进制，交给调用方自行处理。
+
+  /// 语音转写能力目录：`speech/catalog`（无参数）。
+  Future<List<Map<String, dynamic>>> speechCatalog() async {
+    final v = await _rpc('speech.catalog', const {});
+    final raw = v['items'] ?? v['providers'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  /// 准备语音识别器：`speech/prepare(providerId)`。
+  Future<Map<String, dynamic>> prepareSpeech(String providerId) async {
+    return _rpc('speech.prepare', {'providerId': providerId});
+  }
+
+  /// 取消准备：`speech/cancelPreparation(providerId)`。
+  Future<void> cancelSpeechPreparation(String providerId) async {
+    await _rpc('speech.cancelPreparation', {'providerId': providerId});
+  }
+
+  /// 转写一段音频：`speech/transcribe(request)`。
+  Future<Map<String, dynamic>> transcribeSpeech(
+    Map<String, dynamic> request,
+  ) async {
+    return _rpc('speech.transcribe', {'request': request});
+  }
+
+  /// 动态 Cordis 插件清单（只读）：`dynamicCordisRunner/inventory`。
+  Future<Map<String, dynamic>> cordisInventory() async {
+    return _rpc('cordis.inventory', const {});
+  }
+
+  /// Office → PDF：`officeToPdf/render(request)`。
+  Future<Map<String, dynamic>> renderOfficeToPdf(
+    Map<String, dynamic> request,
+  ) async {
+    return _rpc('officeToPdf.render', {'request': request});
+  }
+
+  /// 所有已注册 provider：`llm/listProviders`（无参数）→ `[{id,name}]`。
+  Future<List<Map<String, dynamic>>> listAllProviders() async {
+    final v = await _rpc('llm.listProviders', const {});
+    final raw = v['items'] ?? v['value'];
+    if (raw is! List) return const [];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  /// Office→PDF 生成状态：`officeToPdf/generation(workspaceFileScopeId, path, priority)`。
+  Future<Map<String, dynamic>> officeToPdfGeneration(
+    String sessionId,
+    String path, {
+    int? priority,
+  }) async {
+    return _rpc('officeToPdf.generation', {
+      'workspaceFileScopeId': sessionId,
+      'path': path,
+      'priority': ?priority,
+    });
+  }
+
+  /// 最快的插件镜像源：`pluginRegistryProbe/fastest`（无参数）→ url | null。
+  Future<String?> fastestPluginRegistry() async {
+    final v = await _rpc('pluginRegistryProbe.fastest', const {});
+    final url = (v['value'] ?? v['url'] ?? '').toString();
+    return url.isEmpty ? null : url;
+  }
+
+  /// 会话级反馈：`sessionFeedback/record({sessionId, text?, category?})`。
+  Future<bool> recordSessionFeedback(
+    String sessionId, {
+    String? text,
+    String? category,
+  }) async {
+    final v = await _rpc('sessionFeedback.record', {
+      'sessionId': sessionId,
+      if ((text ?? '').isNotEmpty) 'text': text,
+      if ((category ?? '').isNotEmpty) 'category': category,
+    });
+    return v['recorded'] == true;
+  }
+
+  /// 读某命名空间的设置文档原文：`settings/openSettingsDocument(ns)`。
+  Future<String> openSettingsDocument(String ns) async {
+    final v = await _rpc('settings.openSettingsDocument', {'ns': ns});
+    return (v['text'] ?? v['document'] ?? v['value'] ?? '').toString();
+  }
+
+  /// 覆盖写入某命名空间的一段：`settings/replace(ns, section)`。
+  Future<void> replaceSettings(
+    String ns,
+    Map<String, dynamic> section,
+  ) async {
+    await _rpc('settings.replace', {'ns': ns, 'section': section});
+  }
+
+  /// DSH 自有账号状态：`account/getState(client)`。
+  ///
+  /// `client` 是**官方客户端标识对象**（wire 上是 json 参数，不是服务端查找）。
+  /// 拾忆用自己的 API Key，没有这套 DeepSeek 账号登录 UI，所以只保证接口可达：
+  /// 需要时由调用方传官方形状的 client。
+  Future<Map<String, dynamic>> accountState(Map<String, dynamic> client) async {
+    return _rpc('account.getState', {'client': client});
+  }
+
+  /// 账号资料 / 余额：`account/getProfile` · `account/getBalance`（同样要 client）。
+  Future<Map<String, dynamic>> accountProfile(
+    Map<String, dynamic> client,
+  ) async {
+    return _rpc('account.getProfile', {'client': client});
+  }
+
+  Future<Map<String, dynamic>> accountBalance(
+    Map<String, dynamic> client,
+  ) async {
+    return _rpc('account.getBalance', {'client': client});
+  }
+
+  /// 读会话附件（`session/attachment(sessionId, attachmentId)`）：
+  /// 返回附件元信息 + base64 数据（历史里的图片靠它取回）。
+  Future<({Map<String, dynamic> attachment, String data})> readAttachment(
+    String sessionId,
+    String attachmentId,
+  ) async {
+    final v = await _rpc('session.attachment', {
+      'sessionId': sessionId,
+      'attachmentId': attachmentId,
+    });
+    return (
+      attachment: (v['attachment'] as Map?)?.cast<String, dynamic>() ??
+          const <String, dynamic>{},
+      data: (v['data'] ?? '').toString(),
+    );
+  }
+
+  /// 会话工作区文件清单：`workspaceFiles/list(sessionId, path)`。
+  ///
+  /// 官方侧边栏就是这条（scopeId 就是会话 id）；和目录选择器
+  /// (`directoryPicker/list`) 不同，它只在会话工作区内、带 truncated。
+  Future<({String path, List<DshWorkspaceFileEntry> entries, bool truncated})>
+  listWorkspaceFiles(String sessionId, [String path = '']) async {
+    final v = await _rpc('workspaceFiles.list', {
+      'workspaceFileScopeId': sessionId,
+      'path': path,
+    });
+    return (
+      path: (v['path'] ?? path).toString(),
+      entries: ((v['entries'] as List?) ?? const [])
+          .whereType<Map>()
+          .map(
+            (e) => DshWorkspaceFileEntry.fromJson(e.cast<String, dynamic>()),
+          )
+          .toList(),
+      truncated: v['truncated'] == true,
+    );
+  }
+
+  /// 读工作区文本文件：`workspaceFiles/read(scopeId, path, range?)`。
+  Future<({String text, bool eof, String absolutePath, int lines})>
+  readWorkspaceFile(
+    String sessionId,
+    String path, {
+    int? offset,
+    int? length,
+  }) async {
+    final v = await _rpc('workspaceFiles.read', {
+      'workspaceFileScopeId': sessionId,
+      'path': path,
+      'range': {'offset': ?offset, 'length': ?length},
+    });
+    return (
+      text: (v['text'] ?? '').toString(),
+      eof: v['eof'] == true,
+      absolutePath: (v['absolutePath'] ?? '').toString(),
+      lines: (v['lines'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  /// 读工作区二进制（图片预览等）：`workspaceFiles/readBytes`。
+  ///
+  /// 线上是 base64 字符串，这里直接解回字节。
+  Future<Uint8List> readWorkspaceFileBytes(
+    String sessionId,
+    String path, {
+    int? offset,
+    int? length,
+  }) async {
+    final v = await _rpc('workspaceFiles.readBytes', {
+      'workspaceFileScopeId': sessionId,
+      'path': path,
+      'options': {'offset': ?offset, 'length': ?length},
+    });
+    final raw = (v['data'] ?? '').toString();
+    if (raw.isEmpty) return Uint8List(0);
+    try {
+      return base64Decode(raw);
+    } catch (_) {
+      return Uint8List(0);
+    }
+  }
+
+  /// 工作区文件元信息：`workspaceFiles/stat`。
+  Future<({String absolutePath, int bytes})> statWorkspaceFile(
+    String sessionId,
+    String path,
+  ) async {
+    final v = await _rpc('workspaceFiles.stat', {
+      'workspaceFileScopeId': sessionId,
+      'path': path,
+    });
+    return (
+      absolutePath: (v['absolutePath'] ?? '').toString(),
+      bytes: (v['bytes'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  /// 后台任务清单：`job/list({sessionId})` → `{type:'rows', jobs:[…]}`。
+  /// 后台任务清单。
+  ///
+  /// ⚠️ 目标 DSH 里 `job/list` 的 `mode` 是 **stream**：必须走 WS mux，
+  /// 当 unary POST 打会被网关拒（`gateway/signature-invalid: stream Remote
+  /// methods must be opened through…`）。所以这里只读第一帧；**mux 不可用
+  /// （局域网 8080 不做 WS 隧道）时返回空**，调用方不该在这时来拉。
+  /// 见 docs/fix-log.md #403。
+  Future<List<DshJobInfo>> listJobs(String sessionId) async {
+    final frame = await DshWsDownlink.openRemoteStream(
+      _baseUrl,
+      'job/list',
+      {
+        'request': {'sessionId': sessionId},
+      },
+      headers: _wsHeaders(),
+    ).firstWhere((e) => e is Map).timeout(const Duration(seconds: 6));
+    final v = (frame as Map).cast<String, dynamic>();
+    return ((v['jobs'] as List?) ?? const [])
+        .whereType<Map>()
+        .map((e) => DshJobInfo.fromJson(e.cast<String, dynamic>()))
+        .where((j) => j.id.isNotEmpty)
+        .toList();
+  }
+
+  /// 结束一个后台任务：`job/kill({sessionId, jobId})`。
+  Future<String> killJob(String sessionId, String jobId) async {
+    final v = await _rpc('job.kill', {
+      'sessionId': sessionId,
+      'jobId': jobId,
+    });
+    return (v['outcome'] ?? '').toString();
+  }
+
+  /// 官方斜杠命令清单：`commands/list(agentId)`。
+  ///
+  /// 返回 `[{name, description, input?:{hint, attachments?}}]`；`input` 为空表示
+  /// 这条命令不带参数（可直接执行），否则把 `/name ` 填进输入框让用户补参数。
+  Future<List<DshCommandInfo>> listCommands(String sessionId) async {
+    final v = await _rpc('commands.list', {'agentId': sessionId});
+    final raw = v['value'] ?? v['items'] ?? v['commands'];
+    final list = raw is List ? raw : const [];
+    return list
+        .whereType<Map>()
+        .map((e) => DshCommandInfo.fromJson(e.cast<String, dynamic>()))
+        .where((c) => c.name.isNotEmpty)
+        .toList();
   }
 
   /// Execute an official DSH command without routing it through session.prompt.
   Future<DshCommandExecution> executeCommand({
     required String sessionId,
     required String line,
+    List<Map<String, dynamic>> submittedAttachments = const [],
   }) async {
-    final value = await _rpc('commands/execute', {
+    final value = await _rpc('commands.execute', {
       'agentId': sessionId,
       'line': line,
-      'submittedAttachments': const <dynamic>[],
+      'submittedAttachments': submittedAttachments,
     });
     return DshCommandExecution.fromJson(value);
   }
@@ -1493,12 +2476,18 @@ class DshApiClient {
 
   /// 应答 DSH 下行的 question/requested。
   ///
-  /// rc.2 waterfall 事件用 `$events/result`；旧版仍走 `POST /api/respond`。
+  /// 顺序：
+  /// 1. waterfall `$events/result`（remote-events WS 给了 clientId 时，官方就是
+  ///    在这条事件通道上应答的）；
+  /// 2. **rc.2 官方 `userQuestions/answer`**（agent 作用域、纯 HTTP）—— 局域网
+  ///    没有 WS（8080 转发层不做隧道）时这是唯一答得通的路径；
+  /// 3. 旧版 `POST /api/respond`。
   Future<void> answerQuestion(
     String rpcId,
     String sessionId,
-    List<Map<String, dynamic>> answers,
-  ) async {
+    List<Map<String, dynamic>> answers, {
+    String? callId,
+  }) async {
     final clientId = _remoteEventClientIds[rpcId];
     if (clientId != null && clientId.isNotEmpty) {
       await _rpc(r'$events/result', {
@@ -1511,6 +2500,19 @@ class DshApiClient {
       });
       _remoteEventClientIds.remove(rpcId);
       return;
+    }
+    final id = (callId ?? rpcId).trim();
+    if (id.isNotEmpty && sessionId.trim().isNotEmpty) {
+      try {
+        await _rpc('userQuestions.answer', {
+          'agentId': sessionId,
+          'callId': id,
+          'answer': {'answers': answers},
+        });
+        return;
+      } catch (_) {
+        // 旧版没有这个端点：落到 legacy respond。
+      }
     }
     await _respond(rpcId, {
       'ok': true,
@@ -1762,12 +2764,48 @@ class DshApiClient {
     return (v['agentPreset'] ?? '').toString();
   }
 
-  /// 把预设设为后续新建会话的默认（官方写 agent-presets.default）。
+  /// 把预设设为后续新建会话的默认。
+  ///
+  /// rc.2 的 settings 命名空间由插件名派生（registry 只写 `settings.configure`），
+  /// 写死 `agent-presets` 在换版本时会静默失败；这里**从 `settings.describe`
+  /// 的命名空间里挑含 preset 的那个**，取不到才退回老名字。
+  /// 见 docs/fix-log.md #396。
   Future<void> setDefaultPreset(String agentPreset) async {
     await _rpc('settings.update', {
-      'ns': 'agent-presets',
+      'ns': await _agentPresetNamespace(),
       'patch': {'default': agentPreset},
     });
+  }
+
+  String? _agentPresetNs;
+
+  Future<String> _agentPresetNamespace() async {
+    final cached = _agentPresetNs;
+    if (cached != null && cached.isNotEmpty) return cached;
+    try {
+      final v = await _rpc('settings.describe', const {});
+      final picked = pickAgentPresetNamespace(v['namespaces']);
+      if (picked != null) {
+        _agentPresetNs = picked;
+        return picked;
+      }
+    } catch (_) {
+      // describe 失败就退回老名字，真写不进去由 UI 报错。
+    }
+    _agentPresetNs = 'agent-presets';
+    return 'agent-presets';
+  }
+
+  /// 从 `settings.describe` 的命名空间里挑默认预设该写哪个（纯函数便于单测）：
+  /// 取名字里含 preset 的那个；没有返回 null（调用方退回老名字）。
+  static String? pickAgentPresetNamespace(dynamic namespaces) {
+    if (namespaces is! List) return null;
+    for (final e in namespaces) {
+      if (e is! Map) continue;
+      final ns = (e['ns'] ?? '').toString();
+      if (ns.isNotEmpty && ns.toLowerCase().contains('preset')) return ns;
+    }
+    return null;
   }
 
   /// 读取预设内容（agentPreset.read）。
@@ -1782,30 +2820,93 @@ class DshApiClient {
     );
   }
 
+  /// 当前 DSH 是否支持增删自建预设。
+  ///
+  /// rc.2 的 `dsh-agent-preset-registry` 只暴露 `agentPresets/list|read|select`
+  /// （见 docs/fix-log.md #396），`agentPresets/copy` / `agentPresets/deletePreset`
+  /// **不存在**；一旦撞到 404 就置 false，界面据此收起「复制 / 删除」入口，
+  /// 不再反复打必失败的请求。
+  bool agentPresetMutable = true;
+
   /// 复制预设为新的用户预设（agentPreset.copy）。
   Future<String> copyPreset(
     String from,
     String agentPreset, {
     String? name,
   }) async {
-    final v = await _rpc('agentPreset.copy', {
-      'from': from,
-      'agentPreset': agentPreset,
-      if (name != null && name.isNotEmpty) 'name': name,
-    });
-    return (v['agentPreset'] ?? '').toString();
+    if (!agentPresetMutable) {
+      throw DshApiException('当前 DSH 版本不支持复制预设（没有 agentPresets/copy）');
+    }
+    try {
+      final v = await _rpc('agentPreset.copy', {
+        'from': from,
+        'agentPreset': agentPreset,
+        if (name != null && name.isNotEmpty) 'name': name,
+      });
+      return (v['agentPreset'] ?? '').toString();
+    } catch (e) {
+      _markPresetMutableFromError(e);
+      rethrow;
+    }
   }
 
   /// 删除用户预设（agentPreset.remove）。
   Future<void> removePreset(String agentPreset) async {
-    await _rpc('agentPreset.remove', {'agentPreset': agentPreset});
+    if (!agentPresetMutable) {
+      throw DshApiException('当前 DSH 版本不支持删除预设（没有 agentPresets/deletePreset）');
+    }
+    try {
+      await _rpc('agentPreset.remove', {'agentPreset': agentPreset});
+    } catch (e) {
+      _markPresetMutableFromError(e);
+      rethrow;
+    }
+  }
+
+  /// 「端点不存在」才判死（超时 / 连不上属临时故障，下次还要试）。
+  void _markPresetMutableFromError(Object error) {
+    final text = '$error';
+    if (text.contains('404') || text.contains('unknown endpoint')) {
+      agentPresetMutable = false;
+    }
   }
 
   // ── 工作区域 ──────────────────────────────────────────────────────────
 
-  /// 工作区列表（workspace.list）。
+  /// 工作区列表。
+  ///
+  /// rc.2 **没有** `workspace/list`（官方接口面只有 `workspace/follow` 这条
+  /// 下行流：baseline 帧里带 `items` + `archivedSessionIds`），旧协议
+  /// `workspace.list` 只在更老的 DSH 上存在。所以顺序是：
+  /// 旧协议 RPC（老版本兼容）→ `workspace/follow` baseline →
+  /// 抛错交上层按会话 cwd 分组（局域网 8080 转发层不做 WS 隧道，见
+  /// docs/fix-log.md #392）。第一次 404 之后不再重试，避免每 5 秒白打请求。
+  bool _workspaceListUnsupported = false;
+
   Future<({List<DshWorkspace> items, List<String> archivedSessionIds})>
   listWorkspaces() async {
+    if (_workspaceListUnsupported) {
+      throw DshApiException('工作区接口在当前 DSH 上不可用（已降级为按会话目录分组）');
+    }
+    var endpointMissing = false;
+    try {
+      final v = await _rpc('workspace.list', {});
+      _workspaceListUnsupported = false;
+      return (
+        items: ((v['items'] as List?) ?? const [])
+            .map(
+              (e) => DshWorkspace.fromJson((e as Map).cast<String, dynamic>()),
+            )
+            .toList(),
+        archivedSessionIds: ((v['archivedSessionIds'] as List?) ?? const [])
+            .map((e) => e.toString())
+            .toList(),
+      );
+    } catch (e) {
+      // 只有「接口不存在」（404）才判死；超时 / 连不上属临时故障，下次还要试。
+      endpointMissing = '$e'.contains('404');
+      await _logWsFallback('workspace/list RPC 失败：$e');
+    }
     try {
       final baseline =
           await DshWsDownlink.openRemoteStream(
@@ -1817,7 +2918,7 @@ class DshApiClient {
               .firstWhere((value) {
                 return value is Map && value['type'] == 'baseline';
               })
-              .timeout(const Duration(seconds: 10));
+              .timeout(const Duration(seconds: 4));
       final raw = (baseline as Map)['value'];
       final v = raw is Map
           ? raw.cast<String, dynamic>()
@@ -1832,15 +2933,19 @@ class DshApiClient {
             .map((e) => e.toString())
             .toList(),
       );
-    } catch (_) {}
-    final v = await _rpc('workspace.list', {}, forceLegacy: true);
-    return (
-      items: ((v['items'] as List?) ?? const [])
-          .map((e) => DshWorkspace.fromJson((e as Map).cast<String, dynamic>()))
-          .toList(),
-      archivedSessionIds: ((v['archivedSessionIds'] as List?) ?? const [])
-          .map((e) => e.toString())
-          .toList(),
+    } catch (e) {
+      await _logWsFallback('workspace/follow 下行流没给 baseline：$e');
+    }
+    _workspaceListUnsupported = endpointMissing;
+    throw DshApiException('拿不到工作区列表（workspace/list 与 workspace/follow 都不通）');
+  }
+
+  /// 落一条诊断日志（工作区接口降级路径），排查「一直转圈」时能直接看到原因。
+  Future<void> _logWsFallback(String message) async {
+    await RuntimeLogger.instance.warn(
+      'DSH',
+      'workspace.fallback',
+      data: {'reason': message, 'baseUrl': _baseUrl},
     );
   }
 
@@ -1952,18 +3057,82 @@ class DshApiClient {
 
   // ── 子代理域 ──────────────────────────────────────────────────────────
 
-  /// 子代理列表（subagent.list，需父会话 id）。
+  /// 子代理列表。
+  ///
+  /// rc.2 **没有 `subagents/list`**（只有 `subagents/prompt` /
+  /// `subagents/interruptByParent`），列表要从官方 `session/list` 派生：
+  /// 父会话条目里的 `projections.values.subagentCatalog`
+  /// （`{id, createdAt, mode, label?}`）就是官方子代理目录，子会话本身则带
+  /// `origin:'subagent'` + `parentSessionId`。原来打 `subagents/list` 会 404，
+  /// 子代理状态条 / mini 会话因此全空（见 docs/fix-log.md #396）。
   Future<({List<DshSubagentEntry> entries, bool parentAvailable})>
   listSubagents(String parentSessionId) async {
-    final v = await _rpc('subagent.list', {'parentSessionId': parentSessionId});
+    return deriveSubagents(
+      parentSessionId: parentSessionId,
+      sessions: await listAllSessions(),
+    );
+  }
+
+  /// 由一份 `session/list` 结果派生子代理列表（纯函数，便于单测）。
+  static ({List<DshSubagentEntry> entries, bool parentAvailable})
+  deriveSubagents({
+    required String parentSessionId,
+    required List<DshSessionSummary> sessions,
+  }) {
+    final parent = sessions
+        .where((s) => s.sessionId == parentSessionId)
+        .firstOrNull;
+    final children = <String, DshSessionSummary>{
+      for (final s in sessions)
+        if (s.isSubagent && s.parentSessionId == parentSessionId)
+          s.sessionId: s,
+    };
+    final childIdsOf = <String, int>{};
+    for (final s in sessions) {
+      final p = s.parentSessionId;
+      if (s.isSubagent && p != null && p.isNotEmpty) {
+        childIdsOf[p] = (childIdsOf[p] ?? 0) + 1;
+      }
+    }
+    final entries = <DshSubagentEntry>[];
+    for (final item
+        in parent?.subagentCatalog ?? const <Map<String, dynamic>>[]) {
+      final id = (item['id'] ?? '').toString();
+      if (id.isEmpty) continue;
+      final child = children[id];
+      entries.add(
+        DshSubagentEntry(
+          sessionId: id,
+          title: item['label']?.toString() ?? child?.title,
+          running: child?.running ?? false,
+          updatedAt:
+              child?.updatedAt ?? (item['createdAt'] as num?)?.toInt() ?? 0,
+          turnCount: child?.turnCount ?? 0,
+          mode: (item['mode'] ?? 'one-shot').toString(),
+          hasChildren: (childIdsOf[id] ?? 0) > 0,
+        ),
+      );
+    }
+    // 目录缺失（旧版 DSH / 未物化）时退回「按 parentSessionId 找子会话」。
+    if (entries.isEmpty) {
+      for (final child in children.values) {
+        entries.add(
+          DshSubagentEntry(
+            sessionId: child.sessionId,
+            title: child.title,
+            running: child.running,
+            updatedAt: child.updatedAt,
+            turnCount: child.turnCount,
+            mode: 'one-shot',
+            hasChildren: (childIdsOf[child.sessionId] ?? 0) > 0,
+          ),
+        );
+      }
+    }
+    entries.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     return (
-      entries: ((v['entries'] as List?) ?? const [])
-          .map(
-            (e) =>
-                DshSubagentEntry.fromJson((e as Map).cast<String, dynamic>()),
-          )
-          .toList(),
-      parentAvailable: v['parentAvailable'] == true,
+      entries: entries,
+      parentAvailable: parent?.agentAvailable ?? false,
     );
   }
 
@@ -2103,29 +3272,38 @@ class DshApiClient {
 
   // ── 主机域 ────────────────────────────────────────────────────────────
 
-  /// 主机信息（host.describe）。
+  /// 主机信息。
+  ///
+  /// 目标 DSH（桌面版）组合的可能是**原生**目录选择器（只实现 `pick`），
+  /// 这时 `directoryPicker/list` 会返回 `directory-picker/unavailable`
+  /// —— 浏览拿不到目录很正常，用已知 cwd 兜底即可。
+  /// **不要再回退到 `host.describe`**（目标没有这个端点，只会 404），
+  /// 见 docs/fix-log.md #403。
   Future<DshHostInfo> hostDescribe() async {
+    var cwd = _preferredCwd.trim();
+    var home = '';
     try {
       final listing = await directoryListing();
-      var canOpenPath = false;
-      try {
-        final value = await _rpc('session/canOpenWorkspacePath', const {});
-        canOpenPath = value['value'] == true;
-      } catch (_) {}
-      final hint = listing.path.isNotEmpty ? listing.path : listing.home;
-      final windows =
-          hint.contains('\\') || RegExp(r'^[A-Za-z]:').hasMatch(hint);
-      return DshHostInfo(
-        platform: windows ? 'win32' : 'linux',
-        arch: '',
-        cwd: _preferredCwd.isNotEmpty ? _preferredCwd : hint,
-        home: listing.home,
-        canOpenPath: canOpenPath,
-      );
+      if (listing.path.isNotEmpty && cwd.isEmpty) cwd = listing.path;
+      home = listing.home;
     } catch (_) {
-      final v = await _rpc('host.describe', {}, forceLegacy: true);
-      return DshHostInfo.fromJson(v);
+      // 目标只提供原生选择器 / 旧版没有浏览能力：用已知 cwd 兜底。
     }
+    var canOpenPath = false;
+    try {
+      canOpenPath =
+          (await _rpc('session/canOpenWorkspacePath', const {}))['value'] ==
+          true;
+    } catch (_) {}
+    final hint = cwd.isNotEmpty ? cwd : home;
+    final windows = hint.contains('\\') || RegExp(r'^[A-Za-z]:').hasMatch(hint);
+    return DshHostInfo(
+      platform: windows ? 'win32' : 'linux',
+      arch: '',
+      cwd: cwd,
+      home: home,
+      canOpenPath: canOpenPath,
+    );
   }
 
   /// 完整目录快照（host.listDirectory）；省略 path 时由远端列出其 home。
@@ -2252,7 +3430,7 @@ class DshApiClient {
   /// 注意：typert assertExactArguments 要求可选参数的键也必须存在，
   /// `images` 缺键会被网关以 "missing images" 拒绝，必须显式传空数组。
   Future<String> executeSessionCommand(String sessionId, String line) async {
-    final value = await _rpc('commands/execute', {
+    final value = await _rpc('commands.execute', {
       'agentId': sessionId,
       'line': line,
       'submittedAttachments': const <dynamic>[],
@@ -2382,15 +3560,31 @@ class DshApiClient {
   // ── 搜索域 ────────────────────────────────────────────────────────────
 
   /// 搜索会话（session.search）。部署未启用全文索引时抛 DshApiException。
-  Future<List<DshSessionSummary>> searchSessions(String query) async {
+  /// 搜索会话。
+  ///
+  /// rc.2 的 `session/search` 结果只有 `{items:[{sessionId, snippet}], hasMore}`：
+  /// **没有标题 / 时间 / origin**。直接按 [DshSessionSummary.fromJson] 解析会得到
+  /// 一堆空标题的会话，所以这里必须与 `session/list` 做 join；调用方已经握着
+  /// 会话列表时用 [knownSessions] 传进来，省一次请求。见 docs/fix-log.md #396。
+  Future<List<DshSessionSummary>> searchSessions(
+    String query, {
+    List<DshSessionSummary>? knownSessions,
+  }) async {
     final v = await _rpc('session.search', {'query': query});
     final items = (v['items'] ?? const []) as List;
-    return items
-        .map(
-          (e) => DshSessionSummary.fromJson((e as Map).cast<String, dynamic>()),
-        )
-        .where((s) => !s.isSubagent)
-        .toList();
+    final known = <String, DshSessionSummary>{
+      for (final s in knownSessions ?? await listAllSessions()) s.sessionId: s,
+    };
+    final out = <DshSessionSummary>[];
+    for (final e in items) {
+      if (e is! Map) continue;
+      final map = e.cast<String, dynamic>();
+      final id = (map['sessionId'] ?? '').toString();
+      final session = known[id];
+      if (session == null || session.isSubagent) continue;
+      out.add(session.withSearchSnippet(map['snippet']?.toString()));
+    }
+    return out;
   }
 
   /// 拉取会话历史并重建为消息列表。
@@ -2403,65 +3597,212 @@ class DshApiClient {
   }
 
   /// 历史消息 + 末尾未收口的 live token（打开会话时补种流式气泡）。
-  Future<DshHistoryBundle> historyBundle(String sessionId) async {
-    final value = await _readCompleteHistory('session.history', {
-      'sessionId': sessionId,
-    });
+  ///
+  /// 只读官方尾页窗口（默认 [DshApiClient.historyWindowMessages] 条、至少
+  /// [DshApiClient.historyWindowTurns] 轮）；更早的消息交给 [historyOlder] 上翻。
+  /// 上千轮的长会话必须走这条窗口路径，否则首帧与每一拍轮询都会重拉全量历史。
+  Future<DshHistoryBundle> historyBundle(
+    String sessionId, {
+    int maxMessages = DshApiClient.historyWindowMessages,
+    int minMessages = DshApiClient.historyWindowMinMessages,
+    int minTurns = DshApiClient.historyWindowTurns,
+  }) {
+    return historyWindow(
+      sessionId,
+      maxMessages: maxMessages,
+      minMessages: minMessages,
+      minTurns: minTurns,
+    );
+  }
+
+  /// 只读官方尾页窗口（进入会话 / 每一拍轮询都用这个）。
+  ///
+  /// 官方 `session/page` 的窗口语义：向后取到「至少 [historyWindowMinMessages]
+  /// 条 / 至少 [minTurns] 轮」，上限 [maxMessages] 条。返回的
+  /// [DshHistoryBundle.hasMoreOlder] 表示还能继续向旧翻页，配合 [historyOlder]。
+  Future<DshHistoryBundle> historyWindow(
+    String sessionId, {
+    int maxMessages = DshApiClient.historyWindowMessages,
+    int minMessages = DshApiClient.historyWindowMinMessages,
+    int minTurns = DshApiClient.historyWindowTurns,
+  }) {
+    return _readHistoryPage(
+      'session.history',
+      {'sessionId': sessionId},
+      maxMessages: maxMessages,
+      minMessages: minMessages,
+      minTurns: minTurns,
+      bootstrapCursor: true,
+    );
+  }
+
+  /// 取比 [beforeSeq] 更早的一页（上翻加载更早的消息）。
+  ///
+  /// [throughSeq] 必须与首帧读到的是同一个尾部游标，否则官方会用新游标
+  /// 重新定位窗口（见 `_sessionPageRequest` 的注释）。
+  Future<DshHistoryBundle> historyOlder(
+    String sessionId, {
+    required int beforeSeq,
+    int? throughSeq,
+    int maxMessages = DshApiClient.historyOlderMessages,
+  }) {
+    return _readHistoryPage(
+      'session.history',
+      {'sessionId': sessionId},
+      maxMessages: maxMessages,
+      beforeSeq: beforeSeq,
+      throughSeq: throughSeq,
+    );
+  }
+
+  /// 读一页历史（不做向上翻页合并）。
+  ///
+  /// `maxMessages` / `minMessages` / `minTurns` 只发给 rc.2 的 `session/page`；
+  /// 旧协议回退时用不含这些字段的裸游标请求，避免旧 DSH 拒绝未知参数。
+  Future<DshHistoryBundle> _readHistoryPage(
+    String method,
+    Map<String, dynamic> payload, {
+    required int maxMessages,
+    int? minMessages,
+    int? minTurns,
+    int? beforeSeq,
+    int? throughSeq,
+    bool bootstrapCursor = false,
+  }) async {
+    Map<String, dynamic> windowArgs(int? through) => {
+      ...payload,
+      'maxMessages': maxMessages,
+      'minMessages': ?minMessages,
+      'minTurns': ?minTurns,
+      'beforeSeq': ?beforeSeq,
+      'throughSeq': ?through,
+    };
+
+    final legacyPayload = <String, dynamic>{
+      ...payload,
+      'beforeSeq': ?beforeSeq,
+      'throughSeq': ?throughSeq,
+    };
+
+    // throughSeq 是**包含式上界**：rc.2 里 -1 的语义是「空游标」，
+    // 服务端据此返回空页（`{"records":[],"hasMore":false}`），页面于是
+    // 显示成空会话。官方客户端的游标来自 `session/follow` 首帧 snapshot；
+    // 这里优先用最近读到过的尾部 seq，没有就先按读取参数、再靠
+    // snapshot / 越界探测学一次（见下），之后由 [_tailCursors] 自维护。
+    final key = _historyKey(payload);
+    final through = throughSeq ?? _tailCursors[key];
+    var value = _normalizeHistoryValue(
+      await _rpc(
+        method,
+        windowArgs(through),
+        legacyPayload: {...legacyPayload, 'throughSeq': ?through},
+      ),
+    );
+    if (bootstrapCursor && (value['events'] as List?)?.isEmpty == true) {
+      final snapshot = await _followSnapshot(payload);
+      final records = (snapshot?['records'] as List?) ?? const <dynamic>[];
+      if (records.isNotEmpty) {
+        // 官方首帧就带着首页记录，直接用。
+        value = _normalizeHistoryValue({
+          'events': records,
+          if (snapshot?['hasMore'] != null) 'hasMore': snapshot!['hasMore'],
+          if (snapshot?['projections'] != null)
+            'projections': snapshot!['projections'],
+        });
+      } else {
+        var cursor = (snapshot?['cursor'] as num?)?.toInt();
+        if (cursor == null || cursor < 0) {
+          cursor = await _probeTailCursor(method, windowArgs, legacyPayload);
+        }
+        if (cursor != null && cursor >= 0) {
+          // 先记住，避免每次读都重走一遍 snapshot / 越界探测。
+          _tailCursors[key] = cursor;
+          value = _normalizeHistoryValue(
+            await _rpc(
+              method,
+              windowArgs(cursor),
+              legacyPayload: {...legacyPayload, 'throughSeq': cursor},
+            ),
+          );
+        }
+      }
+    }
+    final events = (value['events'] as List?) ?? const <dynamic>[];
+    final newest = _lastHistorySeq(events);
+    if (newest != null) _tailCursors[key] = newest;
     return DshHistoryBundle(
       messages: _historyFromValue(value),
       live: DshLiveTurn.fromHistoryValue(value),
       responseModels: _responseModelsFromValue(value),
       turnEnded: _historyTurnEnded(value),
       permissionPreset: permissionPresetFromValue(value),
+      hasMoreOlder: value['hasMore'] == true,
+      oldestSeq: _firstHistorySeq(events),
+      newestSeq: newest,
     );
   }
 
-  /// 读取 DSH 官方 SessionEventStream 的完整历史。
-  ///
-  /// rc.2 的 session/page 是“尾页 + hasMore”，官方客户端通过
-  /// `prepend(request, currentCursor)` 持续向旧 seq 翻页。拾忆没有独立的
-  /// 上拉分页入口，所以打开会话时把所有页合并成一份稳定的时间线，避免
-  /// live 气泡和不完整历史互相覆盖。
-  Future<Map<String, dynamic>> _readCompleteHistory(
+  /// 每个会话最近读到的尾部 seq，作为下一次读取的 `throughSeq`。
+  /// 官方客户端从 `session/follow` 的 snapshot 拿 cursor，那条下行流在
+  /// 部分链路（局域网 + 桌面宿主）拿不到帧，所以这里学一次后缓存复用。
+  final Map<String, int> _tailCursors = {};
+
+  static String _historyKey(Map<String, dynamic> payload) =>
+      (payload['sessionId'] ?? payload['childSessionId'] ?? '').toString();
+
+  /// 越界探测：用一个必然超过当前游标的 throughSeq 问一次，服务端会回
+  /// `session page through seq N is past cursor M`，M 就是当前尾部游标
+  /// （实测 rc.2：-1 是「空游标」，只有真实游标才拿得到记录）。
+  Future<int?> _probeTailCursor(
     String method,
-    Map<String, dynamic> payload,
+    Map<String, dynamic> Function(int?) windowArgs,
+    Map<String, dynamic> legacyPayload,
   ) async {
-    var value = _normalizeHistoryValue(await _rpc(method, payload));
-    if ((value['events'] as List?)?.isEmpty == true &&
-        (method == 'session.history' || method == 'subagent.history')) {
-      final cursor = await _historyCursor(payload);
-      if (cursor != null && cursor >= 0) {
-        value = _normalizeHistoryValue(
-          await _rpc(method, {...payload, 'throughSeq': cursor}),
-        );
+    const probeSeq = 1 << 40;
+    try {
+      await _rpc(
+        method,
+        windowArgs(probeSeq),
+        legacyPayload: {...legacyPayload, 'throughSeq': probeSeq},
+      );
+    } catch (e) {
+      final cursor = parsePastCursor('$e');
+      if (cursor != null) {
+        unawaited(_diagHistory('cursor.learned', {'cursor': cursor}));
+        return cursor;
       }
     }
-    final all = <dynamic>[...((value['events'] as List?) ?? const <dynamic>[])];
-    var hasMore = value['hasMore'] == true;
-    final throughSeq = _lastHistorySeq(all);
-    var beforeSeq = _firstHistorySeq(all);
-    var pages = 0;
-    while (hasMore && beforeSeq != null && beforeSeq > 0 && pages < 200) {
-      final next = _normalizeHistoryValue(
-        await _rpc(method, {
-          ...payload,
-          'beforeSeq': beforeSeq - 1,
-          if (throughSeq != null) 'throughSeq': throughSeq,
-        }),
-      );
-      final older = (next['events'] as List?) ?? const <dynamic>[];
-      if (older.isEmpty) break;
-      final nextBefore = _firstHistorySeq(older);
-      if (nextBefore == null || nextBefore >= beforeSeq) break;
-      all.insertAll(0, older);
-      beforeSeq = nextBefore;
-      hasMore = next['hasMore'] == true;
-      pages++;
-    }
-    return {...value, 'events': all, 'hasMore': hasMore};
+    return null;
   }
 
-  Future<int?> _historyCursor(Map<String, dynamic> payload) async {
+  /// 从服务端的越界报错里取当前尾部游标：
+  /// `session page through seq N is past cursor M` → M。
+  static int? parsePastCursor(String message) {
+    final match = RegExp(r'past cursor (\d+)').firstMatch(message);
+    final value = int.tryParse(match?.group(1) ?? '');
+    return (value != null && value >= 0) ? value : null;
+  }
+
+  /// 历史读取分步诊断（定位「会话页一直转圈」卡在哪一步）。
+  Future<void> _diagHistory(String step, Map<String, dynamic> extra) =>
+      RuntimeLogger.instance.info(
+        'DSH',
+        'history.diag',
+        data: {'step': step, ...extra},
+      );
+
+  /// `session/follow` 连续失败次数。局域网 + 桌面宿主实测升级后拿不到任何
+  /// 帧（HTTP 通、WS 静默），失败两次后就不再白等 4 秒超时，直接走
+  /// 越界探测学游标；换连接会新建 client，自然重新尝试官方路径。
+  int _followFailures = 0;
+
+  /// `session/follow` 的首帧 snapshot（官方 `follow()` 的开启参数：
+  /// `{request: {address, assistantStream: true}}`——少一层 `request` 或漏了
+  /// `assistantStream` 服务端都不给开局 baseline）。
+  Future<Map<String, dynamic>?> _followSnapshot(
+    Map<String, dynamic> payload,
+  ) async {
+    if (_followFailures >= 2) return null;
     final sessionId = (payload['sessionId'] ?? '').toString().trim();
     final parentSessionId = (payload['parentSessionId'] ?? '')
         .toString()
@@ -2476,21 +3817,31 @@ class DshApiClient {
             'mode': (payload['mode'] ?? 'one-shot').toString(),
           };
     try {
-      await for (final value in DshWsDownlink.openRemoteStream(
-        _baseUrl,
-        'session/follow',
-        {
-          'request': {'address': address},
-        },
-        headers: _wsHeaders(),
-      )) {
-        if (value is! Map || value['type']?.toString() != 'snapshot') {
-          continue;
-        }
-        return (value['cursor'] as num?)?.toInt();
-      }
-    } catch (_) {
-      // 旧版 DSH 没有 session/follow 时，保留原有 page 读取路径。
+      // 官方 `follow()` 的开启参数：{address, assistantStream:true}。
+      // 参数按官方 `session/follow` 的 schema：单个 `request` 参数，
+      // 里面是 `{address, assistantStream: true}`（漏了 assistantStream
+      // 拿不到开局 baseline）。Host/Origin 仍走 [_wsHeaders] 的兼容身份。
+      final snapshot =
+          await DshWsDownlink.openRemoteStream(
+                _baseUrl,
+                'session/follow',
+                {
+                  'request': {'address': address, 'assistantStream': true},
+                },
+                headers: _wsHeaders(),
+              )
+              .firstWhere(
+                (value) =>
+                    value is Map && value['type']?.toString() == 'snapshot',
+              )
+              .timeout(const Duration(seconds: 4));
+      _followFailures = 0;
+      return (snapshot as Map).cast<String, dynamic>();
+    } catch (e) {
+      // 旧版 DSH 没有 session/follow / 下行流拿不到帧：保留原有 page 路径，
+      // 由 [_probeTailCursor] 兜底学游标。
+      _followFailures++;
+      unawaited(_diagHistory('follow.fallback', {'reason': '$e'}));
     }
     return null;
   }
@@ -3380,7 +4731,22 @@ class DshApiClient {
     for (final part in content) {
       final p = (part as Map?)?.cast<String, dynamic>();
       if (p == null) continue;
-      if (p['type'] == 'text') buf.write(p['text']?.toString() ?? '');
+      final type = p['type']?.toString() ?? '';
+      if (type == 'text') {
+        buf.write(p['text']?.toString() ?? '');
+        continue;
+      }
+      // rc.2 的图片/文件块：正文里给个占位（附件本体要另取，
+      // 见 DshApiClient.readAttachment），否则历史里这两类内容整条消失。
+      if (type == 'image') {
+        final name = p['name']?.toString() ?? '';
+        buf.write(name.isEmpty ? '【图片】' : '【图片：$name】');
+        continue;
+      }
+      if (type == 'file') {
+        final name = p['name']?.toString() ?? '';
+        buf.write(name.isEmpty ? '【附件】' : '【附件：$name】');
+      }
     }
     return buf.toString().trim();
   }

@@ -107,32 +107,60 @@ void main() {
           "grep -q 'apk-tools 2' && APK_TO=\"--wait 300 --no-cache\"",
         ),
       );
-      expect(init, contains(r'timeout 90 apk $APK_TO $APK_SINGLE update'));
-      expect(init, contains(r'timeout 120 apk $APK_TO $APK_SINGLE add bash'));
+      // 基础包单源：update 120s 索引、add 480s（33 个包 + --no-cache 重下）
+      expect(init, contains(r'timeout 120 apk $APK_TO update'));
+      expect(init, contains(r'timeout 480 apk $APK_TO add bash'));
       expect(init, isNot(contains('--network-timeout 300')));
     });
 
     test('init 锁 chmod 777（proot -0 属主 root，app 才能删释放）', () {
       expect(init, contains(r'chmod 777 "$INIT_LOCK"'));
       expect(init, contains(r'INIT_LOCK=/tmp/shiyi-init.lock'));
-      expect(init, contains(r'find "$INIT_LOCK" -mmin +15'));
+      // 残留锁兜底：超过单轮最坏耗时（3×(120s+480s) ≈ 30 分钟）就按残留清掉
+      expect(init, contains(r'find "$INIT_LOCK" -mmin +40'));
     });
 
-    test('init 锁被占时等待持有者完成，不绕过并发 apk', () {
-      expect(init, contains(r'while [ $i -lt 120 ] && [ -d "$INIT_LOCK" ]'));
+    test('init 锁：持有者活着才等，进程已死/旧版残留锁立刻清', () {
+      expect(init, contains(r'holder=$(cat "$INIT_LOCK/pid" 2>/dev/null)'));
+      expect(init, contains(r'kill -0 "$holder"'));
+      expect(
+        init,
+        contains(r'while [ $i -lt 60 ] && [ -d "$INIT_LOCK" ]'),
+      );
       expect(init, contains(r'sleep 5'));
       expect(init, contains(r'rmdir "$INIT_LOCK"'));
     });
 
-    test('init 部署进度日志写 /sdcard（定位卡点）', () {
+    test('init 部署进度日志写 /sdcard，且在拿锁之前就落（卡住也能看见）', () {
       expect(init, contains('INIT_LOG=/sdcard/agent/logs/init-debug.log'));
       expect(init, contains(r'echo "[$(date)] init start'));
+      final logAt = init.indexOf(r'echo "[$(date)] init start');
+      final lockAt = init.indexOf(r'if ! mkdir "$INIT_LOCK"');
+      expect(logAt, greaterThanOrEqualTo(0));
+      expect(lockAt, greaterThanOrEqualTo(0));
+      expect(logAt, lessThan(lockAt), reason: '拿锁前的卡点也要能落日志');
     });
 
-    test('基础包阶段清华单源（-X），避免多源索引下载卡死', () {
-      expect(init, contains(r'APK_SINGLE="-X http://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main"'));
-      expect(init, contains(r'apk $APK_TO $APK_SINGLE update'));
-      expect(init, contains(r'apk $APK_TO $APK_SINGLE add bash'));
+    test('基础包阶段只留清华单源 repositories，装完恢复多源', () {
+      // 单源写在 repositories 文件里（比 -X 追加更彻底：多源索引不再参与）
+      expect(init, contains(r'> /etc/apk/repositories'));
+      expect(
+        init,
+        contains(
+          r'"http://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main"',
+        ),
+      );
+      expect(
+        init,
+        contains(
+          r'"http://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community"',
+        ),
+      );
+      // 基础包就绪后恢复「测速多源」，用户后续 apk 命令仍走快源
+      expect(
+        init,
+        contains(r'shiyi-apk-sources >>"$INIT_LOG" 2>&1 || true'),
+      );
     });
 
     test('install 重建 rootfs 前先彻底删除旧目录', () {

@@ -4,10 +4,10 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
+import 'chat_liquid_glass.dart';
 import '../core/models.dart';
 import 'context_menu.dart';
 import 'ios_style.dart';
-import 'chat_liquid_glass.dart';
 import 'markdown_text.dart';
 import 'smooth_stream_text.dart';
 
@@ -40,6 +40,13 @@ class MessageBubble extends StatefulWidget {
   final void Function(ChatMessage msg)? onSaveSkill;
   final void Function(ChatMessage msg)? onSpeak;
   final VoidCallback? onStopSpeak;
+
+  /// DSH 消息反馈（官方 `messageFeedback/*`）：拾忆传 null 就不显示。
+  final void Function(ChatMessage msg)? onFeedbackUp;
+  final void Function(ChatMessage msg)? onFeedbackDown;
+
+  /// 这条消息当前的服务端反馈评分：`positive` / `negative` / null。
+  final String? feedbackRating;
   final bool speaking;
 
   /// 刚发出的用户气泡做水滴分离；新出现的流式助手气泡做轻入场。
@@ -65,6 +72,9 @@ class MessageBubble extends StatefulWidget {
     this.onSaveSkill,
     this.onSpeak,
     this.onStopSpeak,
+    this.onFeedbackUp,
+    this.onFeedbackDown,
+    this.feedbackRating,
     this.speaking = false,
     this.animateEnter = false,
     this.speakerName,
@@ -140,6 +150,9 @@ class _MessageBubbleState extends State<MessageBubble> {
   void Function(ChatMessage)? get onSaveSkill => widget.onSaveSkill;
   void Function(ChatMessage)? get onSpeak => widget.onSpeak;
   VoidCallback? get onStopSpeak => widget.onStopSpeak;
+  void Function(ChatMessage)? get onFeedbackUp => widget.onFeedbackUp;
+  void Function(ChatMessage)? get onFeedbackDown => widget.onFeedbackDown;
+  String? get feedbackRating => widget.feedbackRating;
 
   String? _extractMarkedContent(String content, String marker) {
     final trimmed = content.trimLeft();
@@ -475,7 +488,7 @@ class _MessageBubbleState extends State<MessageBubble> {
               const SizedBox(
                 width: 15,
                 height: 15,
-                child: CupertinoActivityIndicator(radius: 7),
+                child: AppLoading(size: AppLoadingSize.inline),
               )
             else
               Icon(
@@ -792,6 +805,25 @@ class _MessageBubbleState extends State<MessageBubble> {
           icon: Icons.delete_outline,
           tooltip: '删除',
           onTap: () => onDelete?.call(message),
+        ),
+      // 官方消息反馈（DSH 会话页才传）：当前评分高亮。
+      if (!busy && !isUser && onFeedbackUp != null)
+        _barButton(
+          theme: theme,
+          icon: feedbackRating == 'positive'
+              ? Icons.thumb_up
+              : Icons.thumb_up_outlined,
+          tooltip: '有帮助',
+          onTap: () => onFeedbackUp?.call(message),
+        ),
+      if (!busy && !isUser && onFeedbackDown != null)
+        _barButton(
+          theme: theme,
+          icon: feedbackRating == 'negative'
+              ? Icons.thumb_down
+              : Icons.thumb_down_outlined,
+          tooltip: '没帮助',
+          onTap: () => onFeedbackDown?.call(message),
         ),
     ];
     if (actions.isEmpty) return const SizedBox.shrink();

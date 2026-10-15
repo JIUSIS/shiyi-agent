@@ -9,6 +9,7 @@ import '../core/app_state.dart';
 import '../core/mac_page_route.dart';
 import '../services/dsh_api.dart';
 import '../services/dsh_service.dart';
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/mac_action_button.dart';
 import 'dsh_center_screen.dart';
@@ -435,7 +436,7 @@ class _DshSkillsScreenState extends State<DshSkillsScreen> {
 
   Widget _buildBody() {
     if (_loading && _sessions.isEmpty && _skills.isEmpty) {
-      return const Center(child: CupertinoActivityIndicator(radius: 13));
+      return const Center(child: AppLoading(size: AppLoadingSize.hero));
     }
     if (_error != null && _sessions.isEmpty) {
       return _StateMessage(
@@ -769,9 +770,10 @@ class _StateMessage extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 16),
-            CupertinoButton.filled(
+            GlassActionButton(
+              label: action,
               onPressed: () => unawaited(onAction()),
-              child: Text(action),
+              accent: true,
             ),
           ],
         ),

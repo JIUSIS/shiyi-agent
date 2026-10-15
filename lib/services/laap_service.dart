@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'laap_api.dart';
+import 'socks5_config.dart';
 import 'termux_runtime.dart';
 
 enum LaapStatus {
@@ -29,10 +30,18 @@ class LaapService {
   static const port = 11546;
   static const _versionKey = 'laap_local_version';
   static const _readyName = '.shiyi-laap-ready';
-  static const _zipUrl =
-      'https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip';
-  static const _zipMirror =
-      'https://ghproxy.net/https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip';
+
+  /// 源码包下载地址：直连 GitHub + 三个加速镜像，逐个试、快速失败。
+  /// 国内直连 github.com 基本拉不动，靠镜像；有 SOCKS5 代理时全部走代理。
+  static const List<String> _zipUrls = [
+    'https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip',
+    'https://ghproxy.net/https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip',
+    'https://gh-proxy.com/https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip',
+    'https://ghfast.top/https://github.com/lorryjovens-hub/laap-AGI/archive/refs/heads/main.zip',
+  ];
+
+  /// Alpine 分支（与 [TermuxRuntime] init 脚本里的分支保持一致）。
+  static const _alpineBranch = 'v3.24';
 
   final ValueNotifier<LaapStatus> status = ValueNotifier<LaapStatus>(
     LaapStatus.idle,
@@ -151,6 +160,16 @@ class LaapService {
       if (Platform.isAndroid) {
         _setStep(0.08, '正在准备 Android 运行环境…');
         await TermuxRuntime.waitReady();
+        // rootfs 首次 init（apk 装基础包）没完成就继续，后面的 apk/pip
+        // 只会叠在同一个 init 上互相踩，表现就是「一直卡住」。这里直接
+        // 说明卡点，别让用户干等。
+        if (!await TermuxRuntime.isReady()) {
+          throw LaapApiException(
+            '内置 Alpine 环境还没初始化完成（基础包未装完）。'
+            '可到「终端」页随便跑一条命令等它装完再回来点安装；'
+            '网络不稳时多试一次即可。',
+          );
+        }
         _setStep(0.16, '正在安装 Python…');
         await _ensurePython();
       } else {
@@ -201,12 +220,18 @@ class LaapService {
         'apk',
         'add',
         '--no-cache',
+        // 单源（清华）：多源 repositories 里有失效镜像，逐个重试能把
+        // apk add 拖到几分钟以上，最后被超时杀掉，什么都装不上。
+        '-X',
+        'http://mirrors.tuna.tsinghua.edu.cn/alpine/$_alpineBranch/main',
+        '-X',
+        'http://mirrors.tuna.tsinghua.edu.cn/alpine/$_alpineBranch/community',
         'python3',
         'py3-pip',
         'py3-numpy',
         'py3-yaml',
         'py3-requests',
-      ], timeout: const Duration(minutes: 4));
+      ], timeout: const Duration(minutes: 10));
       if (apk.exitCode != 0) {
         throw LaapApiException('安装 Python 失败：${apk.output}');
       }
@@ -265,10 +290,16 @@ class LaapService {
     final root = Directory(await hostRoot());
     await root.create(recursive: true);
     final zipPath = '${root.path}${_sep}src.zip';
-    final bytes =
-        await _httpGetBytes(_zipUrl) ?? await _httpGetBytes(_zipMirror);
+    List<int>? bytes;
+    for (final url in _zipUrls) {
+      bytes = await _httpGetBytes(url);
+      if (bytes != null && bytes.isNotEmpty) break;
+    }
     if (bytes == null || bytes.isEmpty) {
-      throw LaapApiException('下载 laap-MAX 失败，请检查网络后重试');
+      throw LaapApiException(
+        '下载 laap-MAX 失败：直连与加速镜像都不通。'
+        '可在「设置 → 通用 → SOCKS5 代理」打开代理（对话与这里的下载走同一条通道）后重试。',
+      );
     }
     await File(zipPath).writeAsBytes(bytes, flush: true);
     _append('已下载 ${(bytes.length / 1048576).toStringAsFixed(1)} MB\n');
@@ -276,11 +307,15 @@ class LaapService {
   }
 
   Future<List<int>?> _httpGetBytes(String url) async {
+    http.Client? client;
     try {
       _append('GET $url\n');
-      final resp = await http
+      // 与对话 / 拉模型 / 联网搜索同一条通道：用户开了 SOCKS5 就走代理。
+      client = await Socks5Proxy.client();
+      // 单次 90s 兜底：失败立刻换下一个镜像，快速失败好过整体干等几分钟。
+      final resp = await client
           .get(Uri.parse(url))
-          .timeout(const Duration(minutes: 4));
+          .timeout(const Duration(seconds: 90));
       if (resp.statusCode != 200) {
         _append('HTTP ${resp.statusCode}\n');
         return null;
@@ -289,6 +324,8 @@ class LaapService {
     } catch (e) {
       _append('下载失败：$e\n');
       return null;
+    } finally {
+      client?.close();
     }
   }
 
@@ -345,8 +382,13 @@ class LaapService {
         'install',
         '--disable-pip-version-check',
         '--break-system-packages',
+        // 国内直连 pypi.org 基本超时：默认走清华 PyPI 镜像（不需要代理）。
+        '-i',
+        'https://pypi.tuna.tsinghua.edu.cn/simple',
+        '--trusted-host',
+        'pypi.tuna.tsinghua.edu.cn',
         ...pkgs,
-      ], timeout: const Duration(minutes: 6));
+      ], timeout: const Duration(minutes: 10));
       if (r.exitCode != 0) {
         throw LaapApiException('pip 安装失败：${r.output}');
       }

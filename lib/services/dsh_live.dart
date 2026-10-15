@@ -19,12 +19,25 @@ class DshHistoryBundle {
   /// 会话事件流里最后一次 `permission/preset` 的值；null = 会话未显式
   /// 选过权限预设（生效值是创建时的组合默认）。
   final String? permissionPreset;
+
+  /// 本页之外还有更早的事件（官方 `session/page` 的 `hasMore`）。
+  ///
+  /// true 表示上翻可以继续用 [oldestSeq] - 1 当 `beforeSeq` 取更早的消息。
+  final bool hasMoreOlder;
+
+  /// 本页最早 / 最晚事件的 seq；空页为 null。
+  final int? oldestSeq;
+  final int? newestSeq;
+
   const DshHistoryBundle({
     required this.messages,
     required this.live,
     this.responseModels = const <String>{},
     this.turnEnded = false,
     this.permissionPreset,
+    this.hasMoreOlder = false,
+    this.oldestSeq,
+    this.newestSeq,
   });
 }
 
@@ -220,6 +233,21 @@ class DshLiveTurn {
     return false;
   }
 }
+
+/// 是否允许关掉本地 live 缓冲。
+///
+/// `session.history` 里的 live 是从会话事件流**重建**的：同一段未收口缓冲既会
+/// 被 `freezePendingLive` 冻成正式助手消息，也会被 [DshLiveTurn.fromHistoryValue]
+/// 还原成 `open` 的缓冲。会话已经 stopped 时若仍让这份重建缓冲压住收口，正式
+/// 助手消息与重建出来的流式气泡会同时渲染，表现为“生成完成多一条重复信息”，
+/// 而 `_maybePoll` 的停止条件又要求 `!bundle.live.open`，轮询也停不下来。
+/// 因此只有确实还有回合在跑（DSH 报 running 或本地仍在等正式助手消息）时，
+/// 才参考 `bundle.live.open`。
+bool dshAllowsLiveClose({
+  required bool turnInFlight,
+  required bool incomingLiveOpen,
+  required bool historyConfirmsLive,
+}) => !turnInFlight || (!incomingLiveOpen && historyConfirmsLive);
 
 /// mux / host WebSocket 下行。
 class DshWsDownlink {

@@ -9,6 +9,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
 import '../widgets/markdown_text.dart';
 
@@ -264,7 +265,7 @@ class UpdateService {
               builder: (_, p, _) => Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const CupertinoActivityIndicator(),
+                  const AppLoading(),
                   const SizedBox(height: 10),
                   Text(
                     p > 0 ? '已下载 ${(p * 100).toStringAsFixed(0)}%' : '正在连接…',
@@ -362,4 +363,3 @@ class UpdateService {
     }
   }
 }
-
