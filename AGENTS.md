@@ -18,6 +18,13 @@
 - 常用测试设备：`9LKZL7TGZTJFZ575`（近期覆盖安装验证）、`2509FPN0BC`（Android 16 / API 36）
 - 应用包名：`com.shiyi.agent`（由 `com.hermes.hermes_agent_app` 改名而来）
 
+## 发布正式包（规范，2026-10-16 定）
+- 正式包文件名统一 **`shiyi-agent-<版本号>.apk`**（如 `shiyi-agent-v2.6.11.apk`），仓库根放一份、GitHub Release 资产用同一个名字。
+- 上传资产时 **不要填 `label`**：GitHub 会把非空 label 当主标题显示，结果版本页上看到的是一句描述（曾出现「Android arm64」）而不是文件名 —— 这就是用户反馈的「正式包没规范名字」。**label 一律留空**，让页面显示文件名。
+- 版本号三处必须一致：`pubspec.yaml`（`x.y.z+code`）、`android/app/build.gradle.kts`（`versionCode` / `versionName`）、tag `vx.y.z`。
+- 发布前必须：`flutter analyze` 0 error + `flutter test` 全绿（允许既有的 5 条无关失败）；构建只出 arm64-v8a release；用 `aapt2 dump badging` 核对 versionName/label；`adb install -r` 覆盖安装发布的**那个 APK** 验证。
+- Release 正文取自 `CHANGELOG.md` 对应版本段落（面向用户，不写内部 fix-log 编号）。
+
 ## 输出上限（红线：不许自己掐断模型）
 - **一律 0 = 不限制，且默认全为 0**：`maxOutputTokens`（不发 `max_tokens`，用模型自身上限）、`streamWaitSeconds`（不套超时、不挂空闲计时器）、`maxContinuationRounds`（一直续写，靠「无新增内容」收口）、`maxToolRounds`（工具循环不限轮）。用户可在设置页自行收紧，`sanitize*` 只拒绝负数。详见 `docs/fix-log.md` #412。
 - **改默认值必须同时写迁移**：老用户的设置文件里存着旧默认值，`fromJson` 会把它们读回来，只改默认值等于对老用户无效。现行做法见 `SettingsService.load()` 的 `outputLimitsV2` 一次性迁移（旧默认 8192/600/16 → 0，用户显式改过的值保留），迁移只回写这几个键，**禁止整体 `toJson()` 写盘**（会把 `apiKey` 写回明文）。新默认值一律要配一条这种迁移 + 回归测试。
