@@ -1845,12 +1845,14 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
   late int _maxOutputTokens;
   late int _streamWaitSeconds;
   late int _continuationRounds;
+  late int _toolRounds;
   late double _threshold;
   late bool _autoCompress;
   late final TextEditingController _contextLimitCtrl;
   late final TextEditingController _maxOutputTokensCtrl;
   late final TextEditingController _streamWaitCtrl;
   late final TextEditingController _continuationCtrl;
+  late final TextEditingController _toolRoundsCtrl;
   late final TextEditingController _thresholdCtrl;
   late final _DebouncedSave _save;
 
@@ -1862,6 +1864,7 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
     _maxOutputTokens = s.maxOutputTokens;
     _streamWaitSeconds = s.streamWaitSeconds;
     _continuationRounds = s.maxContinuationRounds;
+    _toolRounds = s.maxToolRounds;
     _threshold = s.compressThresholdPercent;
     _autoCompress = s.autoCompress;
     _contextLimitCtrl = TextEditingController(text: _contextLimit.toString());
@@ -1874,6 +1877,7 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
     _continuationCtrl = TextEditingController(
       text: _continuationRounds.toString(),
     );
+    _toolRoundsCtrl = TextEditingController(text: _toolRounds.toString());
     _thresholdCtrl = TextEditingController(text: _threshold.toStringAsFixed(0));
     _save = _DebouncedSave(
       widget.shiyi,
@@ -1882,6 +1886,7 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
         maxOutputTokens: _maxOutputTokens,
         streamWaitSeconds: _streamWaitSeconds,
         maxContinuationRounds: _continuationRounds,
+        maxToolRounds: _toolRounds,
         compressThresholdPercent: _threshold,
         autoCompress: _autoCompress,
       ),
@@ -1894,6 +1899,7 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
     _maxOutputTokensCtrl.dispose();
     _streamWaitCtrl.dispose();
     _continuationCtrl.dispose();
+    _toolRoundsCtrl.dispose();
     _thresholdCtrl.dispose();
     // 快速返回时把未落盘的编辑立即保存，避免丢改动。
     if (_save.hasPending) unawaited(_save.flush());
@@ -1921,15 +1927,17 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                 color: _iosBlue,
               ),
               title: const Text('输出上限'),
-              subtitle: const Text('单次请求最大输出 token，思考型模型建议调大'),
+              subtitle: const Text('单次请求最大输出 token。0 = 不限制（不发该字段，用模型自身上限）'),
               trailing: _IosValueField(
                 controller: _maxOutputTokensCtrl,
                 keyboardType: TextInputType.number,
                 width: 120,
                 onChanged: (v) {
                   final n = int.tryParse(v);
-                  if (n != null && n > 0) {
-                    setState(() => _maxOutputTokens = n.clamp(512, 384000));
+                  if (n != null && n >= 0) {
+                    setState(
+                      () => _maxOutputTokens = sanitizeMaxOutputTokens(n),
+                    );
                     _save.schedule();
                   }
                 },
@@ -1942,8 +1950,8 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
               ),
               title: const Text('长推理等待上限'),
               subtitle: const Text(
-                '等模型开始回包、以及流中途没数据的上限（秒）。思考型模型会长时间不出字，'
-                '被普通网络超时砍断时调大；默认 600，最大 3600。',
+                '等模型开始回包、以及流中途没数据的上限（秒）。'
+                '0 = 不限制（默认，一直等，不会因为等待被砍断）。',
               ),
               trailing: _IosValueField(
                 controller: _streamWaitCtrl,
@@ -1951,12 +1959,9 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                 width: 110,
                 onChanged: (v) {
                   final n = int.tryParse(v);
-                  if (n != null && n > 0) {
+                  if (n != null && n >= 0) {
                     setState(
-                      () => _streamWaitSeconds = n.clamp(
-                        kMinStreamWaitSeconds,
-                        kMaxStreamWaitSeconds,
-                      ),
+                      () => _streamWaitSeconds = sanitizeStreamWaitSeconds(n),
                     );
                     _save.schedule();
                   }
@@ -1970,8 +1975,8 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
               ),
               title: const Text('自动续写轮数'),
               subtitle: const Text(
-                '被输出上限截断后自动接着写的轮数（每轮都按输出上限算）；'
-                '0 = 不续写，只标记内容不完整。默认 16。',
+                '被输出上限截断后自动接着写的轮数；'
+                '0 = 不限制（默认，一直续写到模型自然结束）。',
               ),
               trailing: _IosValueField(
                 controller: _continuationCtrl,
@@ -1986,6 +1991,29 @@ class _ContextSectionPageState extends State<_ContextSectionPage> {
                         kMaxContinuationRoundsLimit,
                       ),
                     );
+                    _save.schedule();
+                  }
+                },
+              ),
+            ),
+            CupertinoListTile(
+              leading: _IosIconTile(
+                icon: CupertinoIcons.hammer,
+                color: _iosTeal,
+              ),
+              title: const Text('工具轮数上限'),
+              subtitle: const Text(
+                '一次回复里模型最多连着调几轮工具；'
+                '0 = 不限制（默认，直到模型不再调工具）。',
+              ),
+              trailing: _IosValueField(
+                controller: _toolRoundsCtrl,
+                keyboardType: TextInputType.number,
+                width: 110,
+                onChanged: (v) {
+                  final n = int.tryParse(v);
+                  if (n != null && n >= 0) {
+                    setState(() => _toolRounds = sanitizeToolRounds(n));
                     _save.schedule();
                   }
                 },

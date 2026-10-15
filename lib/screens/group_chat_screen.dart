@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -15,7 +14,6 @@ import '../core/reasoning_models.dart';
 import '../services/group_chat_store.dart';
 import '../services/file_workspace.dart';
 import '../services/llm_client.dart';
-import '../services/termux_runtime.dart';
 import '../widgets/bagua_icon.dart';
 import '../widgets/chat_liquid_glass.dart';
 import '../widgets/ios_style.dart';
@@ -24,6 +22,9 @@ import '../widgets/mac_action_button.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/traffic_lights_button.dart';
 import 'group_chat_setup_screen.dart';
+import '../core/text_safe.dart';
+import '../widgets/code_change_card.dart';
+import '../widgets/tool_glass.dart';
 
 class GroupChatScreen extends StatefulWidget {
   final ShiyiState shiyi;
@@ -236,47 +237,29 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     try {
       await _store.insertMessage(user);
       _jumpToLatest(force: true);
-      final reworkCounts = <String, int>{};
-      final queue = [...groupChatInitialTargets(text, room.agents)];
-      var emptySpins = 0;
-      while (queue.isNotEmpty && !_activeRun.stopRequested) {
-        final batch = <GroupAgent>[];
-        while (batch.length < groupChatMaxParallelAgents && queue.isNotEmpty) {
-          final agent = queue.removeAt(0);
-          batch.add(agent);
-        }
-        if (batch.isEmpty) continue;
+      // 层级行动：一批 = 同一层被叫到的人，全员并行；整批汇报完才轮到下一批。
+      // 上级不会被下属的半成品提前拉起来（见 docs/fix-log.md #404）。
+      final scheduler = GroupRoundScheduler(
+        agents: room.agents,
+        initialTargets: groupChatInitialTargets(text, room.agents),
+      );
+      while (scheduler.hasWave && !_activeRun.stopRequested) {
+        final wave = scheduler.wave;
         final results = await Future.wait([
-          for (final agent in batch) _runAgent(agent),
+          for (final agent in wave)
+            _runAgent(
+              agent,
+              // 负责人「自己开干」时给一次派活提醒（只进本次请求，不落库）。
+              nudge: scheduler.isNudge(agent.id)
+                  ? groupChatDelegateNudge(agent, room.agents)
+                  : '',
+            ),
         ]);
         if (_activeRun.stopRequested) break;
         if (results.any((result) => result.failed)) break;
-        final progressed = results.any(
-          (result) =>
-              result.message != null &&
-              (result.message!.content.trim().isNotEmpty ||
-                  result.message!.reasoning.trim().isNotEmpty),
-        );
-        final followups = groupChatNextFollowupTargets(
-          speakers: batch,
+        scheduler.complete(
           replies: [for (final result in results) result.message],
-          agents: room.agents,
         );
-        if (!progressed && followups.isNotEmpty) {
-          emptySpins++;
-          if (emptySpins >= 3) break;
-        } else if (progressed) {
-          emptySpins = 0;
-        }
-        for (final followup in followups) {
-          if (followup.isRework) {
-            final count = (reworkCounts[followup.handoffKey] ?? 0) + 1;
-            reworkCounts[followup.handoffKey] = count;
-            if (count > groupChatMaxReworksPerHandoff) continue;
-          }
-          if (queue.any((item) => item.id == followup.target.id)) continue;
-          queue.add(followup.target);
-        }
       }
     } finally {
       _activeRun.active = false;
@@ -298,7 +281,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     return '已附加文件，可用 file_read 或 run_terminal 读取：\n${parts.join('\n')}';
   }
 
-  Future<_AgentTurnResult> _runAgent(GroupAgent agent) async {
+  Future<_AgentTurnResult> _runAgent(GroupAgent agent, {String nudge = ''}) async {
     final room = _room;
     if (room == null) return const _AgentTurnResult();
     final profile = groupChatProfileFor(
@@ -359,15 +342,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         message: await _failedDraft(room, agent, message),
       );
     }
-    return _runAgentWithTools(room, agent, profile, model);
+    return _runAgentWithTools(room, agent, profile, model, nudge: nudge);
   }
 
   Future<_AgentTurnResult> _runAgentWithTools(
     GroupRoom room,
     GroupAgent agent,
     ApiProfile profile,
-    String model,
-  ) async {
+    String model, {
+    String nudge = '',
+  }) async {
     final draft = GroupMessage(
       id: groupChatNewId('gm'),
       roomId: room.id,
@@ -380,17 +364,22 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     _markDraftChanged();
     _jumpToLatest();
     final settings = widget.shiyi.settings;
-    final workingDir = await _projectWorkingDir(room.projectId);
-    final tools = _groupChatTools();
-    final contextSummary = await _store.getSummary(room.id, agent.id);
     final latestUserText = _messages.lastWhere(
       (message) => message.isUser,
       orElse: () =>
           GroupMessage(id: '', roomId: '', role: 'user', createdAt: 0),
     );
-    final presencePrompt = await widget.shiyi.cognitivePromptFor(
+    // 请求前的三件独立小事（工作目录 / 历史摘要 / 皮层快照）**并行**发起：
+    // 串行时它们会把「发消息 → 出思考链」拖慢几秒（见 docs/fix-log.md #407）。
+    final tools = _groupChatTools();
+    final workingDirFuture = _projectWorkingDir(room.projectId);
+    final summaryFuture = _store.getSummary(room.id, agent.id);
+    final presenceFuture = widget.shiyi.cognitivePromptFor(
       '群聊成员「${agent.name}」正在处理：${latestUserText.content}',
     );
+    final workingDir = await workingDirFuture;
+    final contextSummary = await summaryFuture;
+    final presencePrompt = await presenceFuture;
     String? failure;
     final loopMsgs = groupChatApiMessages(
       speaker: agent,
@@ -399,7 +388,13 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       contextSummary: contextSummary,
       presencePrompt: presencePrompt,
     );
-    const maxToolRounds = 8;
+    // 派活提醒只进这一次请求的动尾，不落库（聊天记录里看不到）。
+    if (nudge.trim().isNotEmpty) {
+      loopMsgs.add({'role': 'user', 'content': nudge.trim()});
+    }
+    // 工具轮数：设置里的值，**0 = 不限制**（默认，直到模型不再调工具）。
+    final configuredRounds = widget.shiyi.settings.maxToolRounds;
+    final maxToolRounds = configuredRounds > 0 ? configuredRounds : 1000000;
     var roundCached = 0;
     var roundInput = 0;
     try {
@@ -467,11 +462,31 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         // Execute each tool call.
         for (final tc in result.toolCalls) {
           final toolId = tc['id'] ?? 'call_${groupChatNewId('tc')}';
+          final toolName = (tc['name'] ?? '').toString();
+          final toolArgs = (tc['arguments'] ?? '{}').toString();
+          // 工具调用挂到该成员的气泡上（含代码改动预览），实时可见。
+          final record = GroupToolCall(
+            name: toolName,
+            argsSummary: groupChatToolArgsSummary(toolName, toolArgs),
+            argsJson: toolArgs,
+          );
+          draft.toolCalls.add(record);
+          _markDraftChanged();
+          _jumpToLatest();
           final output = await _executeGroupTool(
-            tc['name'] ?? '',
-            tc['arguments'] ?? '{}',
+            toolName,
+            toolArgs,
             workingDir: workingDir,
           );
+          record
+            ..done = true
+            ..ok = !output.startsWith('错误')
+            // 完整输出给调用日志看（保留 20KB，写入结果/报错都看得到）。
+            ..result = cutRunes(output, 20000, ellipsis: '\n…（输出过长已截断）')
+            ..summary =
+                codeChangePreview(toolName, toolArgs) ??
+                cutRunes(output.trim().replaceAll(RegExp(r'\s+'), ' '), 120);
+          _markDraftChanged();
           loopMsgs.add({
             'role': 'tool',
             'content': output,
@@ -562,190 +577,23 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   List<Map<String, dynamic>> _groupChatTools() {
-    return [
-      {
-        'type': 'function',
-        'function': {
-          'name': 'file_read',
-          'description': '读取文本文件内容（最大200KB）。相对路径基于项目工作目录。',
-          'parameters': {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string', 'description': '文件路径'},
-            },
-            'required': ['path'],
-          },
-        },
-      },
-      {
-        'type': 'function',
-        'function': {
-          'name': 'file_write',
-          'description': '把文本内容写入文件（自动创建父目录）。用于保存生成的内容。',
-          'parameters': {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string', 'description': '文件路径'},
-              'content': {'type': 'string', 'description': '完整内容'},
-            },
-            'required': ['path', 'content'],
-          },
-        },
-      },
-      {
-        'type': 'function',
-        'function': {
-          'name': 'run_terminal',
-          'description':
-              '执行 shell 命令并返回输出。默认工作目录是项目目录。'
-              '你可以用这个工具运行脚本、查看文件列表、安装依赖等。',
-          'parameters': {
-            'type': 'object',
-            'properties': {
-              'command': {'type': 'string', 'description': '要执行的 shell 命令'},
-            },
-            'required': ['command'],
-          },
-        },
-      },
-    ];
+    // 完整工具集：与拾忆会话同一份注册表（排除绑死单会话 UI 的几个，
+    // 见 AppState._groupChatExcludedTools / docs/fix-log.md #411）。
+    final schemas = widget.shiyi.groupToolSchemas();
+    if (schemas.isNotEmpty) return schemas;
+    return const [];
   }
 
+  /// 群聊执行工具：直接走拾忆共享工具实现（完整工具集），
+  /// 只把成员的工作目录传下去（见 docs/fix-log.md #411）。
   Future<String> _executeGroupTool(
     String name,
     String argsJson, {
     required String workingDir,
   }) async {
-    Map<String, dynamic> args = {};
-    try {
-      args = jsonDecode(argsJson) as Map<String, dynamic>;
-    } catch (_) {}
-    try {
-      switch (name) {
-        case 'file_read':
-          final path = args['path']?.toString() ?? '';
-          if (path.isEmpty) return '错误：path 不能为空';
-          final file = File(
-            path.startsWith('/') || path.contains(':')
-                ? path
-                : workingDir.isEmpty
-                ? path
-                : '$workingDir/$path',
-          );
-          if (!file.existsSync()) return '文件不存在: $path';
-          final content = await file.readAsString();
-          if (content.length > 200 * 1024) {
-            return content.substring(0, 200 * 1024) + '\n（截断，超过200KB）';
-          }
-          return content;
-        case 'file_write':
-          final path = args['path']?.toString() ?? '';
-          final content = args['content']?.toString() ?? '';
-          if (path.isEmpty) return '错误：path 不能为空';
-          final file = File(
-            path.startsWith('/') || path.contains(':')
-                ? path
-                : workingDir.isEmpty
-                ? path
-                : '$workingDir/$path',
-          );
-          await file.parent.create(recursive: true);
-          await file.writeAsString(content);
-          return '已写入: ${file.path} (${content.length} chars)';
-        case 'run_terminal':
-          final command = args['command']?.toString() ?? '';
-          if (command.isEmpty) return '错误：command 不能为空';
-          return _runGroupTerminal(command, workingDir);
-        default:
-          return '未知工具: $name';
-      }
-    } catch (e) {
-      return '工具 $name 执行失败: $e';
-    }
+    return widget.shiyi.runGroupTool(name, argsJson, workingDir: workingDir);
   }
 
-  Future<String> _runGroupTerminal(String command, String workingDir) async {
-    try {
-      final settings = widget.shiyi.settings;
-      final cwd = workingDir.trim().isEmpty ? null : workingDir.trim();
-      final String shell;
-      final List<String> args;
-      Map<String, String>? environment;
-      var backendWarn = '';
-      if (TermuxRuntime.isWindows) {
-        final backend = await TermuxRuntime.resolveWindowsBackend(
-          settings.terminalBackend,
-        );
-        switch (backend) {
-          case 'wsl2':
-            shell = 'wsl.exe';
-            args = ['-e', 'bash', '-lc', command];
-            environment = const {'WSL_UTF8': '1'};
-          case 'gitbash':
-            shell =
-                await TermuxRuntime.gitBashPath() ??
-                r'C:\Program Files\Git\bin\bash.exe';
-            args = ['--login', '-c', command];
-          case 'cmd':
-            shell = 'cmd';
-            args = ['/c', command];
-          default:
-            shell = 'pwsh';
-            args = [
-              '-NoProfile',
-              '-NoLogo',
-              '-NonInteractive',
-              '-Command',
-              command,
-            ];
-        }
-        if (settings.terminalBackend == 'wsl2' && backend != 'wsl2') {
-          backendWarn = '（你选择了 WSL2，但当前不可用，已回退 $backend）';
-        } else if (settings.terminalBackend == 'gitbash' &&
-            backend != 'gitbash') {
-          backendWarn = '（你选择了 Git Bash，但当前不可用，已回退 $backend）';
-        }
-      } else {
-        await TermuxRuntime.ensureInstalled();
-        final argv = await TermuxRuntime.shellCommand(['-c', command]);
-        shell = argv.first;
-        args = argv.sublist(1);
-        environment = await TermuxRuntime.environment();
-      }
-      final proc = await Process.start(
-        shell,
-        args,
-        workingDirectory: cwd,
-        environment: environment,
-      );
-      final stdoutFuture = proc.stdout.transform(utf8.decoder).join();
-      final stderrFuture = proc.stderr.transform(utf8.decoder).join();
-      int? exitCode;
-      try {
-        exitCode = await proc.exitCode.timeout(const Duration(seconds: 60));
-      } on TimeoutException {
-        proc.kill();
-        return '终端执行超时（已强制终止）：命令超过 60 秒未完成。';
-      }
-      final stdout = (await stdoutFuture).trim();
-      final stderr = (await stderrFuture).trim();
-      final buf = StringBuffer();
-      if (stdout.isNotEmpty) buf.write(stdout);
-      if (stderr.isNotEmpty) {
-        if (buf.isNotEmpty) buf.write('\n');
-        buf.write(stderr);
-      }
-      if (backendWarn.isNotEmpty) {
-        if (buf.isNotEmpty) buf.write('\n');
-        buf.write(backendWarn);
-      }
-      return buf.isEmpty ? '命令执行完成（无输出），退出码 $exitCode' : '退出码 $exitCode\n$buf';
-    } on ProcessException catch (e) {
-      return '终端执行异常: ${e.message}';
-    } catch (e) {
-      return '终端执行失败: $e';
-    }
-  }
 
   void _stopRun() {
     _activeRun.stopRequested = true;
@@ -1053,6 +901,166 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     return should;
   }
 
+  /// 成员气泡里的工具调用列表（写入类工具点开就是代码改动）。
+  Widget _toolCallFooter(GroupMessage message) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 16, right: 40, top: 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final call in message.toolCalls)
+            GroupToolPill(
+              name: call.name,
+              argsSummary: call.argsSummary,
+              summary: call.summary,
+              argsJson: call.argsJson,
+              result: call.result,
+              ok: call.ok,
+              done: call.done,
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 调用日志：本群所有成员的工具调用，**完整**入参与完整输出。
+  Future<void> _openToolLog() async {
+    final room = _room;
+    if (room == null) return;
+    final rows = <(String, GroupToolCall)>[];
+    final drafts = _activeRun.liveDrafts.values.toList();
+    for (final message in [..._messages, ...drafts]) {
+      if (message.toolCalls.isEmpty) continue;
+      final who = _speakerName(message, room);
+      for (final call in message.toolCalls) {
+        rows.add((who, call));
+      }
+    }
+    await showIosFadeModalPopup<void>(
+      context: context,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return Container(
+          height: MediaQuery.of(ctx).size.height * 0.8,
+          decoration: BoxDecoration(
+            color: theme.scaffoldBackgroundColor,
+            borderRadius: const BorderRadius.vertical(
+              top: Radius.circular(16),
+            ),
+          ),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 8, 8),
+                child: Row(
+                  children: [
+                    const Icon(CupertinoIcons.chevron_left_slash_chevron_right, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '调用日志（${rows.length}）',
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    CupertinoButton(
+                      padding: EdgeInsets.zero,
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('关闭'),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: rows.isEmpty
+                    ? Center(
+                        child: Text(
+                          '还没有工具调用',
+                          style: TextStyle(color: theme.hintColor),
+                        ),
+                      )
+                    : ListView.separated(
+                        padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
+                        itemCount: rows.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 12),
+                        itemBuilder: (_, index) {
+                          // 最新的在最上面
+                          final (who, call) = rows[rows.length - 1 - index];
+                          return _toolLogTile(who, call, theme);
+                        },
+                      ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _toolLogTile(String who, GroupToolCall call, ThemeData theme) {
+    final isChange = isCodeChangeTool(call.name);
+    final status = !call.done ? '运行中' : (call.ok ? '完成' : '失败');
+    final mono = TextStyle(
+      fontFamily: 'monospace',
+      fontFamilyFallback: const ['NotoSansSC', 'Menlo', 'Consolas'],
+      fontSize: 11.5,
+      height: 1.4,
+    );
+    return toolGlassPanel(
+      context: context,
+      cornerRadius: 14,
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '$who · ${toolEventLabelSafe(call.name)}',
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Text(
+                status,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: call.done && !call.ok
+                      ? theme.colorScheme.error
+                      : theme.hintColor,
+                ),
+              ),
+            ],
+          ),
+          if (call.argsJson.trim().isNotEmpty) ...[
+            const SizedBox(height: 6),
+            SelectableText(
+              '入参：${call.argsJson.trim()}',
+              style: mono.copyWith(color: theme.hintColor),
+            ),
+          ],
+          const SizedBox(height: 6),
+          if (isChange && call.summary.trim().isNotEmpty)
+            CodeChangeBlock(preview: call.summary)
+          else if (call.result.trim().isNotEmpty)
+            SelectableText('输出：${call.result.trim()}', style: mono)
+          else
+            Text(
+              call.done ? '（无输出）' : '执行中…',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.hintColor,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   void _jumpToLatest({bool force = false}) {
     if (!mounted) return;
     if (force) _followTail = true;
@@ -1180,6 +1188,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                     ],
                   ),
                   actions: [
+                    // 调用日志：所有成员的工具调用 + 完整入参/输出（不截断）。
+                    CupertinoButton(
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      onPressed: _openToolLog,
+                      child: const Icon(CupertinoIcons.chevron_left_slash_chevron_right, size: 20),
+                    ),
                     Padding(
                       padding: const EdgeInsets.only(right: 12),
                       child: FrostedSettingsButton(onPressed: _editMembers),
@@ -1228,6 +1242,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                   animateEnter: _shouldAnimateEnter(message),
                                   speakerName: _speakerName(message, room),
                                   speakerColor: _speakerColor(message, room),
+                                  // 该成员这一轮的工具调用与代码改动，挂在它自己的气泡里。
+                                  footer: message.toolCalls.isEmpty
+                                      ? null
+                                      : _toolCallFooter(message),
                                   onCopy: _copyMessage,
                                   onDelete: _deleteMessage,
                                 );

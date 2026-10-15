@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'file_workspace.dart';
+import '../core/text_safe.dart';
 
 /// App 级运行审计日志。记录运行事实，不记录明文凭据或完整敏感内容。
 class RuntimeLogEntry {
@@ -366,7 +367,7 @@ class RuntimeLogger {
       '<redacted>',
     );
     return text.length > 12000
-        ? '${text.substring(0, 12000)}…<truncated>'
+        ? '${cutRunes(text, 12000, ellipsis: '…<truncated>')}'
         : text;
   }
 }

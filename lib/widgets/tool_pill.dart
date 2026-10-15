@@ -5,6 +5,11 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 import 'chat_liquid_glass.dart';
 import '../core/poll_visibility.dart';
 import '../core/models.dart';
+import 'code_change_card.dart';
+import 'tool_glass.dart';
+
+/// 工具胶囊的液态玻璃外观与外壳统一在 tool_glass.dart（拾忆信息流与群聊成员气泡共用）。
+export 'tool_glass.dart' show toolGlassPanel, toolGlassStyle, toolPillShell;
 
 String toolEventLabel(String name) => switch (name) {
   'web_search' => '搜索',
@@ -38,72 +43,6 @@ IconData toolEventIcon(String name) => switch (name) {
   'file_write' => Icons.edit_note,
   _ => Icons.construction,
 };
-
-BoxShadow _toolPillShadow(BuildContext context) {
-  final isLight = Theme.of(context).brightness == Brightness.light;
-  return BoxShadow(
-    color: Colors.black.withValues(alpha: isLight ? 0.16 : 0.35),
-    blurRadius: 12,
-    offset: const Offset(0, 3),
-  );
-}
-
-Color _toolPillBackground(BuildContext context) {
-  final isLight = Theme.of(context).brightness == Brightness.light;
-  return Colors.white.withValues(alpha: isLight ? 0.40 : 0.10);
-}
-
-LiquidGlassStyle _toolPillStyle(
-  BuildContext context, {
-  double cornerRadius = 14,
-}) {
-  final dark = Theme.of(context).brightness == Brightness.dark;
-  return LiquidGlassStyle(
-    shape: LiquidGlassShape.continuousRoundedRectangle(
-      cornerRadius: cornerRadius,
-      borderWidth: 1,
-      borderColor: Colors.white.withValues(alpha: dark ? .16 : .52),
-      lightIntensity: .8,
-      lightDirection: 110,
-    ),
-    appearance: LiquidGlassAppearance(
-      color: _toolPillBackground(context),
-      blur: const LiquidGlassBlur(sigmaX: 16, sigmaY: 16),
-      saturation: 1.1,
-    ),
-    refraction: const LiquidGlassRefraction(
-      distortion: .06,
-      distortionWidth: 18,
-      magnification: 1.01,
-      chromaticAberration: .001,
-    ),
-  );
-}
-
-Widget toolPillShell({
-  required BuildContext context,
-  required VoidCallback onTap,
-  required Widget child,
-}) {
-  return Container(
-    decoration: BoxDecoration(
-      borderRadius: BorderRadius.circular(14),
-      boxShadow: [_toolPillShadow(context)],
-    ),
-    child: LiquidGlassLens(
-      style: _toolPillStyle(context),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(14),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(14),
-          onTap: onTap,
-          child: child,
-        ),
-      ),
-    ),
-  );
-}
 
 /// 待机状态的工具胶囊：灰色圆点 + 「工具」字样。
 class ToolPillIdle extends StatelessWidget {
@@ -297,10 +236,10 @@ class ToolLogPanel extends StatelessWidget {
     return Container(
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
-        boxShadow: [_toolPillShadow(context)],
+        boxShadow: [toolGlassShadow(context)],
       ),
       child: LiquidGlassLens(
-        style: _toolPillStyle(context, cornerRadius: 16),
+        style: toolGlassStyle(context, cornerRadius: 16),
         child: Material(
           color: Colors.transparent,
           child: Column(
@@ -438,13 +377,17 @@ class _ToolLogItem extends StatelessWidget {
                   ),
                 ],
                 if (event.summary != null && event.summary!.isNotEmpty) ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    event.summary!,
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall,
-                  ),
+                  const SizedBox(height: 4),
+                  // 写入类工具：summary 里是改动预览，按等宽 diff 上色显示。
+                  if (isCodeChangeTool(event.name))
+                    CodeChangeBlock(preview: event.summary!)
+                  else
+                    Text(
+                      event.summary!,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall,
+                    ),
                 ],
               ],
             ),

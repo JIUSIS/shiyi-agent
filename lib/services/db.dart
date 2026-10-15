@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import '../core/models.dart';
 import 'runtime_logger.dart';
 import 'group_chat_store.dart';
+import '../core/text_safe.dart';
 
 class AppDatabase {
   static final AppDatabase _instance = AppDatabase._();
@@ -751,7 +752,7 @@ class AppDatabase {
   String _snippetAround(String content, String query, {int radius = 28}) {
     final idx = content.indexOf(query);
     if (idx < 0) {
-      return content.length > 60 ? '${content.substring(0, 60)}…' : content;
+      return cutRunes(content, 60);
     }
     var start = idx - radius;
     if (start < 0) start = 0;

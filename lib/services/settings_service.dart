@@ -53,13 +53,20 @@ class SettingsService {
       );
       // 旧版本没有输出上限字段：按已选预设带出建议值，
       // 避免思考型模型继续用偏小的 8192。
-      if (!json.containsKey('maxOutputTokens')) {
-        for (final p in modelPresets) {
-          if (p.baseUrl == s.baseUrl.trim()) {
-            s.maxOutputTokens = p.suggestedMaxTokens;
-            break;
-          }
-        }
+      // 输出上限策略 V2（0 = 不限制，见 docs/fix-log.md #415）：
+      // 老配置里存的 8192 / 600 / 16 是**旧版本硬塞的默认值**，不是用户的选择，
+      // 正是「模型输出被截断」的真凶（每次请求都发 max_tokens: 8192）。
+      // 一次性迁移成「不限制」，用户显式改过的其它值原样保留；
+      // 只回写这几个键（不能整体 toJson，那会把 apiKey 写回明文）。
+      if (json['outputLimitsV2'] != true) {
+        if (s.maxOutputTokens == 8192) s.maxOutputTokens = 0;
+        if (s.streamWaitSeconds == 600) s.streamWaitSeconds = 0;
+        if (s.maxContinuationRounds == 16) s.maxContinuationRounds = 0;
+        json['maxOutputTokens'] = s.maxOutputTokens;
+        json['streamWaitSeconds'] = s.streamWaitSeconds;
+        json['maxContinuationRounds'] = s.maxContinuationRounds;
+        json['outputLimitsV2'] = true;
+        await prefs.setString(_key, jsonEncode(json));
       }
       // 自定义 OpenAI 兼容接口缺 /v1 时自动补上，避免请求打到错误路径。
       final isPreset = modelPresets.any((p) => p.baseUrl == s.baseUrl.trim());

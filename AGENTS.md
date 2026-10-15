@@ -18,6 +18,13 @@
 - 常用测试设备：`9LKZL7TGZTJFZ575`（近期覆盖安装验证）、`2509FPN0BC`（Android 16 / API 36）
 - 应用包名：`com.shiyi.agent`（由 `com.hermes.hermes_agent_app` 改名而来）
 
+## 输出上限（红线：不许自己掐断模型）
+- **一律 0 = 不限制，且默认全为 0**：`maxOutputTokens`（不发 `max_tokens`，用模型自身上限）、`streamWaitSeconds`（不套超时、不挂空闲计时器）、`maxContinuationRounds`（一直续写，靠「无新增内容」收口）、`maxToolRounds`（工具循环不限轮）。用户可在设置页自行收紧，`sanitize*` 只拒绝负数。详见 `docs/fix-log.md` #412。
+- **改默认值必须同时写迁移**：老用户的设置文件里存着旧默认值，`fromJson` 会把它们读回来，只改默认值等于对老用户无效。现行做法见 `SettingsService.load()` 的 `outputLimitsV2` 一次性迁移（旧默认 8192/600/16 → 0，用户显式改过的值保留），迁移只回写这几个键，**禁止整体 `toJson()` 写盘**（会把 `apiKey` 写回明文）。新默认值一律要配一条这种迁移 + 回归测试。
+- `request.sent` 日志带 `maxTokens` 字段（0 = 不限制）：怀疑被截断时先看这个值，再看设置文件。
+- 续写收口只认真实判据：服务商明确报 `length`/`max_tokens` 截断，或续写确实没有新增内容；**禁止**用固定轮数、固定 token 数假装正常完成。
+- 无法继续时必须如实告知用户原因（哪个上限、哪个错误），不得静默截断。
+
 ## Android 内嵌终端（Alpine，2026-08-15 起）
 - **架构**（参照 OmniBot/ReTerminal）：Android 宿主 + proot + Alpine minirootfs（3.85MB 内置资产），
   取代旧 Termux bootstrap（40MB+，apt/dpkg 全家桶）。详见 `docs/fix-log.md` #153/#154。
@@ -164,9 +171,9 @@
 - 功能页可建多个群聊、可删除（左滑删除 / 编辑）。
 - 每个 Agent 独立：自己的名字、职位、人设提示词、拾忆 API 配置和模型。人设只进该成员的 system，不改全局人设。
 - 新建/编辑可粘贴 mermaid 或字符思维导图：识别角色人数、人设、汇报关系。填入只替换当前编辑中的成员和标题，不自动保存。每人先套当前默认 API 配置（`apiProfiles.first`）和模型，之后可单独改。有起步路线时可选「全部 / 最小 N 人」。
-- 官方会话工具不进群聊（`tools: []`），没有文件 / 终端 / 子代理 / 记忆写入。
+- 群聊成员用**完整工具集**（`ShiyiState.groupToolSchemas()` / `runGroupTool()`，与拾忆会话同一份 `toolRegistry`；每个成员的工具调用与代码改动显示在它自己的气泡里，顶栏终端图标可开「调用日志」看完整入参与输出）。只排除绑死单会话 UI/状态的 4 个：`question`、`spawn_agent`、`enter_plan_mode`、`exit_plan_mode`（见 `_groupChatExcludedTools`）。文件/终端类工具按成员工作目录解析：走 `runGroupTool` 注入 `_cwd`，不要另写一套 `_executeGroupTool` 分支。
 - 组织是公司结构，不是全员抢答：`reports_to` 为空的人对接用户；其他人被 `@名字` 或上级安排后才发言，说完向直接上级汇报。正常推进不设固定轮次/每人次数上限；只有明确「打回」的同一交接环节最多 3 次。
-- 群聊按并行批次调度：同一批最多 3 个 Agent 同时生成；多个成员汇报同一位上级时合并成一次排队，已超限或已在队列里的成员不重复排队。
+- 群聊按**层级行动**调度（`GroupRoundScheduler`，见 `docs/fix-log.md` #404）：一批 = 同一层被叫到的人，**全员并行**（叫 5 个就 5 条线程，不再有 3 线程上限）；整批**每一个都汇报完**才轮到下一批，上级不会被下属的半成品提前拉起（下属还在跑时上级进 `_deferred` 等屏障）。派活的人持续算「在飞」，直到它真正向上汇报，它的上级才可能启动。多个下属汇报同一位上级只叫一次；同一交接环节打回最多 3 次；`maxWaves=40` / 每人激活 8 次只是互相 @ 死循环的安全阀，不是正常推进上限。
 - 每个 Agent 的思考过程单独显示在自己的气泡里，禁止把 reasoning 写进正文。
 - 库表 `group_rooms` / `group_agents` / `group_messages`，DB v23 只 `CREATE TABLE IF NOT EXISTS`；`title` / `reports_to` 在 `ensureTables` 里 ALTER，不清数据。
 

@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import '../core/reasoning_models.dart';
 import 'llm_error.dart';
+import '../core/text_safe.dart';
 import 'runtime_logger.dart';
 import 'socks5_config.dart';
 
@@ -43,12 +44,18 @@ class TurnResult {
   final List<Map<String, String>> toolCalls; // [{id,name,arguments}]
   final String reasoning; // 模型思考内容（reasoning_content）
   final String reasoningEncrypted; // Responses encrypted_content，原样回放
+
+  /// 出口统一做 UTF-16 净化：流式拼接/截断一旦切出孤立代理项，
+  /// Flutter 文字引擎会抛 `string is not well-formed UTF-16`，整列表渲染失败
+  /// （见 docs/fix-log.md #405）。这里挡在 UI 之前。
   TurnResult({
-    this.text = '',
-    this.reasoning = '',
+    String text = '',
+    String reasoning = '',
     this.reasoningEncrypted = '',
     List<Map<String, String>>? toolCalls,
-  }) : toolCalls = toolCalls ?? [];
+  }) : text = sanitizeUtf16(text),
+       reasoning = sanitizeUtf16(reasoning),
+       toolCalls = toolCalls ?? [];
 }
 
 /// OpenAI-compatible streaming client with SSE parsing and tool calls.
@@ -321,6 +328,9 @@ class LlmClient {
     try {
       _throwIfCancelled();
       var includeUsage = true;
+      // 输出上限（max_tokens）：**0 = 不限制** —— 不发该字段，用模型自身最大输出。
+      // 不再对模型输出做人为掐断（这是本项目的红线，见 docs/fix-log.md #412）。
+      final unlimitedOutput = maxTokens <= 0;
       // 部分网关/中转不支持过大的 max_tokens：HTTP 400 时自动降级重试。
       var outputLimit = maxTokens;
       // 明显思考型模型默认请求思考输出；网关拒绝 thinking / reasoning_effort
@@ -349,8 +359,19 @@ class LlmClient {
       // 续写轮追加的消息：纯文本被截断时，把已输出内容 + 「继续」指令发回，
       // 模型从断点继续（不重发整轮，不丢已输出）。
       final continuation = <Map<String, dynamic>>[];
-      for (var round = 0; round <= maxContinuationRounds; round++) {
+      // 连接类瞬态错误的重试预算（**每一轮**都有，不只在首轮）。
+      // 之前只在 round==0 重试，导致工具轮（round≥1）里一次断连就整轮失败，
+      // 用户看到「网络连接失败」（见 docs/fix-log.md #405）。
+      const maxConnectionRetries = 2;
+      var connectionRetries = 0;
+      // maxContinuationRounds <= 0 视为**不限制**：一直续写到模型自然结束，
+      // 用极大值兜底避免 `for` 无法表达无限（真正的收口在「续写无新增内容」）。
+      final roundCeiling = maxContinuationRounds > 0
+          ? maxContinuationRounds
+          : 1000000;
+      for (var round = 0; round <= roundCeiling; round++) {
         _throwIfCancelled();
+        connectionRetries = 0;
         final body = _buildRequestBody(
           messages: [...messages, ...continuation],
           stream: true,
@@ -391,6 +412,8 @@ class LlmClient {
                 'model': model,
                 'endpoint': _safeEndpoint(_endpoint),
                 'round': round + 1,
+                // 0 = 不限制（请求体里不发 max_tokens）。截断排查先看这个值。
+                'maxTokens': outputLimit,
                 'stream': true,
                 'bytes': utf8.encode(bodyPreview).length,
                 'messages': messages.length,
@@ -403,9 +426,10 @@ class LlmClient {
         }
         try {
           _throwIfCancelled();
-          final response = await client
-              .send(request)
-              .timeout(streamWaitTimeout);
+          // 等待上限 0 = 不限制（默认）：不套超时，一直等模型回包。
+          final response = streamWaitTimeout > Duration.zero
+              ? await client.send(request).timeout(streamWaitTimeout)
+              : await client.send(request);
           _throwIfCancelled();
           if (response.statusCode != 200) {
             final err = await response.stream.bytesToString();
@@ -478,6 +502,15 @@ class LlmClient {
               onDiag?.call('[stream] max_tokens 被拒，下调到 $outputLimit 重试');
               continue;
             }
+            // 「不限制输出」时少发了 max_tokens，而个别协议（Anthropic）要求必填：
+            // 补一个足够大的值再试一次，而不是直接失败。
+            if (unlimitedOutput &&
+                _isMaxTokensParamError(err) &&
+                outputLimit <= 0) {
+              outputLimit = 64000;
+              onDiag?.call('[stream] 该协议要求 max_tokens，补 $outputLimit 重试');
+              continue;
+            }
             throw LlmHttpException(
               LlmErrorInfo.fromHttp(response.statusCode, err),
               err,
@@ -522,10 +555,10 @@ class LlmClient {
               lastFinishReason == 'length' || lastFinishReason == 'max_tokens';
           // 续写预算用尽：模型仍被输出上限截断（或连接反复断），如实标记
           // 不完整（上层据此告知用户原因），绝不假装正常完成。
-          if (round == maxContinuationRounds) {
+          if (round == roundCeiling) {
             endedIncomplete = providerTruncated || lastRoundInterrupted;
             onDiag?.call(
-              '[stream] 续写轮数用尽（$maxContinuationRounds 轮）：'
+              '[stream] 续写轮数用尽（$roundCeiling 轮）：'
               'incomplete=$endedIncomplete',
             );
             return;
@@ -540,7 +573,7 @@ class LlmClient {
             onDiag?.call('[stream] 续写无新增内容，收口（incomplete=$endedIncomplete）');
             return;
           }
-          _displayText = merged;
+          _displayText = sanitizeUtf16(merged);
           _displayReasoning += _lastRoundReasoning;
           continuationRounds = round + 1;
           // 纯文本截断：追加已输出 + 继续指令，发起续写请求。
@@ -614,16 +647,21 @@ class LlmClient {
             throw LlmCancelledException();
           }
           final m = e.message;
-          // 连接类瞬态错误（连接超时/拒绝/断连/DNS 失败）：首轮自动重试
-          // 一次；仍失败则转成可读的中文提示，不再把原始
-          // "ClientException with SocketException ..." 直接抛给界面。
-          if (round == 0 &&
-              (m.contains('timed out') ||
-                  m.contains('SocketException') ||
-                  m.contains('Connection refused') ||
-                  m.contains('Connection reset') ||
-                  m.contains('Failed host lookup'))) {
-            onDiag?.call('[stream] 连接异常，自动重试一次: $m');
+          // 连接类瞬态错误（连接超时/拒绝/断连/DNS 失败）：**每一轮**都自动
+          // 重试，最多 [maxConnectionRetries] 次（递增退避）；仍失败才转成
+          // 可读的中文提示，不把原始 ClientException 直接抛给界面。
+          final transient = m.contains('timed out') ||
+              m.contains('SocketException') ||
+              m.contains('Connection refused') ||
+              m.contains('Connection reset') ||
+              m.contains('Connection closed') ||
+              m.contains('Failed host lookup') ||
+              m.contains('Connection terminated');
+          if (transient && connectionRetries < maxConnectionRetries) {
+            connectionRetries++;
+            onDiag?.call(
+              '[stream] 连接异常（第 $round 轮第 $connectionRetries 次），自动重试: $m',
+            );
             unawaited(
               RuntimeLogger.instance.warn(
                 'LLM',
@@ -631,9 +669,17 @@ class LlmClient {
                 sessionId: sessionId,
                 requestId: requestId,
                 result: 'connection',
-                data: {'round': round + 1, 'error': m},
+                data: {
+                  'round': round + 1,
+                  'attempt': connectionRetries,
+                  'error': m,
+                },
               ),
             );
+            await Future<void>.delayed(
+              Duration(milliseconds: 400 * connectionRetries),
+            );
+            _throwIfCancelled();
             continue;
           }
           unawaited(
@@ -649,7 +695,10 @@ class LlmClient {
               data: {'round': round + 1, 'error': m},
             ),
           );
-          throw LlmException('网络连接失败：${_short(m)}，请检查网络/代理或稍后重试');
+          throw LlmException(
+            '网络连接失败（第 ${round + 1} 轮，已自动重试 $connectionRetries 次）：'
+            '${_short(m)}，请检查网络/代理或稍后重试',
+          );
         }
       }
     } finally {
@@ -671,9 +720,12 @@ class LlmClient {
     bool sendParallel = false,
     bool sendInclude = false,
   }) {
+    // 出口净化：孤立代理项编码成 UTF-8 是非法字节，发出去会被对端直接断连
+    // （日志：Connection closed before full header was received，见 #405）。
+    final safeMessages = _sanitizeJson(messages);
     if (protocol == 'anthropic') {
       return _buildAnthropicBody(
-        messages: messages,
+        messages: safeMessages,
         stream: stream,
         maxTokens: maxTokens,
         thinkingEnabled: thinkingEnabled,
@@ -682,7 +734,7 @@ class LlmClient {
     }
     if (_isResponses) {
       return _buildResponsesBody(
-        messages: messages,
+        messages: safeMessages,
         stream: stream,
         maxTokens: maxTokens,
         thinkingEnabled: thinkingEnabled,
@@ -693,7 +745,7 @@ class LlmClient {
       );
     }
     return _buildChatCompletionsBody(
-      messages: messages,
+      messages: safeMessages,
       stream: stream,
       includeUsage: includeUsage,
       maxTokens: maxTokens,
@@ -704,6 +756,23 @@ class LlmClient {
     );
   }
 
+  /// 递归净化 JSON 里的所有字符串（消息、工具参数、图片 URL 等）。
+  static List<Map<String, dynamic>> _sanitizeJson(Object? value) {
+    final cleaned = _sanitizeValue(value);
+    return (cleaned as List).cast<Map<String, dynamic>>();
+  }
+
+  static Object? _sanitizeValue(Object? value) {
+    if (value is String) return sanitizeUtf16(value);
+    if (value is List) return [for (final item in value) _sanitizeValue(item)];
+    if (value is Map) {
+      return <String, dynamic>{
+        for (final entry in value.entries)
+          entry.key.toString(): _sanitizeValue(entry.value),
+      };
+    }
+    return value;
+  }
   static String _safeEndpoint(String endpoint) {
     final uri = Uri.tryParse(endpoint);
     if (uri == null) return '<endpoint>';
@@ -763,10 +832,12 @@ class LlmClient {
       if (includeUsage) 'stream_options': {'include_usage': true},
       if (effortField == null || effortField.isEmpty)
         'temperature': temperature,
-      if (useMaxCompletionTokens ?? _useMaxCompletionTokens)
-        'max_completion_tokens': maxTokens
-      else
-        'max_tokens': maxTokens,
+      // 0 = 不限制：不发上限字段，交给模型自身最大输出。
+      if (maxTokens > 0)
+        if (useMaxCompletionTokens ?? _useMaxCompletionTokens)
+          'max_completion_tokens': maxTokens
+        else
+          'max_tokens': maxTokens,
       if (thinkingEnabled) 'thinking': {'type': 'enabled'},
       if (effortField != null && effortField.isNotEmpty)
         'reasoning_effort': effortField,
@@ -812,13 +883,16 @@ class LlmClient {
       'model': model,
       if (systemBlocks.isNotEmpty) 'system': systemBlocks,
       'messages': _toAnthropicMessages(split.messages),
-      'max_tokens': maxTokens,
+      if (maxTokens > 0) 'max_tokens': maxTokens,
       'stream': stream,
       if (!thinkingOn) 'temperature': temperature,
       if (thinkingOn)
         'thinking': {
           'type': 'enabled',
-          'budget_tokens': ReasoningModels.anthropicBudget(effort, maxTokens),
+          'budget_tokens': ReasoningModels.anthropicBudget(
+            effort,
+            maxTokens > 0 ? maxTokens : 32000,
+          ),
         },
       if (anthTools.isNotEmpty) 'tools': anthTools,
       if (anthTools.isNotEmpty)
@@ -847,7 +921,7 @@ class LlmClient {
       if (split.frozen.trim().isNotEmpty) 'instructions': split.frozen,
       'input': input,
       'stream': stream,
-      'max_output_tokens': maxTokens,
+      if (maxTokens > 0) 'max_output_tokens': maxTokens,
       if (sendStore) 'store': false,
       if (effortField == null || effortField.isEmpty)
         'temperature': temperature,
@@ -1046,7 +1120,7 @@ class LlmClient {
     );
     return redacted.length <= 2000
         ? redacted
-        : '${redacted.substring(0, 2000)}…';
+        : cutRunes(redacted, 2000);
   }
 
   static String _contentMeta(Map<String, dynamic> body) {
@@ -1271,7 +1345,7 @@ class LlmClient {
 
   String _short(String s) {
     final t = s.trim();
-    return t.length > 300 ? t.substring(0, 300) : t;
+    return cutRunes(t, 300);
   }
 
   /// 单次非流式补全，返回完整的 assistant 文本。用于自动沉淀记忆等后端调用。
@@ -1295,7 +1369,9 @@ class LlmClient {
 
     final client = await Socks5Proxy.client();
     try {
-      final response = await client.send(request).timeout(streamWaitTimeout);
+      final response = streamWaitTimeout > Duration.zero
+          ? await client.send(request).timeout(streamWaitTimeout)
+          : await client.send(request);
       final raw = await response.stream.bytesToString().timeout(
         streamWaitTimeout,
       );
@@ -1693,7 +1769,7 @@ class LlmClient {
         rawFramesLeft--;
         final preview = data.length <= 500
             ? data
-            : '${data.substring(0, 500)}…';
+            : cutRunes(data, 500);
         onDiag?.call('[sse] $preview');
       }
       if (data == '[DONE]') {
@@ -1723,7 +1799,7 @@ class LlmClient {
       }
       final tail = text.length <= 40
           ? text
-          : '…${text.substring(text.length - 40)}';
+          : tailRunes(text, 40);
       onDiag?.call(
         '[stream] end responses model=$model max=$maxTokens '
         'fr=$finishReason done=$doneReceived broken=$broken '
@@ -1794,6 +1870,8 @@ class LlmClient {
 
     void resetIdleTimer() {
       idleTimer?.cancel();
+      // 等待上限 0 = 不限制：不挂空闲计时器，绝不因为「等太久没数据」砍断。
+      if (streamWaitTimeout <= Duration.zero) return;
       idleTimer = Timer(streamWaitTimeout, () {
         idleTimer = null;
         streamBroken = true;
@@ -1927,7 +2005,7 @@ class LlmClient {
           rawFramesLeft--;
           final preview = data.length <= 500
               ? data
-              : '${data.substring(0, 500)}…';
+              : cutRunes(data, 500);
           onDiag?.call('[sse] $preview');
         }
         if (data == '[DONE]') {
@@ -2061,7 +2139,7 @@ class LlmClient {
       }
       final tail = text.length <= 40
           ? text
-          : '…${text.substring(text.length - 40)}';
+          : tailRunes(text, 40);
       onDiag?.call(
         '[stream] end model=$model max=$maxTokens '
         'fr=$finishReason done=$doneReceived broken=$broken '
@@ -2134,6 +2212,8 @@ class LlmClient {
 
     void resetIdleTimer() {
       idleTimer?.cancel();
+      // 等待上限 0 = 不限制：不挂空闲计时器，绝不因为「等太久没数据」砍断。
+      if (streamWaitTimeout <= Duration.zero) return;
       idleTimer = Timer(streamWaitTimeout, () {
         idleTimer = null;
         streamBroken = true;
@@ -2391,6 +2471,8 @@ class LlmClient {
 
     void resetIdleTimer() {
       idleTimer?.cancel();
+      // 等待上限 0 = 不限制：不挂空闲计时器，绝不因为「等太久没数据」砍断。
+      if (streamWaitTimeout <= Duration.zero) return;
       idleTimer = Timer(streamWaitTimeout, () {
         idleTimer = null;
         streamBroken = true;

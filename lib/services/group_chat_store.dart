@@ -39,7 +39,8 @@ class GroupChatStore {
         agent_id TEXT,
         content TEXT NOT NULL DEFAULT '',
         reasoning TEXT NOT NULL DEFAULT '',
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        tool_calls TEXT NOT NULL DEFAULT ''
       )
     ''');
     await db.execute('''
@@ -59,6 +60,7 @@ class GroupChatStore {
     );
     await ensureAgentOrgColumns(db);
     await ensureGroupRoomProjectColumn(db);
+    await ensureMessageToolCallsColumn(db);
   }
 
   static Future<void> ensureGroupRoomProjectColumn(Database db) async {
@@ -82,6 +84,18 @@ class GroupChatStore {
     if (!names.contains('reports_to')) {
       await db.execute(
         "ALTER TABLE group_agents ADD COLUMN reports_to TEXT NOT NULL DEFAULT ''",
+      );
+    }
+  }
+
+  /// 群聊消息新增 `tool_calls` 列（成员这一轮调过哪些工具、改了哪些代码）。
+  /// 只 ALTER，不升 DB version、不清数据（见 docs/fix-log.md #410）。
+  static Future<void> ensureMessageToolCallsColumn(Database db) async {
+    final cols = await db.rawQuery('PRAGMA table_info(group_messages)');
+    final names = {for (final col in cols) '${col['name']}'};
+    if (!names.contains('tool_calls')) {
+      await db.execute(
+        "ALTER TABLE group_messages ADD COLUMN tool_calls TEXT NOT NULL DEFAULT ''",
       );
     }
   }

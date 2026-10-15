@@ -58,6 +58,9 @@ class MessageBubble extends StatefulWidget {
   final Color? speakerColor;
   final bool smoothHeightAnimation;
 
+  /// 气泡内容下方的额外插槽（群聊工具调用/代码改动）。
+  final Widget? footer;
+
   const MessageBubble({
     super.key,
     required this.message,
@@ -79,6 +82,7 @@ class MessageBubble extends StatefulWidget {
     this.animateEnter = false,
     this.speakerName,
     this.speakerColor,
+    this.footer,
     this.smoothHeightAnimation = true,
   });
 
@@ -415,6 +419,8 @@ class _MessageBubbleState extends State<MessageBubble> {
             : CrossAxisAlignment.start,
         children: [
           smoothPadded,
+          // 额外插槽（群聊用：把该成员的工具调用/代码改动挂在自己的气泡里）。
+          if (widget.footer != null) ...[widget.footer!],
           _actionBar(theme, isUser),
           Padding(
             padding: EdgeInsets.only(

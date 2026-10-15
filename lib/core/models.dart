@@ -14,16 +14,25 @@ int sanitizeLoadedContextLimit(int value) {
 
 /// 长推理等待上限（秒）：等响应头与流中途无数据共用同一上限。
 /// 思考型模型可能在网关侧先推理很久才开始回包，普通 HTTP 超时会误杀。
-const int kDefaultStreamWaitSeconds = 600;
-const int kMinStreamWaitSeconds = 30;
-const int kMaxStreamWaitSeconds = 3600;
+/// **0 = 不限制**（默认，一直等）。
+const int kDefaultStreamWaitSeconds = 0;
+const int kMaxStreamWaitSeconds = 86400;
 
-/// 单轮回复被输出上限截断后的自动续写轮数上限（0 = 不续写）。
-const int kDefaultContinuationRounds = 16;
-const int kMaxContinuationRoundsLimit = 100;
+/// 单轮回复被输出上限截断后的自动续写轮数上限。
+/// **0 = 不限制**（默认，一直续写到模型自然结束）。
+const int kDefaultContinuationRounds = 0;
+const int kMaxContinuationRoundsLimit = 1000000;
+
+/// 工具循环轮数上限。**0 = 不限制**（默认，直到模型不再调工具）。
+const int kDefaultToolRounds = 0;
+const int kMaxToolRoundsLimit = 1000000;
+
+/// 单次请求的输出上限（max_tokens）。**0 = 不限制**（不发该字段，用模型自身上限）。
+const int kDefaultMaxOutputTokens = 0;
+const int kMaxOutputTokensLimit = 100000000;
 
 int sanitizeStreamWaitSeconds(int value) {
-  if (value < kMinStreamWaitSeconds) return kDefaultStreamWaitSeconds;
+  if (value < 0) return kDefaultStreamWaitSeconds;
   if (value > kMaxStreamWaitSeconds) return kMaxStreamWaitSeconds;
   return value;
 }
@@ -31,6 +40,18 @@ int sanitizeStreamWaitSeconds(int value) {
 int sanitizeContinuationRounds(int value) {
   if (value < 0) return kDefaultContinuationRounds;
   if (value > kMaxContinuationRoundsLimit) return kMaxContinuationRoundsLimit;
+  return value;
+}
+
+int sanitizeToolRounds(int value) {
+  if (value < 0) return kDefaultToolRounds;
+  if (value > kMaxToolRoundsLimit) return kMaxToolRoundsLimit;
+  return value;
+}
+
+int sanitizeMaxOutputTokens(int value) {
+  if (value < 0) return kDefaultMaxOutputTokens;
+  if (value > kMaxOutputTokensLimit) return kMaxOutputTokensLimit;
   return value;
 }
 
@@ -658,6 +679,9 @@ class AppSettings {
   /// 被输出上限截断后的自动续写轮数上限（0 = 只标记不完整，不续写）。
   int maxContinuationRounds;
 
+  /// 工具循环轮数上限（0 = 不限制）。
+  int maxToolRounds;
+
   /// 上下文压缩阈值（占上下文上限的百分比，如 80 表示 80%）。
   double compressThresholdPercent;
 
@@ -771,9 +795,10 @@ class AppSettings {
     this.ttsRate = 1.0,
     this.themeMode = 'dark',
     this.contextLimit = kDefaultContextLimit,
-    this.maxOutputTokens = 8192,
+    this.maxOutputTokens = kDefaultMaxOutputTokens,
     this.streamWaitSeconds = kDefaultStreamWaitSeconds,
     this.maxContinuationRounds = kDefaultContinuationRounds,
+    this.maxToolRounds = kDefaultToolRounds,
     this.compressThresholdPercent = 80,
     this.autoCompress = true,
     this.visionEnabled = false,
@@ -830,6 +855,7 @@ class AppSettings {
     int? maxOutputTokens,
     int? streamWaitSeconds,
     int? maxContinuationRounds,
+    int? maxToolRounds,
     double? compressThresholdPercent,
     bool? autoCompress,
     bool? visionEnabled,
@@ -941,6 +967,9 @@ class AppSettings {
     'maxOutputTokens': maxOutputTokens,
     'streamWaitSeconds': streamWaitSeconds,
     'maxContinuationRounds': maxContinuationRounds,
+    'maxToolRounds': maxToolRounds,
+    // 输出上限策略 V2 已生效（0 = 不限制）：标记写盘，避免下次启动重复迁移。
+    'outputLimitsV2': true,
     'compressThresholdPercent': compressThresholdPercent,
     'autoCompress': autoCompress,
     'visionEnabled': visionEnabled,
@@ -991,13 +1020,18 @@ class AppSettings {
     ttsRate: (j['ttsRate'] as num?)?.toDouble() ?? 1.0,
     themeMode: j['themeMode'] ?? 'dark',
     contextLimit: (j['contextLimit'] as num?)?.toInt() ?? kDefaultContextLimit,
-    maxOutputTokens: (j['maxOutputTokens'] as num?)?.toInt() ?? 8192,
+    maxOutputTokens: sanitizeMaxOutputTokens(
+      (j['maxOutputTokens'] as num?)?.toInt() ?? kDefaultMaxOutputTokens,
+    ),
     streamWaitSeconds: sanitizeStreamWaitSeconds(
       (j['streamWaitSeconds'] as num?)?.toInt() ?? kDefaultStreamWaitSeconds,
     ),
     maxContinuationRounds: sanitizeContinuationRounds(
       (j['maxContinuationRounds'] as num?)?.toInt() ??
           kDefaultContinuationRounds,
+    ),
+    maxToolRounds: sanitizeToolRounds(
+      (j['maxToolRounds'] as num?)?.toInt() ?? kDefaultToolRounds,
     ),
     compressThresholdPercent:
         (j['compressThresholdPercent'] as num?)?.toDouble() ?? 80,

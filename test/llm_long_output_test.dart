@@ -222,8 +222,39 @@ void main() {
     }
   });
 
-  test('maxContinuationRounds=0 时不续写，直接标记不完整', () async {
+  test('maxContinuationRounds 显式收紧到 1 时只续写一轮，超出即标记不完整', () async {
     final s = await serve([(_) => '${chunk('截断内容', finish: 'length')}$done']);
+    try {
+      final client = LlmClient(
+        baseUrl: 'http://${s.server.address.host}:${s.server.port}/v1',
+        apiKey: 'k',
+        model: 'deepseek-v4-flash',
+        temperature: 0.2,
+        maxTokens: 1024,
+        tools: const [],
+        maxContinuationRounds: 1,
+      );
+      await client.send([
+        {'role': 'user', 'content': '长文'},
+      ]);
+      expect(s.bodies, hasLength(2));
+      expect(client.endedIncomplete, isTrue);
+    } finally {
+      await s.server.close(force: true);
+    }
+  });
+
+  test('maxContinuationRounds=0 是「不限制」：续写到模型自然收口（#412）', () async {
+    // 第 1 轮报 length，第 2 轮正常 stop：应发两轮，且不算不完整。
+    var call = 0;
+    final s = await serve([
+      (_) {
+        call++;
+        return call == 1
+            ? '${chunk('前半段', finish: 'length')}$done'
+            : '${chunk('后半段')}$done';
+      },
+    ]);
     try {
       final client = LlmClient(
         baseUrl: 'http://${s.server.address.host}:${s.server.port}/v1',
@@ -237,8 +268,8 @@ void main() {
       await client.send([
         {'role': 'user', 'content': '长文'},
       ]);
-      expect(s.bodies, hasLength(1));
-      expect(client.endedIncomplete, isTrue);
+      expect(s.bodies, hasLength(2), reason: '0 不再表示「不续写」');
+      expect(client.endedIncomplete, isFalse);
     } finally {
       await s.server.close(force: true);
     }

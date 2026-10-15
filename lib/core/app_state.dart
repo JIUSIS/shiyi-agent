@@ -37,6 +37,8 @@ import 'tool_result_pruner.dart';
 import 'tool_output_spill.dart';
 import '../services/runtime_logger.dart';
 import '../services/shiyi_api_relay.dart';
+import 'text_safe.dart';
+import 'code_change.dart';
 
 /// 单个可执行工具：LLM 可见的 JSON schema + 执行函数 + 只读标记。
 /// readOnly=true 的工具在计划模式（planMode）下仍然可用；
@@ -2839,9 +2841,7 @@ class ShiyiState extends ChangeNotifier {
       if (s != null && s.title.startsWith('新会话')) {
         final title = cleanText.isEmpty
             ? '[图片]'
-            : (cleanText.length <= 20
-                  ? cleanText
-                  : '${cleanText.substring(0, 20)}…');
+            : (cleanText.length <= 20 ? cleanText : cutRunes(cleanText, 20));
         await _db.renameSession(targetSessionId, title);
       }
 
@@ -3310,7 +3310,12 @@ class ShiyiState extends ChangeNotifier {
 
   /// 多轮工具调用循环：每轮工具调用输出的文字作为独立消息保留，
   /// 最多 99 轮（每轮可含多个工具），最后一轮强制再请求一次拿到最终文本。
-  static const int _maxToolRounds = 99;
+  /// 工具循环轮数上限：0 = 不限制（默认，直到模型不再调工具）。
+  /// 设置页「工具轮数上限」可改，见 docs/fix-log.md #412。
+  int get _maxToolRounds {
+    final configured = settings.maxToolRounds;
+    return configured > 0 ? configured : 1000000;
+  }
 
   /// 流式增量落库的节流间隔（毫秒）。
   static const int _streamCheckpointMs = 2000;
@@ -3999,11 +4004,20 @@ class ShiyiState extends ChangeNotifier {
     try {
       final args = jsonDecode(argsJson);
       if (args is Map) {
+        // 写入类工具先给路径（改动本身走 codeChangePreview，不再塞正文）。
+        if (isCodeChangeTool(name)) {
+          for (final k in ['path', 'file_path', 'filename', 'file']) {
+            final v = args[k];
+            if (v is String && v.trim().isNotEmpty) {
+              return cutRunes(v.trim(), 60);
+            }
+          }
+        }
         for (final k in ['query', 'url', 'content', 'name', 'command']) {
           final v = args[k];
           if (v is String && v.trim().isNotEmpty) {
             final t = v.trim();
-            return t.length > 36 ? '${t.substring(0, 36)}…' : t;
+            return cutRunes(t, 36);
           }
         }
       }
@@ -4013,7 +4027,7 @@ class ShiyiState extends ChangeNotifier {
 
   static String _summarizeOutput(String output) {
     final t = output.trim().replaceAll(RegExp(r'\s+'), ' ');
-    return t.length > 90 ? '${t.substring(0, 90)}…' : t;
+    return cutRunes(t, 90);
   }
 
   static bool _isToolError(String output) =>
@@ -4149,7 +4163,11 @@ class ShiyiState extends ChangeNotifier {
     ev
       ..done = true
       ..ok = !_isToolError(output)
-      ..summary = _summarizeOutput(output)
+      // 写入类工具把「代码改动」放进 summary（胶囊里按等宽 diff 渲染），
+      // 其余工具仍是输出摘要（见 docs/fix-log.md #410）。
+      ..summary =
+          codeChangePreview(tname, (call['arguments'] ?? '').toString()) ??
+          _summarizeOutput(output)
       ..finishedAt = finishedAt;
     if (ev.id != null) {
       await _db.updateToolEvent(ev.id!, ev);
@@ -4576,6 +4594,7 @@ class ShiyiState extends ChangeNotifier {
       final resolved = await _resolveToolPath(
         wPath,
         sessionId: args['_sessionId']?.toString(),
+        baseDir: args['_cwd']?.toString(),
       );
       if (resolved == null) return '写入失败：路径无效';
       final f = File(resolved);
@@ -4594,6 +4613,7 @@ class ShiyiState extends ChangeNotifier {
       final resolved = await _resolveToolPath(
         rPath,
         sessionId: args['_sessionId']?.toString(),
+        baseDir: args['_cwd']?.toString(),
       );
       if (resolved == null) return '文件不存在：$rPath';
       final f = File(resolved);
@@ -5019,11 +5039,51 @@ class ShiyiState extends ChangeNotifier {
   /// 解析工具的文件路径：相对路径基于当前会话工作目录，绝对路径直接使用；
   /// 统一经 [_normAbsPath] 归一化（消除 `..`、重复分隔符），语义明确、
   /// 防路径混淆（与子代理 write_paths 同款归一化）。
-  Future<String?> _resolveToolPath(String path, {String? sessionId}) async {
+  Future<String?> _resolveToolPath(
+    String path, {
+    String? sessionId,
+    String? baseDir,
+  }) async {
     final t = path.trim();
     if (t.isEmpty) return null;
-    final base = await workspaceForSession(sessionId);
+    final base = (baseDir != null && baseDir.trim().isNotEmpty)
+        ? baseDir.trim()
+        : await workspaceForSession(sessionId);
     return _normAbsPath(t, base);
+  }
+
+  // ---------------- 群聊：完整工具 ----------------
+
+  /// 不发给群聊的工具：实现绑死在**单个拾忆会话**的 UI/状态上，
+  /// 群聊里调用会串台或无处落地（见 docs/fix-log.md #411）。
+  static const _groupChatExcludedTools = {
+    'question', // 提问面板绑当前会话的 run/UI
+    'spawn_agent', // 子代理 mini 会话绑当前会话
+    'enter_plan_mode', // 计划模式是会话级全局开关，群聊里会翻掉整个 App
+    'exit_plan_mode',
+  };
+
+  /// 群聊成员的可用工具（完整工具集，OpenAI function 形式）。
+  List<Map<String, dynamic>> groupToolSchemas() => [
+    for (final tool in toolRegistry)
+      if (!_groupChatExcludedTools.contains(tool.name)) tool.toJson(),
+  ];
+
+  /// 群聊执行工具：文件/终端按 [workingDir] 解析，不依赖拾忆会话。
+  Future<String> runGroupTool(
+    String name,
+    String argsJson, {
+    required String workingDir,
+  }) async {
+    Map<String, dynamic> args = {};
+    try {
+      final decoded = jsonDecode(argsJson);
+      if (decoded is Map) args = decoded.cast<String, dynamic>();
+    } catch (_) {}
+    if (workingDir.trim().isNotEmpty) {
+      args['_cwd'] = workingDir.trim();
+    }
+    return _executeTool(name, jsonEncode(args));
   }
 
   // ---------------- 上下文压缩 ----------------
@@ -5157,7 +5217,10 @@ class ShiyiState extends ChangeNotifier {
     required int estimatedInputTokens,
   }) {
     final outputCap = contextLimit > 0 ? contextLimit ~/ 2 : 0;
-    final outputReserve = maxOutputTokens.clamp(0, outputCap);
+    // maxOutputTokens = 0 表示「不限制输出」：预算上按输出上限的一半预留，
+    // 否则预留 0 会把输入预算撑满，请求超出窗口被服务端拒（见 #412）。
+    final reserveBase = maxOutputTokens > 0 ? maxOutputTokens : outputCap;
+    final outputReserve = reserveBase.clamp(0, outputCap);
     final safetyReserve = (contextLimit * 0.02).round().clamp(
       0,
       (contextLimit * 0.05).round(),
@@ -5427,7 +5490,7 @@ class ShiyiState extends ChangeNotifier {
         final t = m.content.replaceAll(RegExp(r'\s+'), ' ').trim();
         if (t.isEmpty) continue;
         final title = _memoryTitle(t);
-        final hook = t.length > 40 ? '${t.substring(0, 40)}…' : t;
+        final hook = cutRunes(t, 40);
         sb.writeln('- [$title](memory-${m.id}) — [${m.type}] $hook');
       }
       await f.writeAsString(sb.toString(), flush: true);
@@ -5441,7 +5504,7 @@ class ShiyiState extends ChangeNotifier {
     final link = RegExp(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]').firstMatch(content);
     final raw = link?.group(1)?.trim() ?? '';
     if (raw.isNotEmpty) return raw;
-    return content.length > 20 ? '${content.substring(0, 20)}…' : content;
+    return cutRunes(content, 20);
   }
 
   /// 自动沉淀记忆：每轮对话结束后提炼重要信息存入长期记忆。
@@ -5710,7 +5773,24 @@ echo "[rc=\$?]"
         laap.status.value = LaapStatus.running;
       }
       await _ensureLaapBootstrap();
-      final remote = await LaapApiClient.instance.cognitiveState(text);
+      // 皮层数据**并行拉取 + 各自限时**：以前是「cognitive_state 完 → 再
+      // recall_memory」串行 HTTP，真机实测把「发消息 → 出思考链」拖慢 ~3 秒
+      // （日志：response.completed → reflect → cognitive_state → recall_memory
+      //  → request.sent）。皮层是加分项，绝不允许拖住请求；超时就先不带。
+      final results = await Future.wait<Object?>([
+        LaapApiClient.instance
+            .cognitiveState(text)
+            .timeout(const Duration(milliseconds: 900))
+            .then<Object?>((value) => value)
+            .onError<Object>((_, _) => null),
+        LaapApiClient.instance
+            .recallMemory(text)
+            .timeout(const Duration(milliseconds: 900))
+            .then<Object?>((value) => value)
+            .onError<Object>((_, _) => null),
+      ]);
+      final remote = results[0];
+      if (remote is! LaapCognitiveState) return;
       final applied = presence.applyRemote(
         needs: remote.needs,
         valence: remote.valence,
@@ -5734,8 +5814,8 @@ echo "[rc=\$?]"
           ),
         );
       }
-      try {
-        final memories = await LaapApiClient.instance.recallMemory(text);
+      final memories = results[1];
+      if (memories is List<LaapMemory>) {
         presence.applyMemories(memories.map((memory) => memory.content));
         unawaited(
           RuntimeLogger.instance.info(
@@ -5744,9 +5824,9 @@ echo "[rc=\$?]"
             data: {'count': presence.recalledMemories.length},
           ),
         );
-      } catch (e) {
+      } else {
+        // 皮层这次没给记忆（超时/失败）：清空，别把上一次的记忆当本次。
         presence.applyMemories(const []);
-        unawaited(_logError('LAAP', 'recall_memory: $e'));
       }
     } catch (e) {
       presence.cortexConnected = false;
@@ -5758,10 +5838,30 @@ echo "[rc=\$?]"
   ///
   /// 群聊不走普通会话的 PromptBuilder，因此由群聊页面显式请求这段
   /// 官方 PSI 动态提示词，再拼进该成员自己的 system 消息。
+  DateTime? _presenceFetchedAt;
+  String _presenceSection = '';
+
   Future<String> cognitivePromptFor(String text) async {
     if (!settings.enablePresence || text.trim().isEmpty) return '';
-    await _syncPresenceWithLaap(text);
-    return presence.promptSection();
+    // 群聊一批里可能有 N 个成员同时要皮层快照：2 秒内直接复用上一次结果。
+    // 本地皮层的 HTTP 是串行的，N 个成员各等一次会把「出字」拖成好几秒
+    // （见 docs/fix-log.md #407）。
+    final last = _presenceFetchedAt;
+    if (last != null &&
+        _presenceSection.isNotEmpty &&
+        DateTime.now().difference(last) < const Duration(seconds: 2)) {
+      return _presenceSection;
+    }
+    // 整体限时（含 LAAP 健康检查/引导）：皮层慢或没起来时**直接跳过**，
+    // 不能把「发消息 → 出字」拖成几秒。
+    try {
+      await _syncPresenceWithLaap(
+        text,
+      ).timeout(const Duration(milliseconds: 1400));
+    } catch (_) {}
+    _presenceSection = presence.promptSection();
+    _presenceFetchedAt = DateTime.now();
+    return _presenceSection;
   }
 
   Future<void> reflectCognitiveOutput(String output) => _reflectLaap(output);

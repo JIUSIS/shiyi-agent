@@ -87,3 +87,5 @@ phone_runtime_*.jsonl
 /.claude/
 /.freebuff/
 /.zcode/
+tmp_*
+third_party/**/android/.gradle/
