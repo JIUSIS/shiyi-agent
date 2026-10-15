@@ -336,7 +336,7 @@ DS Harness 引擎验证点（#114，两端共享）：
 - **2026-08-26**（共享 `lib/`；详见 `docs/fix-log.md` #243-#259）：
   #243 会话长按无拖影已由 #245 重建关闭（`HomeLongPressDrag` + 自建 overlay，不再用 `LongPressDraggable`）。
   后续补齐跨项目状态、抓取点、收起动画、挤开高度、源空槽、飞入曲线和搜索栏层级。
-  真机 `af3700b1` 正式包 `adb install -r` Success，未卸载未清数据。
+  真机 `<安卓真机 B>` 正式包 `adb install -r` Success，未卸载未清数据。
 - **2026-08-26 2.5.9**（共享 `lib/` 改动；Windows 无新增平台分支；详见 `docs/fix-log.md` #241）：
   左滑 / 交错展开 / 分组头 / 飞行层抽成共享组件。DSH 工作区会话长按拖拽按 `sessionIds` 排序，
   `dshReorderPlanForInsertion` 生成 `insertSessionBefore`。Windows 拾忆主页同一套拖拽。
@@ -492,7 +492,7 @@ DS Harness 引擎验证点（#114，两端共享）：
   reasoning-only 增量提升为正文；`_applyTurn` 仅在整轮最终确认无正文时执行兼容兜底，
   始终保持 `streamText` / `streamReasoning` 分离。新增 6 个流式 reasoning 回归用例。
   共享验证：`flutter analyze` 0 issues；`flutter test` 414 项全绿；`flutter build apk --debug`
-  成功；真机 `9LKZL7TGZTJFZ575` 使用 `adb install -r` 覆盖安装 Success，未卸载、未清数据。
+  成功；真机 `<安卓真机 A>` 使用 `adb install -r` 覆盖安装 Success，未卸载、未清数据。
 
 - **2026-08-20**（共享 `lib/` 改动；Windows 无新增平台分支；详见 `docs/fix-log.md` 会话页与 DSH 同步条目）：
   拾忆与 DSH 会话页统一为悬空液态玻璃输入区、消息入场动画、流式跟随；输入区增加思考开关、思考强度与手动压缩。

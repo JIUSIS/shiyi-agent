@@ -122,7 +122,7 @@ void main() {
   test('Host 扫描只在远程模式启用，且不复用局域网配置', () {
     final lanSettings = AppSettings(
       dshConnectionMode: 'lan',
-      dshLanHost: '192.168.2.175',
+      dshLanHost: '192.168.77.13',
       dshLanPort: 43120,
       dshRemoteHost: '10.0.0.8:3080',
     );
@@ -130,22 +130,22 @@ void main() {
 
     final remoteSettings = AppSettings(
       dshConnectionMode: 'remote',
-      dshRemoteUrl: '103.236.89.105:56646',
-      dshRemoteHost: '192.168.2.175:43120',
-      dshLanHost: '192.168.9.9',
+      dshRemoteUrl: '203.0.113.9:56646',
+      dshRemoteHost: '192.168.77.13:43120',
+      dshLanHost: '192.168.77.14',
       dshLanPort: 9999,
     );
     expect(
       DshEndpoint.remoteCustomCompatibilityHosts(remoteSettings),
       containsAllInOrder([
-        '192.168.2.175:43120',
-        '192.168.2.175:56646',
-        '192.168.2.175:3080',
+        '192.168.77.13:43120',
+        '192.168.77.13:56646',
+        '192.168.77.13:3080',
       ]),
     );
     expect(
       DshEndpoint.remoteCompatibilityHosts(remoteSettings),
-      isNot(contains('192.168.9.9:9999')),
+      isNot(contains('192.168.77.14:9999')),
     );
     expect(
       DshEndpoint.remotePresetCompatibilityHosts(remoteSettings),
@@ -171,7 +171,7 @@ void main() {
       dshLanHost: '192.168.1.8',
       dshLanPort: 3090,
       dshRemoteUrl: 'https://dsh.example.com',
-      dshRemoteHost: '192.168.2.175:43120',
+      dshRemoteHost: '192.168.77.13:43120',
       dshRemoteToken: 'secret',
     ).toJson();
     final restored = AppSettings.fromJson(saved);
@@ -179,7 +179,7 @@ void main() {
     expect(restored.dshLanHost, '192.168.1.8');
     expect(restored.dshLanPort, 3090);
     expect(restored.dshRemoteUrl, 'https://dsh.example.com');
-    expect(restored.dshRemoteHost, '192.168.2.175:43120');
+    expect(restored.dshRemoteHost, '192.168.77.13:43120');
     expect(restored.dshRemoteToken, 'secret');
     expect(AppSettings.fromJson({'dshLanPort': 0}).dshLanPort, 3080);
     expect(

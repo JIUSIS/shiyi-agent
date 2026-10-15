@@ -5,7 +5,7 @@
 ## 一、项目与设备
 
 - **代码库**：`D:\sourcecode\hermes_agent_app`（Flutter app，包名 `com.shiyi.agent`，Android 端 + Windows 桌面端共享 lib/）
-- **当前测试设备**：`9LKZL7TGZTJFZ575`（Android 15/16 类，**KernelSU root 可用**，adb 直连 `adb -s 9LKZL7TGZTJFZ575`）
+- **当前测试设备**：`<安卓真机 A>`（Android 15/16 类，**KernelSU root 可用**，adb 直连 `adb -s <安卓真机 A>`）
 - **app uid**：`u0_a225` = 10225（卸载重装后从 u0_a223 变为 u0_a225）
 - **targetSdk**：36（2026-08-16 刚从 27 升级，见 fix-log #166）
 - **内嵌终端架构**：Android 宿主 + proot + Alpine 3.24.1 minirootfs（`assets/termux/alpine-minirootfs-3.24.1-aarch64.tar.gz`）

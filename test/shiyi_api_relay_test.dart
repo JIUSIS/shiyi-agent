@@ -124,7 +124,7 @@ void main() {
       apiKey: 'sk-real-secret',
       model: 'model-a',
       dshConnectionMode: 'lan',
-      dshLanHost: '192.168.2.175',
+      dshLanHost: '192.168.77.13',
       dshLanPort: 43120,
       dshApiSource: 'shiyi',
     );
@@ -221,8 +221,8 @@ void main() {
 
   test('局域网入口继续使用手机局域网 Relay 地址', () {
     expect(
-      ShiyiApiRelay.reachableBaseUrl(lanIpv4: '192.168.2.161', port: 43121),
-      'http://192.168.2.161:43121${ShiyiApiRelay.routePrefix}',
+      ShiyiApiRelay.reachableBaseUrl(lanIpv4: '192.168.77.12', port: 43121),
+      'http://192.168.77.12:43121${ShiyiApiRelay.routePrefix}',
     );
     expect(ShiyiApiRelay.reachableBaseUrl(lanIpv4: '', port: 43121), isEmpty);
   });

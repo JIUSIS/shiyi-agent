@@ -223,7 +223,7 @@ void main() {
       );
     });
     final client = DshApiClient(
-      baseUrl: 'http://192.168.2.175:43120',
+      baseUrl: 'http://192.168.77.13:43120',
       hostOverride: '127.0.0.1:43120',
       client: mock,
     );
@@ -233,7 +233,7 @@ void main() {
 
     expect(
       requests.map((request) => request.url.host),
-      everyElement('192.168.2.175'),
+      everyElement('192.168.77.13'),
     );
     expect(
       requests.map((request) => request.headers['host']),
@@ -264,7 +264,7 @@ void main() {
     });
     final client = DshApiClient(
       baseUrl: 'http://203.0.113.8:56646',
-      customCompatibilityHosts: const ['192.168.2.175:43120'],
+      customCompatibilityHosts: const ['192.168.77.13:43120'],
       compatibilityHosts: const ['127.0.0.1:56646'],
       client: mock,
     );
@@ -273,7 +273,7 @@ void main() {
     await client.listSessions();
 
     expect(calls, 3);
-    expect(hosts, [null, '192.168.2.175:43120', '192.168.2.175:43120']);
+    expect(hosts, [null, '192.168.77.13:43120', '192.168.77.13:43120']);
   });
 
   test('内置回环 Host 的空隔离视图不会被误判为连接成功', () async {

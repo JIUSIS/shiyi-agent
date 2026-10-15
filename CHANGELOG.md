@@ -317,7 +317,7 @@
 
 - 远端 provider 合并、协议映射、自动 ID、模型编辑还原、320px 小屏滚动、中转选择按 scope/会话隔离、抽屉返回键收合新增回归测试。
 - `flutter analyze` 仅仓库既有 1 warning / 2 info；`flutter test` 847 项全绿；`flutter build apk --release` 生成 37.5MB `app-release.apk`。
-- 真机 `af3700b1`（2509FPN0BC）手动 `adb install -r` Success，无卸载。`versionName=2.6.1 / versionCode=26`，签名 `f6dde40b`，`firstInstallTime` 保持 `2026-08-17 18:41:21`。
+- 真机 `<安卓真机 B>`（<安卓机型>）手动 `adb install -r` Success，无卸载。`versionName=2.6.1 / versionCode=26`，签名 `f6dde40b`，`firstInstallTime` 保持 `2026-08-17 18:41:21`。
 - 详细记录见 `docs/fix-log.md` #293 / #307–#317。
 
 ## [2.6.0] - 2026-08-27
@@ -378,7 +378,7 @@
 ### 验证
 
 - `flutter test test/laap_api_test.dart test/presence_engine_test.dart test/prompt_section_test.dart test/llm_protocol_cache_test.dart test/media_query_fix_test.dart test/tool_output_spill_test.dart test/context_budget_test.dart test/settings_model_test.dart` 通过。
-- 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
+- 正式包同签名覆盖安装到 `<安卓真机 B>`（<安卓机型>），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
 
 ## [2.5.9] - 2026-08-26
 
@@ -398,7 +398,7 @@
 
 - `flutter test test/home_list_order_test.dart test/dsh_workspace_display_name_test.dart test/home_sessions_tab_test.dart` 通过。
 - `dart analyze` 相关文件无告警。
-- 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
+- 正式包同签名覆盖安装到 `<安卓真机 B>`（<安卓机型>），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
 
 ## [2.5.8] - 2026-08-24
 
@@ -422,7 +422,7 @@
 
 - `flutter test` 全量通过（含 `session_bridge` / `file_workspace` / `terminal_backend` / `prompt_section` / 工具与提示词快照）。
 - 2026-08-25 覆盖：`flutter test test/terminal_pane_test.dart test/markdown_text_test.dart test/home_list_order_test.dart test/home_sessions_tab_test.dart` 通过。
-- 正式包同签名覆盖安装到 `af3700b1`（2509FPN0BC），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
+- 正式包同签名覆盖安装到 `<安卓真机 B>`（<安卓机型>），`adb install -r` Success，`firstInstallTime` 未变化，数据保留。
 
 ## [2.5.7] - 2026-08-24
 
@@ -512,7 +512,7 @@
 
 - `flutter analyze` 针对同步与思考目录无告警。
 - `flutter test test/dsh_model_sync_test.dart test/dsh_service_test.dart test/reasoning_models_test.dart` 全部通过。
-- 真机 `2509FPN0BC` 使用 `adb install -r` 覆盖安装 debug 包验证凭据迁移路径；正式包同签名覆盖安装。
+- 真机 `<安卓机型>` 使用 `adb install -r` 覆盖安装 debug 包验证凭据迁移路径；正式包同签名覆盖安装。
 
 ## [2.5.2] - 2026-08-21
 
@@ -572,7 +572,7 @@
 ### 验证
 
 - `flutter analyze` 针对同步改动无告警；`flutter test test/dsh_model_sync_test.dart` 42 项全部通过。
-- 真机 `9LKZL7TGZTJFZ575` 使用 `adb install -r` 覆盖安装，未卸载、未清除数据。
+- 真机 `<安卓真机 A>` 使用 `adb install -r` 覆盖安装，未卸载、未清除数据。
 
 ## [2.0.0] - 2026-08-13
 

@@ -31,7 +31,7 @@ void main() {
 
   test('copyWith 保留该标记', () {
     final s = AppSettings.fromJson(const {'dshConnectionMode': 'lan'});
-    expect(s.copyWith(dshLanHost: '192.168.1.9').dshConnectionModeConfigured, isTrue);
+    expect(s.copyWith(dshLanHost: '192.168.77.15').dshConnectionModeConfigured, isTrue);
     expect(
       s.copyWith(dshConnectionModeConfigured: false).dshConnectionModeConfigured,
       isFalse,

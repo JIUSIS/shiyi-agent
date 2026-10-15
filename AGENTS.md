@@ -15,7 +15,7 @@
   - 注意：因此**构建 debug 同样需要 `KEYSTORE_PASSWORD`**（`android/local.properties` 或环境变量），缺密码时 debug 构建直接报错。
 
 ## 真机环境
-- 常用测试设备：`9LKZL7TGZTJFZ575`（近期覆盖安装验证）、`2509FPN0BC`（Android 16 / API 36）
+- 常用测试设备：`<安卓真机 A>`（近期覆盖安装验证）、`<安卓机型>`（Android 16 / API 36）
 - 应用包名：`com.shiyi.agent`（由 `com.hermes.hermes_agent_app` 改名而来）
 
 ## 发布正式包（规范，2026-10-16 定）
@@ -24,6 +24,14 @@
 - 版本号三处必须一致：`pubspec.yaml`（`x.y.z+code`）、`android/app/build.gradle.kts`（`versionCode` / `versionName`）、tag `vx.y.z`。
 - 发布前必须：`flutter analyze` 0 error + `flutter test` 全绿（允许既有的 5 条无关失败）；构建只出 arm64-v8a release；用 `aapt2 dump badging` 核对 versionName/label；`adb install -r` 覆盖安装发布的**那个 APK** 验证。
 - Release 正文取自 `CHANGELOG.md` 对应版本段落（面向用户，不写内部 fix-log 编号）。
+
+## 隐私与仓库卫生（2026-10-16 起，铁律）
+- **禁止把下列内容提交进仓库**（仓库是公开的）：真实 API Key / Token / Cookie、`android/local.properties`（含 KEYSTORE_PASSWORD）、`*.jks` / keystore、`~/.dsh/.credentials.yaml`、真机序列号与机型号、真实的局域网/公网 IP 与端口、本机用户名与绝对路径、会话数据库与运行日志。
+- 测试 fixtures 一律用文档地址：公网用 RFC 5737 的 `203.0.113.x` / `198.51.100.x`，内网用 `192.168.77.x` 这类不会指向真实设备的网段；密钥用 `sk-test-...` 这类明显假值。
+- 文档里提到测试设备写成 `<安卓真机 A>` / `<安卓机型>`，不要写序列号。
+- `.gitignore` 必须继续挡住 `android/local.properties`、`*.jks`、`*.keystore`、`tmp_*`、`docs/fix-log.md`。
+- 提交前自检（一条命令）：`git grep -n -I -E 'sk-[A-Za-z0-9_-]{20,}|ghp_|github_pat_|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|C:\\\\Users\\\\'`；再用 `git grep -n -I -F '<你的设备序列号>'` 复核。
+- 注意：**清理工作区不等于清理历史**。已经推上去的内容仍在 git 历史里；发现真密钥必须立刻吊销/轮换，而不是只删文件。
 
 ## 输出上限（红线：不许自己掐断模型）
 - **一律 0 = 不限制，且默认全为 0**：`maxOutputTokens`（不发 `max_tokens`，用模型自身上限）、`streamWaitSeconds`（不套超时、不挂空闲计时器）、`maxContinuationRounds`（一直续写，靠「无新增内容」收口）、`maxToolRounds`（工具循环不限轮）。用户可在设置页自行收紧，`sanitize*` 只拒绝负数。详见 `docs/fix-log.md` #412。
@@ -182,6 +190,13 @@
 - 组织是公司结构，不是全员抢答：`reports_to` 为空的人对接用户；其他人被 `@名字` 或上级安排后才发言，说完向直接上级汇报。正常推进不设固定轮次/每人次数上限；只有明确「打回」的同一交接环节最多 3 次。
 - 群聊按**层级行动**调度（`GroupRoundScheduler`，见 `docs/fix-log.md` #404）：一批 = 同一层被叫到的人，**全员并行**（叫 5 个就 5 条线程，不再有 3 线程上限）；整批**每一个都汇报完**才轮到下一批，上级不会被下属的半成品提前拉起（下属还在跑时上级进 `_deferred` 等屏障）。派活的人持续算「在飞」，直到它真正向上汇报，它的上级才可能启动。多个下属汇报同一位上级只叫一次；同一交接环节打回最多 3 次；`maxWaves=40` / 每人激活 8 次只是互相 @ 死循环的安全阀，不是正常推进上限。
 - 每个 Agent 的思考过程单独显示在自己的气泡里，禁止把 reasoning 写进正文。
+- **`@` 到名字 ≠ 现在就启动**（`groupChatDirectCallMentions`，见 `docs/fix-log.md` #408/#409）：只有真正被指派的人才启动，下面三类 `@` 只是引用 ——
+  ① 条件/顺序子句里的（`通过后|之后再|然后|再让|再叫|等…后|如果|一旦|待|先…再|后续`）；
+  ② **文档体**里的（开头已点名收件人，之后出现 `**小标题**：`、行首列表 `- ` / `1. `、或 `需求|约束|建议|方案|步骤|计划|规范|说明|要求|背景|目标|验收|交付` 加 `：`）；
+  ③ 动作对象位置的（`审核|审批|验收|检查|评估|查看|参考|针对|关于|依据|复核` 或 `…的方案|的报告|的结果|的代码` 之后）。
+  真正的多人指派照旧（`请 @甲 和 @乙 一起做` 都启动）；整条消息全是引用时回落到对接用户的负责人。**不要**把这条收窄成「只有句首 @ 才算指派」——那会打破 `这个 bug @开发 看一下`、`打回：@开发 修边界`（已被测试逮过）。
+- **负责人不许自己开干**（派活提醒，见 #406）：有下属、本轮没派过活、也没提醒过，却写了 ≥60 字实质内容 → 判定「自己开干」，补一轮提醒（`groupChatDelegateNudge`，只进本次请求的动尾、**不落库**），并把它继续留在「在飞」，它的上级仍不许启动；短回复（「收到，待命」）不提醒，每人每轮最多提醒一次。
+- **汇报必须有实质内容**（见 #414）：团队里只有正文会被别人看到，思考过程不算汇报；要求写清结论/完成度、具体产出（文件路径、命令、关键数据、行数/字节数）、问题或不确定点、下一步谁接；禁止只回「收到/已完成/好的」或把大段原始输出粘进正文。
 - 库表 `group_rooms` / `group_agents` / `group_messages`，DB v23 只 `CREATE TABLE IF NOT EXISTS`；`title` / `reports_to` 在 `ensureTables` 里 ALTER，不清数据。
 
 ## DSH 连接

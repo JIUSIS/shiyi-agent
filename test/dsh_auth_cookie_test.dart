@@ -8,10 +8,10 @@ import 'package:shiyi_agent_app/services/dsh_api.dart';
 void main() {
   test('不同连接 scope 用不同落盘键（Cookie 不会串主机）', () {
     final a = DshApiClient.authCookieStorageKey(
-      'lan\u0000http://192.168.0.103:8080',
+      'lan\u0000http://192.168.77.10:8080',
     );
     final b = DshApiClient.authCookieStorageKey(
-      'lan\u0000http://192.168.0.104:8080',
+      'lan\u0000http://192.168.77.11:8080',
     );
     final c = DshApiClient.authCookieStorageKey(
       'local\u0000http://127.0.0.1:3080',
@@ -22,7 +22,7 @@ void main() {
   });
 
   test('同一个 scope 稳定（重启后能读回同一条）', () {
-    const scope = 'lan\u0000http://192.168.0.103:8080';
+    const scope = 'lan\u0000http://192.168.77.10:8080';
     expect(
       DshApiClient.authCookieStorageKey(scope),
       DshApiClient.authCookieStorageKey(scope),
